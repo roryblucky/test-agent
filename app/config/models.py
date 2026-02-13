@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -97,25 +96,33 @@ class GroundednessConfig(BaseModel):
 
 
 class FlowStepType(str, Enum):
-    """Available flow step types."""
+    """Available flow step module types.
+
+    Each type is a *module* — the ``mode`` field on :class:`FlowStep`
+    selects the specific action within that module.
+    """
 
     MODERATION = "moderation"
-    REFINE_QUESTION = "refine_question"
-    INTENT_RECOGNITION = "intent_recognition"
+    LLM = "llm"
     RETRIEVER = "retriever"
     RANKING = "ranking"
-    LLM = "llm"
     GROUNDEDNESS = "groundedness"
+    ANALYSIS = "analysis"
+    MEMORY = "memory"
 
 
 class FlowStep(BaseModel):
     """A single step in the flow pipeline.
 
-    ``model`` is optional — only used by LLM-related steps to reference
-    a named model from ``llmConfig.models``.
+    - ``type``  — the module to execute (moderation, llm, retriever, …)
+    - ``mode``  — action variant within that module
+      (e.g. ``"pre"``/``"post"`` for moderation,
+      ``"refine_question"``/``"intent"``/``"answer"`` for llm)
+    - ``model`` — named model from ``llmConfig.models`` (llm steps only)
     """
 
     type: FlowStepType
+    mode: str | None = None
     model: str | None = None
 
     model_config = {"populate_by_name": True}
