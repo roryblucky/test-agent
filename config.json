@@ -1,0 +1,115 @@
+[
+    {
+        "kmsAppName": "",
+        "applicationId": "",
+        "adGroups": [],
+        "llmConfig": {
+            "models": {
+                "fast": {
+                    "provider": "azure",
+                    "modelName": "gpt-4.1-mini",
+                    "temperature": 0,
+                    "topP": 0.0,
+                    "maxTokens": 8000,
+                    "thinkingLevel": "low",
+                    "thinkingSummary": "auto"
+                },
+                "pro": {
+                    "provider": "gcp",
+                    "modelName": "gemini-3",
+                    "temperature": 0,
+                    "topP": 0.0,
+                    "maxTokens": 8000,
+                    "thinkingEffort": "medium",
+                    "thinkingSummary": "auto"
+                },
+                "intent": {
+                    "provider": "azure",
+                    "modelName": "gpt-4.1-mini",
+                    "temperature": 0,
+                    "maxTokens": 2000
+                }
+            }
+        },
+        "retrieverConfig": {
+            "provider": "gcp",
+            "topK": 10,
+            "searchType": "semantic"
+        },
+        "rankingConfig": {
+            "provider": "gcp",
+            "topN": 5,
+            "model": "semantic-ranker-512"
+        },
+        "moderationConfig": {
+            "provider": "azure",
+            "categories": [
+                "hate",
+                "violence",
+                "self_harm",
+                "sexual"
+            ],
+            "threshold": "medium"
+        },
+        "groundednessConfig": {
+            "provider": "gcp",
+            "threshold": 0.7
+        },
+        "flowConfig": {
+            "mode": "simple",
+            "steps": [
+                {
+                    "type": "moderation",
+                    "mode": "pre"
+                },
+                {
+                    "type": "llm",
+                    "mode": "refine_question",
+                    "model": "fast"
+                },
+                {
+                    "type": "llm",
+                    "mode": "intent",
+                    "model": "intent"
+                },
+                {
+                    "type": "retriever"
+                },
+                {
+                    "type": "ranking"
+                },
+                {
+                    "type": "llm",
+                    "mode": "answer",
+                    "model": "pro"
+                },
+                {
+                    "type": "groundedness"
+                },
+                {
+                    "type": "moderation",
+                    "mode": "post"
+                },
+                {
+                    "type": "analysis"
+                }
+            ]
+        },
+        "azureConfig": {
+            "tenantId": "",
+            "clientId": "",
+            "clientSecret": "",
+            "openAIEndpoint": "",
+            "contentSafetyEndpoint": "",
+            "aiLanguageEndpoint": "",
+            "proxyHost": "",
+            "proxyPort": 80,
+            "noProxy": ""
+        },
+        "gcpConfig": {
+            "projectId": "",
+            "bucketName": "",
+            "datastore": ""
+        }
+    }
+]
