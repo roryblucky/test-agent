@@ -104,12 +104,17 @@ def create_coordinator_agent(
     The Coordinator uses the ``pro`` model for complex reasoning.
     Each tool is a specialist that the LLM can invoke autonomously.
     """
+    from app.agents.history_processors import filter_thinking, trim_history
 
     coordinator = Agent[CoordinatorDeps, CoordinatorOutput](
         registry.get_model("pro").model,
         output_type=CoordinatorOutput,
         model_settings=registry.get_model("pro").settings,
         toolsets=extra_toolsets or [],
+        history_processors=[
+            trim_history(max_messages=20),
+            filter_thinking(),
+        ],
         instructions=(
             "You are an expert analysis coordinator. Your job is to answer the user's "
             "question by strategically using the available tools.\n\n"
