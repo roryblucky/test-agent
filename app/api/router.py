@@ -7,6 +7,7 @@ determines which tenant's components are loaded.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends
@@ -14,28 +15,50 @@ from fastapi.responses import StreamingResponse
 
 from app.api.dependencies import TenantContext, get_tenant, get_tenant_manager
 from app.api.schemas import HealthResponse, QueryRequest, QueryResponse
+from app.memory.session_store import BaseSessionStore, InMemorySessionStore
 from app.services.events import EventEmitter
 from app.services.exceptions import ContentFlaggedError
 from app.services.tenant_manager import TenantManager
 
 router = APIRouter(prefix="/api/v1", tags=["KMS"])
 
+# Default session store — swap out via DI for production (Redis, etc.)
+_session_store = InMemorySessionStore()
+
+
+def get_session_store() -> BaseSessionStore:
+    return _session_store
+
 
 @router.post("/query", response_model=QueryResponse)
 async def query(
     request: QueryRequest,
     tenant: TenantContext = Depends(get_tenant),
+    session_store: BaseSessionStore = Depends(get_session_store),
 ) -> QueryResponse:
     """Execute the full RAG pipeline (non-streaming) for the tenant."""
+    session_id = request.session_id or str(uuid.uuid4())
+    message_history = await session_store.get(session_id)
+
     flow = tenant.manager.get_flow_engine(tenant.app_id)
     try:
-        ctx = await flow.execute(request.query)
+        ctx = await flow.execute(
+            request.query,
+            session_id=session_id,
+            message_history=message_history,
+        )
     except ContentFlaggedError as exc:
         return QueryResponse(
             query=request.query,
             moderation=exc.result,
             answer="Your query was flagged by content moderation.",
+            session_id=session_id,
         )
+
+    # Persist updated conversation history
+    if ctx.new_messages:
+        await session_store.save(session_id, ctx.new_messages)
+
     return QueryResponse.from_flow_context(ctx)
 
 
@@ -43,6 +66,7 @@ async def query(
 async def query_stream(
     request: QueryRequest,
     tenant: TenantContext = Depends(get_tenant),
+    session_store: BaseSessionStore = Depends(get_session_store),
 ) -> StreamingResponse:
     """Execute the RAG pipeline with real-time SSE streaming.
 
@@ -57,15 +81,26 @@ async def query_stream(
     This protocol is consistent with LangGraph streaming events,
     OpenAI Assistants streaming, and Vercel AI SDK data stream protocol.
     """
+    session_id = request.session_id or str(uuid.uuid4())
 
     async def event_generator() -> AsyncIterator[str]:
         emitter = EventEmitter()
         flow = tenant.manager.get_flow_engine(tenant.app_id)
+        message_history = await session_store.get(session_id)
 
         async def run_pipeline() -> None:
             """Execute the pipeline in a background task."""
             try:
-                ctx = await flow.execute(request.query, emitter=emitter)
+                ctx = await flow.execute(
+                    request.query,
+                    emitter=emitter,
+                    session_id=session_id,
+                    message_history=message_history,
+                )
+                # Persist updated conversation history
+                if ctx.new_messages:
+                    await session_store.save(session_id, ctx.new_messages)
+
                 result = QueryResponse.from_flow_context(ctx)
                 await emitter.emit_done(result.model_dump())
             except ContentFlaggedError as exc:

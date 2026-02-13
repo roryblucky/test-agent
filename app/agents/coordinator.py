@@ -340,9 +340,16 @@ class DelegationOrchestrator:
         self,
         query: str,
         emitter: EventEmitter | None = None,
+        session_id: str | None = None,
+        message_history: list | None = None,
     ) -> FlowContext:
         """Run the delegation pipeline."""
-        ctx = FlowContext(query=query, emitter=emitter)
+        ctx = FlowContext(
+            query=query,
+            emitter=emitter,
+            session_id=session_id,
+            message_history=message_history or [],
+        )
 
         # ── Step 1: Fixed guard — Moderation ────────────────────────
         await self._run_moderation(ctx)
@@ -422,7 +429,11 @@ class DelegationOrchestrator:
             ctx.query,
             deps=deps,
             usage_limits=self._usage_limits,
+            message_history=ctx.message_history or None,
         )
+
+        # Store new messages for session persistence
+        ctx.new_messages = result.all_messages()
 
         # Extract results
         output: CoordinatorOutput = result.output

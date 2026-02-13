@@ -19,6 +19,11 @@ class QueryRequest(BaseModel):
     """Incoming query request body."""
 
     query: str = Field(..., min_length=1, description="The user's question")
+    session_id: str | None = Field(
+        None,
+        alias="sessionId",
+        description="Session ID for multi-turn conversation continuity",
+    )
 
 
 class QueryResponse(BaseModel):
@@ -31,6 +36,7 @@ class QueryResponse(BaseModel):
     documents: list[Document] = Field(default_factory=list)
     moderation: ModerationResult | None = None
     groundedness: GroundednessResult | None = None
+    session_id: str | None = Field(None, alias="sessionId")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
@@ -43,6 +49,7 @@ class QueryResponse(BaseModel):
             documents=ctx.ranked_documents or ctx.documents,
             moderation=ctx.moderation_result,
             groundedness=ctx.groundedness_result,
+            session_id=ctx.session_id,
             metadata=ctx.metadata,
         )
 

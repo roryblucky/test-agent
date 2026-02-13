@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic_ai.messages import ModelMessage
+
 from app.models.domain import (
     Document,
     GroundednessResult,
@@ -25,6 +27,11 @@ class FlowContext:
 
     # Input
     query: str
+
+    # Session / conversation continuity
+    session_id: str | None = None
+    message_history: list[ModelMessage] = field(default_factory=list)
+    new_messages: list[ModelMessage] = field(default_factory=list)
 
     # Populated by flow steps
     refined_query: str | None = None

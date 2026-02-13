@@ -60,9 +60,16 @@ class AgentOrchestrator:
         self,
         query: str,
         emitter: EventEmitter | None = None,
+        session_id: str | None = None,
+        message_history: list | None = None,
     ) -> FlowContext:
         """Dispatch to the named expert-chain graph."""
-        ctx = FlowContext(query=query, emitter=emitter)
+        ctx = FlowContext(
+            query=query,
+            emitter=emitter,
+            session_id=session_id,
+            message_history=message_history or [],
+        )
 
         match self.graph_name:
             case "rag_with_intent_branching":
@@ -243,4 +250,9 @@ class AgentOrchestrator:
             usage_limit_config=self._usage_limit_config,
             mcp_configs=self._mcp_configs,
         )
-        return await delegator.execute(ctx.query, emitter=ctx.emitter)
+        return await delegator.execute(
+            ctx.query,
+            emitter=ctx.emitter,
+            session_id=ctx.session_id,
+            message_history=ctx.message_history,
+        )

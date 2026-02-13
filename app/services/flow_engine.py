@@ -64,12 +64,19 @@ class FlowEngine:
         self,
         query: str,
         emitter: EventEmitter | None = None,
+        session_id: str | None = None,
+        message_history: list | None = None,
     ) -> FlowContext:
         """Run the pipeline end-to-end.
 
         Raises on first error (fail-fast).
         """
-        ctx = FlowContext(query=query, emitter=emitter)
+        ctx = FlowContext(
+            query=query,
+            emitter=emitter,
+            session_id=session_id,
+            message_history=message_history or [],
+        )
         for step in self.steps:
             handler = self._handlers.get(step.type)
             if handler is None:
