@@ -121,6 +121,21 @@ class FlowStep(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class MCPServerConfig(BaseModel):
+    """External MCP tool-server connection.
+
+    Provide *either* ``url`` (HTTP/SSE) or ``command`` (stdio).
+    """
+
+    name: str
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] | None = None
+
+    model_config = {"populate_by_name": True}
+
+
 class UsageLimitConfig(BaseModel):
     """Token / call budget for agent orchestration.
 
@@ -148,6 +163,7 @@ class FlowConfig(BaseModel):
     steps: list[FlowStep] = Field(default_factory=list)
     agent_graph: str | None = Field(None, alias="agentGraph")
     usage_limits: UsageLimitConfig | None = Field(None, alias="usageLimits")
+    mcp_servers: list[MCPServerConfig] = Field(default_factory=list, alias="mcpServers")
 
     model_config = {"populate_by_name": True}
 

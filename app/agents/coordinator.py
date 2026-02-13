@@ -38,9 +38,10 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import UsageLimits
 
-from app.config.models import UsageLimitConfig
+from app.config.models import MCPServerConfig, UsageLimitConfig
 from app.core.model_registry import ModelRegistry
 from app.models.domain import Document, GroundednessResult, ModerationResult
 from app.providers.base import (
@@ -95,6 +96,7 @@ class CoordinatorOutput(BaseModel):
 
 def create_coordinator_agent(
     registry: ModelRegistry,
+    extra_toolsets: list[AbstractToolset] | None = None,
 ) -> Agent[CoordinatorDeps, CoordinatorOutput]:
     """Create the Coordinator Agent with specialist tools.
 
@@ -106,6 +108,7 @@ def create_coordinator_agent(
         registry.get_model("pro").model,
         output_type=CoordinatorOutput,
         model_settings=registry.get_model("pro").settings,
+        toolsets=extra_toolsets or [],
         instructions=(
             "You are an expert analysis coordinator. Your job is to answer the user's "
             "question by strategically using the available tools.\n\n"
@@ -323,10 +326,14 @@ class DelegationOrchestrator:
         registry: ModelRegistry,
         providers: Any,  # TenantProviders — duck-typed to avoid import
         usage_limit_config: UsageLimitConfig | None = None,
+        mcp_configs: list[MCPServerConfig] | None = None,
     ) -> None:
         self.registry = registry
         self.providers = providers
-        self._coordinator = create_coordinator_agent(registry)
+        self._coordinator = create_coordinator_agent(
+            registry,
+            extra_toolsets=_build_mcp_toolsets(mcp_configs or []),
+        )
         self._usage_limits = _build_usage_limits(usage_limit_config)
 
     async def execute(
@@ -445,6 +452,39 @@ class DelegationOrchestrator:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_mcp_toolsets(
+    configs: list[MCPServerConfig],
+) -> list[AbstractToolset]:
+    """Convert MCP server configs to pydantic-ai toolset instances."""
+    if not configs:
+        return []
+
+    toolsets: list[AbstractToolset] = []
+    for cfg in configs:
+        if cfg.url:
+            # SSE transport (legacy) vs Streamable HTTP
+            if cfg.url.rstrip("/").endswith("/sse"):
+                from pydantic_ai.mcp import MCPServerSSE
+
+                toolsets.append(MCPServerSSE(cfg.url, tool_prefix=cfg.name))
+            else:
+                from pydantic_ai.mcp import MCPServerStreamableHTTP
+
+                toolsets.append(MCPServerStreamableHTTP(cfg.url, tool_prefix=cfg.name))
+        elif cfg.command:
+            from pydantic_ai.mcp import MCPServerStdio
+
+            toolsets.append(
+                MCPServerStdio(
+                    cfg.command,
+                    args=cfg.args,
+                    env=cfg.env,
+                    tool_prefix=cfg.name,
+                )
+            )
+    return toolsets
 
 
 def _build_usage_limits(cfg: UsageLimitConfig | None) -> UsageLimits | None:

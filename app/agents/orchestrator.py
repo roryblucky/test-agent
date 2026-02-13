@@ -23,7 +23,7 @@ from app.agents.intent_recognition import create_intent_agent
 from app.agents.rag_answer import create_rag_answer_agent
 from app.agents.refine_question import create_refine_agent
 from app.core.model_registry import ModelRegistry
-from app.config.models import UsageLimitConfig
+from app.config.models import MCPServerConfig, UsageLimitConfig
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 
@@ -48,11 +48,13 @@ class AgentOrchestrator:
         providers: Any,  # TenantProviders
         graph_name: str = "rag_with_intent_branching",
         usage_limit_config: UsageLimitConfig | None = None,
+        mcp_configs: list[MCPServerConfig] | None = None,
     ) -> None:
         self.registry = registry
         self.providers = providers
         self.graph_name = graph_name
         self._usage_limit_config = usage_limit_config
+        self._mcp_configs = mcp_configs
 
     async def execute(
         self,
@@ -239,5 +241,6 @@ class AgentOrchestrator:
             self.registry,
             self.providers,
             usage_limit_config=self._usage_limit_config,
+            mcp_configs=self._mcp_configs,
         )
         return await delegator.execute(ctx.query, emitter=ctx.emitter)

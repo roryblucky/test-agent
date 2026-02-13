@@ -90,6 +90,7 @@ class TenantManager:
                 providers,
                 graph_name=graph_name,
                 usage_limit_config=cfg.flow_config.usage_limits,
+                mcp_configs=cfg.flow_config.mcp_servers or None,
             )
         return FlowEngine(cfg, registry, providers)
 
