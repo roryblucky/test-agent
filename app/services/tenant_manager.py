@@ -54,6 +54,7 @@ class TenantManager:
         self._tenants: dict[str, TenantConfig] = {}
         self._registries: dict[str, ModelRegistry] = {}
         self._providers: dict[str, TenantProviders] = {}
+        self._engines: dict[str, FlowEngine | AgentOrchestrator] = {}
 
         for cfg in configs:
             self._tenants[cfg.application_id] = cfg
@@ -68,31 +69,25 @@ class TenantManager:
             self._providers[cfg.application_id] = self._init_providers(
                 cfg, cloud_configs, http_pool
             )
+            # Pre-build and cache the flow engine / orchestrator
+            self._engines[cfg.application_id] = self._build_engine(
+                cfg,
+                self._registries[cfg.application_id],
+                self._providers[cfg.application_id],
+            )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def get_flow_engine(self, app_id: str) -> FlowEngine | AgentOrchestrator:
-        """Get the appropriate flow executor for a tenant.
+        """Get the cached flow executor for a tenant.
 
         Returns a :class:`FlowEngine` for ``"simple"`` mode configs,
         or an :class:`AgentOrchestrator` for ``"agent"`` mode.
         """
-        cfg = self._resolve_tenant(app_id)
-        registry = self._registries[app_id]
-        providers = self._providers[app_id]
-
-        if cfg.flow_config.mode == "agent":
-            graph_name = cfg.flow_config.agent_graph or "rag_with_intent_branching"
-            return AgentOrchestrator(
-                registry,
-                providers,
-                graph_name=graph_name,
-                usage_limit_config=cfg.flow_config.usage_limits,
-                mcp_configs=cfg.flow_config.mcp_servers or None,
-            )
-        return FlowEngine(cfg, registry, providers)
+        self._resolve_tenant(app_id)  # validate tenant exists
+        return self._engines[app_id]
 
     def get_tenant_config(self, app_id: str) -> TenantConfig:
         return self._resolve_tenant(app_id)
@@ -111,6 +106,24 @@ class TenantManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_engine(
+        cfg: TenantConfig,
+        registry: ModelRegistry,
+        providers: TenantProviders,
+    ) -> FlowEngine | AgentOrchestrator:
+        """Create the appropriate engine for a tenant's flow mode."""
+        if cfg.flow_config.mode == "agent":
+            graph_name = cfg.flow_config.agent_graph or "rag_with_intent_branching"
+            return AgentOrchestrator(
+                registry,
+                providers,
+                graph_name=graph_name,
+                usage_limit_config=cfg.flow_config.usage_limits,
+                mcp_configs=cfg.flow_config.mcp_servers or None,
+            )
+        return FlowEngine(cfg, registry, providers)
 
     def _resolve_tenant(self, app_id: str) -> TenantConfig:
         if app_id not in self._tenants:

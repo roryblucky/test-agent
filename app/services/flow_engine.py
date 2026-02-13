@@ -26,6 +26,8 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from pydantic_ai import Agent
+
 from app.agents.intent_recognition import create_intent_agent
 from app.agents.rag_answer import create_rag_answer_agent
 from app.agents.refine_question import create_refine_agent
@@ -71,6 +73,46 @@ class FlowEngine:
             FlowStepType.ANALYSIS: self._run_analysis,
             FlowStepType.MEMORY: self._run_memory,
         }
+
+        # Agent cache: keyed by (mode, model_name) — pydantic-ai Agent
+        # is stateless & thread-safe, safe to reuse across requests.
+        self._agent_cache: dict[tuple[str, str], Agent] = {}
+
+        # Pre-warm cache for agents declared in config steps
+        _AGENT_FACTORIES: dict[str, Callable] = {
+            "refine_question": create_refine_agent,
+            "intent": create_intent_agent,
+            "answer": create_rag_answer_agent,
+        }
+        _DEFAULT_MODELS: dict[str, str] = {
+            "refine_question": "fast",
+            "intent": "intent",
+            "answer": "pro",
+        }
+        for step in self.steps:
+            if step.type == FlowStepType.LLM:
+                mode = step.mode or "answer"
+                model_name = step.model or _DEFAULT_MODELS.get(mode, "pro")
+                factory = _AGENT_FACTORIES.get(mode)
+                if factory and (mode, model_name) not in self._agent_cache:
+                    self._agent_cache[(mode, model_name)] = factory(
+                        registry, model_name
+                    )
+
+    def _get_agent(self, mode: str, model_name: str) -> Agent:
+        """Get or create a cached Agent for (mode, model_name)."""
+        key = (mode, model_name)
+        if key not in self._agent_cache:
+            factories: dict[str, Callable] = {
+                "refine_question": create_refine_agent,
+                "intent": create_intent_agent,
+                "answer": create_rag_answer_agent,
+            }
+            factory = factories.get(mode)
+            if factory is None:
+                raise ValueError(f"No agent factory for LLM mode: {mode!r}")
+            self._agent_cache[key] = factory(self.registry, model_name)
+        return self._agent_cache[key]
 
     async def execute(
         self,
@@ -188,7 +230,7 @@ class FlowEngine:
         self, ctx: FlowContext, step: FlowStep
     ) -> FlowContext:
         model_name = step.model or "fast"
-        agent = create_refine_agent(self.registry, model_name)
+        agent = self._get_agent("refine_question", model_name)
         settings = _build_step_settings(step)
         async with agent.run_stream(ctx.query, model_settings=settings) as stream:
             result = await stream.get_output()
@@ -207,7 +249,7 @@ class FlowEngine:
 
     async def _llm_intent(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         model_name = step.model or "intent"
-        agent = create_intent_agent(self.registry, model_name)
+        agent = self._get_agent("intent", model_name)
         effective_query = ctx.refined_query or ctx.query
         settings = _build_step_settings(step)
         async with agent.run_stream(effective_query, model_settings=settings) as stream:
@@ -227,7 +269,7 @@ class FlowEngine:
 
     async def _llm_answer(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         model_name = step.model or "pro"
-        agent = create_rag_answer_agent(self.registry, model_name)
+        agent = self._get_agent("answer", model_name)
 
         context_docs = ctx.ranked_documents or ctx.documents
         context_text = "\n\n---\n\n".join(

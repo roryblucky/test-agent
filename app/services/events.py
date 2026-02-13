@@ -87,8 +87,8 @@ class EventEmitter:
             yield sse_line  # already formatted as SSE
     """
 
-    def __init__(self) -> None:
-        self._queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
+    def __init__(self, maxsize: int = 2000) -> None:
+        self._queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue(maxsize=maxsize)
         self._closed = False
 
     # ------------------------------------------------------------------

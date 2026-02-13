@@ -7,6 +7,7 @@ determines which tenant's components are loaded.
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from collections.abc import AsyncIterator
 
@@ -22,8 +23,22 @@ from app.services.tenant_manager import TenantManager
 
 router = APIRouter(prefix="/api/v1", tags=["KMS"])
 
-# Default session store — swap out via DI for production (Redis, etc.)
-_session_store = InMemorySessionStore()
+
+def _create_session_store() -> BaseSessionStore:
+    """Create session store based on ``SESSION_STORE_URL`` env var.
+
+    - Set ``SESSION_STORE_URL=redis://redis-svc:6379/0`` for production.
+    - Leave unset for local dev (in-memory fallback).
+    """
+    url = os.environ.get("SESSION_STORE_URL")
+    if url and url.startswith("redis"):
+        from app.memory.redis_session_store import RedisSessionStore
+
+        return RedisSessionStore(url)
+    return InMemorySessionStore()
+
+
+_session_store = _create_session_store()
 
 
 def get_session_store() -> BaseSessionStore:
