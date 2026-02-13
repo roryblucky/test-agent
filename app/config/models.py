@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -114,16 +115,20 @@ class FlowStepType(str, Enum):
 class FlowStep(BaseModel):
     """A single step in the flow pipeline.
 
-    - ``type``  — the module to execute (moderation, llm, retriever, …)
-    - ``mode``  — action variant within that module
+    - ``type``     — the module to execute (moderation, llm, retriever, …)
+    - ``mode``     — action variant within that module
       (e.g. ``"pre"``/``"post"`` for moderation,
       ``"refine_question"``/``"intent"``/``"answer"`` for llm)
-    - ``model`` — named model from ``llmConfig.models`` (llm steps only)
+    - ``model``    — named model from ``llmConfig.models`` (llm steps only)
+    - ``settings`` — per-step overrides for model parameters
+      (temperature, maxTokens, topP, …).  Merged over the base
+      ``ModelConfig`` defaults at runtime.
     """
 
     type: FlowStepType
     mode: str | None = None
     model: str | None = None
+    settings: dict[str, Any] | None = None
 
     model_config = {"populate_by_name": True}
 

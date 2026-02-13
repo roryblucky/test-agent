@@ -168,6 +168,9 @@ class FlowEngine:
         - ``refine_question`` — rewrite / refine the query
         - ``intent``          — classify intent
         - ``answer``          — generate RAG answer (default)
+
+        ``step.settings`` (if provided) overrides the model's base config
+        for this call only (temperature, maxTokens, topP, …).
         """
         mode = step.mode or "answer"
 
@@ -186,7 +189,8 @@ class FlowEngine:
     ) -> FlowContext:
         model_name = step.model or "fast"
         agent = create_refine_agent(self.registry, model_name)
-        async with agent.run_stream(ctx.query) as stream:
+        settings = _build_step_settings(step)
+        async with agent.run_stream(ctx.query, model_settings=settings) as stream:
             result = await stream.get_output()
         ctx.refined_query = result.refined_query
         ctx.metadata["keywords"] = result.keywords
@@ -205,7 +209,8 @@ class FlowEngine:
         model_name = step.model or "intent"
         agent = create_intent_agent(self.registry, model_name)
         effective_query = ctx.refined_query or ctx.query
-        async with agent.run_stream(effective_query) as stream:
+        settings = _build_step_settings(step)
+        async with agent.run_stream(effective_query, model_settings=settings) as stream:
             result = await stream.get_output()
         ctx.intent = result
         if ctx.emitter:
@@ -234,7 +239,8 @@ class FlowEngine:
         )
 
         # All AI calls use streaming — emit per-token events
-        async with agent.run_stream(prompt) as stream:
+        settings = _build_step_settings(step)
+        async with agent.run_stream(prompt, model_settings=settings) as stream:
             chunks: list[str] = []
             async for chunk in stream.stream_text():
                 chunks.append(chunk)
@@ -359,3 +365,35 @@ class FlowEngine:
         if ctx.emitter:
             await ctx.emitter.emit_step_completed("memory", {"mode": step.mode})
         return ctx
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Mapping from config-style keys (camelCase) to pydantic-ai ModelSettings keys
+_SETTINGS_KEY_MAP: dict[str, str] = {
+    "temperature": "temperature",
+    "maxTokens": "max_tokens",
+    "max_tokens": "max_tokens",
+    "topP": "top_p",
+    "top_p": "top_p",
+}
+
+
+def _build_step_settings(step: FlowStep) -> dict[str, Any] | None:
+    """Convert ``FlowStep.settings`` to pydantic-ai ``ModelSettings``.
+
+    - Accepts both camelCase (``maxTokens``) and snake_case (``max_tokens``)
+    - Returns ``None`` when no overrides are present (agent defaults apply)
+    - Unknown keys are passed through as-is (provider-specific settings)
+    """
+    if not step.settings:
+        return None
+
+    result: dict[str, Any] = {}
+    for key, value in step.settings.items():
+        mapped_key = _SETTINGS_KEY_MAP.get(key, key)
+        result[mapped_key] = value
+
+    return result
