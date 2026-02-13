@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -45,6 +45,7 @@ class EventType(str, Enum):
     STEP_START = "step_start"
     STEP_COMPLETED = "step_completed"
     TOKEN = "token"
+    THINKING = "thinking"
     DONE = "done"
     ERROR = "error"
 
@@ -112,6 +113,10 @@ class EventEmitter:
     async def emit_token(self, token: str) -> None:
         """Convenience: emit a single LLM streaming token."""
         await self.emit(StreamEvent(type=EventType.TOKEN, data=token))
+
+    async def emit_thinking(self, content: str) -> None:
+        """Convenience: emit a thinking / reasoning step."""
+        await self.emit(StreamEvent(type=EventType.THINKING, data=content))
 
     async def emit_done(self, data: Any = None) -> None:
         """Convenience: emit the final ``done`` event and close."""

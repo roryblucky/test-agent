@@ -38,6 +38,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ThinkingPart, ModelResponse
 from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import UsageLimits
 
@@ -434,6 +435,20 @@ class DelegationOrchestrator:
 
         # Store new messages for session persistence
         ctx.new_messages = result.all_messages()
+
+        # ── Extract thinking / reasoning traces ─────────────────────
+        thinking_parts: list[str] = []
+        for msg in result.all_messages():
+            if isinstance(msg, ModelResponse):
+                for part in msg.parts:
+                    if isinstance(part, ThinkingPart) and part.content:
+                        thinking_parts.append(part.content)
+
+        if thinking_parts:
+            ctx.metadata["thinking"] = thinking_parts
+            if ctx.emitter:
+                for thought in thinking_parts:
+                    await ctx.emitter.emit_thinking(thought)
 
         # Extract results
         output: CoordinatorOutput = result.output
