@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.usage import UsageLimits
 
-from app.config.models import FlowConfig
+from app.config.models import UsageLimitConfig
 from app.core.model_registry import ModelRegistry
 from app.models.domain import Document, GroundednessResult, ModerationResult
 from app.providers.base import (
@@ -322,12 +322,12 @@ class DelegationOrchestrator:
         self,
         registry: ModelRegistry,
         providers: Any,  # TenantProviders — duck-typed to avoid import
-        flow_config: FlowConfig | None = None,
+        usage_limit_config: UsageLimitConfig | None = None,
     ) -> None:
         self.registry = registry
         self.providers = providers
         self._coordinator = create_coordinator_agent(registry)
-        self._usage_limits = self._build_usage_limits(flow_config)
+        self._usage_limits = _build_usage_limits(usage_limit_config)
 
     async def execute(
         self,
@@ -412,7 +412,9 @@ class DelegationOrchestrator:
 
         # Run the coordinator — LLM decides which tools to invoke
         result = await self._coordinator.run(
-            ctx.query, deps=deps, usage_limits=self._usage_limits
+            ctx.query,
+            deps=deps,
+            usage_limits=self._usage_limits,
         )
 
         # Extract results
@@ -439,19 +441,20 @@ class DelegationOrchestrator:
                 },
             )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_usage_limits(flow_config: FlowConfig | None) -> UsageLimits:
-        """Build ``UsageLimits`` from tenant flow config."""
-        if not flow_config:
-            return UsageLimits(request_limit=50)
-        return UsageLimits(
-            request_limit=flow_config.request_limit,
-            tool_calls_limit=flow_config.tool_calls_limit,
-            input_tokens_limit=flow_config.input_tokens_limit,
-            output_tokens_limit=flow_config.output_tokens_limit,
-            total_tokens_limit=flow_config.total_tokens_limit,
-        )
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_usage_limits(cfg: UsageLimitConfig | None) -> UsageLimits | None:
+    """Convert config to pydantic-ai ``UsageLimits``, or ``None`` for defaults."""
+    if cfg is None:
+        return None
+    return UsageLimits(
+        request_limit=cfg.request_limit,
+        tool_calls_limit=cfg.tool_calls_limit,
+        input_tokens_limit=cfg.input_tokens_limit,
+        output_tokens_limit=cfg.output_tokens_limit,
+        total_tokens_limit=cfg.total_tokens_limit,
+    )

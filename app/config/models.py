@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -121,6 +121,21 @@ class FlowStep(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class UsageLimitConfig(BaseModel):
+    """Token / call budget for agent orchestration.
+
+    Maps directly to pydantic-ai's ``UsageLimits``.
+    """
+
+    request_limit: int = Field(50, alias="requestLimit")
+    tool_calls_limit: int | None = Field(None, alias="toolCallsLimit")
+    input_tokens_limit: int | None = Field(None, alias="inputTokensLimit")
+    output_tokens_limit: int | None = Field(None, alias="outputTokensLimit")
+    total_tokens_limit: int | None = Field(None, alias="totalTokensLimit")
+
+    model_config = {"populate_by_name": True}
+
+
 class FlowConfig(BaseModel):
     """Pipeline orchestration configuration.
 
@@ -132,13 +147,7 @@ class FlowConfig(BaseModel):
     mode: str = "simple"
     steps: list[FlowStep] = Field(default_factory=list)
     agent_graph: str | None = Field(None, alias="agentGraph")
-
-    # Token budget / circuit-breaker for agent runs
-    request_limit: int = Field(50, alias="requestLimit")
-    tool_calls_limit: int | None = Field(None, alias="toolCallsLimit")
-    input_tokens_limit: int | None = Field(None, alias="inputTokensLimit")
-    output_tokens_limit: int | None = Field(None, alias="outputTokensLimit")
-    total_tokens_limit: int | None = Field(None, alias="totalTokensLimit")
+    usage_limits: UsageLimitConfig | None = Field(None, alias="usageLimits")
 
     model_config = {"populate_by_name": True}
 

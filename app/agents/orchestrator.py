@@ -22,8 +22,8 @@ from typing import Any
 from app.agents.intent_recognition import create_intent_agent
 from app.agents.rag_answer import create_rag_answer_agent
 from app.agents.refine_question import create_refine_agent
-from app.config.models import FlowConfig
 from app.core.model_registry import ModelRegistry
+from app.config.models import UsageLimitConfig
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 
@@ -47,12 +47,12 @@ class AgentOrchestrator:
         registry: ModelRegistry,
         providers: Any,  # TenantProviders
         graph_name: str = "rag_with_intent_branching",
-        flow_config: FlowConfig | None = None,
+        usage_limit_config: UsageLimitConfig | None = None,
     ) -> None:
         self.registry = registry
         self.providers = providers
         self.graph_name = graph_name
-        self.flow_config = flow_config
+        self._usage_limit_config = usage_limit_config
 
     async def execute(
         self,
@@ -236,6 +236,8 @@ class AgentOrchestrator:
         from app.agents.coordinator import DelegationOrchestrator
 
         delegator = DelegationOrchestrator(
-            self.registry, self.providers, flow_config=self.flow_config
+            self.registry,
+            self.providers,
+            usage_limit_config=self._usage_limit_config,
         )
         return await delegator.execute(ctx.query, emitter=ctx.emitter)
