@@ -85,7 +85,9 @@ class TenantManager:
 
         if cfg.flow_config.mode == "agent":
             graph_name = cfg.flow_config.agent_graph or "rag_with_intent_branching"
-            return AgentOrchestrator(registry, providers, graph_name=graph_name)
+            return AgentOrchestrator(
+                registry, providers, graph_name=graph_name, flow_config=cfg.flow_config
+            )
         return FlowEngine(cfg, registry, providers)
 
     def get_tenant_config(self, app_id: str) -> TenantConfig:

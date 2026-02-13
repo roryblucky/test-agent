@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+
 
 from pydantic import BaseModel, Field
 
@@ -132,6 +132,13 @@ class FlowConfig(BaseModel):
     mode: str = "simple"
     steps: list[FlowStep] = Field(default_factory=list)
     agent_graph: str | None = Field(None, alias="agentGraph")
+
+    # Token budget / circuit-breaker for agent runs
+    request_limit: int = Field(50, alias="requestLimit")
+    tool_calls_limit: int | None = Field(None, alias="toolCallsLimit")
+    input_tokens_limit: int | None = Field(None, alias="inputTokensLimit")
+    output_tokens_limit: int | None = Field(None, alias="outputTokensLimit")
+    total_tokens_limit: int | None = Field(None, alias="totalTokensLimit")
 
     model_config = {"populate_by_name": True}
 
