@@ -41,3 +41,16 @@ class BaseGroundednessProvider(ABC):
     async def check(
         self, answer: str, context: list[Document]
     ) -> GroundednessResult: ...
+
+
+class TenantProvidersProtocol(ABC):
+    """Protocol for the collection of tenant providers.
+
+    Used to avoid circular imports where consumers (FlowEngine, Orchestrator)
+    need to reference the provider collection defined in TenantManager.
+    """
+
+    retriever: BaseRetrieverProvider | None
+    ranker: BaseRankerProvider | None
+    moderation: BaseModerationProvider | None
+    groundedness: BaseGroundednessProvider | None

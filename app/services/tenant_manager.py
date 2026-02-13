@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.agents.orchestrator import AgentOrchestrator
-from app.config.models import TenantConfig
+from app.config.models import AzureConfig, GCPConfig, TenantConfig
 from app.core.http_client_pool import HttpClientPool
 from app.core.model_registry import ModelRegistry
 from app.providers.base import (
@@ -131,9 +131,9 @@ class TenantManager:
         return self._tenants[app_id]
 
     @staticmethod
-    def _collect_cloud_configs(cfg: TenantConfig) -> dict[str, Any]:
+    def _collect_cloud_configs(cfg: TenantConfig) -> dict[str, AzureConfig | GCPConfig]:
         """Gather cloud-provider configs into a flat dict keyed by provider name."""
-        configs: dict[str, Any] = {}
+        configs: dict[str, AzureConfig | GCPConfig] = {}
         if cfg.azure_config:
             configs["azure"] = cfg.azure_config
         if cfg.gcp_config:
@@ -144,7 +144,7 @@ class TenantManager:
     @staticmethod
     def _init_providers(
         cfg: TenantConfig,
-        cloud_configs: dict[str, Any],
+        cloud_configs: dict[str, AzureConfig | GCPConfig],
         http_pool: HttpClientPool,
     ) -> TenantProviders:
         """Create non-LLM provider instances using the ProviderFactory.

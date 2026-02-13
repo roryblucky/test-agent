@@ -37,6 +37,10 @@ from app.services.events import EventEmitter
 from app.services.exceptions import ContentFlaggedError
 from app.services.flow_context import FlowContext
 
+from app.core.resilience import safe_execute
+from app.core.telemetry import trace_span
+from app.providers.base import TenantProvidersProtocol
+
 
 class FlowEngine:
     """Executes a linear pipeline defined by ``flowConfig.steps``.
@@ -55,7 +59,7 @@ class FlowEngine:
         self,
         tenant_config: TenantConfig,
         registry: ModelRegistry,
-        providers: Any,  # TenantProviders (forward ref)
+        providers: TenantProvidersProtocol,
     ) -> None:
         self.steps = tenant_config.flow_config.steps
         self.registry = registry
@@ -157,6 +161,7 @@ class FlowEngine:
 
     # ── Moderation ────────────────────────────────────────────────────
 
+    @trace_span("moderation")
     async def _run_moderation(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         """Run content moderation.
 
@@ -203,6 +208,9 @@ class FlowEngine:
 
     # ── LLM (unified dispatcher) ─────────────────────────────────────
 
+    # ── LLM (unified dispatcher) ─────────────────────────────────────
+
+    @trace_span("llm_unified")
     async def _run_llm(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         """Unified LLM handler — ``step.mode`` selects the agent factory.
 
@@ -267,6 +275,7 @@ class FlowEngine:
             )
         return ctx
 
+    @trace_span("llm_answer")
     async def _llm_answer(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         model_name = step.model or "pro"
         agent = self._get_agent("answer", model_name)
@@ -296,14 +305,19 @@ class FlowEngine:
 
     # ── Retriever ─────────────────────────────────────────────────────
 
+    @trace_span("retriever")
     async def _run_retriever(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         if not self.providers.retriever:
             raise ValueError(
                 "Flow step 'retriever' requires 'retrieverConfig' in tenant config"
             )
         effective_query = ctx.refined_query or ctx.query
-        ctx.documents = await self.providers.retriever.retrieve(
-            effective_query, self.providers.retriever.config.top_k
+
+        # Use safe_execute for retrieval
+        ctx.documents = await safe_execute(
+            self.providers.retriever.retrieve,
+            effective_query,
+            self.providers.retriever.config.top_k,
         )
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
@@ -319,6 +333,7 @@ class FlowEngine:
 
     # ── Ranking ────────────────────────────────────────────────────────
 
+    @trace_span("ranking")
     async def _run_ranking(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         if not self.providers.ranker:
             raise ValueError(
@@ -342,6 +357,7 @@ class FlowEngine:
 
     # ── Groundedness ──────────────────────────────────────────────────
 
+    @trace_span("groundedness")
     async def _run_groundedness(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         if not self.providers.groundedness:
             raise ValueError(
@@ -365,6 +381,7 @@ class FlowEngine:
 
     # ── Analysis (observability) ──────────────────────────────────────
 
+    @trace_span("analysis")
     async def _run_analysis(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         """Aggregate pipeline execution data for observability.
 

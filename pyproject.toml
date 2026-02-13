@@ -12,6 +12,11 @@ dependencies = [
     "pydantic-ai>=1.58.0",
     "pydantic-settings>=2.12.0",
     "redis>=7.1.1",
+    "opentelemetry-api>=1.24.0",
+    "opentelemetry-sdk>=1.24.0",
+    "opentelemetry-exporter-gcp-trace>=1.6.0",
+    "google-cloud-logging>=3.10.0",
+    "tenacity>=8.2.3",
     "uvicorn>=0.34.0",
     "uvloop>=0.22.1",
 ]

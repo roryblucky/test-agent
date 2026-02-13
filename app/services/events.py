@@ -96,9 +96,23 @@ class EventEmitter:
     # ------------------------------------------------------------------
 
     async def emit(self, event: StreamEvent) -> None:
-        """Push a single event."""
-        if not self._closed:
+        """Push a single event.
+
+        If the queue is full (slow client), this will block until space is available.
+        If blocking takes too long, we might want to drop events or error out,
+        but for now we rely on standard asyncio backpressure.
+        """
+        if self._closed:
+            return
+
+        try:
+            # wait for space if queue is full
             await self._queue.put(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Fallback for unexpected queue errors
+            pass
 
     async def emit_step_start(self, step_name: str) -> None:
         """Convenience: emit a ``step_start`` event."""
@@ -130,9 +144,15 @@ class EventEmitter:
 
     async def close(self) -> None:
         """Signal that no more events will be emitted."""
-        if not self._closed:
-            self._closed = True
+        if self._closed:
+            return
+        self._closed = True
+        try:
             await self._queue.put(None)  # sentinel
+        except asyncio.QueueFull:
+            # If queue is full during close, force space or ignore
+            # treating 'closed' flag as sufficient for no more puts
+            pass
 
     # ------------------------------------------------------------------
     # Consumer API (used by API layer)

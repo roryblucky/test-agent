@@ -57,6 +57,11 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan — initialise and tear down shared resources."""
     # Startup
+    from app.core.telemetry import TelemetryService
+
+    # Initialize OpenTelemetry
+    TelemetryService("agent-kms-api")
+
     http_pool = HttpClientPool()
     configs = load_config("config.json")
     app.state.tenant_manager = TenantManager(configs, http_pool)

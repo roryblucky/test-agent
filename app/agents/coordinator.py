@@ -34,20 +34,20 @@ components (FlowEngine, FlowContext, providers, etc.).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent
 from pydantic_ai.messages import ThinkingPart, ModelResponse
 from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import UsageLimits
 
 from app.config.models import MCPServerConfig, UsageLimitConfig
 from app.core.model_registry import ModelRegistry
-from app.models.domain import Document, GroundednessResult, ModerationResult
+from app.models.domain import GroundednessResult, ModerationResult
 from app.providers.base import (
     BaseRankerProvider,
     BaseRetrieverProvider,
+    TenantProvidersProtocol,
 )
 from app.services.events import EventEmitter
 from app.services.exceptions import ContentFlaggedError
@@ -133,171 +133,18 @@ def create_coordinator_agent(
         ),
     )
 
-    # -- Tool: search_documents -----------------------------------------
+    # Register tools from tools.py
+    from app.agents.tools import (
+        search_documents_tool,
+        rank_documents_tool,
+        decompose_question_tool,
+        analyze_section_tool,
+    )
 
-    @coordinator.tool
-    async def search_documents(ctx: RunContext[CoordinatorDeps], query: str) -> str:
-        """Search the knowledge base for documents relevant to a query.
-
-        Args:
-            query: The search query, can be a sub-question or refined query.
-
-        Returns:
-            Formatted text of retrieved documents.
-        """
-        if not ctx.deps.retriever:
-            return "No retriever configured for this tenant."
-
-        if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_start("search_documents")
-
-        docs = await ctx.deps.retriever.retrieve(query)
-
-        if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_completed(
-                "search_documents",
-                {
-                    "query": query,
-                    "document_count": len(docs),
-                    "documents": [{"id": d.id, "score": d.score} for d in docs],
-                },
-            )
-
-        if not docs:
-            return "No documents found for this query."
-
-        return "\n\n---\n\n".join(
-            f"[Document {d.id} | score={d.score}]\n{d.content}" for d in docs
-        )
-
-    # -- Tool: rank_documents ------------------------------------------
-
-    @coordinator.tool
-    async def rank_documents(
-        ctx: RunContext[CoordinatorDeps], query: str, document_texts: list[str]
-    ) -> str:
-        """Re-rank documents by relevance to a specific query.
-
-        Use this when you have many documents and want to focus on the
-        most relevant ones for a particular aspect of the question.
-
-        Args:
-            query: The ranking query.
-            document_texts: List of document texts to rank.
-
-        Returns:
-            The top-ranked documents as formatted text.
-        """
-        if not ctx.deps.ranker:
-            return "No ranker configured for this tenant."
-
-        if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_start("rank_documents")
-
-        # Wrap raw text into Document objects for the ranker
-        docs = [
-            Document(id=f"doc_{i}", content=text)
-            for i, text in enumerate(document_texts)
-        ]
-        ranked = await ctx.deps.ranker.rank(query, docs)
-
-        if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_completed(
-                "rank_documents",
-                {
-                    "query": query,
-                    "input_count": len(docs),
-                    "output_count": len(ranked),
-                },
-            )
-
-        return "\n\n---\n\n".join(
-            f"[Ranked #{i + 1} | score={d.score}]\n{d.content}"
-            for i, d in enumerate(ranked)
-        )
-
-    # -- Tool: decompose_question --------------------------------------
-
-    @coordinator.tool
-    async def decompose_question(
-        ctx: RunContext[CoordinatorDeps], complex_question: str
-    ) -> list[str]:
-        """Break a complex question into 2-5 focused sub-questions.
-
-        Use this for multi-part questions, comparisons, or questions
-        that need information from different angles.
-
-        Args:
-            complex_question: The complex question to decompose.
-
-        Returns:
-            A list of focused sub-questions.
-        """
-        if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_start("decompose_question")
-
-        decompose_agent = ctx.deps.registry.create_agent(
-            "fast",
-            output_type=list[str],
-            instructions=(
-                "Break the given question into 2-5 specific, focused sub-questions "
-                "that can each be answered independently. Each sub-question should "
-                "target a distinct aspect of the original question."
-            ),
-        )
-        result = await decompose_agent.run(complex_question, usage=ctx.usage)
-        sub_questions = result.output
-
-        if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_completed(
-                "decompose_question",
-                {"sub_questions": sub_questions},
-            )
-
-        return sub_questions
-
-    # -- Tool: analyze_section -----------------------------------------
-
-    @coordinator.tool
-    async def analyze_section(
-        ctx: RunContext[CoordinatorDeps],
-        question: str,
-        context: str,
-    ) -> str:
-        """Analyze specific content to answer a focused question.
-
-        Use this as a specialist to get deeper analysis on a particular
-        topic, using the provided context.
-
-        Args:
-            question: The specific question to analyze.
-            context: The reference text to analyze.
-
-        Returns:
-            A focused analysis.
-        """
-        if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_start("analyze_section")
-
-        analysis_agent = ctx.deps.registry.create_agent(
-            "fast",
-            output_type=str,
-            instructions=(
-                "You are a specialist analyst. Answer the given question "
-                "based strictly on the provided context. Be precise and "
-                "cite specific data points when available."
-            ),
-        )
-        prompt = f"Question: {question}\n\nContext:\n{context}"
-        result = await analysis_agent.run(prompt, usage=ctx.usage)
-
-        if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_completed(
-                "analyze_section",
-                {"question": question, "analysis_length": len(result.output)},
-            )
-
-        return result.output
+    coordinator.tool(search_documents_tool)
+    coordinator.tool(rank_documents_tool)
+    coordinator.tool(decompose_question_tool)
+    coordinator.tool(analyze_section_tool)
 
     return coordinator
 
@@ -330,7 +177,7 @@ class DelegationOrchestrator:
     def __init__(
         self,
         registry: ModelRegistry,
-        providers: Any,  # TenantProviders — duck-typed to avoid import
+        providers: TenantProvidersProtocol,
         usage_limit_config: UsageLimitConfig | None = None,
         mcp_configs: list[MCPServerConfig] | None = None,
     ) -> None:

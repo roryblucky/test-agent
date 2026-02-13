@@ -17,8 +17,8 @@ corresponding agents in ``app/agents/``.
 
 from __future__ import annotations
 
-from typing import Any
 
+from app.providers.base import TenantProvidersProtocol
 from app.agents.intent_recognition import create_intent_agent
 from app.agents.rag_answer import create_rag_answer_agent
 from app.agents.refine_question import create_refine_agent
@@ -45,7 +45,7 @@ class AgentOrchestrator:
     def __init__(
         self,
         registry: ModelRegistry,
-        providers: Any,  # TenantProviders
+        providers: TenantProvidersProtocol,
         graph_name: str = "rag_with_intent_branching",
         usage_limit_config: UsageLimitConfig | None = None,
         mcp_configs: list[MCPServerConfig] | None = None,
