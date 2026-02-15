@@ -2,7 +2,7 @@
 
 Launch with::
 
-    gunicorn main:app -c gunicorn.conf.py
+    gunicorn app.main:app -c gunicorn.conf.py
 
 For 4-core / 8GB K8s pods:
 - Single worker (async handles concurrency; multiple workers duplicate memory)

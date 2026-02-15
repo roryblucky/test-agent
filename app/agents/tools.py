@@ -6,15 +6,17 @@ without mocking the entire PydanticAI Agent machinery.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 import logging
+from typing import TYPE_CHECKING
+
 from app.models.domain import Document
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from app.agents.coordinator import CoordinatorDeps
     from pydantic_ai import RunContext
+
+    from app.agents.coordinator import CoordinatorDeps
 
 
 async def search_documents_tool(ctx: RunContext[CoordinatorDeps], query: str) -> str:

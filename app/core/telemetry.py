@@ -79,7 +79,6 @@ class TelemetryService:
     def instrument(self) -> None:
         """Apply auto-instrumentation (future expansion)."""
         # Could add FastAPIInstrumentor here
-        pass
 
 
 def trace_span(name: str | None = None) -> Callable[[Callable[P, R]], Callable[P, R]]:

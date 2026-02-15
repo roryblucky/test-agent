@@ -1,16 +1,18 @@
 """Unit tests for FlowEngine."""
 
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
+
 from app.config.models import (
+    FlowConfig,
     FlowStep,
     FlowStepType,
-    TenantConfig,
-    FlowConfig,
     LLMConfig,
+    TenantConfig,
 )
-from app.services.flow_engine import FlowEngine
 from app.services.flow_context import FlowContext
+from app.services.flow_engine import FlowEngine
 
 
 @pytest.fixture

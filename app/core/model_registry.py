@@ -110,8 +110,7 @@ class ModelRegistry:
                 settings = _build_gcp_settings(cfg)
             case _:
                 raise ValueError(
-                    f"Unknown LLM provider '{cfg.provider}' for model '{name}'. "
-                    f"Supported: azure, gcp"
+                    f"Unknown LLM provider '{cfg.provider}' for model '{name}'. Supported: azure, gcp"
                 )
 
         return RegisteredModel(name=name, model=model, settings=settings)

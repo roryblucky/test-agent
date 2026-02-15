@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException, Request
 
-from app.services.exceptions import AccessDeniedError, TenantNotFoundError
+from app.services.exceptions import TenantNotFoundError
 from app.services.tenant_manager import TenantManager
 
 

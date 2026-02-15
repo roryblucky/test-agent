@@ -33,13 +33,12 @@ from app.agents.rag_answer import create_rag_answer_agent
 from app.agents.refine_question import create_refine_agent
 from app.config.models import FlowStep, FlowStepType, TenantConfig
 from app.core.model_registry import ModelRegistry
-from app.services.events import EventEmitter
-from app.services.exceptions import ContentFlaggedError
-from app.services.flow_context import FlowContext
-
 from app.core.resilience import safe_execute
 from app.core.telemetry import trace_span
 from app.providers.base import TenantProvidersProtocol
+from app.services.events import EventEmitter
+from app.services.exceptions import ContentFlaggedError
+from app.services.flow_context import FlowContext
 
 
 class FlowEngine:
@@ -189,10 +188,7 @@ class FlowEngine:
             result = await self.providers.moderation.check(ctx.llm_response)
             if result.is_flagged:
                 # Replace the answer with a safe message instead of raising
-                ctx.llm_response = (
-                    "The generated response was flagged by content moderation "
-                    "and has been removed."
-                )
+                ctx.llm_response = "The generated response was flagged by content moderation and has been removed."
             ctx.metadata["post_moderation"] = {
                 "is_flagged": result.is_flagged,
             }

@@ -17,13 +17,12 @@ corresponding agents in ``app/agents/``.
 
 from __future__ import annotations
 
-
-from app.providers.base import TenantProvidersProtocol
 from app.agents.intent_recognition import create_intent_agent
 from app.agents.rag_answer import create_rag_answer_agent
 from app.agents.refine_question import create_refine_agent
-from app.core.model_registry import ModelRegistry
 from app.config.models import MCPServerConfig, UsageLimitConfig
+from app.core.model_registry import ModelRegistry
+from app.providers.base import TenantProvidersProtocol
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 

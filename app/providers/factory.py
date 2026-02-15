@@ -61,8 +61,7 @@ class ProviderFactory:
         if key not in _REGISTRY:
             available = [k[1] for k in _REGISTRY if k[0] == component]
             raise ValueError(
-                f"No provider registered for ({component}, {provider}). "
-                f"Available {component} providers: {available}"
+                f"No provider registered for ({component}, {provider}). Available {component} providers: {available}"
             )
         cls = _REGISTRY[key]
         return cls(config=config, cloud_config=cloud_config, http_pool=http_pool)

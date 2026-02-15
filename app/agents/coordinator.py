@@ -37,7 +37,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
-from pydantic_ai.messages import ThinkingPart, ModelResponse
+from pydantic_ai.messages import ModelResponse, ThinkingPart
 from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import UsageLimits
 
@@ -52,7 +52,6 @@ from app.providers.base import (
 from app.services.events import EventEmitter
 from app.services.exceptions import ContentFlaggedError
 from app.services.flow_context import FlowContext
-
 
 # ---------------------------------------------------------------------------
 # Coordinator dependencies — injected into every tool via RunContext
@@ -135,10 +134,10 @@ def create_coordinator_agent(
 
     # Register tools from tools.py
     from app.agents.tools import (
-        search_documents_tool,
-        rank_documents_tool,
-        decompose_question_tool,
         analyze_section_tool,
+        decompose_question_tool,
+        rank_documents_tool,
+        search_documents_tool,
     )
 
     coordinator.tool(search_documents_tool)

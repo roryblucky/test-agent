@@ -40,7 +40,7 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
                 call_next(request),
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return Response(
                 content='{"detail":"Request timed out"}',
                 status_code=504,

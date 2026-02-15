@@ -7,8 +7,8 @@ from pydantic_ai import RunContext
 
 from app.agents.coordinator import CoordinatorDeps
 from app.agents.tools import (
-    search_documents_tool,
     decompose_question_tool,
+    search_documents_tool,
 )
 from app.models.domain import Document
 
