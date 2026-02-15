@@ -9,7 +9,7 @@ appropriate ``system_prompt``, ``output_type``, and ``tools``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
@@ -128,7 +128,7 @@ def _build_azure_model(
 ) -> Model:
     """Create a pydantic-ai ``OpenAIChatModel`` with ``AzureProvider``."""
     from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import AzureProvider
+    from pydantic_ai.providers.azure import AzureProvider
 
     azure_cfg = cloud_configs.get("azure")
     if azure_cfg is None:
@@ -149,15 +149,16 @@ def _build_gcp_model(
 ) -> Model:
     """Create a pydantic-ai ``GoogleModel``."""
     from pydantic_ai.models.google import GoogleModel
+    from pydantic_ai.providers.google import GoogleProvider
 
     gcp_cfg = cloud_configs.get("gcp")
     project_id = gcp_cfg.project_id if gcp_cfg else None
 
-    return GoogleModel(
-        cfg.model_name,
-        project_id=project_id,
+    provider = GoogleProvider(
+        project=project_id,
         http_client=http_pool.get("gcp"),
     )
+    return GoogleModel(cfg.model_name, provider=provider)
 
 
 # -----------------------------------------------------------------------
@@ -179,6 +180,7 @@ def _build_gcp_settings(cfg: ModelConfig) -> ModelSettings:
         base["top_p"] = cfg.top_p
 
     if cfg.thinking_level or cfg.thinking_budget:
+        from google.genai.types import ThinkingConfigDict
         from pydantic_ai.models.google import GoogleModelSettings
 
         thinking_config: dict[str, Any] = {"include_thoughts": True}
@@ -191,7 +193,7 @@ def _build_gcp_settings(cfg: ModelConfig) -> ModelSettings:
 
         return GoogleModelSettings(
             **base,
-            google_thinking_config=thinking_config,
+            google_thinking_config=ThinkingConfigDict(**thinking_config),
         )
 
     return ModelSettings(**base)
@@ -214,11 +216,12 @@ def _build_azure_settings(cfg: ModelConfig) -> ModelSettings:
         base["top_p"] = cfg.top_p
 
     if cfg.thinking_effort:
+        from openai.types import ReasoningEffort
         from pydantic_ai.models.openai import OpenAIChatModelSettings
 
         return OpenAIChatModelSettings(
             **base,
-            openai_reasoning_effort=cfg.thinking_effort,
+            openai_reasoning_effort=cast(ReasoningEffort, cfg.thinking_effort.lower()),
         )
 
     return ModelSettings(**base)
