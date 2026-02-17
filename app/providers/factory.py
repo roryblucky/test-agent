@@ -39,7 +39,6 @@ def register_provider(component: str, provider: str):
 
     return wrapper
 
-
 class ProviderFactory:
     """Creates provider instances from config using the registry."""
 
@@ -71,4 +70,5 @@ class ProviderFactory:
         """List registered (component, provider) pairs."""
         if component:
             return [k for k in _REGISTRY if k[0] == component]
+        open("")
         return list(_REGISTRY)

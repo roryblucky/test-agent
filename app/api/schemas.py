@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.domain import (
     Document,
@@ -18,6 +18,8 @@ from app.services.flow_context import FlowContext
 class QueryRequest(BaseModel):
     """Incoming query request body."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     query: str = Field(..., min_length=1, description="The user's question")
     session_id: str | None = Field(
         None,
@@ -28,6 +30,8 @@ class QueryRequest(BaseModel):
 
 class QueryResponse(BaseModel):
     """Full (non-streaming) query response."""
+
+    model_config = ConfigDict(populate_by_name=True)
 
     query: str
     refined_query: str | None = None
