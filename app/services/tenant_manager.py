@@ -122,7 +122,32 @@ class TenantManager:
                 usage_limit_config=cfg.flow_config.usage_limits,
                 mcp_configs=cfg.flow_config.mcp_servers or None,
             )
-        return FlowEngine(cfg, registry, providers)
+
+        # Build handlers for the FlowEngine
+        from app.config.models import FlowStepType
+        from app.services.handlers.analysis import AnalysisHandler
+        from app.services.handlers.groundedness import GroundednessHandler
+        from app.services.handlers.llm import LLMHandler
+        from app.services.handlers.memory import MemoryHandler
+        from app.services.handlers.moderation import ModerationHandler
+        from app.services.handlers.ranking import RankingHandler
+        from app.services.handlers.retriever import RetrieverHandler
+
+        # Initialize LLM handler and pre-warm cache
+        llm_handler = LLMHandler(registry)
+        llm_handler.warmup(cfg.flow_config.steps)
+
+        handlers = {
+            FlowStepType.MODERATION: ModerationHandler(providers.moderation),
+            FlowStepType.RETRIEVER: RetrieverHandler(providers.retriever),
+            FlowStepType.RANKING: RankingHandler(providers.ranker),
+            FlowStepType.GROUNDEDNESS: GroundednessHandler(providers.groundedness),
+            FlowStepType.ANALYSIS: AnalysisHandler(),
+            FlowStepType.MEMORY: MemoryHandler(),
+            FlowStepType.LLM: llm_handler,
+        }
+
+        return FlowEngine(cfg, handlers)
 
     def _resolve_tenant(self, app_id: str) -> TenantConfig:
         if app_id not in self._tenants:
