@@ -3,28 +3,42 @@
 Uses a *pro* model to synthesise an answer from retrieved context.
 """
 
-from __future__ import annotations
+from dataclasses import dataclass
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.toolsets import AbstractToolset
 
+from app.config.models import MCPServerConfig
+from app.core.mcp import build_mcp_toolsets
 from app.core.model_registry import ModelRegistry
 
-_INSTRUCTIONS = """\
-You are a knowledgeable assistant for an enterprise knowledge management system.
-Answer the user's question **strictly based on the provided reference documents**.
-- If the documents do not contain enough information, say so honestly.
-- Cite which document(s) you used.
-- Be concise but thorough.
-"""
+
+@dataclass
+class RAGAgentDeps:
+    """Dependencies for the RAG agent."""
+
+    system_prompt: str
+    # Add other dependencies here if needed (e.g., specific user context)
+
+
+def rag_system_prompt(ctx: RunContext[RAGAgentDeps]) -> str:
+    """Dynamic system prompt for the RAG agent."""
+    return ctx.deps.system_prompt
 
 
 def create_rag_answer_agent(
     registry: ModelRegistry,
     model_name: str = "pro",
-) -> Agent[None, str]:
+    mcp_configs: list[MCPServerConfig] | None = None,
+) -> Agent[RAGAgentDeps, str]:
     """Create a RAG answer agent that produces a text response."""
+    # Build MCP toolsets if provided
+    toolsets: list[AbstractToolset] = build_mcp_toolsets(mcp_configs or [])
+
     return registry.create_agent(
         model_name,
         output_type=str,
-        instructions=_INSTRUCTIONS,
+        deps_type=RAGAgentDeps,
+        system_prompt=rag_system_prompt,
+        toolsets=toolsets,
     )

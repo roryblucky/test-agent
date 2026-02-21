@@ -105,7 +105,11 @@ class LLMHandler:
         model_name = step.model or "fast"
         agent = self._get_agent("refine_question", model_name)
         settings = _build_step_settings(step)
-        async with agent.run_stream(ctx.query, model_settings=settings) as stream:
+        async with agent.run_stream(
+            ctx.query,
+            model_settings=settings,
+            message_history=ctx.message_history or None,
+        ) as stream:
             result = await stream.get_output()
         ctx.refined_query = result.refined_query
         ctx.metadata["keywords"] = result.keywords
@@ -125,7 +129,11 @@ class LLMHandler:
         agent = self._get_agent("intent", model_name)
         effective_query = ctx.refined_query or ctx.query
         settings = _build_step_settings(step)
-        async with agent.run_stream(effective_query, model_settings=settings) as stream:
+        async with agent.run_stream(
+            effective_query,
+            model_settings=settings,
+            message_history=ctx.message_history or None,
+        ) as stream:
             result = await stream.get_output()
         ctx.intent = result
         if ctx.emitter:
@@ -150,19 +158,26 @@ class LLMHandler:
             f"[Document {d.id}]\n{d.content}" for d in context_docs
         )
         effective_query = ctx.refined_query or ctx.query
-        prompt = (
-            f"Reference Documents:\n{context_text}\n\nUser Question: {effective_query}"
-        )
+
+        from app.agents.rag_answer import RAGAgentDeps
+
+        deps = RAGAgentDeps(system_prompt=f"Reference Documents:\n{context_text}")
 
         # All AI calls use streaming — emit per-token events
         settings = _build_step_settings(step)
-        async with agent.run_stream(prompt, model_settings=settings) as stream:
+        async with agent.run_stream(
+            effective_query,
+            deps=deps,
+            model_settings=settings,
+            message_history=ctx.message_history or None,
+        ) as stream:
             chunks: list[str] = []
             async for chunk in stream.stream_text():
                 chunks.append(chunk)
                 if ctx.emitter:
                     await ctx.emitter.emit_token(chunk)
             ctx.llm_response = "".join(chunks)
+            ctx.new_messages = stream.new_messages()
 
         if ctx.emitter:
             await ctx.emitter.emit_step_completed("llm:answer", {"model": model_name})

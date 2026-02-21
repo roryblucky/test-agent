@@ -53,7 +53,8 @@ async def query(
 ) -> QueryResponse:
     """Execute the full RAG pipeline (non-streaming) for the tenant."""
     session_id = request.session_id or str(uuid.uuid4())
-    message_history = await session_store.get(session_id)
+    store_key = f"{tenant.app_id}:{session_id}"
+    message_history = await session_store.get(store_key)
 
     flow = tenant.manager.get_flow_engine(tenant.app_id)
     try:
@@ -72,7 +73,8 @@ async def query(
 
     # Persist updated conversation history
     if ctx.new_messages:
-        await session_store.save(session_id, ctx.new_messages)
+        full_history = message_history + ctx.new_messages
+        await session_store.save(store_key, full_history)
 
     return QueryResponse.from_flow_context(ctx)
 
@@ -97,11 +99,12 @@ async def query_stream(
     OpenAI Assistants streaming, and Vercel AI SDK data stream protocol.
     """
     session_id = request.session_id or str(uuid.uuid4())
+    store_key = f"{tenant.app_id}:{session_id}"
 
     async def event_generator() -> AsyncIterator[str]:
         emitter = EventEmitter()
         flow = tenant.manager.get_flow_engine(tenant.app_id)
-        message_history = await session_store.get(session_id)
+        message_history = await session_store.get(store_key)
 
         async def run_pipeline() -> None:
             """Execute the pipeline in a background task."""
@@ -114,7 +117,8 @@ async def query_stream(
                 )
                 # Persist updated conversation history
                 if ctx.new_messages:
-                    await session_store.save(session_id, ctx.new_messages)
+                    full_history = message_history + ctx.new_messages
+                    await session_store.save(store_key, full_history)
 
                 result = QueryResponse.from_flow_context(ctx)
                 await emitter.emit_done(result.model_dump())

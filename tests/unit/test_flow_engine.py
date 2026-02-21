@@ -11,59 +11,49 @@ from app.config.models import (
     LLMConfig,
     TenantConfig,
 )
-from app.services.flow_context import FlowContext
 from app.services.flow_engine import FlowEngine
+from app.services.handlers.base import StepHandler
 
 
 @pytest.fixture
-def mock_providers():
-    """Mock TenantProviders."""
-    providers = MagicMock()
-    providers.moderation = AsyncMock()
-    providers.retriever = AsyncMock()
-    providers.ranker = AsyncMock()
-    providers.groundedness = AsyncMock()
-    return providers
+def mock_handlers():
+    """Mock StepHandlers."""
+    handlers = {}
+    for step_type in FlowStepType:
+        mock_handler = MagicMock(spec=StepHandler)
+        mock_handler.handle = AsyncMock(side_effect=lambda ctx, step: ctx)
+        handlers[step_type] = mock_handler
+    return handlers
 
 
 @pytest.fixture
-def flow_engine(mock_registry, mock_providers):
+def flow_engine(mock_handlers):
     """Create FlowEngine instance with mocks."""
     config = TenantConfig(
         id="test-tenant",
         kmsAppName="Test App",
         applicationId="app-123",
         adGroups=["group1"],
-        flow_config=FlowConfig(steps=[]),
+        flow_config=FlowConfig(
+            steps=[
+                FlowStep(type=FlowStepType.MODERATION, mode="pre"),
+                FlowStep(type=FlowStepType.RETRIEVER),
+            ]
+        ),
         llm_config=LLMConfig(models={}),
     )
-    return FlowEngine(config, mock_registry, mock_providers)
+    return FlowEngine(config, mock_handlers)
 
 
 @pytest.mark.asyncio
-async def test_run_moderation_pre(flow_engine, mock_providers, mock_emitter):
-    """Test moderation step (pre-check)."""
-    step = FlowStep(type=FlowStepType.MODERATION, mode="pre")
-    ctx = FlowContext(query="bad query", emitter=mock_emitter)
+async def test_execute_pipeline(flow_engine, mock_handlers, mock_emitter):
+    """Test full pipeline execution."""
+    ctx = await flow_engine.execute("test query", emitter=mock_emitter)
+    assert ctx is not None
 
-    mock_providers.moderation.check.return_value.is_flagged = False
+    # Verify handlers were called
+    mock_handlers[FlowStepType.MODERATION].handle.assert_awaited_once()
+    mock_handlers[FlowStepType.RETRIEVER].handle.assert_awaited_once()
 
-    await flow_engine._run_moderation(ctx, step)
-
-    mock_providers.moderation.check.assert_awaited_with("bad query")
-    mock_emitter.emit_step_completed.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_run_retriever(flow_engine, mock_providers, mock_emitter):
-    """Test retriever step."""
-    step = FlowStep(type=FlowStepType.RETRIEVER)
-    ctx = FlowContext(query="test", emitter=mock_emitter)
-
-    mock_providers.retriever.config.top_k = 3
-    mock_providers.retriever.retrieve.return_value = []
-
-    await flow_engine._run_retriever(ctx, step)
-
-    mock_providers.retriever.retrieve.assert_awaited_with("test", 3)
-    mock_emitter.emit_step_completed.assert_awaited()
+    # Verify emitter events emitted
+    assert mock_emitter.emit_step_start.call_count == 2

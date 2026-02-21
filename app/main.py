@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -16,6 +17,24 @@ from app.core.http_client_pool import HttpClientPool
 from app.services.tenant_manager import TenantManager
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Concurrency Limiter Middleware
+# ---------------------------------------------------------------------------
+
+
+class ConcurrencyLimiterMiddleware(BaseHTTPMiddleware):
+    """Global request concurrency limiter."""
+
+    def __init__(self, app, max_concurrent_requests: int = 100):
+        super().__init__(app)
+        self._semaphore = asyncio.Semaphore(max_concurrent_requests)
+
+    async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[override]
+        """Apply concurrency limit to the request dispatch."""
+        async with self._semaphore:
+            return await call_next(request)
+
 
 # ---------------------------------------------------------------------------
 # Request timeout middleware
@@ -32,6 +51,7 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:  # type: ignore[override]
+        """Apply timeout bounds to the request dispatch unless it's an SSE stream."""
         # Skip timeout for SSE streaming endpoints
         if request.url.path.endswith("/stream"):
             return await call_next(request)
@@ -93,4 +113,6 @@ app = FastAPI(
 )
 
 app.add_middleware(TimeoutMiddleware)
+max_concurrent = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "100"))
+app.add_middleware(ConcurrencyLimiterMiddleware, max_concurrent_requests=max_concurrent)
 app.include_router(router)

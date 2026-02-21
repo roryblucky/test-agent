@@ -54,13 +54,25 @@ class BaseSessionStore(ABC):
 
 
 class InMemorySessionStore(BaseSessionStore):
-    """Dict-backed session store — suitable for dev/testing only."""
+    """Dict-backed session store with LRU eviction — suitable for dev/testing only."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_sessions: int = 10000) -> None:
         self._store: dict[str, bytes] = {}
+        self._max_sessions = max_sessions
 
     async def _get_raw(self, session_id: str) -> bytes | None:
-        return self._store.get(session_id)
+        if session_id in self._store:
+            # Move to end (most recently used)
+            value = self._store.pop(session_id)
+            self._store[session_id] = value
+            return value
+        return None
 
     async def _set_raw(self, session_id: str, data: bytes) -> None:
+        if session_id in self._store:
+            del self._store[session_id]
+        elif len(self._store) >= self._max_sessions:
+            # Evict least recently used (first item)
+            first_key = next(iter(self._store))
+            del self._store[first_key]
         self._store[session_id] = data

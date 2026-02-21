@@ -104,7 +104,9 @@ class AgentOrchestrator:
         if ctx.emitter:
             await ctx.emitter.emit_step_start("refine_question")
         refine_agent = create_refine_agent(self.registry)
-        async with refine_agent.run_stream(ctx.query) as stream:
+        async with refine_agent.run_stream(
+            ctx.query, message_history=ctx.message_history or None
+        ) as stream:
             refined = await stream.get_output()
         ctx.refined_query = refined.refined_query
         if ctx.emitter:
@@ -117,7 +119,9 @@ class AgentOrchestrator:
         if ctx.emitter:
             await ctx.emitter.emit_step_start("intent_recognition")
         intent_agent = create_intent_agent(self.registry)
-        async with intent_agent.run_stream(ctx.refined_query) as stream:
+        async with intent_agent.run_stream(
+            ctx.refined_query, message_history=ctx.message_history or None
+        ) as stream:
             intent = await stream.get_output()
         ctx.intent = intent
         if ctx.emitter:
@@ -177,17 +181,23 @@ class AgentOrchestrator:
         context_text = "\n\n---\n\n".join(
             f"[Document {d.id}]\n{d.content}" for d in ctx.ranked_documents
         )
-        prompt = (
-            f"Reference Documents:\n{context_text}\n\nUser Question: {effective_query}"
-        )
         answer_agent = create_rag_answer_agent(self.registry)
-        async with answer_agent.run_stream(prompt) as stream:
+        from app.agents.rag_answer import RAGAgentDeps
+
+        # Inject context text as a system prompt dependency, not user query,
+        # to avoid polluting the user's conversation history with large docs.
+        deps = RAGAgentDeps(system_prompt=f"Reference Documents:\n{context_text}")
+
+        async with answer_agent.run_stream(
+            effective_query, deps=deps, message_history=ctx.message_history or None
+        ) as stream:
             chunks: list[str] = []
             async for chunk in stream.stream_text():
                 chunks.append(chunk)
                 if ctx.emitter:
                     await ctx.emitter.emit_token(chunk)
             ctx.llm_response = "".join(chunks)
+            ctx.new_messages = stream.new_messages()
         if ctx.emitter:
             await ctx.emitter.emit_step_completed("llm", {"model": "pro"})
 
@@ -216,13 +226,16 @@ class AgentOrchestrator:
             output_type=str,
             instructions="You are a friendly assistant. Respond conversationally.",
         )
-        async with agent.run_stream(ctx.refined_query or ctx.query) as stream:
+        async with agent.run_stream(
+            ctx.refined_query or ctx.query, message_history=ctx.message_history or None
+        ) as stream:
             chunks: list[str] = []
             async for chunk in stream.stream_text():
                 chunks.append(chunk)
                 if ctx.emitter:
                     await ctx.emitter.emit_token(chunk)
             ctx.llm_response = "".join(chunks)
+            ctx.new_messages = stream.new_messages()
         if ctx.emitter:
             await ctx.emitter.emit_step_completed("llm", {"model": "fast"})
         return ctx
