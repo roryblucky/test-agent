@@ -29,8 +29,11 @@ def create_intent_agent(
     model_name: str = "intent",
 ) -> Agent[None, IntentResult]:
     """Create an intent-recognition agent with the given model."""
+    from app.agents.history_processors import filter_thinking, trim_history
+
     return registry.create_agent(
         model_name,
         output_type=IntentResult,
         instructions=_INSTRUCTIONS,
+        history_processors=[trim_history(20), filter_thinking()],
     )

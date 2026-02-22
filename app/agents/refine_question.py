@@ -26,8 +26,11 @@ def create_refine_agent(
     model_name: str = "fast",
 ) -> Agent[None, RefinedQuestion]:
     """Create a question-refinement agent with the given model."""
+    from app.agents.history_processors import filter_thinking, trim_history
+
     return registry.create_agent(
         model_name,
         output_type=RefinedQuestion,
         instructions=_INSTRUCTIONS,
+        history_processors=[trim_history(20), filter_thinking()],
     )

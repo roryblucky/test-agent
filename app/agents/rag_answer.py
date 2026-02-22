@@ -32,6 +32,8 @@ def create_rag_answer_agent(
     mcp_configs: list[MCPServerConfig] | None = None,
 ) -> Agent[RAGAgentDeps, str]:
     """Create a RAG answer agent that produces a text response."""
+    from app.agents.history_processors import filter_thinking, trim_history
+
     # Build MCP toolsets if provided
     toolsets: list[AbstractToolset] = build_mcp_toolsets(mcp_configs or [])
 
@@ -41,4 +43,5 @@ def create_rag_answer_agent(
         deps_type=RAGAgentDeps,
         system_prompt=rag_system_prompt,
         toolsets=toolsets,
+        history_processors=[trim_history(20), filter_thinking()],
     )
