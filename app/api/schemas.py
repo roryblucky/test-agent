@@ -46,6 +46,16 @@ class QueryResponse(BaseModel):
     @classmethod
     def from_flow_context(cls, ctx: FlowContext) -> QueryResponse:
         """Create a QueryResponse from a finalized FlowContext."""
+        # Attach global token usage to the metadata block
+        final_meta = dict(ctx.metadata) if ctx.metadata else {}
+        if ctx.total_usage:
+            final_meta["usage"] = {
+                "requests": ctx.total_usage.requests,
+                "request_tokens": ctx.total_usage.request_tokens,
+                "response_tokens": ctx.total_usage.response_tokens,
+                "total_tokens": ctx.total_usage.total_tokens,
+            }
+
         return cls(
             query=ctx.query,
             refined_query=ctx.refined_query,
@@ -55,7 +65,7 @@ class QueryResponse(BaseModel):
             moderation=ctx.moderation_result,
             groundedness=ctx.groundedness_result,
             session_id=ctx.session_id,
-            metadata=ctx.metadata,
+            metadata=final_meta,
         )
 
 

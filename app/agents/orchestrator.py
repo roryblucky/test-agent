@@ -108,6 +108,7 @@ class AgentOrchestrator:
             ctx.query, message_history=ctx.message_history or None
         ) as stream:
             refined = await stream.get_output()
+            ctx.add_usage(stream.usage())
         ctx.refined_query = refined.refined_query
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
@@ -123,6 +124,7 @@ class AgentOrchestrator:
             ctx.refined_query, message_history=ctx.message_history or None
         ) as stream:
             intent = await stream.get_output()
+            ctx.add_usage(stream.usage())
         ctx.intent = intent
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
@@ -198,6 +200,7 @@ class AgentOrchestrator:
                     await ctx.emitter.emit_token(chunk)
             ctx.llm_response = "".join(chunks)
             ctx.new_messages = stream.new_messages()
+            ctx.add_usage(stream.usage())
         if ctx.emitter:
             await ctx.emitter.emit_step_completed("llm", {"model": "pro"})
 
@@ -236,6 +239,7 @@ class AgentOrchestrator:
                     await ctx.emitter.emit_token(chunk)
             ctx.llm_response = "".join(chunks)
             ctx.new_messages = stream.new_messages()
+            ctx.add_usage(stream.usage())
         if ctx.emitter:
             await ctx.emitter.emit_step_completed("llm", {"model": "fast"})
         return ctx

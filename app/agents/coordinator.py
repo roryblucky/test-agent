@@ -289,7 +289,7 @@ class DelegationOrchestrator:
             message_history=ctx.message_history or None,
         ) as stream:
             try:
-                async for partial in stream.stream_structured():
+                async for partial in stream.stream_output():
                     # partial is a CoordinatorOutput dictionary/object with potentially None fields
                     ans = getattr(partial, "answer", None)
                     if isinstance(ans, str) and len(ans) > len(prev_answer):
@@ -307,6 +307,9 @@ class DelegationOrchestrator:
             # Store new messages for session persistence
             ctx.new_messages = stream.new_messages()
             all_msgs = stream.all_messages()
+
+            # Add to global token count
+            ctx.add_usage(stream.usage())
 
         # ── Extract thinking / reasoning traces ─────────────────────
         thinking_parts: list[str] = []

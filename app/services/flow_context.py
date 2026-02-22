@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai.messages import ModelMessage
+from pydantic_ai.usage import RunUsage
 
 from app.models.domain import (
     Document,
@@ -47,3 +48,13 @@ class FlowContext:
 
     # Event emitter for SSE streaming (step events + tokens)
     emitter: EventEmitter | None = None
+
+    # Global token consumption tracking
+    total_usage: RunUsage = field(default_factory=RunUsage)
+
+    def add_usage(self, usage: RunUsage) -> None:
+        """Accumulate token usage from a run into the total context tracker."""
+        self.total_usage.requests += usage.requests
+        self.total_usage.request_tokens += usage.request_tokens
+        self.total_usage.response_tokens += usage.response_tokens
+        self.total_usage.total_tokens += usage.total_tokens

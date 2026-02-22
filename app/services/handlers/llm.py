@@ -111,6 +111,8 @@ class LLMHandler:
             message_history=ctx.message_history or None,
         ) as stream:
             result = await stream.get_output()
+            ctx.add_usage(stream.usage())
+
         ctx.refined_query = result.refined_query
         ctx.metadata["keywords"] = result.keywords
         if ctx.emitter:
@@ -135,6 +137,8 @@ class LLMHandler:
             message_history=ctx.message_history or None,
         ) as stream:
             result = await stream.get_output()
+            ctx.add_usage(stream.usage())
+
         ctx.intent = result
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
@@ -178,6 +182,7 @@ class LLMHandler:
                     await ctx.emitter.emit_token(chunk)
             ctx.llm_response = "".join(chunks)
             ctx.new_messages = stream.new_messages()
+            ctx.add_usage(stream.usage())
 
         if ctx.emitter:
             await ctx.emitter.emit_step_completed("llm:answer", {"model": model_name})
