@@ -37,7 +37,7 @@ RETRY_POLICY = AsyncRetrying(
 )
 
 
-async def safe_execute(
+async def safe_execute[**P, R](
     func: Callable[P, Awaitable[R]],
     *args: P.args,
     **kwargs: P.kwargs,

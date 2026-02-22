@@ -89,6 +89,7 @@ class TenantManager:
         return self._engines[app_id]
 
     def get_tenant_config(self, app_id: str) -> TenantConfig:
+        """Get the full configuration for a specific tenant."""
         return self._resolve_tenant(app_id)
 
     def validate_ad_group(self, app_id: str, user_groups: list[str]) -> bool:
@@ -100,6 +101,7 @@ class TenantManager:
 
     @property
     def tenant_ids(self) -> list[str]:
+        """List all loaded tenant application IDs."""
         return list(self._tenants)
 
     # ------------------------------------------------------------------

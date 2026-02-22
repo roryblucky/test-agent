@@ -35,11 +35,11 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class EventType(str, Enum):
+class EventType(StrEnum):
     """SSE event types."""
 
     STEP_START = "step_start"
@@ -59,7 +59,7 @@ class StreamEvent:
     data: Any = None
 
     def to_sse(self) -> str:
-        """Serialise to SSE wire format (``data: ...\\n\\n``)."""
+        r"""Serialise to SSE wire format (``data: ...\\n\\n``)."""
         payload = {"type": self.type.value}
         if self.step is not None:
             payload["step"] = self.step

@@ -1,7 +1,9 @@
 """Tests for HttpClientPool."""
 
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
+
 import pytest
+
 from app.core.http_client_pool import HttpClientPool
 
 
@@ -18,7 +20,7 @@ def test_get_azure_transport_lazy_init(mock_transport_cls, mock_session_cls):
     mock_session_instance.closed = False
 
     # First call
-    t1 = pool.get_azure_transport()
+    pool.get_azure_transport()
     mock_session_cls.assert_called_once()
     assert pool._aiohttp_session == mock_session_instance
     mock_transport_cls.assert_called_with(

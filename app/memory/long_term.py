@@ -83,6 +83,7 @@ class NoOpLongTermMemory(BaseLongTermMemory):
         user_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        """Add a memory (not implemented)."""
         return ""
 
     async def search(
@@ -92,14 +93,16 @@ class NoOpLongTermMemory(BaseLongTermMemory):
         user_id: str | None = None,
         limit: int = 5,
     ) -> list[MemoryEntry]:
+        """Search memories (not implemented)."""
         return []
 
     async def delete(self, memory_id: str) -> None:
-        pass
+        """Delete a memory by its ID."""
 
     async def get_all(
         self,
         *,
         user_id: str | None = None,
     ) -> list[MemoryEntry]:
+        """Get all memories (not implemented)."""
         return []

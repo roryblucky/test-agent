@@ -277,24 +277,47 @@ class DelegationOrchestrator:
             emitter=ctx.emitter,
         )
 
-        # Run the coordinator — LLM decides which tools to invoke
-        result = await self._coordinator.run(
+        # Run the coordinator — LLM decides which tools to invoke streamingly
+        import logging
+
+        prev_answer = ""
+
+        async with self._coordinator.run_stream(
             ctx.query,
             deps=deps,
             usage_limits=self._usage_limits,
             message_history=ctx.message_history or None,
-        )
+        ) as stream:
+            try:
+                async for partial in stream.stream_structured():
+                    # partial is a CoordinatorOutput dictionary/object with potentially None fields
+                    ans = getattr(partial, "answer", None)
+                    if isinstance(ans, str) and len(ans) > len(prev_answer):
+                        chunk = ans[len(prev_answer) :]
+                        if ctx.emitter:
+                            await ctx.emitter.emit_token(chunk)
+                        prev_answer = ans
+            except Exception as e:
+                logging.getLogger(__name__).debug(
+                    "Streaming structured partial error: %s", e
+                )
 
-        # Store new messages for session persistence
-        ctx.new_messages = result.all_messages()
+            output: CoordinatorOutput = await stream.get_output()
+
+            # Store new messages for session persistence
+            ctx.new_messages = stream.new_messages()
+            all_msgs = stream.all_messages()
 
         # ── Extract thinking / reasoning traces ─────────────────────
         thinking_parts: list[str] = []
-        for msg in result.all_messages():
+        for msg in all_msgs:
             if isinstance(msg, ModelResponse):
-                for part in msg.parts:
-                    if isinstance(part, ThinkingPart) and part.content:
-                        thinking_parts.append(part.content)
+                # Fast extension of thinking parts
+                thinking_parts.extend(
+                    part.content
+                    for part in msg.parts
+                    if isinstance(part, ThinkingPart) and part.content
+                )
 
         if thinking_parts:
             ctx.metadata["thinking"] = thinking_parts
@@ -303,7 +326,6 @@ class DelegationOrchestrator:
                     await ctx.emitter.emit_thinking(thought)
 
         # Extract results
-        output: CoordinatorOutput = result.output
         ctx.llm_response = output.answer
         ctx.metadata["sources_used"] = output.sources_used
         ctx.metadata["reasoning"] = output.reasoning
@@ -311,9 +333,9 @@ class DelegationOrchestrator:
         # Collect documents retrieved during tool execution
         # (they were stored by the tools, available via usage tracking)
         ctx.metadata["coordinator_usage"] = {
-            "requests": result.usage().requests,
-            "input_tokens": result.usage().input_tokens,
-            "output_tokens": result.usage().output_tokens,
+            "requests": stream.usage().requests,
+            "input_tokens": stream.usage().input_tokens,
+            "output_tokens": stream.usage().output_tokens,
         }
 
         if ctx.emitter:

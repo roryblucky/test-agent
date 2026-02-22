@@ -3,7 +3,6 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import azure.ai.contentsafety  # Ensure namespace is loaded
 from azure.core.exceptions import HttpResponseError
 
 from app.config.models import AzureConfig, ModerationConfig

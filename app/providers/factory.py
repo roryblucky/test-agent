@@ -39,6 +39,7 @@ def register_provider(component: str, provider: str):
 
     return wrapper
 
+
 class ProviderFactory:
     """Creates provider instances from config using the registry."""
 

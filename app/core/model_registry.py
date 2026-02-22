@@ -88,6 +88,7 @@ class ModelRegistry:
 
     @property
     def available_models(self) -> list[str]:
+        """List all available model names."""
         return sorted(self._models)
 
     # ------------------------------------------------------------------

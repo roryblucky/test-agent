@@ -15,7 +15,9 @@ class BaseRetrieverProvider(ABC):
     """Retrieve documents relevant to a query."""
 
     @abstractmethod
-    async def retrieve(self, query: str, top_k: int = 10) -> list[Document]: ...
+    async def retrieve(self, query: str, top_k: int = 10) -> list[Document]:
+        """Retrieve relevant documents for a query."""
+        ...
 
 
 class BaseRankerProvider(ABC):
@@ -24,23 +26,27 @@ class BaseRankerProvider(ABC):
     @abstractmethod
     async def rank(
         self, query: str, documents: list[Document], top_n: int = 5
-    ) -> list[Document]: ...
+    ) -> list[Document]:
+        """Rank documents by relevance to a query."""
+        ...
 
 
 class BaseModerationProvider(ABC):
     """Check text for policy violations."""
 
     @abstractmethod
-    async def check(self, text: str) -> ModerationResult: ...
+    async def check(self, text: str) -> ModerationResult:
+        """Check text for moderation violations."""
+        ...
 
 
 class BaseGroundednessProvider(ABC):
     """Check whether an answer is grounded in the source documents."""
 
     @abstractmethod
-    async def check(
-        self, answer: str, context: list[Document]
-    ) -> GroundednessResult: ...
+    async def check(self, answer: str, context: list[Document]) -> GroundednessResult:
+        """Check if an answer is grounded in the provided context."""
+        ...
 
 
 class TenantProvidersProtocol(ABC):

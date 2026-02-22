@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request
 
@@ -24,13 +25,16 @@ def get_tenant_manager(request: Request) -> TenantManager:
 
 
 async def get_tenant(
-    x_application_id: str = Header(
-        ..., alias="X-Application-Id", description="Tenant application ID"
-    ),
-    x_user_groups: str = Header(
-        "", alias="X-User-Groups", description="Comma-separated AD groups from gateway"
-    ),
-    tenant_manager: TenantManager = Depends(get_tenant_manager),
+    x_application_id: Annotated[
+        str, Header(alias="X-Application-Id", description="Tenant application ID")
+    ],
+    tenant_manager: Annotated[TenantManager, Depends(get_tenant_manager)],
+    x_user_groups: Annotated[
+        str,
+        Header(
+            alias="X-User-Groups", description="Comma-separated AD groups from gateway"
+        ),
+    ] = "",
 ) -> TenantContext:
     """Resolve and validate a tenant from request headers.
 

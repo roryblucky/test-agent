@@ -45,6 +45,7 @@ class QueryResponse(BaseModel):
 
     @classmethod
     def from_flow_context(cls, ctx: FlowContext) -> QueryResponse:
+        """Create a QueryResponse from a finalized FlowContext."""
         return cls(
             query=ctx.query,
             refined_query=ctx.refined_query,

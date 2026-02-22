@@ -10,6 +10,7 @@ import asyncio
 import os
 import uuid
 from collections.abc import AsyncIterator
+from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -42,14 +43,15 @@ _session_store = _create_session_store()
 
 
 def get_session_store() -> BaseSessionStore:
+    """Get the active session store instance."""
     return _session_store
 
 
 @router.post("/query", response_model=QueryResponse)
 async def query(
     request: QueryRequest,
-    tenant: TenantContext = Depends(get_tenant),
-    session_store: BaseSessionStore = Depends(get_session_store),
+    tenant: Annotated[TenantContext, Depends(get_tenant)],
+    session_store: Annotated[BaseSessionStore, Depends(get_session_store)],
 ) -> QueryResponse:
     """Execute the full RAG pipeline (non-streaming) for the tenant."""
     session_id = request.session_id or str(uuid.uuid4())
@@ -82,8 +84,8 @@ async def query(
 @router.post("/query/stream")
 async def query_stream(
     request: QueryRequest,
-    tenant: TenantContext = Depends(get_tenant),
-    session_store: BaseSessionStore = Depends(get_session_store),
+    tenant: Annotated[TenantContext, Depends(get_tenant)],
+    session_store: Annotated[BaseSessionStore, Depends(get_session_store)],
 ) -> StreamingResponse:
     """Execute the RAG pipeline with real-time SSE streaming.
 
@@ -156,7 +158,7 @@ async def query_stream(
 
 @router.get("/health", response_model=HealthResponse)
 async def health(
-    tenant_manager: TenantManager = Depends(get_tenant_manager),
+    tenant_manager: Annotated[TenantManager, Depends(get_tenant_manager)],
 ) -> HealthResponse:
     """Health check — returns loaded tenant IDs."""
     return HealthResponse(status="ok", tenants=tenant_manager.tenant_ids)

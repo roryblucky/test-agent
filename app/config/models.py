@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -95,7 +95,7 @@ class GroundednessConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class FlowStepType(str, Enum):
+class FlowStepType(StrEnum):
     """Available flow step module types.
 
     Each type is a *module* — the ``mode`` field on :class:`FlowStep`

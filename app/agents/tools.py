@@ -23,6 +23,7 @@ async def search_documents_tool(ctx: RunContext[CoordinatorDeps], query: str) ->
     """Search the knowledge base for documents relevant to a query.
 
     Args:
+        ctx: Tools context with access to dependencies.
         query: The search query, can be a sub-question or refined query.
 
     Returns:
@@ -60,6 +61,7 @@ async def rank_documents_tool(
     """Re-rank documents by relevance to a specific query.
 
     Args:
+        ctx: Tools context with access to dependencies.
         query: The ranking query.
         document_texts: List of document texts to rank.
 
@@ -100,6 +102,7 @@ async def decompose_question_tool(
     """Break a complex question into 2-5 focused sub-questions.
 
     Args:
+        ctx: Tools context with access to dependencies.
         complex_question: The complex question to decompose.
 
     Returns:
@@ -141,6 +144,7 @@ async def analyze_section_tool(
     """Analyze specific content to answer a focused question.
 
     Args:
+        ctx: Tools context with access to dependencies.
         question: The specific question to analyze.
         context: The reference text to analyze.
 
