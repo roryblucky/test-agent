@@ -11,7 +11,6 @@ from pydantic_ai.usage import RunUsage
 from app.models.domain import (
     Document,
     GroundednessResult,
-    IntentResult,
     ModerationResult,
 )
 from app.services.events import EventEmitter
@@ -36,7 +35,7 @@ class FlowContext:
 
     # Populated by flow steps
     refined_query: str | None = None
-    intent: IntentResult | None = None
+    # Note: `intent` was removed as it's now handled dynamically by the RouterAgent
     documents: list[Document] = field(default_factory=list)
     ranked_documents: list[Document] = field(default_factory=list)
     llm_response: str | None = None

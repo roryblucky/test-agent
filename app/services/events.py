@@ -146,13 +146,17 @@ class EventEmitter:
         """Signal that no more events will be emitted."""
         if self._closed:
             return
-        self._closed = True
+
         try:
+            # We must put the sentinel BEFORE setting _closed=True
+            # Otherwise our own emit/put logic might be bypassed if
+            # we rely on _closed in other places (though we use raw _queue.put here)
             await self._queue.put(None)  # sentinel
         except asyncio.QueueFull:
             # If queue is full during close, force space or ignore
-            # treating 'closed' flag as sufficient for no more puts
             pass
+        finally:
+            self._closed = True
 
     # ------------------------------------------------------------------
     # Consumer API (used by API layer)

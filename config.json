@@ -32,9 +32,13 @@
             }
         },
         "retrieverConfig": {
-            "provider": "gcp",
-            "topK": 10,
-            "searchType": "semantic"
+            "sources": [
+                {
+                    "provider": "gcp",
+                    "topK": 10,
+                    "searchType": "semantic"
+                }
+            ]
         },
         "rankingConfig": {
             "provider": "gcp",

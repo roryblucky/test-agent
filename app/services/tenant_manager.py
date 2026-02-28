@@ -20,6 +20,7 @@ from app.providers.base import (
     BaseRetrieverProvider,
 )
 from app.providers.factory import ProviderFactory
+from app.providers.federated import FederatedRetrieverProvider
 from app.services.exceptions import TenantNotFoundError
 from app.services.flow_engine import FlowEngine
 
@@ -180,14 +181,24 @@ class TenantManager:
         """
         providers = TenantProviders()
 
-        if cfg.retriever_config:
-            providers.retriever = ProviderFactory.create(
-                "retriever",
-                cfg.retriever_config.provider,
-                cfg.retriever_config,
-                cloud_configs.get(cfg.retriever_config.provider),
-                http_pool,
-            )
+        if cfg.retriever_config and cfg.retriever_config.sources:
+            # Multi-source retrieval: instantiate all configured providers
+            source_retrievers = []
+            for source_cfg in cfg.retriever_config.sources:
+                provider_instance = ProviderFactory.create(
+                    "retriever",
+                    source_cfg.provider,
+                    source_cfg,
+                    cloud_configs.get(source_cfg.provider),
+                    http_pool,
+                )
+                if provider_instance:
+                    source_retrievers.append(provider_instance)
+
+            # Bundle them into the top-level FederatedRetrieverProvider
+            # (If only 1 source, it still cleanly wraps it)
+            providers.retriever = FederatedRetrieverProvider(source_retrievers)
+
         if cfg.ranking_config:
             providers.ranker = ProviderFactory.create(
                 "ranker",

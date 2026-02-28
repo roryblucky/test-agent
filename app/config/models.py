@@ -49,12 +49,20 @@ class LLMConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class RetrieverConfig(BaseModel):
-    """Retriever component configuration."""
+class RetrieverSourceConfig(BaseModel):
+    """Configuration for a single retriever source."""
 
     provider: str  # "gcp", "azure", extensible
     top_k: int = Field(10, alias="topK")
     search_type: str = Field("semantic", alias="searchType")
+
+    model_config = {"populate_by_name": True}
+
+
+class RetrieverConfig(BaseModel):
+    """Retriever component configuration. Supports multiple concurrent sources."""
+
+    sources: list[RetrieverSourceConfig] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 

@@ -169,7 +169,7 @@ class LLMHandler:
 
         # All AI calls use streaming — emit per-token events
         settings = _build_step_settings(step)
-        async with agent.run_stream(
+        async with agent.run_stream_e(
             effective_query,
             deps=deps,
             model_settings=settings,
