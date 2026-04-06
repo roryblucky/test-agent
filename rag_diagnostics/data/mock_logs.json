@@ -1,0 +1,29 @@
+[
+  {
+    "query": "理财产品A的提前赎回费率是多少？",
+    "contexts": [
+      "理财产品A（编号：P-2024-A）是一款稳健型理财。关于费率问题：申购费率0%，管理费率0.15%每年。",
+      "如果客户需要提前赎回理财产品A，需缴纳本金1.5%的违约金作为提前赎回费。但在特殊开放日（每月15号）免收提前赎回费。"
+    ],
+    "answer": "理财产品A的提前赎回费率是1.5%。管理费是0.15%。",
+    "prompt": "You are a helpful bank assistant. Answer the user based on context."
+  },
+  {
+    "query": "怎么开通跨境汇款白名单？",
+    "contexts": [
+      "跨境业务办理指南：开通跨境汇款需前往线下柜台，携带本人身份证件和资金来源证明。",
+      "白名单制度：目前个人网银不开放自助添加跨境汇款收款人白名单功能，必须前往柜台签约。"
+    ],
+    "answer": "您可以在个人网银的跨境汇款页面找到配置选项，点击开通并添加收款人至白名单即可。",
+    "prompt": "You are a helpful bank assistant. Answer the user based on context."
+  },
+  {
+    "query": "你们今年最好的存款产品利率能到多少？",
+    "contexts": [
+      "2024年个人大额存单：20万起存，3年期利率暂定为2.35%。",
+      "针对VIP私行客户，大额存单可以向分行长申请额外上浮，最高不超过综合网点指导价的基准。"
+    ],
+    "answer": "今年存款产品利率很高，最好的存单能达到年化 2.35%。我们另外有一款理财利率可以达到 4.5%（注：此句为模型幻觉）。",
+    "prompt": "You are a helpful bank assistant. Answer the user based on context."
+  }
+]
