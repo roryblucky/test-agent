@@ -45,36 +45,70 @@ turbo = dspy.LM("openai/gpt-4o-mini", temperature=0.1)
 dspy.configure(lm=turbo)
 
 # ==============================================================
-# 定义 RAG 生成签名 (Signature)
+# 真实系统 Prompt 模板映射
 # ==============================================================
-# 注意：我们去掉了 QueryRewrite 模块。
-# 原因：在离线诊断场景下，重写后的搜索词不会被用来重新检索（因为
-# context 来自历史日志），QueryRewrite 的输出会被丢弃。
-# 保留它只会增加 DSPy 搜索空间的噪声，降低优化效率。
-# 当接入真实检索引擎后，可以重新加入 QueryRewrite 模块。
+# 你的真实 system prompt 模板大致如下:
+#
+#   "You are an expert knowledge base assistant.
+#    Today is {{current_date}}.
+#    {{user_instruction}}
+#    Answer based on the following context:
+#    {{context}}"
+#
+# DSPy 映射规则:
+#   模板中的「固定指令」 → Signature docstring（DSPy 会优化它）
+#   模板中的「变量插槽」 → Signature InputField（作为数据传入）
+#   生成的「回答」      → Signature OutputField
+#
+# 这样 DSPy 优化出来的 prompt 可以直接替换你模板中的固定指令部分，
+# 而变量插槽保持不变。
 # ==============================================================
 
 
 class RAGAnswer(dspy.Signature):
-    """你是一个专业的银行坐席辅助系统。
-    请根据搜索引擎取回的文档，精准、客观、不落窠臼地回答。
-    严格要求：不能编造任何文档中没有的信息。
-    如果文档中没有相关信息，请明确告知用户。"""
+    """You are an expert knowledge base assistant. Answer the user's
+    question using ONLY the provided retrieved context.
+    If the context does not contain the answer, say you don't know.
 
-    context = dspy.InputField(desc="从检索引擎取回的相关文档片段")
-    question = dspy.InputField(desc="客户的问题")
-    answer = dspy.OutputField(desc="严格基于文档的准确客观回答，不编造任何外部信息")
+    Use the current date for any time-sensitive questions.
+    Follow the user instruction if provided.
+    """
+
+    # ---- 对应模板中的动态变量 ----
+    context = dspy.InputField(
+        desc="Retrieved reference documents from the search engine (maps to {{context}} in prompt template)"
+    )
+    question = dspy.InputField(
+        desc="The user's question"
+    )
+    current_date = dspy.InputField(
+        desc="Today's date for time-sensitive questions (maps to {{current_date}} in prompt template)",
+    )
+    user_instruction = dspy.InputField(
+        desc="Optional per-request instruction to customize behavior (maps to {{user_instruction}} in prompt template)",
+    )
+    # ---- 要生成的输出 ----
+    answer = dspy.OutputField(
+        desc="A precise, objective answer strictly grounded in the provided context. "
+             "Do not fabricate information not present in the documents."
+    )
 
 
 class RAGPipeline(dspy.Module):
-    """RAG 生成管线：接收 context + question，输出防幻觉的答案。"""
+    """RAG generation pipeline with template variable support."""
 
     def __init__(self):
         super().__init__()
         self.generate_answer = dspy.ChainOfThought(RAGAnswer)
 
-    def forward(self, question, context):
-        result = self.generate_answer(context=context, question=question)
+    def forward(self, question, context, current_date="", user_instruction=""):
+        """Generate answer from context with optional template variables."""
+        result = self.generate_answer(
+            context=context,
+            question=question,
+            current_date=current_date,
+            user_instruction=user_instruction,
+        )
         return dspy.Prediction(answer=result.answer)
 
 
@@ -93,10 +127,11 @@ def comprehensive_ragas_metric(example, pred, trace=None):
     当 trace 为 None 时（普通评估），返回 float 分数。
     """
     # 构造 Ragas SingleTurnSample
+    ctx = example.context
     sample = SingleTurnSample(
         user_input=example.question,
         response=pred.answer,
-        retrieved_contexts=[example.context] if isinstance(example.context, str) else example.context,
+        retrieved_contexts=[ctx] if isinstance(ctx, str) else ctx,
     )
     dataset = EvaluationDataset(samples=[sample])
 
@@ -139,17 +174,23 @@ def comprehensive_ragas_metric(example, pred, trace=None):
 # ==============================================================
 def optimize_pipeline(input_path: str, output_dir: str):
     """加载日志数据，运行 DSPy 端到端优化。"""
+    from datetime import date
+
     print("📂 Loading log data for optimization...")
     with open(input_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     # 构造 DSPy 训练集
+    # 每个 Example 都包含对应模板变量的真实值
     trainset = []
     for item in data:
         ex = dspy.Example(
             question=item["query"],
             context="\n".join(item["contexts"]),
-        ).with_inputs("question", "context")
+            # 从日志中读取模板变量，没有则用默认值
+            current_date=item.get("current_date", str(date.today())),
+            user_instruction=item.get("user_instruction", ""),
+        ).with_inputs("question", "context", "current_date", "user_instruction")
         trainset.append(ex)
 
     print(f"📊 Loaded {len(trainset)} training samples")

@@ -6,7 +6,7 @@
       "如果客户需要提前赎回理财产品A，需缴纳本金1.5%的违约金作为提前赎回费。但在特殊开放日（每月15号）免收提前赎回费。"
     ],
     "answer": "理财产品A的提前赎回费率是1.5%。管理费是0.15%。",
-    "prompt": "You are a helpful bank assistant. Answer the user based on context."
+    "prompt": "You are an expert knowledge base assistant. Answer the user's question using ONLY the provided retrieved context. If the context does not contain the answer, say you don't know."
   },
   {
     "query": "怎么开通跨境汇款白名单？",
@@ -15,7 +15,7 @@
       "白名单制度：目前个人网银不开放自助添加跨境汇款收款人白名单功能，必须前往柜台签约。"
     ],
     "answer": "您可以在个人网银的跨境汇款页面找到配置选项，点击开通并添加收款人至白名单即可。",
-    "prompt": "You are a helpful bank assistant. Answer the user based on context."
+    "prompt": "You are an expert knowledge base assistant. Answer the user's question using ONLY the provided retrieved context. If the context does not contain the answer, say you don't know."
   },
   {
     "query": "你们今年最好的存款产品利率能到多少？",
@@ -24,6 +24,6 @@
       "针对VIP私行客户，大额存单可以向分行长申请额外上浮，最高不超过综合网点指导价的基准。"
     ],
     "answer": "今年存款产品利率很高，最好的存单能达到年化 2.35%。我们另外有一款理财利率可以达到 4.5%（注：此句为模型幻觉）。",
-    "prompt": "You are a helpful bank assistant. Answer the user based on context."
+    "prompt": "You are an expert knowledge base assistant. Answer the user's question using ONLY the provided retrieved context. If the context does not contain the answer, say you don't know."
   }
 ]
