@@ -27,14 +27,13 @@ load_dotenv()
 llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
 
 # 定义生成理想答案的 Prompt（使用 ChatPromptTemplate 替代已弃用的 PromptTemplate）
+SYSTEM_INSTRUCTION = """你是一个客观严格的金融知识打标员。
+你的任务是根据提供的[参考文档(Context)]，以及[用户问题(Query)]，写出一个绝对正确、没有废话、纯客观的[标准答案]。
+如果参考文档中无法回答用户问题，请明确输出：\u201c无法根据提供文档回答\u201d。
+确保你的答案绝对没有任何主观臆测和外部知识的幻觉。"""
+
 system_prompt = ChatPromptTemplate.from_messages([
-    ("system", (
-        "你是一个客观严格的金融知识打标员。\n"
-        "你的任务是根据提供的[参考文档(Context)]，以及[用户问题(Query)]，"
-        "写出一个绝对正确、没有废话、纯客观的[标准答案]。\n"
-        "如果参考文档中无法回答用户问题，请明确输出："无法根据提供文档回答"。\n"
-        "确保你的答案绝对没有任何主观臆测和外部知识的幻觉。"
-    )),
+    ("system", SYSTEM_INSTRUCTION),
     ("human", "[用户问题(Query)]: {query}\n[参考文档(Context)]: {context_str}\n\n[标准答案]: "),
 ])
 

@@ -21,14 +21,15 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # Ragas 0.4.x API
+# NOTE: We use the legacy metric imports (from ragas.metrics) because they are
+# compatible with the evaluate() function. The newer collections API requires
+# llm_factory() and is designed for the experiment() workflow.
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="ragas")
+
 from ragas import evaluate
 from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
-from ragas.metrics import (
-    Faithfulness,
-    AnswerRelevancy,
-    ContextRecall,
-    ContextPrecision,
-)
+from ragas.metrics import Faithfulness, AnswerRelevancy, ContextRecall, ContextPrecision
 
 import nest_asyncio
 

@@ -22,7 +22,10 @@ import dspy
 from dspy.teleprompt import BootstrapFewShot
 from dotenv import load_dotenv
 
-# Ragas 0.4.x API
+# Ragas 0.4.x API (using legacy metric imports compatible with evaluate())
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="ragas")
+
 from ragas import evaluate
 from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
 from ragas.metrics import Faithfulness, AnswerRelevancy
