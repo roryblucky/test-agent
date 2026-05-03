@@ -23,6 +23,8 @@ dependencies = [
     "tenacity>=8.2.3",
     "uvicorn>=0.34.0",
     "uvloop>=0.22.1",
+    "pydantic-ai-skills>=0.8.0",
+    "pydantic-ai-todo>=0.1.10",
 ]
 
 [dependency-groups]

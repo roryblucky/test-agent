@@ -170,6 +170,34 @@ class UsageLimitConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class AgentMCPServerConfig(BaseModel):
+    """Agent specific MCP server configuration."""
+
+    transports: str = "sse"
+    url: str = ""
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] | None = None
+    allowed_tools: list[str] | None = Field(None, alias="allowedTools")
+
+    model_config = {"populate_by_name": True}
+
+
+class AgentConfig(BaseModel):
+    """Configuration for Pydantic AI config-driven orchestrator."""
+
+    llm_type: str = Field("fast", alias="llmType")
+    enable_todo: bool = Field(False, alias="enableTodo")
+    mcp_servers: dict[str, AgentMCPServerConfig] = Field(
+        default_factory=dict, alias="mcpServers"
+    )
+    skills: list[str] = Field(default_factory=list)
+    built_in_tools: list[str] = Field(default_factory=list, alias="buildInTools")
+    prompt_type: str | None = Field(None, alias="promptType")
+
+    model_config = {"populate_by_name": True}
+
+
 class FlowConfig(BaseModel):
     """Pipeline orchestration configuration.
 
@@ -183,6 +211,7 @@ class FlowConfig(BaseModel):
     agent_graph: str | None = Field(None, alias="agentGraph")
     usage_limits: UsageLimitConfig | None = Field(None, alias="usageLimits")
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list, alias="mcpServers")
+    agent_config: AgentConfig | None = Field(None, alias="agentConfig")
 
     model_config = {"populate_by_name": True}
 

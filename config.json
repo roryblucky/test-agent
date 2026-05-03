@@ -1,6 +1,6 @@
 [
     {
-        "kmsAppName": "",
+        "kmsAppName": "case1",
         "applicationId": "",
         "adGroups": [],
         "llmConfig": {
@@ -60,7 +60,36 @@
             "threshold": 0.7
         },
         "flowConfig": {
-            "mode": "simple",
+            "mode": "agent",
+            "agentConfig": {
+                "enableTodo": true,
+                "llmType": "fast",
+                "mcpServers": {
+                    "cioView": {
+                        "transports": "sse",
+                        "url": "",
+                        "allowedTools": [
+                            "A",
+                            "B",
+                            "C"
+                        ]
+                    },
+                    "foundSearch": {
+                        "transports": "streamable",
+                        "url": "",
+                        "allowedTools": [
+                            "A",
+                            "B",
+                            "C"
+                        ]
+                    }
+                },
+                "skills": [
+                    "agents/skills/market_insights_analysis",
+                    "agents/skills/found_search_and_analysis"
+                ],
+                "promptType": "agentSkill"
+            },
             "steps": [
                 {
                     "type": "moderation",
@@ -98,6 +127,113 @@
                     "type": "analysis"
                 }
             ]
+        },
+        "azureConfig": {
+            "tenantId": "",
+            "clientId": "",
+            "clientSecret": "",
+            "openAIEndpoint": "",
+            "contentSafetyEndpoint": "",
+            "aiLanguageEndpoint": "",
+            "proxyHost": "",
+            "proxyPort": 80,
+            "noProxy": ""
+        },
+        "gcpConfig": {
+            "projectId": "",
+            "bucketName": "",
+            "datastore": ""
+        }
+    },
+    {
+        "kmsAppName": "case2",
+        "applicationId": "",
+        "adGroups": [],
+        "llmConfig": {
+            "models": {
+                "fast": {
+                    "provider": "azure",
+                    "modelName": "gpt-4.1-mini",
+                    "temperature": 0,
+                    "topP": 0.0,
+                    "maxTokens": 8000,
+                    "thinkingLevel": "low",
+                    "thinkingSummary": "auto"
+                },
+                "pro": {
+                    "provider": "gcp",
+                    "modelName": "gemini-3",
+                    "temperature": 0,
+                    "topP": 0.0,
+                    "maxTokens": 8000,
+                    "thinkingEffort": "medium",
+                    "thinkingSummary": "auto"
+                },
+                "intent": {
+                    "provider": "azure",
+                    "modelName": "gpt-4.1-mini",
+                    "temperature": 0,
+                    "maxTokens": 2000
+                }
+            }
+        },
+        "retrieverConfig": {
+            "sources": [
+                {
+                    "provider": "gcp",
+                    "topK": 10,
+                    "searchType": "semantic"
+                }
+            ]
+        },
+        "rankingConfig": {
+            "provider": "gcp",
+            "topN": 5,
+            "model": "semantic-ranker-512"
+        },
+        "moderationConfig": {
+            "provider": "azure",
+            "categories": [
+                "hate",
+                "violence",
+                "self_harm",
+                "sexual"
+            ],
+            "threshold": "medium"
+        },
+        "groundednessConfig": {
+            "provider": "gcp",
+            "threshold": 0.7
+        },
+        "flowConfig": {
+            "mode": "agent",
+            "agentConfig": {
+                "enableTodo": true,
+                "mcpServers": {
+                    "cioView": {
+                        "transports": "sse",
+                        "url": "",
+                        "allowedTools": [
+                            "A",
+                            "B",
+                            "C"
+                        ]
+                    },
+                    "foundSearch": {
+                        "transports": "streamable",
+                        "url": "",
+                        "allowedTools": [
+                            "A",
+                            "B",
+                            "C"
+                        ]
+                    }
+                },
+                "buildInTools": [
+                    "plan_and_reason"
+                ],
+                "promptType": "agentWithFunctionTools"
+            }
         },
         "azureConfig": {
             "tenantId": "",

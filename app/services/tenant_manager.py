@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.agents.orchestrator import AgentOrchestrator
+from app.agents.config_orchestrator import ConfigDrivenOrchestrator
 from app.config.models import AzureConfig, GCPConfig, TenantConfig
 from app.core.http_client_pool import HttpClientPool
 from app.core.model_registry import ModelRegistry
@@ -54,7 +54,7 @@ class TenantManager:
         self._tenants: dict[str, TenantConfig] = {}
         self._registries: dict[str, ModelRegistry] = {}
         self._providers: dict[str, TenantProviders] = {}
-        self._engines: dict[str, FlowEngine | AgentOrchestrator] = {}
+        self._engines: dict[str, FlowEngine | ConfigDrivenOrchestrator] = {}
 
         for cfg in configs:
             self._tenants[cfg.application_id] = cfg
@@ -80,7 +80,7 @@ class TenantManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def get_flow_engine(self, app_id: str) -> FlowEngine | AgentOrchestrator:
+    def get_flow_engine(self, app_id: str) -> FlowEngine | ConfigDrivenOrchestrator:
         """Get the cached flow executor for a tenant.
 
         Returns a :class:`FlowEngine` for ``"simple"`` mode configs,
@@ -114,16 +114,13 @@ class TenantManager:
         cfg: TenantConfig,
         registry: ModelRegistry,
         providers: TenantProviders,
-    ) -> FlowEngine | AgentOrchestrator:
+    ) -> FlowEngine | ConfigDrivenOrchestrator:
         """Create the appropriate engine for a tenant's flow mode."""
         if cfg.flow_config.mode == "agent":
-            graph_name = cfg.flow_config.agent_graph or "rag_with_intent_branching"
-            return AgentOrchestrator(
-                registry,
-                providers,
-                graph_name=graph_name,
-                usage_limit_config=cfg.flow_config.usage_limits,
-                mcp_configs=cfg.flow_config.mcp_servers or None,
+            return ConfigDrivenOrchestrator(
+                config=cfg,
+                registry=registry,
+                providers=providers,
             )
 
         # Build handlers for the FlowEngine

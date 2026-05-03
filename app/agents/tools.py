@@ -7,7 +7,7 @@ without mocking the entire PydanticAI Agent machinery.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from app.models.domain import Document
 
@@ -16,10 +16,10 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from pydantic_ai import RunContext
 
-    from app.agents.coordinator import CoordinatorDeps
+    from app.agents.agent_deps import AgentDeps
 
 
-async def search_documents_tool(ctx: RunContext[CoordinatorDeps], query: str) -> str:
+async def search_documents_tool(ctx: RunContext[AgentDeps], query: str) -> str:
     """Search the knowledge base for documents relevant to a query.
 
     Args:
@@ -29,13 +29,13 @@ async def search_documents_tool(ctx: RunContext[CoordinatorDeps], query: str) ->
     Returns:
         Formatted text of retrieved documents.
     """
-    if not ctx.deps.retriever:
+    if not ctx.deps.providers.retriever:
         return "No retriever configured for this tenant."
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_start("search_documents")
 
-    docs = await ctx.deps.retriever.retrieve(query)
+    docs = await ctx.deps.providers.retriever.retrieve(query)
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
@@ -56,7 +56,7 @@ async def search_documents_tool(ctx: RunContext[CoordinatorDeps], query: str) ->
 
 
 async def rank_documents_tool(
-    ctx: RunContext[CoordinatorDeps], query: str, document_texts: list[str]
+    ctx: RunContext[AgentDeps], query: str, document_texts: list[str]
 ) -> str:
     """Re-rank documents by relevance to a specific query.
 
@@ -68,7 +68,7 @@ async def rank_documents_tool(
     Returns:
         The top-ranked documents as formatted text.
     """
-    if not ctx.deps.ranker:
+    if not ctx.deps.providers.ranker:
         return "No ranker configured for this tenant."
 
     if ctx.deps.emitter:
@@ -78,7 +78,7 @@ async def rank_documents_tool(
     docs = [
         Document(id=f"doc_{i}", content=text) for i, text in enumerate(document_texts)
     ]
-    ranked = await ctx.deps.ranker.rank(query, docs)
+    ranked = await ctx.deps.providers.ranker.rank(query, docs)
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
@@ -97,7 +97,7 @@ async def rank_documents_tool(
 
 
 async def decompose_question_tool(
-    ctx: RunContext[CoordinatorDeps], complex_question: str
+    ctx: RunContext[AgentDeps], complex_question: str
 ) -> list[str]:
     """Break a complex question into 2-5 focused sub-questions.
 
@@ -137,7 +137,7 @@ async def decompose_question_tool(
 
 
 async def analyze_section_tool(
-    ctx: RunContext[CoordinatorDeps],
+    ctx: RunContext[AgentDeps],
     question: str,
     context: str,
 ) -> str:
@@ -173,3 +173,16 @@ async def analyze_section_tool(
         )
 
     return result.output
+
+
+async def plan_and_reason_tool(ctx: RunContext[Any], reasoning: str) -> str:
+    """Use this tool to structure your response to the user with reasoning.
+    
+    Call this tool to think out loud and record your internal planning.
+    
+    Args:
+        ctx: Tools context.
+        reasoning: Your detailed reasoning or plan.
+    """
+    logger.info(f"Plan and Reasoning: {reasoning}")
+    return "Reasoning updated and recorded."

@@ -41,6 +41,7 @@ class FlowContext:
     llm_response: str | None = None
     moderation_result: ModerationResult | None = None
     groundedness_result: GroundednessResult | None = None
+    clarification_request: Any | None = None  # Using Any to avoid circular import with schemas
 
     # Extensible metadata bucket
     metadata: dict[str, Any] = field(default_factory=dict)

@@ -15,6 +15,20 @@ from app.models.domain import (
 from app.services.flow_context import FlowContext
 
 
+class QuestionAnswerSelector(BaseModel):
+    """Option selector for clarification requests."""
+    question: str = Field(description="需要用户澄清的具体问题")
+    options: list[str] = Field(description="提供给用户的可选快速回答列表")
+
+
+class ClarificationRequest(BaseModel):
+    """Structured request to ask the user for clarification before proceeding."""
+    response: str = Field(description="向用户解释为什么需要澄清的回复话术")
+    quick_questions: list[QuestionAnswerSelector] | None = Field(
+        None, description="结构化的追问列表"
+    )
+
+
 class QueryRequest(BaseModel):
     """Incoming query request body."""
 
@@ -40,6 +54,7 @@ class QueryResponse(BaseModel):
     documents: list[Document] = Field(default_factory=list)
     moderation: ModerationResult | None = None
     groundedness: GroundednessResult | None = None
+    clarification: ClarificationRequest | None = None
     session_id: str | None = Field(None, alias="sessionId")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -64,6 +79,7 @@ class QueryResponse(BaseModel):
             documents=ctx.ranked_documents or ctx.documents,
             moderation=ctx.moderation_result,
             groundedness=ctx.groundedness_result,
+            clarification=ctx.clarification_request,
             session_id=ctx.session_id,
             metadata=final_meta,
         )

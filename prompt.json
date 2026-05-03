@@ -1,0 +1,17 @@
+{
+    "applicationId": "xxx",
+    "systemPrompts": [
+        {
+            "type": "agentSkill",
+            "content": "xxxxxxxx"
+        },
+        {
+            "type": "agentWithFunctionTools",
+            "content": "xxxxxxxx"
+        },
+        {
+            "type": "refine_question",
+            "content": "xxxxxxxx"
+        }
+    ]
+}
