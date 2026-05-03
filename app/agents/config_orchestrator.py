@@ -117,65 +117,76 @@ class ConfigDrivenOrchestrator:
                 )
 
         # 5. MCP Servers
-        # For tool collision checking across MCP servers
-        all_allowed_mcp_tools = set()
-        has_allowed_lists = False
+        exact_allowed_mcp_tools: set[str] = set()
+        allow_all_mcp_prefixes: list[str] = []
+        has_mcp_allowed_lists = False
         
         for name, mcp_cfg in self.agent_config.mcp_servers.items():
             if mcp_cfg.allowed_tools is not None:
-                has_allowed_lists = True
-                all_allowed_mcp_tools.update(mcp_cfg.allowed_tools)
+                has_mcp_allowed_lists = True
+                for t in mcp_cfg.allowed_tools:
+                    # Because we use .prefix_tools(name), the actual registered tool name is prefixed
+                    exact_allowed_mcp_tools.add(f"{name}_{t}")
+            else:
+                # If allowed_tools is None, we allow ALL tools from this server
+                allow_all_mcp_prefixes.append(f"{name}_")
                 
             if mcp_cfg.url:
                 capabilities.append(MCP(url=mcp_cfg.url).prefix_tools(name))
             elif mcp_cfg.command:
-                # Assuming the builtin MCP capability handles stdio via command soon,
-                # otherwise we fallback to custom instantiation if needed.
-                # For now, pydantic-ai.capabilities.MCP uses `url` to denote sse/http.
-                # We log warning if command is used but not yet supported directly by `MCP()`.
-                # If supported, it might be something like `MCP(command=...)`
                 logger.warning(f"MCP command transport for {name} not yet standard via capabilities.")
 
-        # 6. Global MCP Filter (if any allowed_tools restrictions exist)
-        # Note: We filter at the global level because PrepareTools acts globally on the agent's tool defs.
-        # Since we use `.prefix_tools(name)`, the tool names become `name_toolname`.
-        # We need to refine the filter to handle prefixes if the user configured `allowedTools: ["A"]`.
-        # Here we do a simplified check for exact matches or prefix matching.
-        if has_allowed_lists:
-            async def filter_tools(ctx: RunContext[Any], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
-                filtered = []
-                for td in tool_defs:
-                    # Strip prefix to check against allowed names if using PrefixTools
-                    # E.g., `cioView_A` -> `A`
-                    base_name = td.name
-                    if "_" in td.name:
-                        base_name = td.name.split("_", 1)[1]
-                        
-                    if base_name in all_allowed_mcp_tools or td.name in all_allowed_mcp_tools:
-                        filtered.append(td)
-                    # We also must allow built-in tools and skill tools to pass through
-                    elif self.agent_config.built_in_tools and td.name in self.agent_config.built_in_tools:
-                        filtered.append(td)
-                    elif td.name.startswith("add_todo") or td.name.startswith("read_todos"): 
-                        # Allow Todo tools (should really use metadata to tag safe tools)
-                        filtered.append(td)
-                    else:
-                        # Simple heuristic: if it's an MCP tool not in the allowed list, drop it.
-                        pass
-                        
-                return filtered
-            capabilities.append(PrepareTools(filter_tools))
+        # If Skill allowed_tools is implemented in the future, you would populate it here:
+        exact_allowed_skill_tools: set[str] = set()
+        # allow_all_skill_prefixes = ["skill_"] # if you prefix skill tools
 
-        # Check for immediate collisions between built-in tools and requested MCP tools
-        if all_allowed_mcp_tools and self.agent_config.built_in_tools:
-            overlap = all_allowed_mcp_tools.intersection(self.agent_config.built_in_tools)
-            if overlap:
-                raise ValueError(f"Tool name collision detected (Fail-Fast): {overlap}")
+        # Fail-Fast Collision Check
+        # Now we can precisely check for collisions because we know the EXACT registered names
+        built_in_set = set(allowed_tools) if allowed_tools else set()
+        mcp_builtin_overlap = exact_allowed_mcp_tools.intersection(built_in_set)
+        if mcp_builtin_overlap:
+            raise ValueError(f"Tool name collision detected between MCP and Built-in tools: {mcp_builtin_overlap}")
+            
+        skill_builtin_overlap = exact_allowed_skill_tools.intersection(built_in_set)
+        if skill_builtin_overlap:
+             raise ValueError(f"Tool name collision detected between Skill and Built-in tools: {skill_builtin_overlap}")
+
+        # 6. Global Tool Filter
+        # Note: We filter at the global level because PrepareTools acts globally on the agent's tool defs.
+        # We must use exact tool names or precise prefixes to distinguish sources, since ToolDefinition 
+        # itself does not store "source" metadata.
+        async def filter_tools(ctx: RunContext[Any], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
+            filtered = []
+            for td in tool_defs:
+                # 1. Check Built-in tools
+                if td.name in built_in_set:
+                    filtered.append(td)
+                # 2. Check Todo tools (always allowed if enabled)
+                elif td.name.startswith("add_todo") or td.name.startswith("read_todos"): 
+                    filtered.append(td)
+                # 3. Check exact allowed MCP tools
+                elif has_mcp_allowed_lists and td.name in exact_allowed_mcp_tools:
+                    filtered.append(td)
+                # 4. Check MCP servers that allow all tools
+                elif allow_all_mcp_prefixes and td.name.startswith(tuple(allow_all_mcp_prefixes)):
+                    filtered.append(td)
+                # 5. Check exact allowed Skill tools (Future)
+                elif td.name in exact_allowed_skill_tools:
+                    filtered.append(td)
+                # 6. Check Skill sources that allow all tools (if any prefix or logic applies)
+                # elif td.name.startswith(tuple(allow_all_skill_prefixes)):
+                #     filtered.append(td)
+                else:
+                    logger.debug(f"Filtered out unallowed or unknown tool: {td.name}")
+                    
+            return filtered
+            
+        capabilities.append(PrepareTools(filter_tools))
 
         model = self.registry.get_model(self.agent_config.llm_type)
         agent = Agent(
             model=model,
-            result_type=str | ClarificationRequest,
+            output_type=str | ClarificationRequest,
             system_prompt=system_prompt,
             capabilities=capabilities,
         )
@@ -211,10 +222,15 @@ class ConfigDrivenOrchestrator:
             query, deps=deps, message_history=ctx.message_history or None
         ) as stream:
             # 动态判断：如果大模型选择输出纯文本(str)，则逐字流式打字
-            if stream.is_text:
-                async for chunk in stream.stream_text(delta=True):
-                    if ctx.emitter:
-                        await ctx.emitter.emit_token(chunk)
+            # Pydantic AI 1.x 移除了 is_text 和对 Union 类型调用 stream_text 的支持
+            # 我们通过 stream_output 流式获取解析结果，如果是字符串则计算差值并打字
+            previous_text = ""
+            async for chunk in stream.stream_output(debounce_by=0.01):
+                if isinstance(chunk, str):
+                    new_text = chunk[len(previous_text):]
+                    if new_text and ctx.emitter:
+                        await ctx.emitter.emit_token(new_text)
+                    previous_text = chunk
             
             output = await stream.get_output()
             ctx.add_usage(stream.usage())

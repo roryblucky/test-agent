@@ -29,7 +29,8 @@ class BuiltInToolRegistry:
         "rank_documents": tools.rank_documents_tool,
         "decompose_question": tools.decompose_question_tool,
         "analyze_section": tools.analyze_section_tool,
-        "plan_and_reason": tools.plan_and_reason_tool, 
+        "plan_and_reason": tools.plan_and_reason_tool,
+        "get_user_classification": tools.get_user_classification_tool,
     }
 
     @classmethod

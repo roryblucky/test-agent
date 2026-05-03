@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from app.api.schemas import QuestionAnswerSelector
 from app.models.domain import Document
 
 logger = logging.getLogger(__name__)
@@ -186,3 +187,43 @@ async def plan_and_reason_tool(ctx: RunContext[Any], reasoning: str) -> str:
     """
     logger.info(f"Plan and Reasoning: {reasoning}")
     return "Reasoning updated and recorded."
+
+
+async def get_user_classification_tool(
+    ctx: RunContext[Any],
+    response: str,
+    quick_questions: list[QuestionAnswerSelector] | None = None,
+) -> str:
+    """Get clarification from user if the user's query is too broad.
+    
+    Use this tool when you need the user to clarify their intent by selecting from specific options.
+    You MUST output the exact string returned by this tool as your final answer.
+    
+    Args:
+        ctx: Tools context.
+        response: The explanatory response or question directed at the user.
+        quick_questions: A list of specific questions and their options for the user to choose from.
+    """
+    logger.info(f"Clarification Question: {response}")
+    
+    def _build_quick_questions_markdown(questions: list[QuestionAnswerSelector]) -> str:
+        """Build quick question payload in markdown fenced block for UI parsing."""
+        if not questions:
+            return ""
+
+        lines: list[str] = ["```selection"]
+        for index, item in enumerate(questions, start=1):
+            question = item.question.strip()
+            options = [option.strip() for option in item.options if option and option.strip()]
+
+            lines.append(f"{index}. {question}")
+            for option in options:
+                lines.append(f"- {option}")
+
+        lines.append("```")
+        return "\n".join(lines)
+
+    quick_questions_markdown = _build_quick_questions_markdown(quick_questions or [])
+    answer = response if not quick_questions_markdown else f"{response}\n\n{quick_questions_markdown}"
+    
+    return answer
