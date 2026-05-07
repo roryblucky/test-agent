@@ -60,40 +60,42 @@
             "threshold": 0.7
         },
         "flowConfig": {
-            "mode": "agent",
-            "agentConfig": {
-                "enableTodo": true,
-                "llmType": "fast",
-                "mcpServers": {
-                    "cioView": {
-                        "transports": "sse",
-                        "url": "",
-                        "allowedTools": [
-                            "A",
-                            "B",
-                            "C"
-                        ]
-                    },
-                    "foundSearch": {
-                        "transports": "streamable",
-                        "url": "",
-                        "allowedTools": [
-                            "A",
-                            "B",
-                            "C"
-                        ]
-                    }
-                },
-                "skills": [
-                    "agents/skills/market_insights_analysis",
-                    "agents/skills/found_search_and_analysis"
-                ],
-                "promptType": "agentSkill"
-            },
             "steps": [
                 {
                     "type": "moderation",
                     "mode": "pre"
+                },
+                {
+                    "type": "agent",
+                    "agentConfig": {
+                        "enableTodo": true,
+                        "llmType": "fast",
+                        "mcpServers": {
+                            "cioView": {
+                                "transports": "sse",
+                                "url": "",
+                                "allowedTools": [
+                                    "A",
+                                    "B",
+                                    "C"
+                                ]
+                            },
+                            "foundSearch": {
+                                "transports": "streamable",
+                                "url": "",
+                                "allowedTools": [
+                                    "A",
+                                    "B",
+                                    "C"
+                                ]
+                            }
+                        },
+                        "skills": [
+                            "agents/skills/market_insights_analysis",
+                            "agents/skills/found_search_and_analysis"
+                        ],
+                        "promptType": "agentSkill"
+                    }
                 },
                 {
                     "type": "llm",
@@ -206,34 +208,38 @@
             "threshold": 0.7
         },
         "flowConfig": {
-            "mode": "agent",
-            "agentConfig": {
-                "enableTodo": true,
-                "mcpServers": {
-                    "cioView": {
-                        "transports": "sse",
-                        "url": "",
-                        "allowedTools": [
-                            "A",
-                            "B",
-                            "C"
-                        ]
-                    },
-                    "foundSearch": {
-                        "transports": "streamable",
-                        "url": "",
-                        "allowedTools": [
-                            "A",
-                            "B",
-                            "C"
-                        ]
+            "steps": [
+                {
+                    "type": "agent",
+                    "agentConfig": {
+                        "enableTodo": true,
+                        "mcpServers": {
+                            "cioView": {
+                                "transports": "sse",
+                                "url": "",
+                                "allowedTools": [
+                                    "A",
+                                    "B",
+                                    "C"
+                                ]
+                            },
+                            "foundSearch": {
+                                "transports": "streamable",
+                                "url": "",
+                                "allowedTools": [
+                                    "A",
+                                    "B",
+                                    "C"
+                                ]
+                            }
+                        },
+                        "buildInTools": [
+                            "plan_and_reason"
+                        ],
+                        "promptType": "agentWithFunctionTools"
                     }
-                },
-                "buildInTools": [
-                    "plan_and_reason"
-                ],
-                "promptType": "agentWithFunctionTools"
-            }
+                }
+            ]
         },
         "azureConfig": {
             "tenantId": "",

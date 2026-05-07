@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.agents.config_orchestrator import ConfigDrivenOrchestrator
 from app.config.models import AzureConfig, GCPConfig, TenantConfig
 from app.core.http_client_pool import HttpClientPool
 from app.core.model_registry import ModelRegistry
@@ -54,7 +53,7 @@ class TenantManager:
         self._tenants: dict[str, TenantConfig] = {}
         self._registries: dict[str, ModelRegistry] = {}
         self._providers: dict[str, TenantProviders] = {}
-        self._engines: dict[str, FlowEngine | ConfigDrivenOrchestrator] = {}
+        self._engines: dict[str, FlowEngine] = {}
 
         for cfg in configs:
             self._tenants[cfg.application_id] = cfg
@@ -80,12 +79,8 @@ class TenantManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def get_flow_engine(self, app_id: str) -> FlowEngine | ConfigDrivenOrchestrator:
-        """Get the cached flow executor for a tenant.
-
-        Returns a :class:`FlowEngine` for ``"simple"`` mode configs,
-        or an :class:`AgentOrchestrator` for ``"agent"`` mode.
-        """
+    def get_flow_engine(self, app_id: str) -> FlowEngine:
+        """Get the cached flow executor for a tenant."""
         self._resolve_tenant(app_id)  # validate tenant exists
         return self._engines[app_id]
 
@@ -114,17 +109,11 @@ class TenantManager:
         cfg: TenantConfig,
         registry: ModelRegistry,
         providers: TenantProviders,
-    ) -> FlowEngine | ConfigDrivenOrchestrator:
-        """Create the appropriate engine for a tenant's flow mode."""
-        if cfg.flow_config.mode == "agent":
-            return ConfigDrivenOrchestrator(
-                config=cfg,
-                registry=registry,
-                providers=providers,
-            )
-
+    ) -> FlowEngine:
+        """Create the FlowEngine for a tenant."""
         # Build handlers for the FlowEngine
         from app.config.models import FlowStepType
+        from app.services.handlers.agent import AgentHandler
         from app.services.handlers.analysis import AnalysisHandler
         from app.services.handlers.groundedness import GroundednessHandler
         from app.services.handlers.llm import LLMHandler
@@ -133,9 +122,11 @@ class TenantManager:
         from app.services.handlers.ranking import RankingHandler
         from app.services.handlers.retriever import RetrieverHandler
 
-        # Initialize LLM handler and pre-warm cache
         llm_handler = LLMHandler(registry)
         llm_handler.warmup(cfg.flow_config.steps)
+
+        agent_handler = AgentHandler(registry, providers, cfg)
+        agent_handler.warmup(cfg.flow_config.steps)
 
         handlers = {
             FlowStepType.MODERATION: ModerationHandler(providers.moderation),
@@ -145,6 +136,7 @@ class TenantManager:
             FlowStepType.ANALYSIS: AnalysisHandler(),
             FlowStepType.MEMORY: MemoryHandler(),
             FlowStepType.LLM: llm_handler,
+            FlowStepType.AGENT: agent_handler,
         }
 
         return FlowEngine(cfg, handlers)

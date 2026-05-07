@@ -33,7 +33,7 @@ class SharedState:
 
 def create_router_agent(
     registry: ModelRegistry,
-    extra_toolsets: list[AbstractToolset] | None = None,
+    extra_toolsets: list[AbstractToolset] | None = None,        
 ) -> Agent[SharedState, str]:
     """Create the Router Agent with dynamic tools."""
     from app.agents.history_processors import filter_thinking, trim_history
