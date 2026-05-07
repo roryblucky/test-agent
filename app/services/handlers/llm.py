@@ -169,7 +169,7 @@ class LLMHandler:
 
         # All AI calls use streaming — emit per-token events
         settings = _build_step_settings(step)
-        async with agent.run_stream_e(
+        async with agent.run_stream(
             effective_query,
             deps=deps,
             model_settings=settings,
@@ -177,12 +177,22 @@ class LLMHandler:
         ) as stream:
             chunks: list[str] = []
             async for chunk in stream.stream_text():
+                # Check for stop signal
+                if ctx.emitter and ctx.emitter.is_cancelled:
+                    break
                 chunks.append(chunk)
                 if ctx.emitter:
                     await ctx.emitter.emit_token(chunk)
             ctx.llm_response = "".join(chunks)
             ctx.new_messages = stream.new_messages()
             ctx.add_usage(stream.usage())
+
+        # Signal stop if cancelled mid-stream
+        if ctx.emitter and ctx.emitter.is_cancelled:
+            await ctx.emitter.emit_stopped(ctx.llm_response)
+            from app.services.events import GenerationCancelledError
+
+            raise GenerationCancelledError("Stopped during llm:answer")
 
         if ctx.emitter:
             await ctx.emitter.emit_step_completed("llm:answer", {"model": model_name})

@@ -11,9 +11,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.api.admin_router import admin_router
 from app.api.router import router
 from app.config.loader import load_config
+from app.core.audit_middleware import AuditMiddleware
 from app.core.http_client_pool import HttpClientPool
+from app.core.rate_limit_middleware import TenantRateLimitMiddleware
 from app.services.tenant_manager import TenantManager
 
 logger = logging.getLogger(__name__)
@@ -77,6 +80,9 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan — initialise and tear down shared resources."""
     # Startup
+    from app.config.config_reloader import ConfigReloader
+    from app.core.audit import AuditLogger, BigQueryAuditSink, FileAuditSink
+    from app.core.rate_limiter import create_rate_limiter
     from app.core.telemetry import TelemetryService
 
     # Initialize OpenTelemetry
@@ -87,6 +93,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.tenant_manager = TenantManager(configs, http_pool)
     app.state.http_pool = http_pool
 
+    # Rate limiter (Redis in production, InMemory for dev)
+    redis_url = os.environ.get("RATE_LIMIT_REDIS_URL")
+    app.state.rate_limiter = create_rate_limiter(redis_url)
+
+    # Audit logger with configured sinks
+    audit_sinks = [FileAuditSink()]  # Always available for dev/debug
+    gcp_project = os.environ.get("GCP_PROJECT_ID")
+    if gcp_project:
+        try:
+            audit_sinks.append(BigQueryAuditSink(project_id=gcp_project))
+        except Exception:
+            logger.warning("BigQuery audit sink not available, using file only")
+    app.state.audit_logger = AuditLogger(sinks=audit_sinks)
+
+    # Config hot-reloader
+    app.state.config_reloader = ConfigReloader(app, http_pool)
+
     logger.info("KMS started — tenants: %s", app.state.tenant_manager.tenant_ids)
 
     yield
@@ -96,6 +119,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     if hasattr(_session_store, "close"):
         await _session_store.close()
+
+    # Close audit logger
+    await app.state.audit_logger.close()
+
+    # Close rate limiter if Redis-backed
+    if hasattr(app.state.rate_limiter, "close"):
+        await app.state.rate_limiter.close()
 
     await http_pool.close_all()
     logger.info("KMS shutdown complete")
@@ -112,7 +142,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Middleware stack (order matters — outermost first)
 app.add_middleware(TimeoutMiddleware)
 max_concurrent = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "100"))
 app.add_middleware(ConcurrencyLimiterMiddleware, max_concurrent_requests=max_concurrent)
+app.add_middleware(AuditMiddleware)
+app.add_middleware(TenantRateLimitMiddleware)
+
+# Routers
 app.include_router(router)
+app.include_router(admin_router)

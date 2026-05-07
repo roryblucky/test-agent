@@ -48,6 +48,11 @@ class EventType(StrEnum):
     THINKING = "thinking"
     DONE = "done"
     ERROR = "error"
+    STOPPED = "stopped"
+
+
+class GenerationCancelledError(Exception):
+    """Raised when the LLM generation is cancelled by a stop signal."""
 
 
 @dataclass
@@ -90,6 +95,29 @@ class EventEmitter:
     def __init__(self, maxsize: int = 2000) -> None:
         self._queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue(maxsize=maxsize)
         self._closed = False
+        self._cancelled = asyncio.Event()
+
+    # ------------------------------------------------------------------
+    # Cancellation API
+    # ------------------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Signal the pipeline to stop generating.
+
+        Sets the internal cancellation flag.  Handlers should check
+        :attr:`is_cancelled` during streaming loops and exit early.
+        """
+        self._cancelled.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Return True if a stop signal has been received."""
+        return self._cancelled.is_set()
+
+    def check_cancelled(self) -> None:
+        """Raise :class:`GenerationCancelledError` if cancelled."""
+        if self._cancelled.is_set():
+            raise GenerationCancelledError("Generation stopped by user")
 
     # ------------------------------------------------------------------
     # Producer API (called by flow engine / orchestrator)
@@ -140,6 +168,13 @@ class EventEmitter:
     async def emit_error(self, error: str) -> None:
         """Convenience: emit an ``error`` event and close."""
         await self.emit(StreamEvent(type=EventType.ERROR, data=error))
+        await self.close()
+
+    async def emit_stopped(self, partial_response: str | None = None) -> None:
+        """Convenience: emit a ``stopped`` event and close."""
+        await self.emit(
+            StreamEvent(type=EventType.STOPPED, data={"partial": partial_response})
+        )
         await self.close()
 
     async def close(self) -> None:

@@ -177,21 +177,32 @@ class AgentHandler(StepHandler):
         ) as stream:
             previous_text = ""
             async for chunk in stream.stream_output(debounce_by=0.01):
+                # Check for stop signal
+                if ctx.emitter and ctx.emitter.is_cancelled:
+                    break
                 if isinstance(chunk, str):
                     new_text = chunk[len(previous_text):]
                     if new_text and ctx.emitter:
                         await ctx.emitter.emit_token(new_text)
                     previous_text = chunk
-            
+
             output = await stream.get_output()
             ctx.add_usage(stream.usage())
             ctx.new_messages = stream.new_messages()
 
         ctx.llm_response = output
+
+        # Handle stop signal
+        if ctx.emitter and ctx.emitter.is_cancelled:
+            await ctx.emitter.emit_stopped(previous_text or str(output))
+            from app.services.events import GenerationCancelledError
+
+            raise GenerationCancelledError("Stopped during agent:orchestration")
+
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
                 "agent:orchestration",
                 {"output_length": len(str(output))},
             )
-            
+
         return ctx

@@ -241,6 +241,61 @@ class GCPConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Rate Limiting Config
+# ---------------------------------------------------------------------------
+
+
+class EndpointRateLimitPolicy(BaseModel):
+    """Rate limit policy for a specific endpoint type."""
+
+    requests_per_minute: int = Field(60, alias="requestsPerMinute")
+    requests_per_day: int = Field(10000, alias="requestsPerDay")
+    concurrent_requests: int = Field(10, alias="concurrentRequests")
+
+    model_config = {"populate_by_name": True}
+
+
+class RateLimitConfig(BaseModel):
+    """Per-tenant rate limiting configuration.
+
+    Separate policies for ``/query`` (non-streaming) and
+    ``/query/stream`` (SSE streaming) endpoints, plus a shared
+    monthly token budget.
+    """
+
+    query_policy: EndpointRateLimitPolicy = Field(
+        default_factory=EndpointRateLimitPolicy, alias="queryPolicy"
+    )
+    stream_policy: EndpointRateLimitPolicy = Field(
+        default_factory=lambda: EndpointRateLimitPolicy(
+            requests_per_minute=30,
+            requests_per_day=5000,
+            concurrent_requests=5,
+        ),
+        alias="streamPolicy",
+    )
+    tokens_per_month: int = Field(1_000_000, alias="tokensPerMonth")
+
+    model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
+# Audit Config
+# ---------------------------------------------------------------------------
+
+
+class AuditConfig(BaseModel):
+    """Audit logging configuration for compliance."""
+
+    enabled: bool = True
+    bigquery_dataset: str = Field("audit_logs", alias="bigqueryDataset")
+    bigquery_table: str = Field("kms_audit", alias="bigqueryTable")
+    retention_years: int = Field(7, alias="retentionYears")
+
+    model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
 # Tenant Config (top-level)
 # ---------------------------------------------------------------------------
 
@@ -260,9 +315,14 @@ class TenantConfig(BaseModel):
         None, alias="groundednessConfig"
     )
     flow_config: FlowConfig = Field(alias="flowConfig")
+    rate_limit_config: RateLimitConfig | None = Field(
+        None, alias="rateLimitConfig"
+    )
+    audit_config: AuditConfig | None = Field(None, alias="auditConfig")
 
     # Cloud configs — top-level, extensible (future: aliConfig, awsConfig, etc.)
     azure_config: AzureConfig | None = Field(None, alias="azureConfig")
     gcp_config: GCPConfig | None = Field(None, alias="gcpConfig")
 
     model_config = {"populate_by_name": True}
+

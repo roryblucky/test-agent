@@ -59,6 +59,25 @@
             "provider": "gcp",
             "threshold": 0.7
         },
+        "rateLimitConfig": {
+            "queryPolicy": {
+                "requestsPerMinute": 60,
+                "requestsPerDay": 10000,
+                "concurrentRequests": 10
+            },
+            "streamPolicy": {
+                "requestsPerMinute": 30,
+                "requestsPerDay": 5000,
+                "concurrentRequests": 5
+            },
+            "tokensPerMonth": 2000000
+        },
+        "auditConfig": {
+            "enabled": true,
+            "bigqueryDataset": "audit_logs",
+            "bigqueryTable": "kms_audit",
+            "retentionYears": 7
+        },
         "flowConfig": {
             "steps": [
                 {
@@ -206,6 +225,25 @@
         "groundednessConfig": {
             "provider": "gcp",
             "threshold": 0.7
+        },
+        "rateLimitConfig": {
+            "queryPolicy": {
+                "requestsPerMinute": 30,
+                "requestsPerDay": 5000,
+                "concurrentRequests": 5
+            },
+            "streamPolicy": {
+                "requestsPerMinute": 15,
+                "requestsPerDay": 2000,
+                "concurrentRequests": 3
+            },
+            "tokensPerMonth": 1000000
+        },
+        "auditConfig": {
+            "enabled": true,
+            "bigqueryDataset": "audit_logs",
+            "bigqueryTable": "kms_audit",
+            "retentionYears": 7
         },
         "flowConfig": {
             "steps": [

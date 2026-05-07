@@ -25,7 +25,7 @@ from __future__ import annotations
 import time
 
 from app.config.models import FlowStepType, TenantConfig
-from app.services.events import EventEmitter
+from app.services.events import EventEmitter, GenerationCancelledError
 from app.services.flow_context import FlowContext
 from app.services.handlers.base import StepHandler
 
@@ -64,6 +64,7 @@ class FlowEngine:
         """Run the pipeline end-to-end.
 
         Raises on first error (fail-fast).
+        Stops early if the emitter receives a cancellation signal.
         """
         ctx = FlowContext(
             query=query,
@@ -73,20 +74,32 @@ class FlowEngine:
         )
         ctx.metadata["pipeline_start"] = time.time()
 
-        for step in self.steps:
-            handler = self.handlers.get(step.type)
-            if handler is None:
-                raise ValueError(f"Unknown flow step type: {step.type}")
+        try:
+            for step in self.steps:
+                # Check for stop signal between steps
+                if ctx.emitter and ctx.emitter.is_cancelled:
+                    ctx.metadata["stopped"] = True
+                    break
 
-            # Build a human-readable step name for SSE events
-            step_name = (
-                f"{step.type.value}:{step.mode}" if step.mode else step.type.value
-            )
+                handler = self.handlers.get(step.type)
+                if handler is None:
+                    raise ValueError(f"Unknown flow step type: {step.type}")
 
-            # Emit step_start
-            if ctx.emitter:
-                await ctx.emitter.emit_step_start(step_name)
+                # Build a human-readable step name for SSE events
+                step_name = (
+                    f"{step.type.value}:{step.mode}" if step.mode else step.type.value
+                )
 
-            ctx = await handler.handle(ctx, step)
+                # Track for audit trail
+                ctx.metadata.setdefault("steps_executed", []).append(step_name)
+
+                # Emit step_start
+                if ctx.emitter:
+                    await ctx.emitter.emit_step_start(step_name)
+
+                ctx = await handler.handle(ctx, step)
+        except GenerationCancelledError:
+            ctx.metadata["stopped"] = True
 
         return ctx
+
