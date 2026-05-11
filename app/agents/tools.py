@@ -1,23 +1,192 @@
-"""Coordinator Agent Tools — Standalone functions for unit testing.
+"""Agent Tools — domain tools + agentskills.io skill-loading tools.
 
-Extracted from ``coordinator.py`` to allow direct testing of tool logic
-without mocking the entire PydanticAI Agent machinery.
+All tools are registered as standard Pydantic AI tool functions.
+Pydantic AI auto-generates function-calling schema from type hints + docstrings.
+
+Skill-system tools (agentskills.io progressive disclosure)
+-----------------------------------------------------------
+activate_skill_tool        Tier 2: LLM calls this to load a skill's full instructions.
+load_skill_references_tool Tier 3: LLM calls this to load a skill's reference documents.
+
+Domain tools (RAG operations)
+------------------------------
+search_documents_tool      Vector/semantic search in knowledge base.
+rank_documents_tool        Re-rank retrieved documents by relevance.
+decompose_question_tool    Break a complex question into focused sub-questions.
+analyze_section_tool       Analyze a specific document section.
+plan_and_reason_tool       Lightweight reasoning scratchpad.
+get_user_classification_tool Request clarification from user.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+from pydantic_ai import RunContext
+
+from app.agents.agent_deps import AgentDeps
 from app.api.schemas import QuestionAnswerSelector
 from app.models.domain import Document
 
 logger = logging.getLogger(__name__)
 
-if TYPE_CHECKING:
-    from pydantic_ai import RunContext
 
-    from app.agents.agent_deps import AgentDeps
+# ---------------------------------------------------------------------------
+# Skill system tools — agentskills.io Tier 2 & Tier 3
+# The LLM calls these autonomously at runtime based on the discovery index
+# (name + description) injected into the system prompt.
+# -------------------------------------------------------------------------
+async def activate_skill_tool(ctx: RunContext[AgentDeps], skill_name: str) -> str:
+    """Activate a skill to get its full instructions and tool guidance.
+
+    Call this FIRST when you determine that a specific skill is needed.
+    Returns the complete instructions from the skill's SKILL.md wrapped in
+    <skill_content> tags, along with a list of available resource files.
+
+    IMPORTANT: Only call this with skill names from the <available_skills>
+    list in the system prompt. Do NOT invent skill names.
+
+    After activation, if you need additional context (schemas, examples,
+    data dictionaries), call load_skill_references_tool(skill_name) to load
+    the reference documents listed in <skill_resources>.
+
+    Args:
+        ctx: Tools context with access to skill registry.
+        skill_name: The exact skill name from <available_skills> in system prompt.
+
+    Returns:
+        Skill instructions wrapped in <skill_content> tags, including skill
+        directory path and <skill_resources> listing of available references.
+    """
+    registry = ctx.deps.skill_registry
+    tenant_id = ctx.deps.tenant_id
+
+    if registry is None:
+        return f"Skill system not configured for tenant '{tenant_id}'."
+
+    # Deduplication: return cached instructions if already activated this run
+    if skill_name in ctx.deps.activated_skill_names:
+        cached = registry.get_activated_skill(tenant_id, skill_name)
+        if cached:
+            # Return cached content without re-listing resources
+            skill_dir = cached.source_path.rsplit("/", 1)[0]
+            return (
+                f'<skill_content name="{skill_name}">\n'
+                f"{cached.instructions}\n\n"
+                f"Skill directory: {skill_dir}\n"
+                f"</skill_content>"
+            )
+
+    if ctx.deps.emitter:
+        await ctx.deps.emitter.emit_step_start(f"skill:activate:{skill_name}")
+
+    # Tier 2: load full SKILL.md instructions
+    activated = await registry.activate(tenant_id, [skill_name])
+    if not activated:
+        # Build hint from known names for the model
+        known = [s.name for s in registry.get_summaries(tenant_id)]
+        return (
+            f"Skill '{skill_name}' not found. "
+            f"Valid skill names are: {', '.join(known)}"
+        )
+
+    skill = activated[0]
+    ctx.deps.activated_skill_names.append(skill_name)
+
+    # List available resource files WITHOUT loading them (spec requirement)
+    resource_files = await registry.get_resource_files(tenant_id, skill_name)
+
+    if ctx.deps.emitter:
+        await ctx.deps.emitter.emit_step_completed(
+            f"skill:activate:{skill_name}",
+            {"tools": skill.metadata.allowed_tools, "resources": resource_files},
+        )
+
+    # Build structured response per agentskills.io spec
+    skill_dir = skill.source_path.rsplit("/", 1)[0]
+    parts = [f'<skill_content name="{skill_name}">']
+    parts.append(skill.instructions)
+    parts.append(f"\nSkill directory: {skill_dir}")
+
+    if resource_files:
+        parts.append("\n<skill_resources>")
+        for fname in resource_files:
+            parts.append(f"  <file>references/{fname}</file>")
+        parts.append("</skill_resources>")
+
+    parts.append("</skill_content>")
+
+    logger.info(
+        f"[{tenant_id}] Agent activated skill: '{skill_name}' "
+        f"(tools: {skill.metadata.allowed_tools}, "
+        f"resources: {resource_files})"
+    )
+    return "\n".join(parts)
+
+
+async def load_skill_references_tool(
+    ctx: RunContext[AgentDeps], skill_name: str
+) -> str:
+    """Load detailed reference documents for a previously activated skill.
+
+    Call this when you need additional technical context beyond the skill's
+    instructions — for example: database schemas, API specifications, data
+    dictionaries, or domain-specific lookup tables.
+
+    The available reference files are listed in <skill_resources> inside
+    the <skill_content> returned by activate_skill_tool(). Only call this
+    AFTER activating the skill.
+
+    Args:
+        ctx: Tools context with access to skill registry.
+        skill_name: The name of a previously activated skill.
+
+    Returns:
+        All reference documents concatenated as formatted text.
+    """
+    registry = ctx.deps.skill_registry
+    tenant_id = ctx.deps.tenant_id
+
+    if registry is None:
+        return "Skill system not configured."
+
+    skill = registry.get_activated_skill(tenant_id, skill_name)
+    if skill is None:
+        return (
+            f"Skill '{skill_name}' has not been activated yet. "
+            f"Call activate_skill_tool('{skill_name}') first."
+        )
+
+    if ctx.deps.emitter:
+        await ctx.deps.emitter.emit_step_start(f"skill:references:{skill_name}")
+
+    # Tier 3: load reference document contents
+    refs = await registry.load_references(skill)
+
+    if ctx.deps.emitter:
+        await ctx.deps.emitter.emit_step_completed(
+            f"skill:references:{skill_name}",
+            {"reference_count": len(refs)},
+        )
+
+    if not refs:
+        return f"No reference documents available for skill '{skill_name}'."
+
+    parts = [f"# Reference Documents for '{skill_name}'\n"]
+    for ref in refs:
+        parts.append(f"## {ref.filename}\n\n{ref.content}\n")
+
+    logger.info(
+        f"[{tenant_id}] Agent loaded {len(refs)} reference(s) "
+        f"for skill '{skill_name}'"
+    )
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Domain tools (RAG operations)
+# ---------------------------------------------------------------------------
 
 
 async def search_documents_tool(ctx: RunContext[AgentDeps], query: str) -> str:

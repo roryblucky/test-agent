@@ -13,7 +13,7 @@ dependencies = [
     "azure-ai-contentsafety>=1.0.0",
     "aiohttp>=3.10.0",
     "pydantic>=2.12.5",
-    "pydantic-ai>=1.58.0",
+    "pydantic-ai>=1.93.0",
     "pydantic-settings>=2.12.0",
     "redis>=7.1.1",
     "opentelemetry-api>=1.24.0",
@@ -23,8 +23,7 @@ dependencies = [
     "tenacity>=8.2.3",
     "uvicorn>=0.34.0",
     "uvloop>=0.22.1",
-    "pydantic-ai-skills>=0.8.0",
-    "pydantic-ai-todo>=0.1.10",
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]

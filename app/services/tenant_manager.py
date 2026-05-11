@@ -3,6 +3,9 @@
 Reads the list of :class:`TenantConfig` objects, creates
 :class:`ModelRegistry` and non-LLM provider instances for each,
 and exposes a ``get_flow_engine`` / ``get_orchestrator`` API.
+
+Also integrates the :class:`TenantSkillRegistry` for loading skills
+from GCS at startup.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from app.providers.factory import ProviderFactory
 from app.providers.federated import FederatedRetrieverProvider
 from app.services.exceptions import TenantNotFoundError
 from app.services.flow_engine import FlowEngine
+from app.skills.registry import TenantSkillRegistry
 
 
 @dataclass
@@ -49,11 +53,13 @@ class TenantManager:
         self,
         configs: list[TenantConfig],
         http_pool: HttpClientPool,
+        skill_registry: TenantSkillRegistry | None = None,
     ) -> None:
         self._tenants: dict[str, TenantConfig] = {}
         self._registries: dict[str, ModelRegistry] = {}
         self._providers: dict[str, TenantProviders] = {}
         self._engines: dict[str, FlowEngine] = {}
+        self._skill_registry = skill_registry
 
         for cfg in configs:
             self._tenants[cfg.application_id] = cfg
@@ -73,6 +79,7 @@ class TenantManager:
                 cfg,
                 self._registries[cfg.application_id],
                 self._providers[cfg.application_id],
+                skill_registry,
             )
 
     # ------------------------------------------------------------------
@@ -109,6 +116,7 @@ class TenantManager:
         cfg: TenantConfig,
         registry: ModelRegistry,
         providers: TenantProviders,
+        skill_registry: TenantSkillRegistry | None = None,
     ) -> FlowEngine:
         """Create the FlowEngine for a tenant."""
         # Build handlers for the FlowEngine
@@ -125,7 +133,7 @@ class TenantManager:
         llm_handler = LLMHandler(registry)
         llm_handler.warmup(cfg.flow_config.steps)
 
-        agent_handler = AgentHandler(registry, providers, cfg)
+        agent_handler = AgentHandler(registry, providers, cfg, skill_registry)
         agent_handler.warmup(cfg.flow_config.steps)
 
         handlers = {
