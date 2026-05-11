@@ -15,7 +15,9 @@ class BaseRetrieverProvider(ABC):
     """Retrieve documents relevant to a query."""
 
     @abstractmethod
-    async def retrieve(self, query: str, top_k: int = 10) -> list[Document]:
+    async def retrieve(
+        self, query: str, top_k: int = 10, filter_expr: str | None = None
+    ) -> list[Document]:
         """Retrieve relevant documents for a query."""
         ...
 

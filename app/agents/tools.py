@@ -189,15 +189,16 @@ async def load_skill_references_tool(
 # ---------------------------------------------------------------------------
 
 
-async def search_documents_tool(ctx: RunContext[AgentDeps], query: str) -> str:
+async def search_documents_tool(
+    ctx: RunContext[AgentDeps],
+    query: str,
+    filter_expr: str | None = None,
+) -> str:
     """Search the knowledge base for documents relevant to a query.
 
     Args:
-        ctx: Tools context with access to dependencies.
-        query: The search query, can be a sub-question or refined query.
-
-    Returns:
-        Formatted text of retrieved documents.
+        query: The search query text.
+        filter_expr: Optional metadata filter expression string.
     """
     if not ctx.deps.providers.retriever:
         return "No retriever configured for this tenant."
@@ -205,13 +206,14 @@ async def search_documents_tool(ctx: RunContext[AgentDeps], query: str) -> str:
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_start("search_documents")
 
-    docs = await ctx.deps.providers.retriever.retrieve(query)
+    docs = await ctx.deps.providers.retriever.retrieve(query, filter_expr=filter_expr)
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
             "search_documents",
             {
                 "query": query,
+                "filter_expr": filter_expr,
                 "document_count": len(docs),
                 "documents": [{"id": d.id, "score": d.score} for d in docs],
             },
