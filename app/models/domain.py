@@ -4,6 +4,18 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from app.models.workflow import IntentResult
+
+__all__ = [
+    "Document",
+    "GroundednessResult",
+    "IntentResult",
+    "LLMResponse",
+    "ModerationResult",
+    "RefinedQuestion",
+    "TokenUsage",
+]
+
 
 class Document(BaseModel):
     """A retrieved document with content and metadata."""
@@ -51,11 +63,3 @@ class RefinedQuestion(BaseModel):
 
     refined_query: str
     keywords: list[str] = Field(default_factory=list)
-
-
-class IntentResult(BaseModel):
-    """Output of the intent recognition agent."""
-
-    intent: str
-    confidence: float
-    sub_intents: list[str] = Field(default_factory=list)

@@ -17,6 +17,9 @@ class AnalysisHandler:
         """Aggregate pipeline execution data."""
         pipeline_start = ctx.metadata.get("pipeline_start")
         elapsed = time.time() - pipeline_start if pipeline_start else None
+        planner_output = ctx.planner_output
+        aggregated_evidence = ctx.aggregated_evidence
+        compliance_review = ctx.compliance_review
 
         analysis = {
             "pipeline_duration_seconds": round(elapsed, 3) if elapsed else None,
@@ -30,6 +33,28 @@ class AnalysisHandler:
                 ctx.groundedness_result.is_grounded if ctx.groundedness_result else None
             ),
             "token_usage": ctx.metadata.get("coordinator_usage"),
+            "streaming_policy": ctx.metadata.get("streaming_policy", "token"),
+            "tool_call_count": len(ctx.tool_calls),
+            "tool_observation_count": len(ctx.tool_observations),
+            "evidence_count": len(ctx.evidence_store),
+            "planner_can_synthesize": (
+                planner_output.can_synthesize if planner_output else None
+            ),
+            "planner_evidence_count": (
+                len(planner_output.evidence_ids) if planner_output else None
+            ),
+            "aggregated_evidence_count": (
+                len(aggregated_evidence.evidence) if aggregated_evidence else None
+            ),
+            "synthesis_allowed": (
+                aggregated_evidence.synthesis_allowed if aggregated_evidence else None
+            ),
+            "compliance_passed": (
+                compliance_review.passed if compliance_review else None
+            ),
+            "compliance_violation_count": (
+                len(compliance_review.violations) if compliance_review else None
+            ),
         }
 
         ctx.metadata["analysis"] = analysis

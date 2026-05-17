@@ -16,9 +16,18 @@ K8s/enterprise adaptation:
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
+
+
+class SkillRiskLevel(StrEnum):
+    """Risk level declared by skill metadata."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
 
 
 class SkillMetadata(BaseModel):
@@ -37,9 +46,12 @@ class SkillMetadata(BaseModel):
     compatibility Optional. Max 500 chars. Environment requirements.
     metadata      Optional. Arbitrary key-value pairs (author, version…).
     allowed-tools Optional. Space-separated list of pre-approved tools.
+    required-tools Optional. Space-separated list of tools required by the skill.
 
     Extension fields (enterprise / K8s)
     ------------------------------------
+    risk_level             Skill risk level for runtime policy.
+    tool-constraints       Declarative per-tool constraints.
     redirect               Whether tool results bypass LLM (ToolOutput).
     redirect-output-schema Pydantic model name in OUTPUT_MODEL_REGISTRY.
     """
@@ -56,6 +68,17 @@ class SkillMetadata(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list, alias="allowed-tools")
 
     # ---- Enterprise extension fields ----
+    risk_level: SkillRiskLevel = Field(
+        SkillRiskLevel.LOW,
+        validation_alias=AliasChoices("risk_level", "risk-level"),
+        serialization_alias="risk_level",
+    )
+    required_tools: list[str] = Field(
+        default_factory=list, alias="required-tools"
+    )
+    tool_constraints: dict[str, dict[str, Any]] = Field(
+        default_factory=dict, alias="tool-constraints"
+    )
     # If True, ToolOutput is used to return results directly (redirect=True)
     redirect: bool = False
     # Maps to a Pydantic model class in OUTPUT_MODEL_REGISTRY
@@ -89,13 +112,19 @@ class SkillMetadata(BaseModel):
             )
         return v
 
-    @field_validator("allowed_tools", mode="before")
+    @field_validator("allowed_tools", "required_tools", mode="before")
     @classmethod
-    def parse_allowed_tools(cls, v: Any) -> list[str]:
+    def parse_tool_names(cls, v: Any) -> list[str]:
         """Accept both space-separated string and list."""
         if isinstance(v, str):
             return v.split()
         return v or []
+
+    @field_validator("tool_constraints", mode="before")
+    @classmethod
+    def parse_tool_constraints(cls, v: Any) -> dict[str, dict[str, Any]]:
+        """Normalize missing tool constraints to an empty mapping."""
+        return v or {}
 
 
 class SkillSummary(BaseModel):

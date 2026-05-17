@@ -19,6 +19,7 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -27,9 +28,10 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from app.agents.tools import activate_skill_tool, load_skill_references_tool
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from pydantic_ai import RunContext
-    from pydantic_ai.toolsets import AbstractToolset
 
     from app.agents.agent_deps import AgentDeps
     from app.skills.registry import TenantSkillRegistry
@@ -104,7 +106,7 @@ class SkillsCapability(AbstractCapability["AgentDeps"]):
 
         return _build_catalog
 
-    def get_toolset(self) -> FunctionToolset["AgentDeps"] | None:
+    def get_toolset(self) -> FunctionToolset[AgentDeps] | None:
         """Tier 2 + 3: Register ``activate_skill`` and ``load_skill_references``.
 
         Spec: "If no skills are available, don't register the tool at all."
@@ -129,7 +131,7 @@ class SkillsCapability(AbstractCapability["AgentDeps"]):
     # AbstractCapability — per-run lifecycle
     # ------------------------------------------------------------------
 
-    async def for_run(self, ctx: RunContext["AgentDeps"]) -> SkillsCapability:
+    async def for_run(self, ctx: RunContext[AgentDeps]) -> SkillsCapability:
         """No per-run state to manage — AgentDeps is already fresh per request.
 
         ``AgentHandler.handle()`` constructs a new ``AgentDeps`` for every

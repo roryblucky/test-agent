@@ -64,11 +64,16 @@ class QueryResponse(BaseModel):
         # Attach global token usage to the metadata block
         final_meta = dict(ctx.metadata) if ctx.metadata else {}
         if ctx.total_usage:
+            usage_data = getattr(ctx.total_usage, "__dict__", {})
+            input_tokens = usage_data.get("input_tokens", 0)
+            output_tokens = usage_data.get("output_tokens", 0)
             final_meta["usage"] = {
                 "requests": ctx.total_usage.requests,
-                "request_tokens": ctx.total_usage.request_tokens,
-                "response_tokens": ctx.total_usage.response_tokens,
+                "request_tokens": input_tokens,
+                "response_tokens": output_tokens,
                 "total_tokens": ctx.total_usage.total_tokens,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
             }
 
         return cls(

@@ -8,8 +8,8 @@ Three-tier progressive loading:
         Used to build the agent's capability index in system prompt.
 
     Tier 2 — Activation (on demand or pre-warm)
-        ``registry.activate(tenant_id, skill_names)``
-        Loads full SKILL.md instructions for matched skills.
+        ``registry.activate(tenant_id, skill_name)``
+        Loads full SKILL.md instructions for a matched skill.
         Called when the agent determines it needs specific skills.
 
     Tier 3 — References (on demand during execution)
@@ -43,7 +43,7 @@ class TenantSkillRegistry:
         summaries = registry.get_summaries("acme")
 
         # Tier 2 — when agent decides which skills to use
-        skills = await registry.activate("acme", ["vector-search", "nl-to-sql"])
+        skill = await registry.activate("acme", "vector-search")
 
         # Tier 3 — during execution if more context needed
         refs = await registry.load_references(skill)
@@ -150,59 +150,53 @@ class TenantSkillRegistry:
     # ------------------------------------------------------------------
 
     async def activate(
-        self, tenant_id: str, skill_names: list[str]
-    ) -> list[SkillDefinition]:
-        """Load full SKILL.md for each named skill (Tier 2 Activation).
+        self, tenant_id: str, skill_name: str
+    ) -> SkillDefinition | None:
+        """Load full SKILL.md for a named skill (Tier 2 Activation).
 
         Checks the activation cache first. Downloads from GCS only on
         cache miss.
 
         Args:
-            tenant_id: The tenant whose skills to activate.
-            skill_names: List of skill names to load.
+            tenant_id: The tenant whose skill to activate.
+            skill_name: Name of the skill to load.
 
         Returns:
-            List of fully loaded SkillDefinition objects.
+            Fully loaded SkillDefinition, or None if not found / failed.
         """
-        results: list[SkillDefinition] = []
-        name_set = set(skill_names)
+        cache_key = (tenant_id, skill_name)
+        if cache_key in self._activated:
+            return self._activated[cache_key]
 
-        # Warn about names that have no summary (never discovered)
+        # Warn if the skill was never discovered
         known = {s.name for s in self._summaries.get(tenant_id, [])}
-        unknown = name_set - known
-        if unknown:
+        if skill_name not in known:
             logger.warning(
-                f"[{tenant_id}] Skill names requested but not discovered: "
-                f"{unknown}. Run discover() first."
+                f"[{tenant_id}] Skill '{skill_name}' not in discovery index. "
+                "Run discover() first."
             )
+            return None
 
-        for name in skill_names:
-            cache_key = (tenant_id, name)
-            if cache_key in self._activated:
-                results.append(self._activated[cache_key])
-                continue
+        summary = self.get_summary(tenant_id, skill_name)
+        if summary is None:
+            logger.warning(
+                f"[{tenant_id}] Cannot activate unknown skill: '{skill_name}'"
+            )
+            return None
 
-            summary = self.get_summary(tenant_id, name)
-            if summary is None:
-                logger.warning(
-                    f"[{tenant_id}] Cannot activate unknown skill: '{name}'"
-                )
-                continue
-
-            try:
-                skill = await self._loader.activate_skill(summary)
-                self._activated[cache_key] = skill
-                results.append(skill)
-                logger.info(
-                    f"[{tenant_id}] Activated skill: '{name}' "
-                    f"(tools: {skill.metadata.allowed_tools})"
-                )
-            except Exception:
-                logger.exception(
-                    f"[{tenant_id}] Failed to activate skill: '{name}'"
-                )
-
-        return results
+        try:
+            skill = await self._loader.activate_skill(summary)
+            self._activated[cache_key] = skill
+            logger.info(
+                f"[{tenant_id}] Activated skill: '{skill_name}' "
+                f"(tools: {skill.metadata.allowed_tools})"
+            )
+            return skill
+        except Exception:
+            logger.exception(
+                f"[{tenant_id}] Failed to activate skill: '{skill_name}'"
+            )
+            return None
 
     def get_activated_skill(
         self, tenant_id: str, skill_name: str
@@ -243,13 +237,22 @@ class TenantSkillRegistry:
     def get_tool_names_for_skills(
         self, skills: list[SkillDefinition]
     ) -> set[str]:
-        """Collect all unique tool names from activated skills.
+        """Collect all unique allowed tool names from activated skills.
 
         Uses ``allowed-tools`` from the official agentskills.io spec.
         """
         tool_names: set[str] = set()
         for skill in skills:
             tool_names.update(skill.metadata.allowed_tools)
+        return tool_names
+
+    def get_required_tool_names_for_skills(
+        self, skills: list[SkillDefinition]
+    ) -> set[str]:
+        """Collect all unique required tool names from activated skills."""
+        tool_names: set[str] = set()
+        for skill in skills:
+            tool_names.update(skill.metadata.required_tools)
         return tool_names
 
     def invalidate(self, tenant_id: str) -> None:

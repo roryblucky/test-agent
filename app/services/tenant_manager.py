@@ -122,6 +122,7 @@ class TenantManager:
         # Build handlers for the FlowEngine
         from app.config.models import FlowStepType
         from app.services.handlers.agent import AgentHandler
+        from app.services.handlers.aggregation import AggregationHandler
         from app.services.handlers.analysis import AnalysisHandler
         from app.services.handlers.groundedness import GroundednessHandler
         from app.services.handlers.llm import LLMHandler
@@ -130,7 +131,7 @@ class TenantManager:
         from app.services.handlers.ranking import RankingHandler
         from app.services.handlers.retriever import RetrieverHandler
 
-        llm_handler = LLMHandler(registry)
+        llm_handler = LLMHandler(registry, tenant_config=cfg)
         llm_handler.warmup(cfg.flow_config.steps)
 
         agent_handler = AgentHandler(registry, providers, cfg, skill_registry)
@@ -145,6 +146,7 @@ class TenantManager:
             FlowStepType.MEMORY: MemoryHandler(),
             FlowStepType.LLM: llm_handler,
             FlowStepType.AGENT: agent_handler,
+            FlowStepType.AGGREGATION: AggregationHandler(),
         }
 
         return FlowEngine(cfg, handlers)

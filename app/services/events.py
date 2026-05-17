@@ -2,8 +2,8 @@
 
 Defines a structured event protocol for streaming pipeline progress
 and results to the client.  Every flow step emits ``step_start`` and
-``step_completed`` events, and LLM steps additionally emit ``token``
-events.
+``step_completed`` events. Low-risk LLM steps may emit ``token`` events;
+high-compliance answer flows emit ``answer_delta`` only after approval.
 
 Event types
 -----------
@@ -19,6 +19,12 @@ Event types
      - A pipeline step has finished, includes step result payload.
    * - ``token``
      - A single LLM streaming token.
+   * - ``answer_delta``
+     - Approved answer text released after review.
+   * - ``progress``
+     - Non-answer progress update.
+   * - ``tool_observation``
+     - Lightweight tool observation event.
    * - ``done``
      - The entire pipeline has finished, includes final result.
    * - ``error``
@@ -45,6 +51,9 @@ class EventType(StrEnum):
     STEP_START = "step_start"
     STEP_COMPLETED = "step_completed"
     TOKEN = "token"
+    ANSWER_DELTA = "answer_delta"
+    PROGRESS = "progress"
+    TOOL_OBSERVATION = "tool_observation"
     THINKING = "thinking"
     DONE = "done"
     ERROR = "error"
@@ -155,6 +164,21 @@ class EventEmitter:
     async def emit_token(self, token: str) -> None:
         """Convenience: emit a single LLM streaming token."""
         await self.emit(StreamEvent(type=EventType.TOKEN, data=token))
+
+    async def emit_answer_delta(self, delta: str) -> None:
+        """Convenience: emit approved answer text."""
+        await self.emit(StreamEvent(type=EventType.ANSWER_DELTA, data=delta))
+
+    async def emit_progress(self, message: str, data: Any = None) -> None:
+        """Convenience: emit a non-answer progress event."""
+        payload = {"message": message}
+        if data is not None:
+            payload["data"] = data
+        await self.emit(StreamEvent(type=EventType.PROGRESS, data=payload))
+
+    async def emit_tool_observation(self, data: Any) -> None:
+        """Convenience: emit a lightweight tool observation."""
+        await self.emit(StreamEvent(type=EventType.TOOL_OBSERVATION, data=data))
 
     async def emit_thinking(self, content: str) -> None:
         """Convenience: emit a thinking / reasoning step."""

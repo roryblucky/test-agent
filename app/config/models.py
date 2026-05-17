@@ -99,6 +99,41 @@ class GroundednessConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Domain / Output Config
+# ---------------------------------------------------------------------------
+
+
+class DomainConfig(BaseModel):
+    """Domain-level configuration for prompt layering and policy.
+
+    Controls domain-specific behaviours such as prompt pack selection,
+    locale, and whether model common knowledge is allowed.
+    """
+
+    name: str
+    prompt_pack: str | None = Field(None, alias="promptPack")
+    locale: str = "zh-CN"
+    allow_model_common_knowledge: bool = Field(
+        False, alias="allowModelCommonKnowledge"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class TenantOutputConfig(BaseModel):
+    """Tenant-level output formatting and compliance wording."""
+
+    default_format: str = Field("markdown", alias="defaultFormat")
+    disclaimer: str | None = None
+    forbidden_phrases: list[str] = Field(
+        default_factory=list, alias="forbiddenPhrases"
+    )
+    contract: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
 # Flow Config
 # ---------------------------------------------------------------------------
 
@@ -118,6 +153,62 @@ class FlowStepType(StrEnum):
     ANALYSIS = "analysis"
     MEMORY = "memory"
     AGENT = "agent"
+    AGGREGATION = "aggregation"
+
+
+class ToolRuntimeConfig(BaseModel):
+    """Tenant-level runtime policy for built-in tools."""
+
+    enabled_tools: list[str] = Field(default_factory=list, alias="enabledTools")
+    max_tool_calls: int = Field(8, alias="maxToolCalls")
+    require_confirmation_for_high_risk: bool = Field(
+        True, alias="requireConfirmationForHighRisk"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
+# Step Routing (conditional branching)
+# ---------------------------------------------------------------------------
+
+
+class StepRoutingAction(StrEnum):
+    """What to do when a routing rule matches."""
+
+    CONTINUE = "continue"  # proceed to next step (default)
+    ABORT = "abort"        # stop the pipeline, optionally set a response
+    GOTO = "goto"          # jump to a named step
+    SKIP_TO = "skip_to"    # skip forward to a step type:mode
+
+
+class StepRoutingRule(BaseModel):
+    """A single routing rule evaluated after a step completes.
+
+    Rules are evaluated against fields on ``FlowContext``.  The first
+    matching rule wins; if none match, the pipeline continues normally.
+
+    Examples::
+
+        # Abort on out-of-scope intent
+        {"match_field": "intent.intent", "match_value": "out_of_scope",
+         "action": "abort", "response": "This question is out of scope."}
+
+        # Skip to answer step when clarification is needed
+        {"match_field": "intent.needs_clarification", "match_value": true,
+         "action": "abort",
+         "response_from_field": "intent.clarification_question"}
+    """
+
+    match_field: str = Field(alias="matchField")
+    match_value: Any = Field(alias="matchValue")
+    action: StepRoutingAction = StepRoutingAction.CONTINUE
+    response: str | None = None
+    response_from_field: str | None = Field(None, alias="responseFromField")
+    target_step: str | None = Field(None, alias="targetStep")
+
+    model_config = {"populate_by_name": True}
+
 
 class AgentMCPServerConfig(BaseModel):
     """Agent specific MCP server configuration."""
@@ -158,6 +249,11 @@ class FlowStep(BaseModel):
     - ``settings`` — per-step overrides for model parameters
       (temperature, maxTokens, topP, …).  Merged over the base
       ``ModelConfig`` defaults at runtime.
+    - ``routing``  — optional conditional routing rules evaluated
+      after step execution.  If omitted, the pipeline continues
+      to the next step unconditionally.
+    - ``name``     — optional step name used as a ``goto`` / ``skip_to``
+      target by routing rules on other steps.
     """
 
     type: FlowStepType
@@ -165,8 +261,15 @@ class FlowStep(BaseModel):
     model: str | None = None
     settings: dict[str, Any] | None = None
     agent_config: AgentConfig | None = Field(None, alias="agentConfig")
+    routing: list[StepRoutingRule] | None = None
+    name: str | None = None
 
     model_config = {"populate_by_name": True}
+
+    @property
+    def step_label(self) -> str:
+        """Human-readable step label: ``type:mode`` or just ``type``."""
+        return f"{self.type.value}:{self.mode}" if self.mode else self.type.value
 
 
 class MCPServerConfig(BaseModel):
@@ -319,10 +422,14 @@ class TenantConfig(BaseModel):
         None, alias="rateLimitConfig"
     )
     audit_config: AuditConfig | None = Field(None, alias="auditConfig")
+    tool_runtime_config: ToolRuntimeConfig | None = Field(
+        None, alias="toolRuntimeConfig"
+    )
+    domain_config: DomainConfig | None = Field(None, alias="domainConfig")
+    output_config: TenantOutputConfig | None = Field(None, alias="outputConfig")
 
     # Cloud configs — top-level, extensible (future: aliConfig, awsConfig, etc.)
     azure_config: AzureConfig | None = Field(None, alias="azureConfig")
     gcp_config: GCPConfig | None = Field(None, alias="gcpConfig")
 
     model_config = {"populate_by_name": True}
-

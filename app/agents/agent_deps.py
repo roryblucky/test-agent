@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from app.core.model_registry import ModelRegistry
 from app.services.events import EventEmitter
 from app.services.tenant_manager import TenantProviders
+
+if TYPE_CHECKING:
+    from app.services.flow_context import FlowContext
 
 
 @dataclass
@@ -28,3 +32,7 @@ class AgentDeps:
     tenant_id: str = ""
     # Tracks which skills have already been activated in the current run
     activated_skill_names: list[str] = field(default_factory=list)
+    # Built-in tools available to this agent after tenant/runtime policy filtering
+    available_tool_names: list[str] = field(default_factory=list)
+    # Optional workflow execution context for tools that write evidence/audit data
+    flow_context: FlowContext | None = None

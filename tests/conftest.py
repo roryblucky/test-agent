@@ -48,6 +48,7 @@ def mock_ranker():
 def mock_emitter():
     """Mock EventEmitter."""
     emitter = AsyncMock(spec=EventEmitter)
+    emitter.is_cancelled = False
     return emitter
 
 

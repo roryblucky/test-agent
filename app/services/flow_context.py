@@ -13,6 +13,16 @@ from app.models.domain import (
     GroundednessResult,
     ModerationResult,
 )
+from app.models.workflow import (
+    AggregatedEvidenceBundle,
+    ComplianceReviewResult,
+    EvidenceItem,
+    IntentResult,
+    PlannerOutput,
+    ResolvedQuery,
+    ToolCallRecord,
+    ToolObservation,
+)
 from app.services.events import EventEmitter
 
 
@@ -33,12 +43,27 @@ class FlowContext:
     message_history: list[ModelMessage] = field(default_factory=list)
     new_messages: list[ModelMessage] = field(default_factory=list)
 
-    # Populated by flow steps
+    # Resolver / intent
     refined_query: str | None = None
-    # Note: `intent` was removed as it's now handled dynamically by the RouterAgent
+    resolved_query: ResolvedQuery | None = None
+    intent: IntentResult | None = None
+
+    # Classic RAG
     documents: list[Document] = field(default_factory=list)
     ranked_documents: list[Document] = field(default_factory=list)
+
+    # Agent / tools / evidence
+    active_skills: list[str] = field(default_factory=list)
+    tool_observations: list[ToolObservation] = field(default_factory=list)
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+    evidence_store: dict[str, EvidenceItem] = field(default_factory=dict)
+    planner_output: PlannerOutput | None = None
+    aggregated_evidence: AggregatedEvidenceBundle | None = None
+
+    # Answer / safety
     llm_response: str | None = None
+    draft_answer: Any | None = None
+    compliance_review: ComplianceReviewResult | None = None
     moderation_result: ModerationResult | None = None
     groundedness_result: GroundednessResult | None = None
     clarification_request: Any | None = None  # Using Any to avoid circular import with schemas
@@ -54,7 +79,16 @@ class FlowContext:
 
     def add_usage(self, usage: RunUsage) -> None:
         """Accumulate token usage from a run into the total context tracker."""
-        self.total_usage.requests += usage.requests
-        self.total_usage.request_tokens += usage.request_tokens
-        self.total_usage.response_tokens += usage.response_tokens
-        self.total_usage.total_tokens += usage.total_tokens
+        usage_data = getattr(usage, "__dict__", {})
+        self.total_usage.requests += usage_data.get(
+            "requests", getattr(usage, "requests", 0)
+        )
+        self.total_usage.input_tokens += usage_data.get(
+            "input_tokens", usage_data.get("request_tokens", 0)
+        )
+        self.total_usage.output_tokens += usage_data.get(
+            "output_tokens", usage_data.get("response_tokens", 0)
+        )
+        self.total_usage.tool_calls += usage_data.get(
+            "tool_calls", getattr(usage, "tool_calls", 0)
+        )

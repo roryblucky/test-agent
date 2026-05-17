@@ -1,0 +1,98 @@
+"""Tests for workflow execution contracts."""
+
+from datetime import UTC, datetime
+
+from app.api.schemas import QueryResponse
+from app.models.workflow import (
+    EvidenceItem,
+    IntentResult,
+    PlannerOutput,
+    ToolCallRecord,
+    ToolObservation,
+)
+from app.services.flow_context import FlowContext
+
+
+def test_intent_result_accepts_legacy_payload() -> None:
+    """Old intent outputs remain valid while new fields default safely."""
+    result = IntentResult(intent="knowledge_query", confidence=0.93)
+
+    assert result.intent == "knowledge_query"
+    assert result.sub_intents == []
+    assert result.candidate_skills == []
+    assert result.required_data_sources == []
+    assert result.needs_clarification is False
+
+
+def test_flow_context_phase1_fields_default_empty() -> None:
+    """New workflow fields are optional and do not affect old context creation."""
+    first = FlowContext(query="What is RAG?")
+    second = FlowContext(query="Another question")
+
+    assert first.resolved_query is None
+    assert first.intent is None
+    assert first.active_skills == []
+    assert first.tool_observations == []
+    assert first.tool_calls == []
+    assert first.evidence_store == {}
+    assert first.planner_output is None
+    assert first.aggregated_evidence is None
+    assert first.compliance_review is None
+
+    first.active_skills.append("search")
+    assert second.active_skills == []
+
+
+def test_query_response_keeps_legacy_top_level_shape() -> None:
+    """API response keeps existing top-level fields even with Phase 1 context data."""
+    retrieved_at = datetime(2026, 5, 17, tzinfo=UTC)
+    ctx = FlowContext(
+        query="legacy query",
+        session_id="session-1",
+    )
+    ctx.refined_query = "refined legacy query"
+    ctx.intent = IntentResult(
+        intent="knowledge_query",
+        confidence=0.8,
+        candidate_skills=["generic-search"],
+    )
+    ctx.llm_response = "Legacy answer"
+    ctx.evidence_store["ev1"] = EvidenceItem(
+        id="ev1",
+        source="test-source",
+        content="Evidence content",
+        retrieved_at=retrieved_at,
+    )
+    ctx.tool_observations.append(
+        ToolObservation(
+            tool_name="search_documents",
+            status="success",
+            evidence_ids=["ev1"],
+        )
+    )
+    ctx.tool_calls.append(
+        ToolCallRecord(
+            tool_name="search_documents",
+            input_payload={"query": "legacy query"},
+            status="success",
+            output_evidence_ids=["ev1"],
+        )
+    )
+    ctx.planner_output = PlannerOutput(
+        can_synthesize=True,
+        reason="Evidence found.",
+        evidence_ids=["ev1"],
+    )
+
+    response = QueryResponse.from_flow_context(ctx)
+    payload = response.model_dump(by_alias=True)
+
+    assert payload["query"] == "legacy query"
+    assert payload["refined_query"] == "refined legacy query"
+    assert payload["intent"]["intent"] == "knowledge_query"
+    assert payload["answer"] == "Legacy answer"
+    assert payload["sessionId"] == "session-1"
+    assert "resolved_query" not in payload
+    assert "planner_output" not in payload
+    assert "tool_observations" not in payload
+    assert "evidence_store" not in payload

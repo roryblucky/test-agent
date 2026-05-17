@@ -1,25 +1,30 @@
-"""Unit tests for Coordinator Agent tools."""
+"""Unit tests for Agent tool functions."""
 
 from unittest.mock import MagicMock
 
 import pytest
 from pydantic_ai import RunContext
 
-from app.agents.coordinator import CoordinatorDeps
+from app.agents.agent_deps import AgentDeps
 from app.agents.tools import (
     decompose_question_tool,
     search_documents_tool,
 )
 from app.models.domain import Document
+from app.services.tenant_manager import TenantProviders
 
 
 @pytest.fixture
-def deps(mock_registry, mock_retriever, mock_ranker, mock_emitter):
-    return CoordinatorDeps(
+def deps(mock_registry, mock_retriever, mock_ranker, mock_emitter, flow_context):
+    return AgentDeps(
         registry=mock_registry,
-        retriever=mock_retriever,
-        ranker=mock_ranker,
+        providers=TenantProviders(
+            retriever=mock_retriever,
+            ranker=mock_ranker,
+        ),
         emitter=mock_emitter,
+        tenant_id="test-tenant",
+        flow_context=flow_context,
     )
 
 
@@ -44,9 +49,16 @@ async def test_search_documents_tool(ctx, mock_retriever):
 
     assert "Content 1" in result
     assert "Content 2" in result
-    mock_retriever.retrieve.assert_awaited_once_with("test query")
+    mock_retriever.retrieve.assert_awaited_once_with("test query", filter_expr=None)
     ctx.deps.emitter.emit_step_start.assert_awaited_with("search_documents")
     ctx.deps.emitter.emit_step_completed.assert_awaited()
+    assert len(ctx.deps.flow_context.evidence_store) == 2
+    assert ctx.deps.flow_context.tool_calls[0].tool_name == "search_documents"
+    assert ctx.deps.flow_context.tool_calls[0].tenant_id == "test-tenant"
+    assert ctx.deps.flow_context.tool_observations[0].evidence_ids == [
+        "search_documents:1:doc1",
+        "search_documents:2:doc2",
+    ]
 
 
 @pytest.mark.asyncio
