@@ -54,6 +54,7 @@ def _record_tool_call(
     ctx: RunContext[Any],
     *,
     tool_name: str,
+    task_id: str | None,
     input_payload: dict[str, Any],
     status: str,
     result_count: int = 0,
@@ -73,6 +74,7 @@ def _record_tool_call(
         ToolCallRecord(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
+            task_id=task_id,
             input_payload=input_payload,
             compiled_filter=compiled_filter,
             status=status,
@@ -101,6 +103,7 @@ def _store_document_results(
     *,
     tool_call_id: str,
     tool_name: str,
+    task_id: str | None,
     documents: list[Document],
 ) -> None:
     flow_ctx = _get_flow_context(ctx)
@@ -125,6 +128,7 @@ def _store_document_results(
         ToolResultRecord(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
+            task_id=task_id,
             source=tool_name,
             normalized_items=items,
         )
@@ -136,6 +140,7 @@ def _store_text_result(
     *,
     tool_call_id: str,
     tool_name: str,
+    task_id: str | None,
     item_id: str,
     content: str,
 ) -> None:
@@ -147,6 +152,7 @@ def _store_text_result(
         ToolResultRecord(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
+            task_id=task_id,
             source=tool_name,
             normalized_items=[
                 NormalizedToolResultItem(
@@ -369,6 +375,7 @@ async def search_documents_tool(
     ctx: RunContext[AgentDeps],
     query: str,
     filter_expr: str | None = None,
+    task_id: str | None = None,
 ) -> ToolObservation:
     """Search the knowledge base for documents relevant to a query.
 
@@ -376,19 +383,22 @@ async def search_documents_tool(
         ctx: Tools context with access to dependencies.
         query: The search query text.
         filter_expr: Optional metadata filter expression string.
+        task_id: Checklist task identifier assigned by the planner.
 
     Returns:
         A lightweight observation. Full normalized results are stored on
         ``FlowContext.tool_results`` for aggregation.
     """
     start = time.perf_counter()
-    input_payload = {"query": query, "filter_expr": filter_expr}
+    task_id = task_id or "search_documents"
+    input_payload = {"query": query, "filter_expr": filter_expr, "task_id": task_id}
 
     if not ctx.deps.providers.retriever:
         message = "No retriever configured for this tenant."
         _record_tool_call(
             ctx,
             tool_name="search_documents",
+            task_id=task_id,
             input_payload=input_payload,
             compiled_filter=filter_expr,
             status="error",
@@ -415,6 +425,7 @@ async def search_documents_tool(
         _record_tool_call(
             ctx,
             tool_name="search_documents",
+            task_id=task_id,
             input_payload=input_payload,
             compiled_filter=filter_expr,
             status="error",
@@ -435,6 +446,7 @@ async def search_documents_tool(
     tool_call_id = _record_tool_call(
         ctx,
         tool_name="search_documents",
+        task_id=task_id,
         input_payload=input_payload,
         compiled_filter=filter_expr,
         status=status,
@@ -445,6 +457,7 @@ async def search_documents_tool(
         ctx,
         tool_call_id=tool_call_id,
         tool_name="search_documents",
+        task_id=task_id,
         documents=docs,
     )
     observation = _observation(
@@ -462,6 +475,7 @@ async def search_documents_tool(
                 "filter_expr": filter_expr,
                 "document_count": len(docs),
                 "tool_call_id": tool_call_id,
+                "task_id": task_id,
             },
         )
 
@@ -469,7 +483,10 @@ async def search_documents_tool(
 
 
 async def rank_documents_tool(
-    ctx: RunContext[AgentDeps], query: str, document_texts: list[str]
+    ctx: RunContext[AgentDeps],
+    query: str,
+    document_texts: list[str],
+    task_id: str | None = None,
 ) -> ToolObservation:
     """Re-rank documents by relevance to a specific query.
 
@@ -477,19 +494,26 @@ async def rank_documents_tool(
         ctx: Tools context with access to dependencies.
         query: The ranking query.
         document_texts: List of document texts to rank.
+        task_id: Checklist task identifier assigned by the planner.
 
     Returns:
         A lightweight observation. Ranked documents are stored on
         ``FlowContext.tool_results`` for aggregation.
     """
     start = time.perf_counter()
-    input_payload = {"query": query, "document_count": len(document_texts)}
+    task_id = task_id or "rank_documents"
+    input_payload = {
+        "query": query,
+        "document_count": len(document_texts),
+        "task_id": task_id,
+    }
 
     if not ctx.deps.providers.ranker:
         message = "No ranker configured for this tenant."
         _record_tool_call(
             ctx,
             tool_name="rank_documents",
+            task_id=task_id,
             input_payload=input_payload,
             status="error",
             latency_ms=_latency_ms(start),
@@ -518,6 +542,7 @@ async def rank_documents_tool(
         _record_tool_call(
             ctx,
             tool_name="rank_documents",
+            task_id=task_id,
             input_payload=input_payload,
             status="error",
             latency_ms=_latency_ms(start),
@@ -537,6 +562,7 @@ async def rank_documents_tool(
     tool_call_id = _record_tool_call(
         ctx,
         tool_name="rank_documents",
+        task_id=task_id,
         input_payload=input_payload,
         status=status,
         result_count=len(ranked),
@@ -546,6 +572,7 @@ async def rank_documents_tool(
         ctx,
         tool_call_id=tool_call_id,
         tool_name="rank_documents",
+        task_id=task_id,
         documents=ranked,
     )
     observation = _observation(
@@ -563,6 +590,7 @@ async def rank_documents_tool(
                 "input_count": len(docs),
                 "output_count": len(ranked),
                 "tool_call_id": tool_call_id,
+                "task_id": task_id,
             },
         )
 
@@ -570,20 +598,24 @@ async def rank_documents_tool(
 
 
 async def decompose_question_tool(
-    ctx: RunContext[AgentDeps], complex_question: str
+    ctx: RunContext[AgentDeps],
+    complex_question: str,
+    task_id: str | None = None,
 ) -> ToolObservation:
     """Break a complex question into 2-5 focused sub-questions.
 
     Args:
         ctx: Tools context with access to dependencies.
         complex_question: The complex question to decompose.
+        task_id: Checklist task identifier assigned by the planner.
 
     Returns:
         A lightweight observation. Sub-questions are stored on
         ``FlowContext.tool_results``.
     """
     start = time.perf_counter()
-    input_payload = {"complex_question": complex_question}
+    task_id = task_id or "decompose_question"
+    input_payload = {"complex_question": complex_question, "task_id": task_id}
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_start("decompose_question")
@@ -607,6 +639,7 @@ async def decompose_question_tool(
         _record_tool_call(
             ctx,
             tool_name="decompose_question",
+            task_id=task_id,
             input_payload=input_payload,
             status="error",
             latency_ms=_latency_ms(start),
@@ -626,6 +659,7 @@ async def decompose_question_tool(
     tool_call_id = _record_tool_call(
         ctx,
         tool_name="decompose_question",
+        task_id=task_id,
         input_payload=input_payload,
         status=status,
         result_count=len(sub_questions),
@@ -635,6 +669,7 @@ async def decompose_question_tool(
         ctx,
         tool_call_id=tool_call_id,
         tool_name="decompose_question",
+        task_id=task_id,
         item_id="sub_questions",
         content="\n".join(sub_questions),
     )
@@ -648,7 +683,11 @@ async def decompose_question_tool(
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
             "decompose_question",
-            {"result_count": len(sub_questions), "tool_call_id": tool_call_id},
+            {
+                "result_count": len(sub_questions),
+                "tool_call_id": tool_call_id,
+                "task_id": task_id,
+            },
         )
 
     return observation
@@ -658,6 +697,7 @@ async def analyze_section_tool(
     ctx: RunContext[AgentDeps],
     question: str,
     context: str,
+    task_id: str | None = None,
 ) -> ToolObservation:
     """Analyze specific content to answer a focused question.
 
@@ -665,13 +705,19 @@ async def analyze_section_tool(
         ctx: Tools context with access to dependencies.
         question: The specific question to analyze.
         context: The reference text to analyze.
+        task_id: Checklist task identifier assigned by the planner.
 
     Returns:
         A lightweight observation. The generated analysis is stored on
         ``FlowContext.tool_results``.
     """
     start = time.perf_counter()
-    input_payload = {"question": question, "context_length": len(context)}
+    task_id = task_id or "analyze_section"
+    input_payload = {
+        "question": question,
+        "context_length": len(context),
+        "task_id": task_id,
+    }
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_start("analyze_section")
@@ -692,6 +738,7 @@ async def analyze_section_tool(
         _record_tool_call(
             ctx,
             tool_name="analyze_section",
+            task_id=task_id,
             input_payload=input_payload,
             status="error",
             latency_ms=_latency_ms(start),
@@ -710,6 +757,7 @@ async def analyze_section_tool(
     tool_call_id = _record_tool_call(
         ctx,
         tool_name="analyze_section",
+        task_id=task_id,
         input_payload=input_payload,
         status="success",
         result_count=1,
@@ -719,6 +767,7 @@ async def analyze_section_tool(
         ctx,
         tool_call_id=tool_call_id,
         tool_name="analyze_section",
+        task_id=task_id,
         item_id="analysis",
         content=result.output,
     )
@@ -736,6 +785,7 @@ async def analyze_section_tool(
                 "question": question,
                 "analysis_length": len(result.output),
                 "tool_call_id": tool_call_id,
+                "task_id": task_id,
             },
         )
 
@@ -745,6 +795,7 @@ async def analyze_section_tool(
 async def plan_and_reason_tool(
     ctx: RunContext[Any],
     reasoning: str,
+    task_id: str | None = None,
 ) -> ToolObservation:
     """Use this tool to structure your response to the user with reasoning.
 
@@ -753,13 +804,16 @@ async def plan_and_reason_tool(
     Args:
         ctx: Tools context.
         reasoning: Your detailed reasoning or plan.
+        task_id: Checklist task identifier assigned by the planner.
     """
     start = time.perf_counter()
     logger.info(f"Plan and Reasoning: {reasoning}")
+    task_id = task_id or "plan_and_reason"
     tool_call_id = _record_tool_call(
         ctx,
         tool_name="plan_and_reason",
-        input_payload={"reasoning": reasoning},
+        task_id=task_id,
+        input_payload={"reasoning": reasoning, "task_id": task_id},
         status="success",
         result_count=1,
         latency_ms=_latency_ms(start),
@@ -768,6 +822,7 @@ async def plan_and_reason_tool(
         ctx,
         tool_call_id=tool_call_id,
         tool_name="plan_and_reason",
+        task_id=task_id,
         item_id="reasoning",
         content=reasoning,
     )
@@ -784,6 +839,7 @@ async def get_user_classification_tool(
     ctx: RunContext[Any],
     response: str,
     quick_questions: list[QuestionAnswerSelector] | None = None,
+    task_id: str | None = None,
 ) -> ToolObservation:
     """Get clarification from user if the user's query is too broad.
 
@@ -795,9 +851,11 @@ async def get_user_classification_tool(
         ctx: Tools context.
         response: The explanatory response or question directed at the user.
         quick_questions: Specific questions and options for the user.
+        task_id: Checklist task identifier assigned by the planner.
     """
     start = time.perf_counter()
     logger.info(f"Clarification Question: {response}")
+    task_id = task_id or "get_user_classification"
 
     def _build_quick_questions_markdown(questions: list[QuestionAnswerSelector]) -> str:
         """Build quick question payload in markdown fenced block for UI parsing."""
@@ -828,9 +886,11 @@ async def get_user_classification_tool(
     tool_call_id = _record_tool_call(
         ctx,
         tool_name="get_user_classification",
+        task_id=task_id,
         input_payload={
             "response": response,
             "question_count": len(quick_questions or []),
+            "task_id": task_id,
         },
         status="success",
         result_count=1,
@@ -840,6 +900,7 @@ async def get_user_classification_tool(
         ctx,
         tool_call_id=tool_call_id,
         tool_name="get_user_classification",
+        task_id=task_id,
         item_id="clarification",
         content=answer,
     )

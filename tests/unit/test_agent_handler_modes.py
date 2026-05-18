@@ -18,6 +18,7 @@ from app.config.models import (
 from app.models.workflow import (
     IntentResult,
     PlannerOutput,
+    PlannerTask,
     ToolCallRecord,
     ToolObservation,
 )
@@ -134,7 +135,7 @@ def _skill(
 async def test_agent_without_mode_defaults_to_supervisor(mock_emitter) -> None:
     """Missing agent mode preserves the old supervisor-style final answer path."""
     handler = _handler()
-    agent_config = AgentConfig(llmType="fast")
+    agent_config = AgentConfig(llmType="fast", buildInTools=["search_documents"])
     fake_agent = FakeAgent(
         output="final answer",
         chunks=["final", "final answer"],
@@ -169,7 +170,7 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
 ) -> None:
     """Planner mode writes PlannerOutput and does not populate llm_response."""
     handler = _handler()
-    agent_config = AgentConfig(llmType="fast")
+    agent_config = AgentConfig(llmType="fast", buildInTools=["search_documents"])
 
     def _record_runtime_context(deps: Any) -> None:
         deps.activated_skill_names.append("generic-search")
@@ -195,6 +196,14 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
         output=PlannerOutput(
             can_continue_to_aggregation=True,
             reason="Evidence is available.",
+            planned_tasks=[
+                PlannerTask(
+                    task_id="search_documents",
+                    description="Search normalized evidence.",
+                    status="completed",
+                    tool_name="search_documents",
+                )
+            ],
         ),
         on_enter=_record_runtime_context,
     )
@@ -224,9 +233,19 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
     assert '"standalone_query": "find evidence"' in (fake_agent.last_prompt or "")
     assert '"intent": "knowledge_query"' in (fake_agent.last_prompt or "")
     assert '"candidate_skills": [' in (fake_agent.last_prompt or "")
+    assert "task_checklist" not in (fake_agent.last_prompt or "")
+    assert "planned_tasks" in (fake_agent.last_prompt or "")
     assert result.planner_output == PlannerOutput(
         can_continue_to_aggregation=True,
         reason="Evidence is available.",
+        planned_tasks=[
+            PlannerTask(
+                task_id="search_documents",
+                description="Search normalized evidence.",
+                status="completed",
+                tool_name="search_documents",
+            )
+        ],
         completed_tasks=["search_documents"],
         used_tools=["search_documents"],
     )
@@ -245,37 +264,46 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
 
 
 @pytest.mark.asyncio
-async def test_agent_planner_reports_required_tool_missing(
+async def test_agent_planner_keeps_planner_task_status_as_source_of_truth(
     mock_emitter,
 ) -> None:
-    """Planner output fails closed when an activated skill requires unavailable tools."""
-    skill = _skill(
-        "required-search",
-        allowed_tools=["search_documents", "rank_documents"],
-        required_tools=["search_documents", "rank_documents"],
-    )
-    skill_registry = MagicMock()
-    skill_registry.get_activated_skill.return_value = skill
+    """Runtime tool records do not overwrite planner-authored task status."""
     handler = AgentHandler(
         registry=MagicMock(),
         providers=TenantProviders(),
         cfg=_tenant_config(),
-        skill_registry=skill_registry,
     )
     agent_config = AgentConfig(
         llmType="fast",
         buildInTools=["search_documents"],
     )
 
-    def _activate_skill(deps: Any) -> None:
-        deps.activated_skill_names.append("required-search")
+    def _record_successful_tool_call(deps: Any) -> None:
+        deps.flow_context.tool_calls.append(
+            ToolCallRecord(
+                tool_call_id="search_documents:1",
+                tool_name="search_documents",
+                input_payload={"query": "find evidence"},
+                status="success",
+                result_count=1,
+            )
+        )
 
     fake_agent = FakeAgent(
         output=PlannerOutput(
-            can_continue_to_aggregation=True,
-            reason="Initial plan is ready.",
+            can_continue_to_aggregation=False,
+            reason="Planner marked the task missing.",
+            planned_tasks=[
+                PlannerTask(
+                    task_id="search_documents",
+                    description="Search normalized evidence.",
+                    status="missing",
+                    tool_name="search_documents",
+                    reason="Planner decided evidence is insufficient.",
+                )
+            ],
         ),
-        on_enter=_activate_skill,
+        on_enter=_record_successful_tool_call,
     )
     handler._agent_cache[handler._cache_key("planner", agent_config)] = fake_agent
 
@@ -290,12 +318,10 @@ async def test_agent_planner_reports_required_tool_missing(
 
     assert result.planner_output is not None
     assert result.planner_output.can_continue_to_aggregation is False
-    assert result.planner_output.failed_tasks == [
-        "required_tool_unavailable:rank_documents"
-    ]
-    assert "Required tools unavailable: rank_documents." in (
-        result.planner_output.reason
-    )
+    assert result.planner_output.completed_tasks == []
+    assert result.planner_output.missing_tasks == ["search_documents"]
+    assert result.planner_output.used_tools == ["search_documents"]
+    assert result.planner_output.reason == "Planner marked the task missing."
 
 
 @pytest.mark.asyncio

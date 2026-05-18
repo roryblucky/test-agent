@@ -53,7 +53,8 @@ You are the skill-aware planner agent in an enterprise workflow.
 Your job is task and tool orchestration only.
 
 Do:
-- Follow active skill instructions and complete the required task checklist.
+- Follow active skill instructions.
+- Create a task plan, call tools as needed, and mark each task status yourself.
 - Use only tools made available by the platform runtime.
 - Use ToolObservation only to determine task status.
 - Return only the structured PlannerOutput schema.
@@ -67,8 +68,8 @@ Do not:
 
 ToolObservation contains only execution signals: status, task_status_hint,
 result_count, warnings, and error_code. Full tool results are stored in the
-workflow execution context. The aggregation node will process evidence after
-planning.
+workflow execution context. Put your final task plan in PlannerOutput.planned_tasks.
+The aggregation node will process evidence after planning.
 </node_contract>"""
 
 
@@ -316,7 +317,10 @@ class AgentHandler(StepHandler):
 
         agent = self._get_or_build_agent(step, "planner")
         deps = self._build_deps(ctx, step.agent_config)
-        planner_prompt = self._build_planner_runtime_prompt(ctx, effective_query)
+        planner_prompt = self._build_planner_runtime_prompt(
+            ctx,
+            effective_query,
+        )
 
         async with agent.run_stream(
             planner_prompt,
@@ -326,9 +330,12 @@ class AgentHandler(StepHandler):
             ctx.add_usage(stream.usage())
 
         planner_output = self._coerce_planner_output(output)
-        planner_output = self._enrich_planner_output(ctx, planner_output, deps)
+        ctx.active_skills = self._merge_unique(
+            ctx.active_skills,
+            deps.activated_skill_names,
+        )
+        planner_output = self._normalize_planner_output(ctx, planner_output)
         ctx.planner_output = planner_output
-        ctx.active_skills = self._merge_unique(ctx.active_skills, deps.activated_skill_names)
 
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
@@ -392,19 +399,6 @@ class AgentHandler(StepHandler):
                 skills.append(skill)
         return skills
 
-    def _activated_skill_definitions(
-        self, active_skill_names: list[str]
-    ) -> list[SkillDefinition]:
-        if self.skill_registry is None:
-            return []
-
-        skills: list[SkillDefinition] = []
-        for skill_name in active_skill_names:
-            skill = self.skill_registry.get_activated_skill(self.app_id, skill_name)
-            if skill is not None:
-                skills.append(skill)
-        return skills
-
     def _resolve_builtin_tool_definitions(
         self,
         agent_config: AgentConfig,
@@ -449,11 +443,16 @@ class AgentHandler(StepHandler):
             payload["active_skills"] = ctx.active_skills
 
         return (
-            "Plan task/tool execution for the following resolved workflow task. "
+            "Create and execute a task plan for the following resolved workflow "
+            "task. "
             "Use standalone_query for tool calls. Use original_query only to "
             "preserve the user's wording and audit trail. Do not treat chat "
             "history as evidence. Do not select evidence IDs; aggregation will "
-            "process normalized tool results after planning.\n\n"
+            "process normalized tool results after planning. You may create your "
+            "own task IDs and pass matching task_id values to tool calls for "
+            "audit. Mark each task status yourself based on ToolObservation. "
+            "Return PlannerOutput with planned_tasks and no final user-facing "
+            "answer.\n\n"
             "<planner_runtime_context>\n"
             f"{json.dumps(payload, ensure_ascii=False, default=str, indent=2)}\n"
             "</planner_runtime_context>"
@@ -484,75 +483,21 @@ class AgentHandler(StepHandler):
             return output
         return PlannerOutput.model_validate(output)
 
-    def _enrich_planner_output(
+    def _normalize_planner_output(
         self,
         ctx: FlowContext,
         planner_output: PlannerOutput,
-        deps: AgentDeps,
     ) -> PlannerOutput:
-        active_skills = self._merge_unique(
-            deps.activated_skill_names,
-            ctx.active_skills,
-        )
-        used_tools = planner_output.used_tools or self._merge_unique(
-            [record.tool_name for record in ctx.tool_calls]
-        )
-        completed_tasks = self._merge_unique(planner_output.completed_tasks)
-        missing_tasks = self._merge_unique(planner_output.missing_tasks)
-        partial_tasks = self._merge_unique(planner_output.partial_tasks)
-        stale_tasks = self._merge_unique(planner_output.stale_tasks)
-        failed_tasks = self._merge_unique(planner_output.failed_tasks)
-
-        for observation in ctx.tool_observations:
-            task_name = observation.tool_name
-            match observation.task_status_hint:
-                case "completed":
-                    completed_tasks = self._merge_unique(completed_tasks, [task_name])
-                case "missing":
-                    missing_tasks = self._merge_unique(missing_tasks, [task_name])
-                case "partial":
-                    partial_tasks = self._merge_unique(partial_tasks, [task_name])
-                case "stale":
-                    stale_tasks = self._merge_unique(stale_tasks, [task_name])
-                case "failed":
-                    failed_tasks = self._merge_unique(failed_tasks, [task_name])
-
-        required_tools = self._required_tool_names(active_skills)
-        missing_required_tools = [
-            tool_name
-            for tool_name in required_tools
-            if tool_name not in deps.available_tool_names
-        ]
-        failed_tasks = self._merge_unique(
-            failed_tasks,
-            [f"required_tool_unavailable:{name}" for name in missing_required_tools],
-        )
-        can_continue = planner_output.can_continue_to_aggregation
-        reason = planner_output.reason
-        if missing_required_tools:
-            can_continue = False
-            missing_text = ", ".join(missing_required_tools)
-            reason = f"{reason} Required tools unavailable: {missing_text}."
-
+        used_tools = planner_output.used_tools
+        if not used_tools:
+            used_tools = self._merge_unique(
+                [record.tool_name for record in ctx.tool_calls]
+            )
         return planner_output.model_copy(
             update={
                 "used_tools": used_tools,
-                "completed_tasks": completed_tasks,
-                "missing_tasks": missing_tasks,
-                "partial_tasks": partial_tasks,
-                "stale_tasks": stale_tasks,
-                "failed_tasks": failed_tasks,
-                "can_continue_to_aggregation": can_continue,
-                "reason": reason,
             }
         )
-
-    def _required_tool_names(self, active_skill_names: list[str]) -> list[str]:
-        skills = self._activated_skill_definitions(active_skill_names)
-        required_tools: list[str] = []
-        for skill in skills:
-            required_tools.extend(skill.metadata.required_tools)
-        return self._merge_unique(required_tools)
 
     @staticmethod
     def _merge_unique(*groups: list[str]) -> list[str]:

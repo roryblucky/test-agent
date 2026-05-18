@@ -38,6 +38,9 @@ class AnalysisHandler:
             "tool_observation_count": len(ctx.tool_observations),
             "tool_result_count": len(ctx.tool_results),
             "evidence_count": len(ctx.evidence_store),
+            "planner_task_count": (
+                len(planner_output.planned_tasks) if planner_output else None
+            ),
             "planner_can_continue_to_aggregation": (
                 planner_output.can_continue_to_aggregation if planner_output else None
             ),

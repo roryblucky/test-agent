@@ -7,6 +7,7 @@ from app.models.workflow import (
     IntentResult,
     NormalizedToolResultItem,
     PlannerOutput,
+    PlannerTask,
     ToolResultRecord,
 )
 from app.services.flow_context import FlowContext
@@ -18,11 +19,12 @@ def _tool_result(
     item_id: str,
     content: str = "Evidence content",
     score: float = 0.9,
+    source: str = "search_documents",
 ) -> ToolResultRecord:
     return ToolResultRecord(
         tool_call_id=tool_call_id,
         tool_name="search_documents",
-        source="search_documents",
+        source=source,
         normalized_items=[
             NormalizedToolResultItem(
                 item_id=item_id,
@@ -100,7 +102,14 @@ async def test_aggregation_blocks_when_required_task_missing() -> None:
     ctx.planner_output = PlannerOutput(
         can_continue_to_aggregation=True,
         reason="Planner thinks synthesis is possible.",
-        missing_tasks=["search_documents"],
+        planned_tasks=[
+            PlannerTask(
+                task_id="search_documents",
+                description="Search normalized evidence.",
+                status="missing",
+                tool_name="search_documents",
+            )
+        ],
     )
 
     result = await AggregationHandler().handle(
@@ -114,6 +123,51 @@ async def test_aggregation_blocks_when_required_task_missing() -> None:
     assert bundle.missing_tasks == ["search_documents"]
     assert bundle.synthesis_allowed is False
     assert bundle.synthesis_block_reason == "Missing required tasks: search_documents"
+
+
+@pytest.mark.asyncio
+async def test_aggregation_filters_low_relevance_and_disallowed_sources() -> None:
+    """Aggregation applies mechanical evidence policy before synthesis."""
+    ctx = FlowContext(query="original query")
+    ctx.tool_results.append(
+        _tool_result("search_documents:1", "trusted-high", "High evidence", 0.9)
+    )
+    ctx.tool_results.append(
+        _tool_result("search_documents:2", "trusted-low", "Low evidence", 0.1)
+    )
+    ctx.tool_results.append(
+        _tool_result(
+            "search_documents:3",
+            "external-high",
+            "External evidence",
+            0.9,
+            "external",
+        )
+    )
+    ctx.planner_output = PlannerOutput(
+        can_continue_to_aggregation=True,
+        reason="Planner completed required tasks.",
+        completed_tasks=["search_documents"],
+    )
+
+    result = await AggregationHandler().handle(
+        ctx,
+        FlowStep(
+            type=FlowStepType.AGGREGATION,
+            settings={
+                "allowedSources": ["search_documents"],
+                "minRelevanceScore": 0.35,
+            },
+        ),
+    )
+
+    bundle = result.aggregated_evidence
+    assert bundle is not None
+    assert [item.content for item in bundle.selected_evidence] == ["High evidence"]
+    assert [item.reason for item in bundle.excluded_evidence] == [
+        "low_relevance",
+        "source_not_allowed",
+    ]
 
 
 @pytest.mark.asyncio

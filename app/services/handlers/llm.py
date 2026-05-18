@@ -245,6 +245,22 @@ class LLMHandler:
         agent = self._get_agent("answer", model_name)
         buffer_answer = self._should_buffer_answer(ctx)
 
+        if buffer_answer and ctx.aggregated_evidence is None:
+            ctx.llm_response = (
+                "Unable to synthesize a high-compliance answer because no "
+                "aggregated evidence bundle is available."
+            )
+            if ctx.emitter:
+                await ctx.emitter.emit_progress(
+                    "answer_blocked_before_review",
+                    {"reason": ctx.llm_response},
+                )
+                await ctx.emitter.emit_step_completed(
+                    "llm:answer",
+                    {"model": model_name, "blocked": True},
+                )
+            return ctx
+
         if ctx.aggregated_evidence and not ctx.aggregated_evidence.synthesis_allowed:
             ctx.llm_response = (
                 ctx.aggregated_evidence.synthesis_block_reason

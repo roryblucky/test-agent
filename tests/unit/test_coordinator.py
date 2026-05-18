@@ -45,7 +45,7 @@ async def test_search_documents_tool(ctx, mock_retriever):
         Document(id="doc2", content="Content 2", score=0.8),
     ]
 
-    result = await search_documents_tool(ctx, "test query")
+    result = await search_documents_tool(ctx, "test query", task_id="search-task")
 
     assert result.status == "success"
     assert result.result_count == 2
@@ -55,7 +55,9 @@ async def test_search_documents_tool(ctx, mock_retriever):
     assert len(ctx.deps.flow_context.tool_results) == 1
     assert len(ctx.deps.flow_context.tool_results[0].normalized_items) == 2
     assert ctx.deps.flow_context.tool_calls[0].tool_name == "search_documents"
+    assert ctx.deps.flow_context.tool_calls[0].task_id == "search-task"
     assert ctx.deps.flow_context.tool_calls[0].tenant_id == "test-tenant"
+    assert ctx.deps.flow_context.tool_results[0].task_id == "search-task"
     assert ctx.deps.flow_context.tool_observations[0].result_count == 2
     assert ctx.deps.flow_context.tool_observations[0].task_status_hint == "completed"
 

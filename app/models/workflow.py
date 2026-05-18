@@ -7,9 +7,9 @@ tenant/domain contracts, skill instructions, or tenant config.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 
 class ResolvedQuery(BaseModel):
@@ -66,7 +66,23 @@ class EvidenceItem(BaseModel):
 
 ToolObservationStatus = Literal["success", "empty", "partial", "stale", "error"]
 TaskStatusHint = Literal["completed", "missing", "partial", "stale", "failed"]
+PlannerTaskStatus = Literal[
+    "completed",
+    "missing",
+    "partial",
+    "stale",
+    "failed",
+    "skipped",
+]
 EvidenceRelevance = Literal["high", "medium", "low"]
+ExcludedEvidenceReason = Literal[
+    "duplicate",
+    "empty_content",
+    "low_relevance",
+    "max_evidence_exceeded",
+    "source_not_allowed",
+    "stale",
+]
 
 
 class ToolObservation(BaseModel):
@@ -128,8 +144,20 @@ class ToolResultRecord(BaseModel):
     raw_result_ref: str | None = None
 
 
+class PlannerTask(BaseModel):
+    """Planner-authored task plan item for agent orchestration."""
+
+    task_id: str
+    description: str
+    status: PlannerTaskStatus
+    tool_name: str | None = None
+    reason: str | None = None
+
+
 class PlannerOutput(BaseModel):
     """Structured output for ``agent:planner`` steps."""
+
+    planned_tasks: list[PlannerTask] = Field(default_factory=list)
 
     completed_tasks: list[str] = Field(default_factory=list)
     missing_tasks: list[str] = Field(default_factory=list)
@@ -146,6 +174,35 @@ class PlannerOutput(BaseModel):
     )
     reason: str
 
+    @model_validator(mode="after")
+    def derive_status_lists_from_planned_tasks(self) -> Self:
+        """Normalize planner-owned task plan into compatibility lists."""
+        if not self.planned_tasks:
+            return self
+
+        status_groups: dict[str, list[str]] = {
+            "completed": [],
+            "missing": [],
+            "partial": [],
+            "stale": [],
+            "failed": [],
+        }
+        used_tools: list[str] = []
+        for task in self.planned_tasks:
+            if task.status in status_groups:
+                status_groups[task.status].append(task.task_id)
+            if task.tool_name and task.tool_name not in used_tools:
+                used_tools.append(task.tool_name)
+
+        self.completed_tasks = status_groups["completed"]
+        self.missing_tasks = status_groups["missing"]
+        self.partial_tasks = status_groups["partial"]
+        self.stale_tasks = status_groups["stale"]
+        self.failed_tasks = status_groups["failed"]
+        if not self.used_tools:
+            self.used_tools = used_tools
+        return self
+
 
 class AggregatedEvidence(BaseModel):
     """Evidence selected by the aggregation node for synthesis."""
@@ -161,6 +218,15 @@ class AggregatedEvidence(BaseModel):
     relevance: EvidenceRelevance = "medium"
     score: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExcludedEvidence(BaseModel):
+    """Evidence candidate excluded during aggregation."""
+
+    tool_call_id: str
+    item_id: str
+    reason: ExcludedEvidenceReason
+    detail: str | None = None
 
 
 class AggregatedEvidenceBundle(BaseModel):
@@ -183,7 +249,7 @@ class AggregatedEvidenceBundle(BaseModel):
     stale_tasks: list[str] = Field(default_factory=list)
     failed_tasks: list[str] = Field(default_factory=list)
     conflicting_evidence: list[str] = Field(default_factory=list)
-    excluded_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    excluded_evidence: list[ExcludedEvidence] = Field(default_factory=list)
 
     synthesis_block_reason: str | None = None
 

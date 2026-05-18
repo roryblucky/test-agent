@@ -48,6 +48,7 @@ class SearchDocumentsInput(BaseModel):
 
     query: str
     filter_expr: str | None = None
+    task_id: str | None = None
 
 
 class RankDocumentsInput(BaseModel):
@@ -55,12 +56,14 @@ class RankDocumentsInput(BaseModel):
 
     query: str
     document_texts: list[str]
+    task_id: str | None = None
 
 
 class DecomposeQuestionInput(BaseModel):
     """Input schema for ``decompose_question``."""
 
     complex_question: str
+    task_id: str | None = None
 
 
 class AnalyzeSectionInput(BaseModel):
@@ -68,12 +71,14 @@ class AnalyzeSectionInput(BaseModel):
 
     question: str
     context: str
+    task_id: str | None = None
 
 
 class PlanAndReasonInput(BaseModel):
     """Input schema for ``plan_and_reason``."""
 
     reasoning: str
+    task_id: str | None = None
 
 
 class GetUserClassificationInput(BaseModel):
@@ -81,6 +86,7 @@ class GetUserClassificationInput(BaseModel):
 
     response: str
     quick_questions: list[QuestionAnswerSelector] | None = None
+    task_id: str | None = None
 
 
 class TextToolOutput(BaseModel):

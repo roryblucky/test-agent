@@ -6,6 +6,7 @@ from app.models.workflow import (
     IntentResult,
     NormalizedToolResultItem,
     PlannerOutput,
+    PlannerTask,
     ToolCallRecord,
     ToolObservation,
     ToolResultRecord,
@@ -42,6 +43,41 @@ def test_flow_context_phase1_fields_default_empty() -> None:
 
     first.active_skills.append("search")
     assert second.active_skills == []
+
+
+def test_planner_output_derives_task_lists_from_planned_tasks() -> None:
+    """PlannerOutput preserves planner-authored task status as source of truth."""
+    output = PlannerOutput(
+        can_continue_to_aggregation=False,
+        reason="One task is missing.",
+        planned_tasks=[
+            PlannerTask(
+                task_id="search_documents",
+                description="Search approved sources.",
+                status="completed",
+                tool_name="search_documents",
+            ),
+            PlannerTask(
+                task_id="rank_documents",
+                description="Rank selected candidates.",
+                status="missing",
+                tool_name="rank_documents",
+                reason="No rankable candidates.",
+            ),
+            PlannerTask(
+                task_id="skip_optional",
+                description="Optional task not needed.",
+                status="skipped",
+            ),
+        ],
+    )
+
+    assert output.completed_tasks == ["search_documents"]
+    assert output.missing_tasks == ["rank_documents"]
+    assert output.partial_tasks == []
+    assert output.stale_tasks == []
+    assert output.failed_tasks == []
+    assert output.used_tools == ["search_documents", "rank_documents"]
 
 
 def test_query_response_keeps_legacy_top_level_shape() -> None:
