@@ -6,11 +6,11 @@ from app.agents import tools
 from app.agents.tool_registry import (
     BuiltInToolRegistry,
     SearchDocumentsInput,
-    TextToolOutput,
     ToolDefinition,
     ToolRiskLevel,
 )
 from app.config.models import FlowConfig, LLMConfig, TenantConfig, ToolRuntimeConfig
+from app.models.workflow import ToolObservation
 from app.skills.schema import SkillDefinition, SkillMetadata
 
 
@@ -62,7 +62,7 @@ def test_registered_tool_has_typed_metadata() -> None:
     assert definition.function is tools.search_documents_tool
     assert definition.risk_level == ToolRiskLevel.LOW
     assert definition.input_schema is SearchDocumentsInput
-    assert definition.output_schema is TextToolOutput
+    assert definition.output_schema is ToolObservation
 
 
 def test_resolve_tools_uses_tenant_allowlist() -> None:

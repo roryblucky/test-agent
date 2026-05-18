@@ -406,18 +406,21 @@ def _format_aggregated_evidence(bundle: AggregatedEvidenceBundle) -> str:
         lines.append(f"Intent: {bundle.intent}")
     if bundle.active_skills:
         lines.append(f"Active Skills: {', '.join(bundle.active_skills)}")
-    if bundle.missing_evidence:
-        lines.append(f"Missing Evidence: {', '.join(bundle.missing_evidence)}")
-    if bundle.stale_evidence:
-        lines.append(f"Stale Evidence: {', '.join(bundle.stale_evidence)}")
-    if bundle.conflicts:
-        lines.append(f"Conflicts: {', '.join(bundle.conflicts)}")
+    if bundle.missing_tasks:
+        lines.append(f"Missing Tasks: {', '.join(bundle.missing_tasks)}")
+    if bundle.partial_tasks:
+        lines.append(f"Partial Tasks: {', '.join(bundle.partial_tasks)}")
+    if bundle.stale_tasks:
+        lines.append(f"Stale Tasks: {', '.join(bundle.stale_tasks)}")
+    if bundle.failed_tasks:
+        lines.append(f"Failed Tasks: {', '.join(bundle.failed_tasks)}")
+    if bundle.conflicting_evidence:
+        lines.append(f"Conflicts: {', '.join(bundle.conflicting_evidence)}")
 
     lines.append("\nEvidence:")
-    for item in bundle.evidence:
-        header = f"[Evidence {item.id} | source={item.source}"
-        if item.source_type:
-            header += f" | type={item.source_type}"
+    for item in bundle.selected_evidence:
+        header = f"[Evidence {item.evidence_id} | source={item.source}"
+        header += f" | relevance={item.relevance}"
         if item.score is not None:
             header += f" | score={item.score}"
         header += "]"

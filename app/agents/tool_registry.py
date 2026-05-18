@@ -148,7 +148,7 @@ class BuiltInToolRegistry:
             domains=["knowledge"],
             risk_level=ToolRiskLevel.LOW,
             input_schema=SearchDocumentsInput,
-            output_schema=TextToolOutput,
+            output_schema=ToolObservation,
         ),
         "rank_documents": ToolDefinition(
             name="rank_documents",
@@ -157,7 +157,7 @@ class BuiltInToolRegistry:
             domains=["knowledge"],
             risk_level=ToolRiskLevel.LOW,
             input_schema=RankDocumentsInput,
-            output_schema=TextToolOutput,
+            output_schema=ToolObservation,
         ),
         "decompose_question": ToolDefinition(
             name="decompose_question",
@@ -166,7 +166,7 @@ class BuiltInToolRegistry:
             domains=["reasoning"],
             risk_level=ToolRiskLevel.LOW,
             input_schema=DecomposeQuestionInput,
-            output_schema=QuestionListToolOutput,
+            output_schema=ToolObservation,
         ),
         "analyze_section": ToolDefinition(
             name="analyze_section",
@@ -175,7 +175,7 @@ class BuiltInToolRegistry:
             domains=["knowledge", "reasoning"],
             risk_level=ToolRiskLevel.LOW,
             input_schema=AnalyzeSectionInput,
-            output_schema=TextToolOutput,
+            output_schema=ToolObservation,
         ),
         "plan_and_reason": ToolDefinition(
             name="plan_and_reason",
@@ -184,7 +184,7 @@ class BuiltInToolRegistry:
             domains=["reasoning"],
             risk_level=ToolRiskLevel.LOW,
             input_schema=PlanAndReasonInput,
-            output_schema=TextToolOutput,
+            output_schema=ToolObservation,
         ),
         "get_user_classification": ToolDefinition(
             name="get_user_classification",
@@ -193,7 +193,7 @@ class BuiltInToolRegistry:
             domains=["clarification"],
             risk_level=ToolRiskLevel.LOW,
             input_schema=GetUserClassificationInput,
-            output_schema=TextToolOutput,
+            output_schema=ToolObservation,
         ),
     }
 

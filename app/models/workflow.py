@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class ResolvedQuery(BaseModel):
@@ -49,7 +49,7 @@ class IntentResult(BaseModel):
 
 
 class EvidenceItem(BaseModel):
-    """Normalized evidence item produced by tools or retrieval."""
+    """Legacy normalized evidence item kept for classic RAG compatibility."""
 
     id: str
     source: str
@@ -64,57 +64,103 @@ class EvidenceItem(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-ToolObservationStatus = Literal["success", "empty", "partial", "error"]
-DataFreshness = Literal["fresh", "stale", "unknown"]
-EvidenceRelevance = Literal["high", "medium", "low", "none", "unknown"]
+ToolObservationStatus = Literal["success", "empty", "partial", "stale", "error"]
+TaskStatusHint = Literal["completed", "missing", "partial", "stale", "failed"]
+EvidenceRelevance = Literal["high", "medium", "low"]
 
 
 class ToolObservation(BaseModel):
-    """Lightweight tool result intended for planner consumption."""
+    """Lightweight tool execution signal intended for planner consumption.
+
+    This model deliberately excludes evidence IDs, snippets, summaries, and
+    raw result content. Full normalized results are stored separately on the
+    workflow context for aggregation.
+    """
 
     tool_name: str
     status: ToolObservationStatus
-    evidence_ids: list[str] = Field(default_factory=list)
-
-    summary_for_planner: str | None = None
-    entities_found: list[str] = Field(default_factory=list)
-    data_freshness: DataFreshness = "unknown"
-    relevance: EvidenceRelevance = "unknown"
-
-    missing_fields: list[str] = Field(default_factory=list)
+    task_status_hint: TaskStatusHint
+    result_count: int = 0
     warnings: list[str] = Field(default_factory=list)
-    recommended_next_actions: list[str] = Field(default_factory=list)
+    error_code: str | None = None
 
 
 class ToolCallRecord(BaseModel):
     """Audit record for a single tool call."""
 
+    tool_call_id: str
     tool_name: str
+    task_id: str | None = None
     input_payload: dict[str, Any]
-    status: str
+    status: ToolObservationStatus
+    result_count: int = 0
 
     compiled_filter: str | None = None
-    output_evidence_ids: list[str] = Field(default_factory=list)
     latency_ms: int | None = None
+    error_code: str | None = None
     error: str | None = None
     tenant_id: str | None = None
     user_id: str | None = None
 
 
+class NormalizedToolResultItem(BaseModel):
+    """A normalized tool result item stored for later evidence processing."""
+
+    item_id: str
+    content: str
+
+    title: str | None = None
+    url: str | None = None
+    published_at: datetime | None = None
+    score: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolResultRecord(BaseModel):
+    """Normalized tool result payload stored in workflow context."""
+
+    tool_call_id: str
+    tool_name: str
+    source: str
+
+    task_id: str | None = None
+    normalized_items: list[NormalizedToolResultItem] = Field(default_factory=list)
+    raw_result_ref: str | None = None
+
+
 class PlannerOutput(BaseModel):
     """Structured output for ``agent:planner`` steps."""
 
-    can_synthesize: bool
+    completed_tasks: list[str] = Field(default_factory=list)
+    missing_tasks: list[str] = Field(default_factory=list)
+    partial_tasks: list[str] = Field(default_factory=list)
+    stale_tasks: list[str] = Field(default_factory=list)
+    failed_tasks: list[str] = Field(default_factory=list)
+
+    used_tools: list[str] = Field(default_factory=list)
+    can_continue_to_aggregation: bool = Field(
+        validation_alias=AliasChoices(
+            "can_continue_to_aggregation",
+            "can_synthesize",
+        )
+    )
     reason: str
 
-    active_skills: list[str] = Field(default_factory=list)
-    used_tools: list[str] = Field(default_factory=list)
-    required_tools_missing: list[str] = Field(default_factory=list)
 
-    evidence_ids: list[str] = Field(default_factory=list)
-    missing_evidence: list[str] = Field(default_factory=list)
-    stale_evidence: list[str] = Field(default_factory=list)
-    conflicting_evidence: list[str] = Field(default_factory=list)
+class AggregatedEvidence(BaseModel):
+    """Evidence selected by the aggregation node for synthesis."""
+
+    evidence_id: str
+    source: str
+    content: str
+    tool_call_id: str
+
+    title: str | None = None
+    url: str | None = None
+    published_at: datetime | None = None
+    relevance: EvidenceRelevance = "medium"
+    score: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AggregatedEvidenceBundle(BaseModel):
@@ -128,12 +174,23 @@ class AggregatedEvidenceBundle(BaseModel):
     intent: str | None = None
     active_skills: list[str] = Field(default_factory=list)
 
-    evidence: list[EvidenceItem] = Field(default_factory=list)
-    missing_evidence: list[str] = Field(default_factory=list)
-    stale_evidence: list[str] = Field(default_factory=list)
-    conflicts: list[str] = Field(default_factory=list)
+    selected_evidence: list[AggregatedEvidence] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("selected_evidence", "evidence"),
+    )
+    missing_tasks: list[str] = Field(default_factory=list)
+    partial_tasks: list[str] = Field(default_factory=list)
+    stale_tasks: list[str] = Field(default_factory=list)
+    failed_tasks: list[str] = Field(default_factory=list)
+    conflicting_evidence: list[str] = Field(default_factory=list)
+    excluded_evidence: list[dict[str, Any]] = Field(default_factory=list)
 
     synthesis_block_reason: str | None = None
+
+    @property
+    def evidence(self) -> list[AggregatedEvidence]:
+        """Compatibility alias for older callers."""
+        return self.selected_evidence
 
 
 class ComplianceReviewResult(BaseModel):

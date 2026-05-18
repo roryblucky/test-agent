@@ -1,14 +1,14 @@
 """Tests for workflow execution contracts."""
 
-from datetime import UTC, datetime
-
 from app.api.schemas import QueryResponse
 from app.models.workflow import (
-    EvidenceItem,
+    AggregatedEvidence,
     IntentResult,
+    NormalizedToolResultItem,
     PlannerOutput,
     ToolCallRecord,
     ToolObservation,
+    ToolResultRecord,
 )
 from app.services.flow_context import FlowContext
 
@@ -34,6 +34,7 @@ def test_flow_context_phase1_fields_default_empty() -> None:
     assert first.active_skills == []
     assert first.tool_observations == []
     assert first.tool_calls == []
+    assert first.tool_results == []
     assert first.evidence_store == {}
     assert first.planner_output is None
     assert first.aggregated_evidence is None
@@ -45,7 +46,6 @@ def test_flow_context_phase1_fields_default_empty() -> None:
 
 def test_query_response_keeps_legacy_top_level_shape() -> None:
     """API response keeps existing top-level fields even with Phase 1 context data."""
-    retrieved_at = datetime(2026, 5, 17, tzinfo=UTC)
     ctx = FlowContext(
         query="legacy query",
         session_id="session-1",
@@ -57,31 +57,46 @@ def test_query_response_keeps_legacy_top_level_shape() -> None:
         candidate_skills=["generic-search"],
     )
     ctx.llm_response = "Legacy answer"
-    ctx.evidence_store["ev1"] = EvidenceItem(
-        id="ev1",
+    ctx.tool_results.append(
+        ToolResultRecord(
+            tool_call_id="search_documents:1",
+            tool_name="search_documents",
+            source="search_documents",
+            normalized_items=[
+                NormalizedToolResultItem(
+                    item_id="doc1",
+                    content="Evidence content",
+                )
+            ],
+        )
+    )
+    ctx.evidence_store["ev1"] = AggregatedEvidence(
+        evidence_id="ev1",
         source="test-source",
         content="Evidence content",
-        retrieved_at=retrieved_at,
+        tool_call_id="search_documents:1",
     )
     ctx.tool_observations.append(
         ToolObservation(
             tool_name="search_documents",
             status="success",
-            evidence_ids=["ev1"],
+            task_status_hint="completed",
+            result_count=1,
         )
     )
     ctx.tool_calls.append(
         ToolCallRecord(
+            tool_call_id="search_documents:1",
             tool_name="search_documents",
             input_payload={"query": "legacy query"},
             status="success",
-            output_evidence_ids=["ev1"],
+            result_count=1,
         )
     )
     ctx.planner_output = PlannerOutput(
-        can_synthesize=True,
+        can_continue_to_aggregation=True,
         reason="Evidence found.",
-        evidence_ids=["ev1"],
+        completed_tasks=["search_documents"],
     )
 
     response = QueryResponse.from_flow_context(ctx)

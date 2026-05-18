@@ -14,14 +14,15 @@ from app.models.domain import (
     ModerationResult,
 )
 from app.models.workflow import (
+    AggregatedEvidence,
     AggregatedEvidenceBundle,
     ComplianceReviewResult,
-    EvidenceItem,
     IntentResult,
     PlannerOutput,
     ResolvedQuery,
     ToolCallRecord,
     ToolObservation,
+    ToolResultRecord,
 )
 from app.services.events import EventEmitter
 
@@ -56,7 +57,8 @@ class FlowContext:
     active_skills: list[str] = field(default_factory=list)
     tool_observations: list[ToolObservation] = field(default_factory=list)
     tool_calls: list[ToolCallRecord] = field(default_factory=list)
-    evidence_store: dict[str, EvidenceItem] = field(default_factory=dict)
+    tool_results: list[ToolResultRecord] = field(default_factory=list)
+    evidence_store: dict[str, AggregatedEvidence] = field(default_factory=dict)
     planner_output: PlannerOutput | None = None
     aggregated_evidence: AggregatedEvidenceBundle | None = None
 

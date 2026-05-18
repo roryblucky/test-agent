@@ -175,23 +175,25 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
         deps.activated_skill_names.append("generic-search")
         deps.flow_context.tool_calls.append(
             ToolCallRecord(
+                tool_call_id="search_documents:1",
                 tool_name="search_documents",
                 input_payload={"query": "find evidence"},
                 status="success",
-                output_evidence_ids=["ev1"],
+                result_count=1,
             )
         )
         deps.flow_context.tool_observations.append(
             ToolObservation(
                 tool_name="search_documents",
                 status="success",
-                evidence_ids=["ev1"],
+                task_status_hint="completed",
+                result_count=1,
             )
         )
 
     fake_agent = FakeAgent(
         output=PlannerOutput(
-            can_synthesize=True,
+            can_continue_to_aggregation=True,
             reason="Evidence is available.",
         ),
         on_enter=_record_runtime_context,
@@ -223,20 +225,20 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
     assert '"intent": "knowledge_query"' in (fake_agent.last_prompt or "")
     assert '"candidate_skills": [' in (fake_agent.last_prompt or "")
     assert result.planner_output == PlannerOutput(
-        can_synthesize=True,
+        can_continue_to_aggregation=True,
         reason="Evidence is available.",
-        active_skills=["generic-search"],
+        completed_tasks=["search_documents"],
         used_tools=["search_documents"],
-        evidence_ids=["ev1"],
     )
     assert result.active_skills == ["generic-search"]
     mock_emitter.emit_token.assert_not_awaited()
     mock_emitter.emit_step_completed.assert_any_await(
         "agent:planner",
         {
-            "can_synthesize": True,
-            "evidence_count": 1,
-            "missing_evidence_count": 0,
+            "can_continue_to_aggregation": True,
+            "completed_task_count": 1,
+            "missing_task_count": 0,
+            "failed_task_count": 0,
             "used_tools": ["search_documents"],
         },
     )
@@ -270,8 +272,7 @@ async def test_agent_planner_reports_required_tool_missing(
 
     fake_agent = FakeAgent(
         output=PlannerOutput(
-            active_skills=["required-search"],
-            can_synthesize=True,
+            can_continue_to_aggregation=True,
             reason="Initial plan is ready.",
         ),
         on_enter=_activate_skill,
@@ -288,8 +289,10 @@ async def test_agent_planner_reports_required_tool_missing(
     result = await handler.handle(ctx, step)
 
     assert result.planner_output is not None
-    assert result.planner_output.can_synthesize is False
-    assert result.planner_output.required_tools_missing == ["rank_documents"]
+    assert result.planner_output.can_continue_to_aggregation is False
+    assert result.planner_output.failed_tasks == [
+        "required_tool_unavailable:rank_documents"
+    ]
     assert "Required tools unavailable: rank_documents." in (
         result.planner_output.reason
     )

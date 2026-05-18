@@ -49,11 +49,26 @@ prompts, credentials, raw payloads, raw filters, or internal policies.
 
 _PLANNER_NODE_CONTRACT = """\
 <node_contract mode="agent:planner">
-You are a planner agent. Your job is to activate relevant skills, use allowed
-tools, collect evidence, and return only the structured PlannerOutput schema.
-Do not write the final user answer. Do not use model common knowledge as
-evidence. If required evidence or tools are missing, set can_synthesize=false
-and record missing tools in required_tools_missing with a clear reason.
+You are the skill-aware planner agent in an enterprise workflow.
+Your job is task and tool orchestration only.
+
+Do:
+- Follow active skill instructions and complete the required task checklist.
+- Use only tools made available by the platform runtime.
+- Use ToolObservation only to determine task status.
+- Return only the structured PlannerOutput schema.
+
+Do not:
+- Generate the final user-facing answer.
+- Read, request, summarize, select, or cite raw evidence.
+- Invent facts, tool results, source content, ratings, target values, dates,
+  or recommendations.
+- Use model common knowledge unless tenant policy explicitly allows it.
+
+ToolObservation contains only execution signals: status, task_status_hint,
+result_count, warnings, and error_code. Full tool results are stored in the
+workflow execution context. The aggregation node will process evidence after
+planning.
 </node_contract>"""
 
 
@@ -313,18 +328,18 @@ class AgentHandler(StepHandler):
         planner_output = self._coerce_planner_output(output)
         planner_output = self._enrich_planner_output(ctx, planner_output, deps)
         ctx.planner_output = planner_output
-        ctx.active_skills = self._merge_unique(
-            ctx.active_skills,
-            planner_output.active_skills,
-        )
+        ctx.active_skills = self._merge_unique(ctx.active_skills, deps.activated_skill_names)
 
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
                 "agent:planner",
                 {
-                    "can_synthesize": planner_output.can_synthesize,
-                    "evidence_count": len(planner_output.evidence_ids),
-                    "missing_evidence_count": len(planner_output.missing_evidence),
+                    "can_continue_to_aggregation": (
+                        planner_output.can_continue_to_aggregation
+                    ),
+                    "completed_task_count": len(planner_output.completed_tasks),
+                    "missing_task_count": len(planner_output.missing_tasks),
+                    "failed_task_count": len(planner_output.failed_tasks),
                     "used_tools": planner_output.used_tools,
                 },
             )
@@ -434,10 +449,11 @@ class AgentHandler(StepHandler):
             payload["active_skills"] = ctx.active_skills
 
         return (
-            "Plan evidence collection for the following resolved workflow task. "
-            "Use standalone_query for tool calls and retrieval. Use original_query "
-            "only to preserve the user's wording and audit trail. Do not treat "
-            "chat history as evidence.\n\n"
+            "Plan task/tool execution for the following resolved workflow task. "
+            "Use standalone_query for tool calls. Use original_query only to "
+            "preserve the user's wording and audit trail. Do not treat chat "
+            "history as evidence. Do not select evidence IDs; aggregation will "
+            "process normalized tool results after planning.\n\n"
             "<planner_runtime_context>\n"
             f"{json.dumps(payload, ensure_ascii=False, default=str, indent=2)}\n"
             "</planner_runtime_context>"
@@ -475,43 +491,58 @@ class AgentHandler(StepHandler):
         deps: AgentDeps,
     ) -> PlannerOutput:
         active_skills = self._merge_unique(
-            planner_output.active_skills,
             deps.activated_skill_names,
             ctx.active_skills,
         )
         used_tools = planner_output.used_tools or self._merge_unique(
             [record.tool_name for record in ctx.tool_calls]
         )
-        evidence_ids = planner_output.evidence_ids or self._merge_unique(
-            [
-                evidence_id
-                for observation in ctx.tool_observations
-                for evidence_id in observation.evidence_ids
-            ]
-        )
+        completed_tasks = self._merge_unique(planner_output.completed_tasks)
+        missing_tasks = self._merge_unique(planner_output.missing_tasks)
+        partial_tasks = self._merge_unique(planner_output.partial_tasks)
+        stale_tasks = self._merge_unique(planner_output.stale_tasks)
+        failed_tasks = self._merge_unique(planner_output.failed_tasks)
+
+        for observation in ctx.tool_observations:
+            task_name = observation.tool_name
+            match observation.task_status_hint:
+                case "completed":
+                    completed_tasks = self._merge_unique(completed_tasks, [task_name])
+                case "missing":
+                    missing_tasks = self._merge_unique(missing_tasks, [task_name])
+                case "partial":
+                    partial_tasks = self._merge_unique(partial_tasks, [task_name])
+                case "stale":
+                    stale_tasks = self._merge_unique(stale_tasks, [task_name])
+                case "failed":
+                    failed_tasks = self._merge_unique(failed_tasks, [task_name])
+
         required_tools = self._required_tool_names(active_skills)
-        required_tools_missing = self._merge_unique(
-            planner_output.required_tools_missing,
-            [
-                tool_name
-                for tool_name in required_tools
-                if tool_name not in deps.available_tool_names
-            ],
+        missing_required_tools = [
+            tool_name
+            for tool_name in required_tools
+            if tool_name not in deps.available_tool_names
+        ]
+        failed_tasks = self._merge_unique(
+            failed_tasks,
+            [f"required_tool_unavailable:{name}" for name in missing_required_tools],
         )
-        can_synthesize = planner_output.can_synthesize
+        can_continue = planner_output.can_continue_to_aggregation
         reason = planner_output.reason
-        if required_tools_missing:
-            can_synthesize = False
-            missing_text = ", ".join(required_tools_missing)
+        if missing_required_tools:
+            can_continue = False
+            missing_text = ", ".join(missing_required_tools)
             reason = f"{reason} Required tools unavailable: {missing_text}."
 
         return planner_output.model_copy(
             update={
-                "active_skills": active_skills,
                 "used_tools": used_tools,
-                "evidence_ids": evidence_ids,
-                "required_tools_missing": required_tools_missing,
-                "can_synthesize": can_synthesize,
+                "completed_tasks": completed_tasks,
+                "missing_tasks": missing_tasks,
+                "partial_tasks": partial_tasks,
+                "stale_tasks": stale_tasks,
+                "failed_tasks": failed_tasks,
+                "can_continue_to_aggregation": can_continue,
                 "reason": reason,
             }
         )

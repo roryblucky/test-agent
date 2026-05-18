@@ -47,18 +47,17 @@ async def test_search_documents_tool(ctx, mock_retriever):
 
     result = await search_documents_tool(ctx, "test query")
 
-    assert "Content 1" in result
-    assert "Content 2" in result
+    assert result.status == "success"
+    assert result.result_count == 2
     mock_retriever.retrieve.assert_awaited_once_with("test query", filter_expr=None)
     ctx.deps.emitter.emit_step_start.assert_awaited_with("search_documents")
     ctx.deps.emitter.emit_step_completed.assert_awaited()
-    assert len(ctx.deps.flow_context.evidence_store) == 2
+    assert len(ctx.deps.flow_context.tool_results) == 1
+    assert len(ctx.deps.flow_context.tool_results[0].normalized_items) == 2
     assert ctx.deps.flow_context.tool_calls[0].tool_name == "search_documents"
     assert ctx.deps.flow_context.tool_calls[0].tenant_id == "test-tenant"
-    assert ctx.deps.flow_context.tool_observations[0].evidence_ids == [
-        "search_documents:1:doc1",
-        "search_documents:2:doc2",
-    ]
+    assert ctx.deps.flow_context.tool_observations[0].result_count == 2
+    assert ctx.deps.flow_context.tool_observations[0].task_status_hint == "completed"
 
 
 @pytest.mark.asyncio
@@ -68,7 +67,8 @@ async def test_search_documents_no_results(ctx, mock_retriever):
 
     result = await search_documents_tool(ctx, "test query")
 
-    assert "No documents found" in result
+    assert result.status == "empty"
+    assert result.task_status_hint == "missing"
 
 
 @pytest.mark.asyncio
@@ -80,6 +80,7 @@ async def test_decompose_question_tool(ctx, mock_registry):
 
     result = await decompose_question_tool(ctx, "Complex question")
 
-    assert result == ["Q1", "Q2"]
+    assert result.status == "success"
+    assert result.result_count == 2
     mock_registry.create_agent.assert_called_once()
     mock_agent.run.assert_awaited_once()

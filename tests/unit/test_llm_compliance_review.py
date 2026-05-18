@@ -9,9 +9,9 @@ from pydantic_ai.usage import RunUsage
 
 from app.config.models import FlowStep, FlowStepType
 from app.models.workflow import (
+    AggregatedEvidence,
     AggregatedEvidenceBundle,
     ComplianceReviewResult,
-    EvidenceItem,
 )
 from app.services.flow_context import FlowContext
 from app.services.handlers.llm import LLMHandler
@@ -63,12 +63,13 @@ def _aggregated_bundle() -> AggregatedEvidenceBundle:
         user_query="query",
         standalone_query="query",
         tenant_id="tenant-a",
-        evidence=[
-            EvidenceItem(
-                id="ev1",
+        selected_evidence=[
+            AggregatedEvidence(
+                evidence_id="ev1",
                 source="test-source",
                 content="approved evidence",
-                retrieved_at=datetime(2026, 5, 17, tzinfo=UTC),
+                tool_call_id="search_documents:1",
+                published_at=datetime(2026, 5, 17, tzinfo=UTC),
             )
         ],
         synthesis_allowed=True,

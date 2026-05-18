@@ -36,15 +36,24 @@ class AnalysisHandler:
             "streaming_policy": ctx.metadata.get("streaming_policy", "token"),
             "tool_call_count": len(ctx.tool_calls),
             "tool_observation_count": len(ctx.tool_observations),
+            "tool_result_count": len(ctx.tool_results),
             "evidence_count": len(ctx.evidence_store),
-            "planner_can_synthesize": (
-                planner_output.can_synthesize if planner_output else None
+            "planner_can_continue_to_aggregation": (
+                planner_output.can_continue_to_aggregation if planner_output else None
             ),
-            "planner_evidence_count": (
-                len(planner_output.evidence_ids) if planner_output else None
+            "planner_completed_task_count": (
+                len(planner_output.completed_tasks) if planner_output else None
+            ),
+            "planner_missing_task_count": (
+                len(planner_output.missing_tasks) if planner_output else None
+            ),
+            "planner_failed_task_count": (
+                len(planner_output.failed_tasks) if planner_output else None
             ),
             "aggregated_evidence_count": (
-                len(aggregated_evidence.evidence) if aggregated_evidence else None
+                len(aggregated_evidence.selected_evidence)
+                if aggregated_evidence
+                else None
             ),
             "synthesis_allowed": (
                 aggregated_evidence.synthesis_allowed if aggregated_evidence else None

@@ -9,7 +9,7 @@ from pydantic_ai.usage import RunUsage
 
 from app.config.models import FlowStep, FlowStepType
 from app.models.domain import Document
-from app.models.workflow import AggregatedEvidenceBundle, EvidenceItem
+from app.models.workflow import AggregatedEvidence, AggregatedEvidenceBundle
 from app.services.flow_context import FlowContext
 from app.services.handlers.llm import LLMHandler
 
@@ -60,14 +60,14 @@ def _handler(fake_agent: FakeAnswerAgent) -> LLMHandler:
     return handler
 
 
-def _evidence(evidence_id: str, content: str) -> EvidenceItem:
-    return EvidenceItem(
-        id=evidence_id,
+def _evidence(evidence_id: str, content: str) -> AggregatedEvidence:
+    return AggregatedEvidence(
+        evidence_id=evidence_id,
         source="aggregation-test",
-        source_type="document",
         title="Evidence title",
         content=content,
-        retrieved_at=datetime(2026, 5, 17, tzinfo=UTC),
+        tool_call_id="search_documents:1",
+        published_at=datetime(2026, 5, 17, tzinfo=UTC),
         score=0.91,
     )
 
@@ -84,7 +84,7 @@ async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
         user_query="query",
         standalone_query="standalone query",
         tenant_id="tenant-a",
-        evidence=[_evidence("ev1", "aggregated evidence content")],
+        selected_evidence=[_evidence("ev1", "aggregated evidence content")],
         synthesis_allowed=True,
     )
 
@@ -142,10 +142,10 @@ async def test_llm_answer_blocks_when_aggregation_disallows_synthesis(
         user_query="query",
         standalone_query="query",
         tenant_id="tenant-a",
-        evidence=[],
-        missing_evidence=["ev1"],
+        selected_evidence=[],
+        missing_tasks=["search_documents"],
         synthesis_allowed=False,
-        synthesis_block_reason="Missing required evidence: ev1",
+        synthesis_block_reason="Missing required tasks: search_documents",
     )
 
     result = await handler.handle(
@@ -153,7 +153,7 @@ async def test_llm_answer_blocks_when_aggregation_disallows_synthesis(
         FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
     )
 
-    assert result.llm_response == "Missing required evidence: ev1"
+    assert result.llm_response == "Missing required tasks: search_documents"
     assert fake_agent.run_count == 0
     mock_emitter.emit_step_completed.assert_any_await(
         "llm:answer",

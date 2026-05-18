@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, Self
 from unittest.mock import MagicMock
@@ -29,11 +28,12 @@ from app.models.domain import (
 from app.models.workflow import (
     AggregatedEvidenceBundle,
     ComplianceReviewResult,
-    EvidenceItem,
     IntentResult,
+    NormalizedToolResultItem,
     PlannerOutput,
     ToolCallRecord,
     ToolObservation,
+    ToolResultRecord,
 )
 from app.services.flow_engine import FlowEngine
 from app.services.handlers.agent import AgentHandler
@@ -188,15 +188,25 @@ class RecordingGroundednessProvider:
         )
 
 
-def _evidence(evidence_id: str, content: str) -> EvidenceItem:
-    return EvidenceItem(
-        id=evidence_id,
+def _tool_result() -> ToolResultRecord:
+    return ToolResultRecord(
+        tool_call_id="search_documents:1",
+        tool_name="search_documents",
         source="integration-test",
-        source_type="document",
-        title=f"Evidence {evidence_id}",
-        content=content,
-        retrieved_at=datetime(2026, 5, 17, tzinfo=UTC),
-        score=0.9,
+        normalized_items=[
+            NormalizedToolResultItem(
+                item_id="doc-1",
+                title="Evidence ev-1",
+                content="Evidence one for wealth analysis.",
+                score=0.9,
+            ),
+            NormalizedToolResultItem(
+                item_id="doc-2",
+                title="Evidence ev-2",
+                content="Evidence two for wealth analysis.",
+                score=0.8,
+            ),
+        ],
     )
 
 
@@ -394,35 +404,30 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
         flow_ctx.metadata["tenant_id"] = tenant_id
         flow_ctx.active_skills.append("wealth-skill")
         deps.activated_skill_names.append("wealth-skill")
-        flow_ctx.evidence_store["ev-1"] = _evidence(
-            "ev-1", "Evidence one for wealth analysis."
-        )
-        flow_ctx.evidence_store["ev-2"] = _evidence(
-            "ev-2", "Evidence two for wealth analysis."
-        )
+        flow_ctx.tool_results.append(_tool_result())
         flow_ctx.tool_calls.append(
             ToolCallRecord(
+                tool_call_id="search_documents:1",
                 tool_name="search_documents",
                 input_payload={"query": "wealth query"},
                 status="success",
-                output_evidence_ids=["ev-1", "ev-2"],
+                result_count=2,
             )
         )
         flow_ctx.tool_observations.append(
             ToolObservation(
                 tool_name="search_documents",
                 status="success",
-                evidence_ids=["ev-1", "ev-2"],
-                summary_for_planner="Fetched two evidence items.",
+                task_status_hint="completed",
+                result_count=2,
             )
         )
 
     planner_agent = FakeAgent(
         output=PlannerOutput(
-            can_synthesize=True,
+            can_continue_to_aggregation=True,
             reason="Evidence is sufficient.",
-            active_skills=["wealth-skill"],
-            evidence_ids=["ev-1", "ev-2"],
+            completed_tasks=["search_documents"],
         ),
         on_enter=_planner_setup,
     )
@@ -513,21 +518,28 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
         candidate_skills=["wealth-skill"],
     )
     assert ctx.planner_output is not None
-    assert ctx.planner_output.can_synthesize is True
-    assert ctx.planner_output.evidence_ids == ["ev-1", "ev-2"]
+    assert ctx.planner_output.can_continue_to_aggregation is True
+    assert ctx.planner_output.completed_tasks == ["search_documents"]
+    selected_evidence = ctx.aggregated_evidence.selected_evidence
     assert ctx.aggregated_evidence == AggregatedEvidenceBundle(
         user_query="Give me the wealth view.",
         standalone_query="What is the market view for this asset?",
         tenant_id=tenant_id,
         intent="market_outlook",
         active_skills=["wealth-skill"],
-        evidence=[ctx.evidence_store["ev-1"], ctx.evidence_store["ev-2"]],
-        missing_evidence=[],
-        stale_evidence=[],
-        conflicts=[],
+        selected_evidence=selected_evidence,
+        missing_tasks=[],
+        partial_tasks=[],
+        stale_tasks=[],
+        failed_tasks=[],
+        excluded_evidence=[],
         synthesis_allowed=True,
         synthesis_block_reason=None,
     )
+    assert [item.content for item in selected_evidence] == [
+        "Evidence one for wealth analysis.",
+        "Evidence two for wealth analysis.",
+    ]
     assert ctx.draft_answer == "Draft wealth answer."
     assert ctx.llm_response == expected_answer
     assert ctx.compliance_review == review_output
@@ -539,7 +551,10 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
     mock_emitter.emit_token.assert_not_awaited()
     mock_emitter.emit_answer_delta.assert_any_await(expected_delta)
     assert ctx.metadata["analysis"]["streaming_policy"] == "approved_answer_only"
-    assert ctx.metadata["analysis"]["planner_can_synthesize"] is True
+    assert (
+        ctx.metadata["analysis"]["planner_can_continue_to_aggregation"]
+        is True
+    )
     assert ctx.metadata["analysis"]["compliance_passed"] == review_output.passed
     assert planner_agent.last_deps.available_tool_names == ["search_documents"]
     assert planner_agent.last_deps.flow_context.metadata["tenant_id"] == tenant_id
@@ -560,9 +575,11 @@ async def test_supervisor_agent_workflow_end_to_end(mock_emitter) -> None:
         flow_ctx.metadata["tenant_id"] = tenant_id
         flow_ctx.tool_calls.append(
             ToolCallRecord(
+                tool_call_id="plan_and_reason:1",
                 tool_name="plan_and_reason",
                 input_payload={"reasoning": "Inspect the repository."},
                 status="success",
+                result_count=1,
             )
         )
 

@@ -30,7 +30,12 @@ from pydantic_ai import RunContext
 from app.agents.agent_deps import AgentDeps
 from app.api.schemas import QuestionAnswerSelector
 from app.models.domain import Document
-from app.models.workflow import EvidenceItem, ToolCallRecord, ToolObservation
+from app.models.workflow import (
+    NormalizedToolResultItem,
+    ToolCallRecord,
+    ToolObservation,
+    ToolResultRecord,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,29 +56,35 @@ def _record_tool_call(
     tool_name: str,
     input_payload: dict[str, Any],
     status: str,
-    output_evidence_ids: list[str] | None = None,
+    result_count: int = 0,
     compiled_filter: str | None = None,
     latency_ms: int | None = None,
+    error_code: str | None = None,
     error: str | None = None,
-) -> None:
+) -> str:
     flow_ctx = _get_flow_context(ctx)
     if flow_ctx is None:
-        return
+        return f"{tool_name}:external"
+
+    tool_call_id = f"{tool_name}:{len(flow_ctx.tool_calls) + 1}"
 
     deps = getattr(ctx, "deps", None)
     flow_ctx.tool_calls.append(
         ToolCallRecord(
+            tool_call_id=tool_call_id,
             tool_name=tool_name,
             input_payload=input_payload,
             compiled_filter=compiled_filter,
-            output_evidence_ids=output_evidence_ids or [],
             status=status,
+            result_count=result_count,
             latency_ms=latency_ms,
+            error_code=error_code,
             error=error,
             tenant_id=getattr(deps, "tenant_id", None),
             user_id=None,
         )
     )
+    return tool_call_id
 
 
 def _record_tool_observation(
@@ -85,34 +96,92 @@ def _record_tool_observation(
         flow_ctx.tool_observations.append(observation)
 
 
-def _store_document_evidence(
+def _store_document_results(
     ctx: RunContext[Any],
     *,
+    tool_call_id: str,
     tool_name: str,
     documents: list[Document],
-) -> list[str]:
+) -> None:
     flow_ctx = _get_flow_context(ctx)
     if flow_ctx is None:
-        return []
+        return
 
-    retrieved_at = datetime.now(UTC)
-    evidence_ids: list[str] = []
+    items: list[NormalizedToolResultItem] = []
     for doc in documents:
-        evidence_id = f"{tool_name}:{len(flow_ctx.evidence_store) + 1}:{doc.id}"
-        evidence_ids.append(evidence_id)
         metadata = dict(doc.metadata)
         metadata["document_id"] = doc.id
-        flow_ctx.evidence_store[evidence_id] = EvidenceItem(
-            id=evidence_id,
-            source=tool_name,
-            source_type="document",
-            title=str(doc.metadata["title"]) if "title" in doc.metadata else None,
-            content=doc.content,
-            retrieved_at=retrieved_at,
-            score=doc.score,
-            metadata=metadata,
+        items.append(
+            NormalizedToolResultItem(
+                item_id=doc.id,
+                title=str(doc.metadata["title"]) if "title" in doc.metadata else None,
+                content=doc.content,
+                score=doc.score,
+                metadata=metadata,
+            )
         )
-    return evidence_ids
+
+    flow_ctx.tool_results.append(
+        ToolResultRecord(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            source=tool_name,
+            normalized_items=items,
+        )
+    )
+
+
+def _store_text_result(
+    ctx: RunContext[Any],
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    item_id: str,
+    content: str,
+) -> None:
+    flow_ctx = _get_flow_context(ctx)
+    if flow_ctx is None:
+        return
+
+    flow_ctx.tool_results.append(
+        ToolResultRecord(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            source=tool_name,
+            normalized_items=[
+                NormalizedToolResultItem(
+                    item_id=item_id,
+                    content=content,
+                    metadata={"recorded_at": datetime.now(UTC).isoformat()},
+                )
+            ],
+        )
+    )
+
+
+def _observation(
+    *,
+    tool_name: str,
+    status: str,
+    result_count: int = 0,
+    warnings: list[str] | None = None,
+    error_code: str | None = None,
+) -> ToolObservation:
+    task_status_hint = {
+        "success": "completed",
+        "empty": "missing",
+        "partial": "partial",
+        "stale": "stale",
+        "error": "failed",
+    }[status]
+    return ToolObservation(
+        tool_name=tool_name,
+        status=status,
+        task_status_hint=task_status_hint,
+        result_count=result_count,
+        warnings=warnings or [],
+        error_code=error_code,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -300,13 +369,17 @@ async def search_documents_tool(
     ctx: RunContext[AgentDeps],
     query: str,
     filter_expr: str | None = None,
-) -> str:
+) -> ToolObservation:
     """Search the knowledge base for documents relevant to a query.
 
     Args:
         ctx: Tools context with access to dependencies.
         query: The search query text.
         filter_expr: Optional metadata filter expression string.
+
+    Returns:
+        A lightweight observation. Full normalized results are stored on
+        ``FlowContext.tool_results`` for aggregation.
     """
     start = time.perf_counter()
     input_payload = {"query": query, "filter_expr": filter_expr}
@@ -322,15 +395,14 @@ async def search_documents_tool(
             latency_ms=_latency_ms(start),
             error=message,
         )
-        _record_tool_observation(
-            ctx,
-            ToolObservation(
-                tool_name="search_documents",
-                status="error",
-                warnings=[message],
-            ),
+        observation = _observation(
+            tool_name="search_documents",
+            status="error",
+            warnings=[message],
+            error_code="retriever_not_configured",
         )
-        return "No retriever configured for this tenant."
+        _record_tool_observation(ctx, observation)
+        return observation
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_start("search_documents")
@@ -347,43 +419,40 @@ async def search_documents_tool(
             compiled_filter=filter_expr,
             status="error",
             latency_ms=_latency_ms(start),
+            error_code="retriever_error",
             error=str(exc),
         )
-        _record_tool_observation(
-            ctx,
-            ToolObservation(
-                tool_name="search_documents",
-                status="error",
-                warnings=[str(exc)],
-            ),
+        observation = _observation(
+            tool_name="search_documents",
+            status="error",
+            warnings=[str(exc)],
+            error_code="retriever_error",
         )
+        _record_tool_observation(ctx, observation)
         raise
 
-    evidence_ids = _store_document_evidence(
-        ctx,
-        tool_name="search_documents",
-        documents=docs,
-    )
     status = "success" if docs else "empty"
-    _record_tool_call(
+    tool_call_id = _record_tool_call(
         ctx,
         tool_name="search_documents",
         input_payload=input_payload,
         compiled_filter=filter_expr,
         status=status,
-        output_evidence_ids=evidence_ids,
+        result_count=len(docs),
         latency_ms=_latency_ms(start),
     )
-    _record_tool_observation(
+    _store_document_results(
         ctx,
-        ToolObservation(
-            tool_name="search_documents",
-            status=status,
-            evidence_ids=evidence_ids,
-            summary_for_planner=f"Found {len(docs)} document(s).",
-            relevance="unknown" if docs else "none",
-        ),
+        tool_call_id=tool_call_id,
+        tool_name="search_documents",
+        documents=docs,
     )
+    observation = _observation(
+        tool_name="search_documents",
+        status=status,
+        result_count=len(docs),
+    )
+    _record_tool_observation(ctx, observation)
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
@@ -392,21 +461,16 @@ async def search_documents_tool(
                 "query": query,
                 "filter_expr": filter_expr,
                 "document_count": len(docs),
-                "documents": [{"id": d.id, "score": d.score} for d in docs],
+                "tool_call_id": tool_call_id,
             },
         )
 
-    if not docs:
-        return "No documents found for this query."
-
-    return "\n\n---\n\n".join(
-        f"[Document {d.id} | score={d.score}]\n{d.content}" for d in docs
-    )
+    return observation
 
 
 async def rank_documents_tool(
     ctx: RunContext[AgentDeps], query: str, document_texts: list[str]
-) -> str:
+) -> ToolObservation:
     """Re-rank documents by relevance to a specific query.
 
     Args:
@@ -415,7 +479,8 @@ async def rank_documents_tool(
         document_texts: List of document texts to rank.
 
     Returns:
-        The top-ranked documents as formatted text.
+        A lightweight observation. Ranked documents are stored on
+        ``FlowContext.tool_results`` for aggregation.
     """
     start = time.perf_counter()
     input_payload = {"query": query, "document_count": len(document_texts)}
@@ -428,17 +493,17 @@ async def rank_documents_tool(
             input_payload=input_payload,
             status="error",
             latency_ms=_latency_ms(start),
+            error_code="ranker_not_configured",
             error=message,
         )
-        _record_tool_observation(
-            ctx,
-            ToolObservation(
-                tool_name="rank_documents",
-                status="error",
-                warnings=[message],
-            ),
+        observation = _observation(
+            tool_name="rank_documents",
+            status="error",
+            warnings=[message],
+            error_code="ranker_not_configured",
         )
-        return "No ranker configured for this tenant."
+        _record_tool_observation(ctx, observation)
+        return observation
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_start("rank_documents")
@@ -456,42 +521,39 @@ async def rank_documents_tool(
             input_payload=input_payload,
             status="error",
             latency_ms=_latency_ms(start),
+            error_code="ranker_error",
             error=str(exc),
         )
-        _record_tool_observation(
-            ctx,
-            ToolObservation(
-                tool_name="rank_documents",
-                status="error",
-                warnings=[str(exc)],
-            ),
+        observation = _observation(
+            tool_name="rank_documents",
+            status="error",
+            warnings=[str(exc)],
+            error_code="ranker_error",
         )
+        _record_tool_observation(ctx, observation)
         raise
 
-    evidence_ids = _store_document_evidence(
-        ctx,
-        tool_name="rank_documents",
-        documents=ranked,
-    )
     status = "success" if ranked else "empty"
-    _record_tool_call(
+    tool_call_id = _record_tool_call(
         ctx,
         tool_name="rank_documents",
         input_payload=input_payload,
         status=status,
-        output_evidence_ids=evidence_ids,
+        result_count=len(ranked),
         latency_ms=_latency_ms(start),
     )
-    _record_tool_observation(
+    _store_document_results(
         ctx,
-        ToolObservation(
-            tool_name="rank_documents",
-            status=status,
-            evidence_ids=evidence_ids,
-            summary_for_planner=f"Ranked {len(ranked)} document(s).",
-            relevance="unknown" if ranked else "none",
-        ),
+        tool_call_id=tool_call_id,
+        tool_name="rank_documents",
+        documents=ranked,
     )
+    observation = _observation(
+        tool_name="rank_documents",
+        status=status,
+        result_count=len(ranked),
+    )
+    _record_tool_observation(ctx, observation)
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
@@ -500,18 +562,16 @@ async def rank_documents_tool(
                 "query": query,
                 "input_count": len(docs),
                 "output_count": len(ranked),
+                "tool_call_id": tool_call_id,
             },
         )
 
-    return "\n\n---\n\n".join(
-        f"[Ranked #{i + 1} | score={d.score}]\n{d.content}"
-        for i, d in enumerate(ranked)
-    )
+    return observation
 
 
 async def decompose_question_tool(
     ctx: RunContext[AgentDeps], complex_question: str
-) -> list[str]:
+) -> ToolObservation:
     """Break a complex question into 2-5 focused sub-questions.
 
     Args:
@@ -519,7 +579,8 @@ async def decompose_question_tool(
         complex_question: The complex question to decompose.
 
     Returns:
-        A list of focused sub-questions.
+        A lightweight observation. Sub-questions are stored on
+        ``FlowContext.tool_results``.
     """
     start = time.perf_counter()
     input_payload = {"complex_question": complex_question}
@@ -549,41 +610,55 @@ async def decompose_question_tool(
             input_payload=input_payload,
             status="error",
             latency_ms=_latency_ms(start),
+            error_code="decomposition_error",
             error=str(exc),
         )
+        observation = _observation(
+            tool_name="decompose_question",
+            status="error",
+            warnings=[str(exc)],
+            error_code="decomposition_error",
+        )
+        _record_tool_observation(ctx, observation)
         raise
     sub_questions = result.output
-    _record_tool_call(
+    status = "success" if sub_questions else "empty"
+    tool_call_id = _record_tool_call(
         ctx,
         tool_name="decompose_question",
         input_payload=input_payload,
-        status="success",
+        status=status,
+        result_count=len(sub_questions),
         latency_ms=_latency_ms(start),
     )
-    _record_tool_observation(
+    _store_text_result(
         ctx,
-        ToolObservation(
-            tool_name="decompose_question",
-            status="success",
-            summary_for_planner=f"Generated {len(sub_questions)} sub-question(s).",
-            recommended_next_actions=sub_questions,
-        ),
+        tool_call_id=tool_call_id,
+        tool_name="decompose_question",
+        item_id="sub_questions",
+        content="\n".join(sub_questions),
     )
+    observation = _observation(
+        tool_name="decompose_question",
+        status=status,
+        result_count=len(sub_questions),
+    )
+    _record_tool_observation(ctx, observation)
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
             "decompose_question",
-            {"sub_questions": sub_questions},
+            {"result_count": len(sub_questions), "tool_call_id": tool_call_id},
         )
 
-    return sub_questions
+    return observation
 
 
 async def analyze_section_tool(
     ctx: RunContext[AgentDeps],
     question: str,
     context: str,
-) -> str:
+) -> ToolObservation:
     """Analyze specific content to answer a focused question.
 
     Args:
@@ -592,7 +667,8 @@ async def analyze_section_tool(
         context: The reference text to analyze.
 
     Returns:
-        A focused analysis.
+        A lightweight observation. The generated analysis is stored on
+        ``FlowContext.tool_results``.
     """
     start = time.perf_counter()
     input_payload = {"question": question, "context_length": len(context)}
@@ -619,82 +695,110 @@ async def analyze_section_tool(
             input_payload=input_payload,
             status="error",
             latency_ms=_latency_ms(start),
+            error_code="analysis_error",
             error=str(exc),
         )
+        observation = _observation(
+            tool_name="analyze_section",
+            status="error",
+            warnings=[str(exc)],
+            error_code="analysis_error",
+        )
+        _record_tool_observation(ctx, observation)
         raise
 
-    _record_tool_call(
+    tool_call_id = _record_tool_call(
         ctx,
         tool_name="analyze_section",
         input_payload=input_payload,
         status="success",
+        result_count=1,
         latency_ms=_latency_ms(start),
     )
-    _record_tool_observation(
+    _store_text_result(
         ctx,
-        ToolObservation(
-            tool_name="analyze_section",
-            status="success",
-            summary_for_planner=result.output,
-        ),
+        tool_call_id=tool_call_id,
+        tool_name="analyze_section",
+        item_id="analysis",
+        content=result.output,
     )
+    observation = _observation(
+        tool_name="analyze_section",
+        status="success",
+        result_count=1,
+    )
+    _record_tool_observation(ctx, observation)
 
     if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
             "analyze_section",
-            {"question": question, "analysis_length": len(result.output)},
+            {
+                "question": question,
+                "analysis_length": len(result.output),
+                "tool_call_id": tool_call_id,
+            },
         )
 
-    return result.output
+    return observation
 
 
-async def plan_and_reason_tool(ctx: RunContext[Any], reasoning: str) -> str:
+async def plan_and_reason_tool(
+    ctx: RunContext[Any],
+    reasoning: str,
+) -> ToolObservation:
     """Use this tool to structure your response to the user with reasoning.
-    
-    Call this tool to think out loud and record your internal planning.
-    
+
+    Call this tool to record a lightweight planning note.
+
     Args:
         ctx: Tools context.
         reasoning: Your detailed reasoning or plan.
     """
     start = time.perf_counter()
     logger.info(f"Plan and Reasoning: {reasoning}")
-    _record_tool_call(
+    tool_call_id = _record_tool_call(
         ctx,
         tool_name="plan_and_reason",
         input_payload={"reasoning": reasoning},
         status="success",
+        result_count=1,
         latency_ms=_latency_ms(start),
     )
-    _record_tool_observation(
+    _store_text_result(
         ctx,
-        ToolObservation(
-            tool_name="plan_and_reason",
-            status="success",
-            summary_for_planner="Reasoning note recorded.",
-        ),
+        tool_call_id=tool_call_id,
+        tool_name="plan_and_reason",
+        item_id="reasoning",
+        content=reasoning,
     )
-    return "Reasoning updated and recorded."
+    observation = _observation(
+        tool_name="plan_and_reason",
+        status="success",
+        result_count=1,
+    )
+    _record_tool_observation(ctx, observation)
+    return observation
 
 
 async def get_user_classification_tool(
     ctx: RunContext[Any],
     response: str,
     quick_questions: list[QuestionAnswerSelector] | None = None,
-) -> str:
+) -> ToolObservation:
     """Get clarification from user if the user's query is too broad.
-    
-    Use this tool when you need the user to clarify their intent by selecting from specific options.
-    You MUST output the exact string returned by this tool as your final answer.
-    
+
+    Use this tool when you need the user to clarify their intent by selecting
+    from specific options. The clarification payload is stored on the workflow
+    context; the tool returns only an execution observation.
+
     Args:
         ctx: Tools context.
         response: The explanatory response or question directed at the user.
-        quick_questions: A list of specific questions and their options for the user to choose from.
+        quick_questions: Specific questions and options for the user.
     """
     start = time.perf_counter()
     logger.info(f"Clarification Question: {response}")
-    
+
     def _build_quick_questions_markdown(questions: list[QuestionAnswerSelector]) -> str:
         """Build quick question payload in markdown fenced block for UI parsing."""
         if not questions:
@@ -703,7 +807,11 @@ async def get_user_classification_tool(
         lines: list[str] = ["```selection"]
         for index, item in enumerate(questions, start=1):
             question = item.question.strip()
-            options = [option.strip() for option in item.options if option and option.strip()]
+            options = [
+                option.strip()
+                for option in item.options
+                if option and option.strip()
+            ]
 
             lines.append(f"{index}. {question}")
             lines.extend(f"- {option}" for option in options)
@@ -712,8 +820,12 @@ async def get_user_classification_tool(
         return "\n".join(lines)
 
     quick_questions_markdown = _build_quick_questions_markdown(quick_questions or [])
-    answer = response if not quick_questions_markdown else f"{response}\n\n{quick_questions_markdown}"
-    _record_tool_call(
+    answer = (
+        response
+        if not quick_questions_markdown
+        else f"{response}\n\n{quick_questions_markdown}"
+    )
+    tool_call_id = _record_tool_call(
         ctx,
         tool_name="get_user_classification",
         input_payload={
@@ -721,15 +833,21 @@ async def get_user_classification_tool(
             "question_count": len(quick_questions or []),
         },
         status="success",
+        result_count=1,
         latency_ms=_latency_ms(start),
     )
-    _record_tool_observation(
+    _store_text_result(
         ctx,
-        ToolObservation(
-            tool_name="get_user_classification",
-            status="success",
-            summary_for_planner="Clarification request prepared.",
-        ),
+        tool_call_id=tool_call_id,
+        tool_name="get_user_classification",
+        item_id="clarification",
+        content=answer,
     )
-    
-    return answer
+    observation = _observation(
+        tool_name="get_user_classification",
+        status="success",
+        result_count=1,
+    )
+    _record_tool_observation(ctx, observation)
+
+    return observation
