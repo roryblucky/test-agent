@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 from app.config.models import FlowStep
@@ -12,47 +12,48 @@ from app.models.workflow import (
     AggregatedEvidence,
     AggregatedEvidenceBundle,
     ExcludedEvidence,
+    NormalizedToolResultItem,
 )
 from app.services.flow_context import FlowContext
 
 
 @dataclass(frozen=True)
-class AggregationPolicy:
-    """Typed aggregation policy normalized from step settings."""
+class FreshnessPolicy:
+    """Optional freshness contract attached to an individual result item."""
 
-    min_relevance_score: float = 0.35
-    max_evidence: int = 8
-    allowed_sources: list[str] | None = None
+    date_field: str = "published_at"
     max_age_days: int | None = None
+    fail_if_missing_date: bool = False
 
     @classmethod
-    def from_step(cls, step: FlowStep) -> AggregationPolicy:
-        """Normalize optional step settings into a typed policy."""
-        settings = step.settings or {}
+    def from_item(cls, item: NormalizedToolResultItem) -> FreshnessPolicy | None:
+        """Read an explicit freshness contract from item metadata."""
+        raw_policy = item.metadata.get("freshness_policy") or item.metadata.get(
+            "freshnessPolicy"
+        )
+        if not isinstance(raw_policy, dict):
+            return None
+
         return cls(
-            min_relevance_score=float(
-                cls._get(settings, "min_relevance_score", "minRelevanceScore", 0.35)
-            ),
-            max_evidence=int(cls._get(settings, "max_evidence", "maxEvidence", 8)),
-            allowed_sources=cls._list_or_none(
-                cls._get(settings, "allowed_sources", "allowedSources", None)
+            date_field=str(
+                cls._get(raw_policy, "date_field", "dateField", "published_at")
             ),
             max_age_days=cls._int_or_none(
-                cls._get(settings, "max_age_days", "maxAgeDays", None)
+                cls._get(raw_policy, "max_age_days", "maxAgeDays", None)
+            ),
+            fail_if_missing_date=bool(
+                cls._get(
+                    raw_policy,
+                    "fail_if_missing_date",
+                    "failIfMissingDate",
+                    False,
+                )
             ),
         )
 
     @staticmethod
     def _get(settings: dict[str, Any], snake: str, camel: str, default: Any) -> Any:
         return settings.get(snake, settings.get(camel, default))
-
-    @staticmethod
-    def _list_or_none(value: Any) -> list[str] | None:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            return [value]
-        return list(value)
 
     @staticmethod
     def _int_or_none(value: Any) -> int | None:
@@ -63,13 +64,12 @@ class AggregationHandler:
     """Build the synthesis evidence bundle from normalized tool results."""
 
     @trace_span("aggregation")
-    async def handle(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
+    async def handle(self, ctx: FlowContext, _step: FlowStep) -> FlowContext:
         """Aggregate evidence from the execution context."""
         if ctx.planner_output is None:
             raise ValueError("Aggregation requires ctx.planner_output")
 
-        policy = AggregationPolicy.from_step(step)
-        selected_evidence, excluded_evidence = self._select_evidence(ctx, policy)
+        selected_evidence, excluded_evidence = self._select_evidence(ctx)
         missing_tasks = self._dedupe(ctx.planner_output.missing_tasks)
         partial_tasks = self._dedupe(ctx.planner_output.partial_tasks)
         stale_tasks = self._dedupe(ctx.planner_output.stale_tasks)
@@ -128,7 +128,6 @@ class AggregationHandler:
     def _select_evidence(
         self,
         ctx: FlowContext,
-        policy: AggregationPolicy,
     ) -> tuple[list[AggregatedEvidence], list[ExcludedEvidence]]:
         selected: list[AggregatedEvidence] = []
         excluded: list[ExcludedEvidence] = []
@@ -156,40 +155,12 @@ class AggregationHandler:
                         )
                     )
                     continue
-                if (
-                    policy.allowed_sources is not None
-                    and record.source not in policy.allowed_sources
-                ):
-                    excluded.append(
-                        ExcludedEvidence(
-                            tool_call_id=record.tool_call_id,
-                            item_id=item.item_id,
-                            reason="source_not_allowed",
-                            detail=record.source,
-                        )
-                    )
-                    continue
-                if self._is_stale(item.published_at, policy):
-                    excluded.append(
-                        ExcludedEvidence(
-                            tool_call_id=record.tool_call_id,
-                            item_id=item.item_id,
-                            reason="stale",
-                        )
-                    )
-                    continue
-                if (
-                    item.score is not None
-                    and item.score < policy.min_relevance_score
-                ):
-                    excluded.append(
-                        ExcludedEvidence(
-                            tool_call_id=record.tool_call_id,
-                            item_id=item.item_id,
-                            reason="low_relevance",
-                            detail=str(item.score),
-                        )
-                    )
+                freshness_exclusion = self._freshness_exclusion(
+                    record.tool_call_id,
+                    item,
+                )
+                if freshness_exclusion is not None:
+                    excluded.append(freshness_exclusion)
                     continue
 
                 seen.add(identity)
@@ -207,22 +178,14 @@ class AggregationHandler:
                 )
                 selected.append(evidence)
 
-        selected.sort(
-            key=lambda evidence: evidence.score if evidence.score is not None else 0.0,
-            reverse=True,
-        )
-        overflow = selected[policy.max_evidence :]
-        selected = selected[: policy.max_evidence]
-        excluded.extend(
-            [
-                ExcludedEvidence(
-                    tool_call_id=item.tool_call_id,
-                    item_id=str(item.metadata.get("item_id", item.evidence_id)),
-                    reason="max_evidence_exceeded",
-                )
-                for item in overflow
-            ]
-        )
+        if selected and all(evidence.score is not None for evidence in selected):
+            selected.sort(
+                key=lambda evidence: evidence.score
+                if evidence.score is not None
+                else 0.0,
+                reverse=True,
+            )
+
         selected = [
             evidence.model_copy(
                 update={
@@ -235,12 +198,82 @@ class AggregationHandler:
         ]
         return selected, excluded
 
-    @staticmethod
-    def _is_stale(published_at: datetime | None, policy: AggregationPolicy) -> bool:
-        if published_at is None or policy.max_age_days is None:
-            return False
+    def _freshness_exclusion(
+        self,
+        tool_call_id: str,
+        item: NormalizedToolResultItem,
+    ) -> ExcludedEvidence | None:
+        policy = FreshnessPolicy.from_item(item)
+        if policy is None:
+            return None
+
+        item_date = self._item_date(item, policy)
+        if item_date is None:
+            if policy.fail_if_missing_date:
+                return ExcludedEvidence(
+                    tool_call_id=tool_call_id,
+                    item_id=item.item_id,
+                    reason="stale",
+                    detail=f"missing freshness date: {policy.date_field}",
+                )
+            return None
+
+        if policy.max_age_days is None:
+            return None
+
         cutoff = datetime.now(UTC) - timedelta(days=policy.max_age_days)
-        return published_at < cutoff
+        if item_date < cutoff:
+            return ExcludedEvidence(
+                tool_call_id=tool_call_id,
+                item_id=item.item_id,
+                reason="stale",
+                detail=(
+                    f"{policy.date_field} older than "
+                    f"{policy.max_age_days} day freshness window"
+                ),
+            )
+        return None
+
+    @staticmethod
+    def _item_date(
+        item: NormalizedToolResultItem,
+        policy: FreshnessPolicy,
+    ) -> datetime | None:
+        if policy.date_field == "published_at":
+            return AggregationHandler._normalize_datetime(item.published_at)
+
+        raw_value = getattr(item, policy.date_field, None)
+        if raw_value is None:
+            raw_value = item.metadata.get(policy.date_field)
+        return AggregationHandler._normalize_datetime(raw_value)
+
+    @staticmethod
+    def _normalize_datetime(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=UTC)
+            return value.astimezone(UTC)
+        if isinstance(value, date):
+            return datetime.combine(value, time.min, tzinfo=UTC)
+        if isinstance(value, str):
+            normalized = value.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                try:
+                    return datetime.combine(
+                        date.fromisoformat(value),
+                        time.min,
+                        tzinfo=UTC,
+                    )
+                except ValueError:
+                    return None
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC)
+        return None
 
     @staticmethod
     def _block_reason(
