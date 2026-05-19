@@ -5,6 +5,7 @@ from typing import Any, Self
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.usage import RunUsage
 
 from app.config.models import FlowStep, FlowStepType
@@ -17,8 +18,9 @@ from app.services.handlers.llm import LLMHandler
 class FakeTextStream:
     """Async context manager for answer streaming tests."""
 
-    def __init__(self, output: str) -> None:
+    def __init__(self, output: str, messages: list[Any] | None = None) -> None:
         self._output = output
+        self._messages = messages or []
 
     async def __aenter__(self) -> Self:
         return self
@@ -33,7 +35,7 @@ class FakeTextStream:
         return RunUsage()
 
     def new_messages(self) -> list[Any]:
-        return []
+        return self._messages
 
 
 class FakeAnswerAgent:
@@ -51,7 +53,12 @@ class FakeAnswerAgent:
         self.last_prompt = args[0] if args else None
         self.last_deps = kwargs["deps"]
         self.last_message_history = kwargs.get("message_history")
-        return FakeTextStream(self.output)
+        new_messages = []
+        if self.last_prompt is not None:
+            new_messages.append(
+                ModelRequest(parts=[UserPromptPart(self.last_prompt)])
+            )
+        return FakeTextStream(self.output, new_messages)
 
 
 def _handler(fake_agent: FakeAnswerAgent) -> LLMHandler:
@@ -94,12 +101,21 @@ async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
     )
 
     assert result.llm_response == "aggregated answer"
-    assert fake_agent.last_prompt == "query"
+    assert fake_agent.last_prompt is not None
+    assert "<runtime_answer_input>" in fake_agent.last_prompt
+    assert "<original_user_query>\nquery\n</original_user_query>" in fake_agent.last_prompt
+    assert "aggregated evidence content" in fake_agent.last_prompt
+    assert "Standalone Query: standalone query" in fake_agent.last_prompt
     assert fake_agent.last_message_history is None
     assert fake_agent.last_deps is not None
-    assert "aggregated evidence content" in fake_agent.last_deps.reference_data
-    assert "Standalone Query: standalone query" in fake_agent.last_deps.reference_data
-    assert "legacy document content" not in fake_agent.last_deps.reference_data
+    assert not hasattr(fake_agent.last_deps, "reference_data")
+    assert "legacy document content" not in fake_agent.last_prompt
+    assert result.new_messages
+    persisted_request = result.new_messages[0]
+    assert isinstance(persisted_request, ModelRequest)
+    persisted_part = persisted_request.parts[0]
+    assert isinstance(persisted_part, UserPromptPart)
+    assert persisted_part.content == "query"
     mock_emitter.emit_token.assert_any_await("aggregated answer")
     mock_emitter.emit_answer_delta.assert_not_awaited()
 
@@ -209,7 +225,10 @@ async def test_llm_answer_keeps_document_fallback_without_aggregation() -> None:
     )
 
     assert result.llm_response == "legacy answer"
-    assert fake_agent.last_prompt == "query"
+    assert fake_agent.last_prompt is not None
+    assert "<runtime_answer_input>" in fake_agent.last_prompt
+    assert "<original_user_query>\nquery\n</original_user_query>" in fake_agent.last_prompt
     assert fake_agent.last_deps is not None
-    assert "Standalone Query: standalone query" in fake_agent.last_deps.reference_data
-    assert "ranked document content" in fake_agent.last_deps.reference_data
+    assert not hasattr(fake_agent.last_deps, "reference_data")
+    assert "Standalone Query: standalone query" in fake_agent.last_prompt
+    assert "ranked document content" in fake_agent.last_prompt

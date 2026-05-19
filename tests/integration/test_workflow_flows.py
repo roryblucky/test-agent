@@ -8,6 +8,7 @@ from typing import Any, Self
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.usage import RunUsage
 
 from app.api.schemas import QueryResponse
@@ -56,11 +57,13 @@ class FakeAgentStream:
         chunks: list[str] | None = None,
         on_enter: Callable[[Any], None] | None = None,
         deps: Any | None = None,
+        messages: list[Any] | None = None,
     ) -> None:
         self._output = output
         self._chunks = chunks or []
         self._on_enter = on_enter
         self._deps = deps
+        self._messages = messages or []
 
     async def __aenter__(self) -> Self:
         if self._on_enter:
@@ -85,7 +88,7 @@ class FakeAgentStream:
         return RunUsage()
 
     def new_messages(self) -> list[Any]:
-        return []
+        return self._messages
 
 
 class FakeAgent:
@@ -114,11 +117,13 @@ class FakeAgent:
         self.run_count += 1
         self.last_prompt = prompt
         self.last_deps = deps
+        new_messages = [ModelRequest(parts=[UserPromptPart(prompt)])]
         return FakeAgentStream(
             self.output,
             chunks=self.chunks,
             on_enter=self.on_enter,
             deps=deps,
+            messages=new_messages,
         )
 
 
@@ -350,7 +355,16 @@ async def test_existing_rag_workflow_end_to_end(mock_emitter) -> None:
         details="grounded",
     )
     assert response.answer == "Alpha is the strongest match."
-    assert "Document two with the strongest match." in answer_agent.last_deps.reference_data
+    assert answer_agent.last_prompt is not None
+    assert "Document two with the strongest match." in answer_agent.last_prompt
+    assert not hasattr(answer_agent.last_deps, "reference_data")
+    assert ctx.new_messages
+    persisted_request = ctx.new_messages[0]
+    assert isinstance(persisted_request, ModelRequest)
+    persisted_part = persisted_request.parts[0]
+    assert isinstance(persisted_part, UserPromptPart)
+    assert persisted_part.content == "What is alpha?"
+    assert "Document two with the strongest match." not in persisted_part.content
     assert moderation.checked_texts == ["What is alpha?", "Alpha is the strongest match."]
     assert retriever.calls == [("What is alpha in this tenant?", 2, None)]
     assert ranker.calls == [
@@ -544,7 +558,16 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
     assert ctx.llm_response == expected_answer
     assert ctx.compliance_review == review_output
     assert response.answer == expected_answer
-    assert "Evidence one for wealth analysis." in answer_agent.last_deps.reference_data
+    assert answer_agent.last_prompt is not None
+    assert "Evidence one for wealth analysis." in answer_agent.last_prompt
+    assert not hasattr(answer_agent.last_deps, "reference_data")
+    assert ctx.new_messages
+    persisted_request = ctx.new_messages[0]
+    assert isinstance(persisted_request, ModelRequest)
+    persisted_part = persisted_request.parts[0]
+    assert isinstance(persisted_part, UserPromptPart)
+    assert persisted_part.content == "Give me the wealth view."
+    assert "Evidence one for wealth analysis." not in persisted_part.content
     assert "Draft wealth answer." in review_agent.last_deps.reference_data
     assert "Evidence two for wealth analysis." in review_agent.last_deps.reference_data
     mock_emitter.emit_progress.assert_any_await("answer_buffering")

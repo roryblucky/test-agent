@@ -8,9 +8,11 @@ tenant/domain contract layers — not just the Agent step.
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 
 from app.agents.compliance_review import create_compliance_review_agent
 from app.agents.intent_recognition import (
@@ -106,8 +108,8 @@ class LLMHandler:
         time.  This prefix is identical across requests for the same
         tenant, allowing API providers (Anthropic, OpenAI) to cache it.
 
-        Per-request data (documents, draft answers) is injected separately
-        via the Agent's dynamic ``system_prompt`` function + deps.
+        Per-request answer context (documents, evidence) is sent as the
+        runtime user prompt and then sanitized from persisted history.
 
         For ``refine_question``, ``intent``, and ``compliance_review``,
         the mode-specific role becomes the **identity layer**.
@@ -279,21 +281,18 @@ class LLMHandler:
             return ctx
 
         context_text = self._build_answer_context(ctx)
+        runtime_prompt = self._build_answer_runtime_prompt(ctx, context_text)
 
         from app.agents.rag_answer import RAGAgentDeps
 
-        # Only pass per-request reference data to deps.
-        # Static prompt layers (identity, guardrails, tenant/domain contracts)
-        # are already baked into the agent's instructions at build time,
-        # enabling API-level prompt caching on the prefix.
-        deps = RAGAgentDeps(reference_data=context_text)
+        deps = RAGAgentDeps()
 
         # Use model streaming in both modes; high-compliance flows buffer chunks.
         settings = _build_step_settings(step)
         if buffer_answer and ctx.emitter:
             await ctx.emitter.emit_progress("answer_buffering")
         async with agent.run_stream(
-            ctx.query,
+            runtime_prompt,
             deps=deps,
             model_settings=settings,
         ) as stream:
@@ -306,7 +305,10 @@ class LLMHandler:
                 if ctx.emitter and not buffer_answer:
                     await ctx.emitter.emit_token(chunk)
             ctx.llm_response = "".join(chunks)
-            ctx.new_messages = stream.new_messages()
+            ctx.new_messages = _sanitize_answer_new_messages(
+                stream.new_messages(),
+                visible_user_query=ctx.query,
+            )
             ctx.add_usage(stream.usage())
 
         # Signal stop if cancelled mid-stream
@@ -397,6 +399,30 @@ class LLMHandler:
         return "\n".join(query_lines)
 
     @staticmethod
+    def _build_answer_runtime_prompt(ctx: FlowContext, reference_data: str) -> str:
+        """Build the per-run answer input sent as a user prompt.
+
+        The persisted conversation history is sanitized after the run so
+        this context does not appear in frontend-visible history.
+        """
+        standalone_query = ctx.refined_query or (
+            ctx.resolved_query.standalone_query if ctx.resolved_query else None
+        )
+        return (
+            "<runtime_answer_input>\n"
+            "<original_user_query>\n"
+            f"{ctx.query}\n"
+            "</original_user_query>\n\n"
+            "<standalone_query>\n"
+            f"{standalone_query or ctx.query}\n"
+            "</standalone_query>\n\n"
+            "<reference_data>\n"
+            f"{reference_data}\n"
+            "</reference_data>\n"
+            "</runtime_answer_input>"
+        )
+
+    @staticmethod
     def _coerce_compliance_review(output: Any) -> ComplianceReviewResult:
         if isinstance(output, ComplianceReviewResult):
             return output
@@ -451,6 +477,31 @@ def _format_aggregated_evidence(bundle: AggregatedEvidenceBundle) -> str:
         lines.append("\n".join(parts))
 
     return "\n\n---\n\n".join(lines)
+
+
+def _sanitize_answer_new_messages(
+    messages: list[ModelMessage],
+    *,
+    visible_user_query: str,
+) -> list[ModelMessage]:
+    """Replace the runtime answer prompt with the frontend-visible query."""
+    sanitized: list[ModelMessage] = []
+    replaced_user_prompt = False
+
+    for message in messages:
+        if isinstance(message, ModelRequest) and not replaced_user_prompt:
+            parts = []
+            for part in message.parts:
+                if isinstance(part, UserPromptPart) and not replaced_user_prompt:
+                    parts.append(replace(part, content=visible_user_query))
+                    replaced_user_prompt = True
+                else:
+                    parts.append(part)
+            sanitized.append(replace(message, parts=parts))
+        else:
+            sanitized.append(message)
+
+    return sanitized
 
 
 def _build_compliance_review_data(
