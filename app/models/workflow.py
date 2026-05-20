@@ -80,6 +80,25 @@ class IntentResult(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class IntentCatalogItem(BaseModel):
+    """Tenant-configurable intent option for query understanding."""
+
+    intent: str = Field(validation_alias=AliasChoices("intent", "name"))
+    description: str
+    sub_intents: list[str] = Field(default_factory=list, alias="subIntents")
+    candidate_skills: list[str] = Field(default_factory=list, alias="candidateSkills")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
+class QueryUnderstandingOutput(BaseModel):
+    """Combined resolver + intent output for single-call query understanding."""
+
+    resolved_query: ResolvedQuery
+    intent: IntentResult
+
+
 class EvidenceItem(BaseModel):
     """Legacy normalized evidence item kept for classic RAG compatibility."""
 

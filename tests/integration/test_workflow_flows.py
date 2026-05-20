@@ -32,6 +32,8 @@ from app.models.workflow import (
     IntentResult,
     NormalizedToolResultItem,
     PlannerOutput,
+    QueryUnderstandingOutput,
+    ResolvedQuery,
     ToolCallRecord,
     ToolObservation,
     ToolResultRecord,
@@ -581,6 +583,138 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
     assert ctx.metadata["analysis"]["compliance_passed"] == review_output.passed
     assert planner_agent.last_deps.available_tool_names == ["search_documents"]
     assert planner_agent.last_deps.flow_context.metadata["tenant_id"] == tenant_id
+
+
+@pytest.mark.asyncio
+async def test_query_understanding_planner_aggregation_answer_workflow(
+    mock_emitter,
+) -> None:
+    """A combined understanding step can replace refine_question + intent."""
+    tenant_id = "wealth-combined-tenant"
+
+    def _planner_setup(deps: Any) -> None:
+        flow_ctx = deps.flow_context
+        assert flow_ctx is not None
+        flow_ctx.metadata["tenant_id"] = tenant_id
+        flow_ctx.active_skills.append("wealth-skill")
+        deps.activated_skill_names.append("wealth-skill")
+        flow_ctx.tool_results.append(_tool_result())
+        flow_ctx.tool_calls.append(
+            ToolCallRecord(
+                tool_call_id="search_documents:1",
+                tool_name="search_documents",
+                input_payload={"query": "wealth query"},
+                status="success",
+                result_count=2,
+            )
+        )
+        flow_ctx.tool_observations.append(
+            ToolObservation(
+                tool_name="search_documents",
+                status="success",
+                task_status_hint="completed",
+                result_count=2,
+            )
+        )
+
+    understanding_agent = FakeAgent(
+        output=QueryUnderstandingOutput(
+            resolved_query=ResolvedQuery(
+                original_query="ignored",
+                standalone_query="What is the market view for this asset?",
+            ),
+            intent=IntentResult(
+                intent="market_outlook",
+                confidence=0.94,
+                candidate_skills=["wealth-skill"],
+            ),
+        ),
+    )
+    planner_agent = FakeAgent(
+        output=PlannerOutput(
+            can_continue_to_aggregation=True,
+            reason="Evidence is sufficient.",
+            completed_tasks=["search_documents"],
+        ),
+        on_enter=_planner_setup,
+    )
+    answer_agent = FakeAgent(
+        output="Combined answer.",
+        chunks=["Combined ", "answer."],
+    )
+
+    llm_handler = _llm_handler()
+    llm_handler._agent_cache[("query_understanding", "intent")] = understanding_agent
+    llm_handler._agent_cache[("answer", "pro")] = answer_agent
+
+    agent_config = AgentConfig(
+        llmType="pro",
+        buildInTools=["search_documents"],
+    )
+    steps = [
+        FlowStep(type=FlowStepType.LLM, mode="query_understanding", model="intent"),
+        FlowStep(type=FlowStepType.AGENT, mode="planner", agentConfig=agent_config),
+        FlowStep(type=FlowStepType.AGGREGATION),
+        FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
+        FlowStep(type=FlowStepType.ANALYSIS),
+    ]
+    tenant = TenantConfig(
+        kmsAppName=tenant_id,
+        applicationId=tenant_id,
+        adGroups=[],
+        llm_config=LLMConfig(models={}),
+        flow_config=FlowConfig(steps=steps),
+    )
+
+    planner_handler = _planner_handler(
+        tenant_id=tenant_id,
+        agent_config=agent_config,
+        providers=TenantProviders(),
+        agent=planner_agent,
+    )
+    handlers = {
+        FlowStepType.LLM: llm_handler,
+        FlowStepType.AGENT: planner_handler,
+        FlowStepType.AGGREGATION: AggregationHandler(),
+        FlowStepType.ANALYSIS: AnalysisHandler(),
+    }
+
+    ctx = await FlowEngine(tenant, handlers).execute(
+        "Give me the wealth view.",
+        emitter=mock_emitter,
+        session_id="session-combined",
+    )
+
+    assert ctx.metadata["steps_executed"] == [
+        "llm:query_understanding",
+        "agent:planner",
+        "aggregation",
+        "llm:answer",
+        "analysis",
+    ]
+    assert "llm:refine_question" not in ctx.metadata["steps_executed"]
+    assert "llm:intent" not in ctx.metadata["steps_executed"]
+    assert ctx.refined_query == "What is the market view for this asset?"
+    assert ctx.resolved_query == ResolvedQuery(
+        original_query="Give me the wealth view.",
+        standalone_query="What is the market view for this asset?",
+    )
+    assert ctx.intent == IntentResult(
+        intent="market_outlook",
+        confidence=0.94,
+        candidate_skills=["wealth-skill"],
+    )
+    assert planner_agent.last_prompt is not None
+    assert '"intent": "market_outlook"' in planner_agent.last_prompt
+    assert "What is the market view for this asset?" in planner_agent.last_prompt
+    assert ctx.aggregated_evidence is not None
+    assert ctx.aggregated_evidence.synthesis_allowed is True
+    assert [item.content for item in ctx.aggregated_evidence.selected_evidence] == [
+        "Evidence one for wealth analysis.",
+        "Evidence two for wealth analysis.",
+    ]
+    assert ctx.llm_response == "Combined answer."
+    assert ctx.metadata["analysis"]["streaming_policy"] == "token"
 
 
 @pytest.mark.asyncio

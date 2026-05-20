@@ -10,6 +10,30 @@ from pydantic_ai import Agent
 
 from app.core.model_registry import ModelRegistry
 from app.models.domain import IntentResult
+from app.models.workflow import IntentCatalogItem
+
+DEFAULT_INTENT_CATALOG: tuple[IntentCatalogItem, ...] = (
+    IntentCatalogItem(
+        intent="knowledge_query",
+        description="The user wants to retrieve knowledge from the document base.",
+    ),
+    IntentCatalogItem(
+        intent="chitchat",
+        description="General conversation not requiring document retrieval.",
+    ),
+    IntentCatalogItem(
+        intent="code_help",
+        description="The user needs help with code or technical implementation.",
+    ),
+    IntentCatalogItem(
+        intent="comparison",
+        description="The user wants to compare two or more concepts.",
+    ),
+    IntentCatalogItem(
+        intent="summarization",
+        description="The user wants a summary of a topic.",
+    ),
+)
 
 DEFAULT_INSTRUCTIONS = """\
 You are an intent classification assistant.

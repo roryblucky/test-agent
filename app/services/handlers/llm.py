@@ -7,6 +7,7 @@ tenant/domain contract layers — not just the Agent step.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -26,7 +27,14 @@ from app.agents.intent_recognition import (
     DEFAULT_INSTRUCTIONS as _INTENT_INSTRUCTIONS,
 )
 from app.agents.intent_recognition import (
+    DEFAULT_INTENT_CATALOG,
     create_intent_agent,
+)
+from app.agents.query_understanding import (
+    DEFAULT_INSTRUCTIONS as _QUERY_UNDERSTANDING_INSTRUCTIONS,
+)
+from app.agents.query_understanding import (
+    create_query_understanding_agent,
 )
 from app.agents.rag_answer import create_rag_answer_agent
 from app.agents.refine_question import (
@@ -42,6 +50,9 @@ from app.models.domain import RefinedQuestion
 from app.models.workflow import (
     AggregatedEvidenceBundle,
     ComplianceReviewResult,
+    IntentCatalogItem,
+    IntentResult,
+    QueryUnderstandingOutput,
     ResolvedQuery,
 )
 from app.prompts.builder import LayeredPromptBuilder
@@ -55,6 +66,7 @@ _SETTINGS_KEY_MAP: dict[str, str] = {
     "topP": "top_p",
     "top_p": "top_p",
 }
+_NON_MODEL_SETTINGS_KEYS = {"intentCatalog", "intent_catalog"}
 
 _COMPLIANCE_BLOCKED_RESPONSE = (
     "The draft answer could not be released because it did not pass compliance review."
@@ -71,6 +83,8 @@ def _build_step_settings(step: FlowStep) -> dict[str, Any] | None:
 
     result: dict[str, Any] = {}
     for key, value in step.settings.items():
+        if key in _NON_MODEL_SETTINGS_KEYS:
+            continue
         mapped_key = _SETTINGS_KEY_MAP.get(key, key)
         result[mapped_key] = value
 
@@ -101,6 +115,7 @@ class LLMHandler:
     _MODE_IDENTITY: dict[str, str] = {
         "refine_question": _REFINE_INSTRUCTIONS,
         "intent": _INTENT_INSTRUCTIONS,
+        "query_understanding": _QUERY_UNDERSTANDING_INSTRUCTIONS,
         "compliance_review": (
             "You are reviewing a draft answer before it can be released to the user.\n"
             "Return only the ComplianceReviewResult schema.\n"
@@ -136,12 +151,14 @@ class LLMHandler:
         _AGENT_FACTORIES: dict[str, Callable] = {
             "refine_question": create_refine_agent,
             "intent": create_intent_agent,
+            "query_understanding": create_query_understanding_agent,
             "answer": create_rag_answer_agent,
             "compliance_review": create_compliance_review_agent,
         }
         _DEFAULT_MODELS: dict[str, str] = {
             "refine_question": "fast",
             "intent": "intent",
+            "query_understanding": "intent",
             "answer": "pro",
             "compliance_review": "fast",
         }
@@ -165,6 +182,7 @@ class LLMHandler:
             factories: dict[str, Callable] = {
                 "refine_question": create_refine_agent,
                 "intent": create_intent_agent,
+                "query_understanding": create_query_understanding_agent,
                 "answer": create_rag_answer_agent,
                 "compliance_review": create_compliance_review_agent,
             }
@@ -187,6 +205,8 @@ class LLMHandler:
                 return await self._llm_refine_question(ctx, step)
             case "intent":
                 return await self._llm_intent(ctx, step)
+            case "query_understanding":
+                return await self._llm_query_understanding(ctx, step)
             case "answer":
                 return await self._llm_answer(ctx, step)
             case "compliance_review":
@@ -209,17 +229,7 @@ class LLMHandler:
             ctx.add_usage(stream.usage())
 
         resolved_query = self._coerce_resolved_query(ctx, result)
-        ctx.refined_query = resolved_query.standalone_query
-        ctx.resolved_query = resolved_query
-        ctx.metadata["history_dependency"] = resolved_query.history_dependency
-        if resolved_query.conversation_context_summary:
-            ctx.metadata["conversation_context_summary"] = (
-                resolved_query.conversation_context_summary
-            )
-        if resolved_query.conversation_context:
-            ctx.metadata["conversation_context"] = (
-                resolved_query.conversation_context.model_dump()
-            )
+        self._store_resolved_query(ctx, resolved_query)
         if resolved_query.needs_clarification:
             self._apply_query_clarification(ctx, resolved_query)
         if ctx.emitter:
@@ -254,6 +264,47 @@ class LLMHandler:
                     "intent": result.intent,
                     "confidence": result.confidence,
                     "sub_intents": result.sub_intents,
+                    "model": model_name,
+                },
+            )
+        return ctx
+
+    async def _llm_query_understanding(
+        self, ctx: FlowContext, step: FlowStep
+    ) -> FlowContext:
+        model_name = step.model or "intent"
+        agent = self._get_agent("query_understanding", model_name)
+        settings = _build_step_settings(step)
+        runtime_prompt = self._build_query_understanding_runtime_prompt(ctx, step)
+        async with agent.run_stream(
+            runtime_prompt,
+            model_settings=settings,
+        ) as stream:
+            result = await stream.get_output()
+            ctx.add_usage(stream.usage())
+
+        output = self._coerce_query_understanding_output(ctx, result)
+        self._store_resolved_query(ctx, output.resolved_query)
+        ctx.intent = output.intent
+
+        if output.resolved_query.needs_clarification:
+            self._apply_query_clarification(ctx, output.resolved_query)
+        elif output.intent.needs_clarification:
+            self._apply_intent_clarification(ctx, output.intent)
+
+        if ctx.emitter:
+            await ctx.emitter.emit_step_completed(
+                "llm:query_understanding",
+                {
+                    "refined_query": output.resolved_query.standalone_query,
+                    "history_dependency": output.resolved_query.history_dependency,
+                    "needs_clarification": (
+                        output.resolved_query.needs_clarification
+                        or output.intent.needs_clarification
+                    ),
+                    "intent": output.intent.intent,
+                    "confidence": output.intent.confidence,
+                    "sub_intents": output.intent.sub_intents,
                     "model": model_name,
                 },
             )
@@ -459,6 +510,34 @@ class LLMHandler:
         )
 
     @staticmethod
+    def _build_query_understanding_runtime_prompt(
+        ctx: FlowContext,
+        step: FlowStep,
+    ) -> str:
+        recent_history = _sanitize_visible_message_history(ctx.message_history)
+        rolling_summary = str(ctx.metadata.get("conversation_summary") or "")
+        intent_catalog = _intent_catalog_for_step(step)
+        intent_catalog_json = _dump_runtime_json(
+            [item.model_dump(mode="json") for item in intent_catalog]
+        )
+        return (
+            "<query_understanding_input>\n"
+            "<latest_user_query>\n"
+            f"{ctx.query}\n"
+            "</latest_user_query>\n\n"
+            "<recent_chat_history>\n"
+            f"{recent_history}\n"
+            "</recent_chat_history>\n\n"
+            "<rolling_summary>\n"
+            f"{rolling_summary}\n"
+            "</rolling_summary>\n\n"
+            "<intent_catalog>\n"
+            f"{intent_catalog_json}\n"
+            "</intent_catalog>\n"
+            "</query_understanding_input>"
+        )
+
+    @staticmethod
     def _coerce_compliance_review(output: Any) -> ComplianceReviewResult:
         if isinstance(output, ComplianceReviewResult):
             return output
@@ -480,6 +559,37 @@ class LLMHandler:
             )
         resolved = ResolvedQuery.model_validate(output)
         return resolved.model_copy(update={"original_query": ctx.query})
+
+    @staticmethod
+    def _coerce_query_understanding_output(
+        ctx: FlowContext,
+        output: Any,
+    ) -> QueryUnderstandingOutput:
+        if isinstance(output, QueryUnderstandingOutput):
+            understanding = output
+        else:
+            understanding = QueryUnderstandingOutput.model_validate(output)
+        resolved_query = understanding.resolved_query.model_copy(
+            update={"original_query": ctx.query}
+        )
+        return understanding.model_copy(update={"resolved_query": resolved_query})
+
+    @staticmethod
+    def _store_resolved_query(
+        ctx: FlowContext,
+        resolved_query: ResolvedQuery,
+    ) -> None:
+        ctx.refined_query = resolved_query.standalone_query
+        ctx.resolved_query = resolved_query
+        ctx.metadata["history_dependency"] = resolved_query.history_dependency
+        if resolved_query.conversation_context_summary:
+            ctx.metadata["conversation_context_summary"] = (
+                resolved_query.conversation_context_summary
+            )
+        if resolved_query.conversation_context:
+            ctx.metadata["conversation_context"] = (
+                resolved_query.conversation_context.model_dump()
+            )
 
     @staticmethod
     def _apply_query_clarification(
@@ -508,12 +618,64 @@ class LLMHandler:
         ctx.metadata["stop_reason"] = "query_needs_clarification"
 
     @staticmethod
+    def _apply_intent_clarification(
+        ctx: FlowContext,
+        intent: IntentResult,
+    ) -> None:
+        question = (
+            intent.clarification_question
+            or "Could you clarify what you want this workflow to do?"
+        )
+        ctx.llm_response = question
+        ctx.clarification_request = {
+            "response": question,
+            "quick_questions": [{"question": question, "options": []}],
+        }
+        ctx.metadata["stop_flow"] = True
+        ctx.metadata["stop_reason"] = "intent_needs_clarification"
+
+    @staticmethod
     def _should_buffer_answer(ctx: FlowContext) -> bool:
         return ctx.metadata.get("streaming_policy") == _STREAMING_POLICY_APPROVED_ONLY
 
     @staticmethod
     def _should_release_after_review(ctx: FlowContext) -> bool:
         return ctx.metadata.get("streaming_policy") == _STREAMING_POLICY_APPROVED_ONLY
+
+
+def _intent_catalog_for_step(step: FlowStep) -> list[IntentCatalogItem]:
+    """Normalize optional per-step intent catalog settings."""
+    settings = step.settings or {}
+    raw_catalog = settings.get("intentCatalog")
+    if raw_catalog is None:
+        raw_catalog = settings.get("intent_catalog")
+    if raw_catalog is None:
+        return list(DEFAULT_INTENT_CATALOG)
+
+    if isinstance(raw_catalog, dict):
+        if "intent" in raw_catalog or "name" in raw_catalog:
+            raw_items: Any = [raw_catalog]
+        elif "items" in raw_catalog:
+            raw_items = raw_catalog["items"]
+        elif "intents" in raw_catalog:
+            raw_items = raw_catalog["intents"]
+        else:
+            raw_items = list(raw_catalog.values())
+    else:
+        raw_items = raw_catalog
+
+    if not isinstance(raw_items, list):
+        raise ValueError("step.settings.intentCatalog must be a list of intent items")
+
+    return [
+        item if isinstance(item, IntentCatalogItem) else IntentCatalogItem.model_validate(item)
+        for item in raw_items
+    ]
+
+
+def _dump_runtime_json(value: Any) -> str:
+    """Serialize runtime context for prompt embedding."""
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def _format_aggregated_evidence(bundle: AggregatedEvidenceBundle) -> str:
