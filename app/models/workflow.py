@@ -58,8 +58,7 @@ class ResolvedQuery(BaseModel):
     lookback_days: int | None = None
 
     needs_clarification: bool = False
-    clarification_question: str | None = None
-    keywords: list[str] = Field(default_factory=list)
+    clarification_questions: list[str] = Field(default_factory=list)
     ambiguity: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)

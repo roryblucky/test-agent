@@ -211,7 +211,6 @@ class LLMHandler:
         resolved_query = self._coerce_resolved_query(ctx, result)
         ctx.refined_query = resolved_query.standalone_query
         ctx.resolved_query = resolved_query
-        ctx.metadata["keywords"] = resolved_query.keywords
         ctx.metadata["history_dependency"] = resolved_query.history_dependency
         if resolved_query.conversation_context_summary:
             ctx.metadata["conversation_context_summary"] = (
@@ -221,13 +220,15 @@ class LLMHandler:
             ctx.metadata["conversation_context"] = (
                 resolved_query.conversation_context.model_dump()
             )
+        if resolved_query.needs_clarification:
+            self._apply_query_clarification(ctx, resolved_query)
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
                 "llm:refine_question",
                 {
                     "refined_query": resolved_query.standalone_query,
-                    "keywords": resolved_query.keywords,
                     "history_dependency": resolved_query.history_dependency,
+                    "needs_clarification": resolved_query.needs_clarification,
                     "model": model_name,
                 },
             )
@@ -471,19 +472,40 @@ class LLMHandler:
             return ResolvedQuery(
                 original_query=ctx.query,
                 standalone_query=output.refined_query,
-                keywords=output.keywords,
-                metadata={"keywords": output.keywords},
             )
         if isinstance(output, dict) and "refined_query" in output:
-            keywords = _normalize_keywords(output.get("keywords"))
             return ResolvedQuery(
                 original_query=ctx.query,
                 standalone_query=str(output["refined_query"]),
-                keywords=keywords,
-                metadata={"keywords": keywords},
             )
         resolved = ResolvedQuery.model_validate(output)
         return resolved.model_copy(update={"original_query": ctx.query})
+
+    @staticmethod
+    def _apply_query_clarification(
+        ctx: FlowContext,
+        resolved_query: ResolvedQuery,
+    ) -> None:
+        questions = [
+            question
+            for question in resolved_query.clarification_questions
+            if question.strip()
+        ]
+        fallback_question = "Could you clarify what you mean?"
+        if not questions:
+            questions = [fallback_question]
+
+        response = questions[0]
+        ctx.llm_response = response
+        ctx.clarification_request = {
+            "response": response,
+            "quick_questions": [
+                {"question": question, "options": []}
+                for question in questions
+            ],
+        }
+        ctx.metadata["stop_flow"] = True
+        ctx.metadata["stop_reason"] = "query_needs_clarification"
 
     @staticmethod
     def _should_buffer_answer(ctx: FlowContext) -> bool:
@@ -559,14 +581,6 @@ def _sanitize_answer_new_messages(
             sanitized.append(message)
 
     return sanitized
-
-
-def _normalize_keywords(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(item) for item in value]
-    return [str(value)]
 
 
 def _sanitize_visible_message_history(

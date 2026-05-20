@@ -41,7 +41,6 @@ import time
 from typing import Any
 
 from app.config.models import (
-    FlowStep,
     FlowStepType,
     StepRoutingAction,
     StepRoutingRule,
@@ -126,6 +125,14 @@ class FlowEngine:
                     await ctx.emitter.emit_step_start(step_name)
 
                 ctx = await handler.handle(ctx, step)
+
+                if ctx.metadata.get("stop_flow"):
+                    logger.info(
+                        "Flow stopped at step %r: %s",
+                        step_name,
+                        ctx.metadata.get("stop_reason") or "stop_flow",
+                    )
+                    break
 
                 # --- Conditional routing ---
                 if step.routing:
