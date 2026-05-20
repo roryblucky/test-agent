@@ -11,6 +11,32 @@ from typing import Any, Literal, Self
 
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
+HistoryDependency = Literal[
+    "none",
+    "follow_up",
+    "summarize_history",
+    "revise_previous",
+    "continue_previous",
+    "compare_previous",
+]
+ConversationContextUsage = Literal[
+    "none",
+    "understand_query",
+    "user_requested_summary",
+    "revise_previous",
+    "continue_previous",
+    "compare_previous",
+]
+
+
+class ConversationContext(BaseModel):
+    """Sanitized conversation material approved for downstream use."""
+
+    usage: ConversationContextUsage
+    content: str
+    source: Literal["chat_history"] = "chat_history"
+    source_turn_count: int = 0
+
 
 class ResolvedQuery(BaseModel):
     """Structured query resolution output for complex workflows."""
@@ -18,6 +44,10 @@ class ResolvedQuery(BaseModel):
     original_query: str
     standalone_query: str
     language: str = "zh-CN"
+
+    history_dependency: HistoryDependency = "none"
+    conversation_context_summary: str | None = None
+    conversation_context: ConversationContext | None = None
 
     subject_text: str | None = None
     subject_type: str = "unknown"
@@ -27,6 +57,9 @@ class ResolvedQuery(BaseModel):
     time_range_text: str | None = None
     lookback_days: int | None = None
 
+    needs_clarification: bool = False
+    clarification_question: str | None = None
+    keywords: list[str] = Field(default_factory=list)
     ambiguity: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)

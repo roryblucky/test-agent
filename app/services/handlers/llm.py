@@ -12,7 +12,14 @@ from dataclasses import replace
 from typing import Any
 
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextContent,
+    TextPart,
+    UserPromptPart,
+)
 
 from app.agents.compliance_review import create_compliance_review_agent
 from app.agents.intent_recognition import (
@@ -31,6 +38,7 @@ from app.agents.refine_question import (
 from app.config.models import FlowStep, TenantConfig
 from app.core.model_registry import ModelRegistry
 from app.core.telemetry import trace_span
+from app.models.domain import RefinedQuestion
 from app.models.workflow import (
     AggregatedEvidenceBundle,
     ComplianceReviewResult,
@@ -52,6 +60,8 @@ _COMPLIANCE_BLOCKED_RESPONSE = (
     "The draft answer could not be released because it did not pass compliance review."
 )
 _STREAMING_POLICY_APPROVED_ONLY = "approved_answer_only"
+_HISTORY_MAX_TURNS = 10
+_HISTORY_MAX_CHARS = 12_000
 
 
 def _build_step_settings(step: FlowStep) -> dict[str, Any] | None:
@@ -190,27 +200,34 @@ class LLMHandler:
         model_name = step.model or "fast"
         agent = self._get_agent("refine_question", model_name)
         settings = _build_step_settings(step)
+        runtime_prompt = self._build_query_resolver_runtime_prompt(ctx)
         async with agent.run_stream(
-            ctx.query,
+            runtime_prompt,
             model_settings=settings,
-            message_history=ctx.message_history or None,
         ) as stream:
             result = await stream.get_output()
             ctx.add_usage(stream.usage())
 
-        ctx.refined_query = result.refined_query
-        ctx.resolved_query = ResolvedQuery(
-            original_query=ctx.query,
-            standalone_query=result.refined_query,
-            metadata={"keywords": result.keywords},
-        )
-        ctx.metadata["keywords"] = result.keywords
+        resolved_query = self._coerce_resolved_query(ctx, result)
+        ctx.refined_query = resolved_query.standalone_query
+        ctx.resolved_query = resolved_query
+        ctx.metadata["keywords"] = resolved_query.keywords
+        ctx.metadata["history_dependency"] = resolved_query.history_dependency
+        if resolved_query.conversation_context_summary:
+            ctx.metadata["conversation_context_summary"] = (
+                resolved_query.conversation_context_summary
+            )
+        if resolved_query.conversation_context:
+            ctx.metadata["conversation_context"] = (
+                resolved_query.conversation_context.model_dump()
+            )
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
                 "llm:refine_question",
                 {
-                    "refined_query": result.refined_query,
-                    "keywords": result.keywords,
+                    "refined_query": resolved_query.standalone_query,
+                    "keywords": resolved_query.keywords,
+                    "history_dependency": resolved_query.history_dependency,
                     "model": model_name,
                 },
             )
@@ -423,10 +440,50 @@ class LLMHandler:
         )
 
     @staticmethod
+    def _build_query_resolver_runtime_prompt(ctx: FlowContext) -> str:
+        recent_history = _sanitize_visible_message_history(ctx.message_history)
+        rolling_summary = str(ctx.metadata.get("conversation_summary") or "")
+        return (
+            "<query_resolver_input>\n"
+            "<latest_user_query>\n"
+            f"{ctx.query}\n"
+            "</latest_user_query>\n\n"
+            "<recent_chat_history>\n"
+            f"{recent_history}\n"
+            "</recent_chat_history>\n\n"
+            "<rolling_summary>\n"
+            f"{rolling_summary}\n"
+            "</rolling_summary>\n"
+            "</query_resolver_input>"
+        )
+
+    @staticmethod
     def _coerce_compliance_review(output: Any) -> ComplianceReviewResult:
         if isinstance(output, ComplianceReviewResult):
             return output
         return ComplianceReviewResult.model_validate(output)
+
+    @staticmethod
+    def _coerce_resolved_query(ctx: FlowContext, output: Any) -> ResolvedQuery:
+        if isinstance(output, ResolvedQuery):
+            return output.model_copy(update={"original_query": ctx.query})
+        if isinstance(output, RefinedQuestion):
+            return ResolvedQuery(
+                original_query=ctx.query,
+                standalone_query=output.refined_query,
+                keywords=output.keywords,
+                metadata={"keywords": output.keywords},
+            )
+        if isinstance(output, dict) and "refined_query" in output:
+            keywords = _normalize_keywords(output.get("keywords"))
+            return ResolvedQuery(
+                original_query=ctx.query,
+                standalone_query=str(output["refined_query"]),
+                keywords=keywords,
+                metadata={"keywords": keywords},
+            )
+        resolved = ResolvedQuery.model_validate(output)
+        return resolved.model_copy(update={"original_query": ctx.query})
 
     @staticmethod
     def _should_buffer_answer(ctx: FlowContext) -> bool:
@@ -502,6 +559,93 @@ def _sanitize_answer_new_messages(
             sanitized.append(message)
 
     return sanitized
+
+
+def _normalize_keywords(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _sanitize_visible_message_history(
+    messages: list[ModelMessage],
+    *,
+    max_turns: int = _HISTORY_MAX_TURNS,
+    max_chars: int = _HISTORY_MAX_CHARS,
+) -> str:
+    """Render user-visible chat history for the query resolver.
+
+    This deliberately ignores system instructions, tool returns, raw
+    runtime prompts, and message metadata.
+    """
+    turns: list[tuple[str, str]] = []
+
+    for message in messages:
+        if isinstance(message, ModelRequest):
+            for part in message.parts:
+                if isinstance(part, UserPromptPart):
+                    text = _visible_user_prompt_text(part)
+                    if text:
+                        turns.append(("user", text))
+        elif isinstance(message, ModelResponse):
+            text_parts = [
+                part.content.strip()
+                for part in message.parts
+                if isinstance(part, TextPart) and part.content.strip()
+            ]
+            if text_parts:
+                turns.append(("assistant", "\n".join(text_parts)))
+
+    if not turns:
+        return ""
+
+    selected_turns = turns[-max_turns:]
+    rendered = "\n\n".join(
+        f"[{role}]\n{text}" for role, text in selected_turns
+    )
+    if len(rendered) <= max_chars:
+        return rendered
+    return "[truncated]\n" + rendered[-max_chars:]
+
+
+def _visible_user_prompt_text(part: UserPromptPart) -> str:
+    content = part.content
+    if isinstance(content, str):
+        text = content.strip()
+    else:
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, TextContent):
+                chunks.append(item.content)
+        text = "\n".join(chunk.strip() for chunk in chunks if chunk.strip())
+
+    if not text:
+        return ""
+
+    runtime_original = _extract_xml_text(text, "original_user_query")
+    if runtime_original:
+        return runtime_original
+    if "<runtime_answer_input" in text or "<reference_data>" in text:
+        return ""
+    return text
+
+
+def _extract_xml_text(text: str, tag: str) -> str | None:
+    start_tag = f"<{tag}>"
+    end_tag = f"</{tag}>"
+    start_index = text.find(start_tag)
+    if start_index < 0:
+        return None
+    content_start = start_index + len(start_tag)
+    end_index = text.find(end_tag, content_start)
+    if end_index < 0:
+        return None
+    extracted = text[content_start:end_index].strip()
+    return extracted or None
 
 
 def _build_compliance_review_data(
