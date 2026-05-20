@@ -13,11 +13,15 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.usage import RunUsage
 
+from app.agents.query_understanding import (
+    DEFAULT_INSTRUCTIONS as QUERY_UNDERSTANDING_INSTRUCTIONS,
+)
 from app.api.schemas import QueryResponse
 from app.config.models import FlowStep, FlowStepType
 from app.models.domain import RefinedQuestion
 from app.models.workflow import (
     IntentResult,
+    QueryUnderstandingClarification,
     QueryUnderstandingOutput,
     ResolvedQuery,
 )
@@ -139,6 +143,21 @@ async def test_query_understanding_sets_resolved_query_and_intent() -> None:
     assert '"intent": "market_outlook"' in fake_agent.last_prompt
 
 
+def test_query_understanding_instructions_define_language_and_catalog_rules() -> None:
+    """The combined agent prompt explains language, names, and catalog usage."""
+    assert "<language_rules>" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "zh-Hans" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "zh-Hant" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "yue-Hant" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "<proper_noun_rules>" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "<intent_catalog_rules>" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "runtime <intent_catalog>" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "QueryUnderstandingOutput.clarification" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "ResolvedQuery and IntentResult do not contain user clarification fields" in (
+        QUERY_UNDERSTANDING_INSTRUCTIONS
+    )
+
+
 @pytest.mark.asyncio
 async def test_query_understanding_sanitizes_history_payloads() -> None:
     """Runtime answer payloads and system parts are not exposed as history."""
@@ -188,17 +207,20 @@ SECRET EVIDENCE PAYLOAD
 
 
 @pytest.mark.asyncio
-async def test_query_understanding_resolver_clarification_stops_flow() -> None:
-    """Resolver ambiguity uses the existing query clarification stop-flow path."""
+async def test_query_understanding_query_clarification_stops_flow() -> None:
+    """Top-level query-resolution clarification stops downstream flow."""
     fake_agent = FakeUnderstandingAgent(
         QueryUnderstandingOutput(
             resolved_query=ResolvedQuery(
                 original_query="ignored",
                 standalone_query="Clarify the referenced item.",
-                needs_clarification=True,
-                clarification_questions=["你说的“这个”是指哪个资产？"],
             ),
             intent=IntentResult(intent="market_outlook", confidence=0.55),
+            clarification=QueryUnderstandingClarification(
+                scope="query_resolution",
+                questions=["你说的“这个”是指哪个资产？"],
+                reason="The referenced item is ambiguous.",
+            ),
         )
     )
     handler = _handler(fake_agent)
@@ -210,7 +232,10 @@ async def test_query_understanding_resolver_clarification_stops_flow() -> None:
     )
 
     assert result.metadata["stop_flow"] is True
-    assert result.metadata["stop_reason"] == "query_needs_clarification"
+    assert (
+        result.metadata["stop_reason"]
+        == "query_understanding_needs_query_clarification"
+    )
     assert result.llm_response == "你说的“这个”是指哪个资产？"
     response = QueryResponse.from_flow_context(result)
     assert response.clarification is not None
@@ -218,8 +243,8 @@ async def test_query_understanding_resolver_clarification_stops_flow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_query_understanding_intent_clarification_stops_flow() -> None:
-    """Business ambiguity can stop after intent classification."""
+async def test_query_understanding_intent_selection_clarification_stops_flow() -> None:
+    """Top-level intent-selection clarification stops downstream flow."""
     fake_agent = FakeUnderstandingAgent(
         QueryUnderstandingOutput(
             resolved_query=ResolvedQuery(
@@ -229,8 +254,10 @@ async def test_query_understanding_intent_clarification_stops_flow() -> None:
             intent=IntentResult(
                 intent="market_outlook",
                 confidence=0.52,
-                needs_clarification=True,
-                clarification_question="你想看市场观点、目标价，还是新闻摘要？",
+            ),
+            clarification=QueryUnderstandingClarification(
+                scope="intent_selection",
+                questions=["你想看市场观点、目标价，还是新闻摘要？"],
             ),
         )
     )
@@ -243,7 +270,10 @@ async def test_query_understanding_intent_clarification_stops_flow() -> None:
     )
 
     assert result.metadata["stop_flow"] is True
-    assert result.metadata["stop_reason"] == "intent_needs_clarification"
+    assert (
+        result.metadata["stop_reason"]
+        == "query_understanding_needs_intent_clarification"
+    )
     assert result.llm_response == "你想看市场观点、目标价，还是新闻摘要？"
     response = QueryResponse.from_flow_context(result)
     assert response.clarification is not None

@@ -59,24 +59,6 @@ If the user explicitly asks about prior conversation:
 Do not include chain-of-thought.
 </history_rules>
 
-<clarification_rules>
-Set needs_clarification=true only when the latest user query cannot be safely resolved from the latest query and sanitized history.
-
-Use resolver clarification for:
-- ambiguous pronouns or references,
-- missing subject in a follow-up,
-- multiple possible previous topics,
-- unclear request that cannot be converted into a standalone_query.
-
-Do not ask for clarification just because business intent is broad.
-Business-scenario clarification is handled by the Intent Detector.
-
-When needs_clarification=true:
-- clarification_questions must contain one or more concise user-facing questions,
-- standalone_query should be the best safe restatement of the unresolved request,
-- do not invent missing context.
-</clarification_rules>
-
 <output_requirements>
 Return only JSON matching the ResolvedQuery schema.
 Do not include markdown or explanations outside JSON.

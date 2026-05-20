@@ -27,6 +27,10 @@ ConversationContextUsage = Literal[
     "continue_previous",
     "compare_previous",
 ]
+QueryUnderstandingClarificationScope = Literal[
+    "query_resolution",
+    "intent_selection",
+]
 
 
 class ConversationContext(BaseModel):
@@ -57,8 +61,6 @@ class ResolvedQuery(BaseModel):
     time_range_text: str | None = None
     lookback_days: int | None = None
 
-    needs_clarification: bool = False
-    clarification_questions: list[str] = Field(default_factory=list)
     ambiguity: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -74,8 +76,6 @@ class IntentResult(BaseModel):
     candidate_skills: list[str] = Field(default_factory=list)
     required_data_sources: list[str] = Field(default_factory=list)
 
-    needs_clarification: bool = False
-    clarification_question: str | None = None
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -92,11 +92,20 @@ class IntentCatalogItem(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class QueryUnderstandingClarification(BaseModel):
+    """Unified user clarification request for query understanding."""
+
+    scope: QueryUnderstandingClarificationScope
+    questions: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class QueryUnderstandingOutput(BaseModel):
     """Combined resolver + intent output for single-call query understanding."""
 
     resolved_query: ResolvedQuery
     intent: IntentResult
+    clarification: QueryUnderstandingClarification | None = None
 
 
 class EvidenceItem(BaseModel):

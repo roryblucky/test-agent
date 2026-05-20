@@ -194,10 +194,10 @@ class StepRoutingRule(BaseModel):
         {"match_field": "intent.intent", "match_value": "out_of_scope",
          "action": "abort", "response": "This question is out of scope."}
 
-        # Skip to answer step when clarification is needed
-        {"match_field": "intent.needs_clarification", "match_value": true,
+        # Abort when a handler has produced a clarification request
+        {"match_field": "metadata.needs_clarification", "match_value": true,
          "action": "abort",
-         "response_from_field": "intent.clarification_question"}
+         "response_from_field": "clarification_request.response"}
     """
 
     match_field: str = Field(alias="matchField")

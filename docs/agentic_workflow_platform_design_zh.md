@@ -443,8 +443,6 @@ class IntentResult(BaseModel):
     candidate_skills: list[str] = Field(default_factory=list)
     required_data_sources: list[str] = Field(default_factory=list)
 
-    needs_clarification: bool = False
-    clarification_question: str | None = None
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 ```
@@ -953,8 +951,8 @@ async def handle(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
   "routing": [
     {"matchField": "intent.intent", "matchValue": "out_of_scope",
      "action": "abort", "response": "This question is out of scope."},
-    {"matchField": "intent.needs_clarification", "matchValue": true,
-     "action": "abort", "responseFromField": "intent.clarification_question"},
+    {"matchField": "metadata.needs_clarification", "matchValue": true,
+     "action": "abort", "responseFromField": "clarification_request.response"},
     {"matchField": "intent.intent", "matchValue": "simple_query",
      "action": "skip_to", "targetStep": "llm:answer"}
   ]

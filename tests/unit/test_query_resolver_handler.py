@@ -13,7 +13,6 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.usage import RunUsage
 
-from app.api.schemas import QueryResponse
 from app.config.models import (
     FlowConfig,
     FlowStep,
@@ -179,40 +178,6 @@ SECRET EVIDENCE PAYLOAD
     assert "SECRET EVIDENCE PAYLOAD" not in fake_agent.last_prompt
     assert "SECRET SYSTEM PROMPT" not in fake_agent.last_prompt
     assert "SECRET INSTRUCTIONS" not in fake_agent.last_prompt
-
-
-@pytest.mark.asyncio
-async def test_query_resolver_sets_clarification_and_stop_flow() -> None:
-    """Resolver-level ambiguity asks the user and stops downstream flow."""
-    fake_agent = FakeResolverAgent(
-        ResolvedQuery(
-            original_query="ignored",
-            standalone_query="Clarify the referenced item.",
-            needs_clarification=True,
-            clarification_questions=[
-                "你说的“这个”是指 planner 方案还是 answer 方案？",
-                "你想比较实现复杂度还是合规风险？",
-            ],
-        )
-    )
-    handler = _handler(fake_agent)
-    ctx = FlowContext(query="那这个呢？")
-
-    result = await handler.handle(
-        ctx,
-        FlowStep(type=FlowStepType.LLM, mode="refine_question", model="fast"),
-    )
-
-    assert result.metadata["stop_flow"] is True
-    assert result.metadata["stop_reason"] == "query_needs_clarification"
-    assert result.llm_response == "你说的“这个”是指 planner 方案还是 answer 方案？"
-    response = QueryResponse.from_flow_context(result)
-    assert response.clarification is not None
-    assert response.clarification.response == result.llm_response
-    assert [item.question for item in response.clarification.quick_questions] == [
-        "你说的“这个”是指 planner 方案还是 answer 方案？",
-        "你想比较实现复杂度还是合规风险？",
-    ]
 
 
 @pytest.mark.asyncio

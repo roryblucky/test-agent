@@ -21,7 +21,6 @@ from app.config.models import (
 from app.services.flow_context import FlowContext
 from app.services.flow_engine import FlowEngine
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -68,17 +67,14 @@ def _intent_mutator(intent_value: str):
 
 
 def _clarification_mutator():
-    """Return a mutator that sets needs_clarification on intent."""
+    """Return a mutator that sets a generic clarification request."""
 
     def _mutate(ctx: FlowContext, step):
-        from app.models.workflow import IntentResult
-
-        ctx.intent = IntentResult(
-            intent="clarification_needed",
-            confidence=0.90,
-            needs_clarification=True,
-            clarification_question="Which product are you asking about?",
-        )
+        ctx.metadata["needs_clarification"] = True
+        ctx.clarification_request = {
+            "response": "Which product are you asking about?",
+            "quick_questions": [],
+        }
 
     return _mutate
 
@@ -97,7 +93,6 @@ class TestFlowRoutingAbort:
         llm_handler = RecordingHandler(
             "llm", mutator=_intent_mutator("out_of_scope")
         )
-        answer_handler = RecordingHandler("answer_llm")
 
         steps = [
             FlowStep(
@@ -137,10 +132,10 @@ class TestFlowRoutingAbort:
                 mode="intent",
                 routing=[
                     StepRoutingRule(
-                        matchField="intent.needs_clarification",
+                        matchField="metadata.needs_clarification",
                         matchValue=True,
                         action=StepRoutingAction.ABORT,
-                        responseFromField="intent.clarification_question",
+                        responseFromField="clarification_request.response",
                     ),
                 ],
             ),
@@ -220,7 +215,7 @@ class TestFlowRoutingSkipTo:
             _make_tenant(steps),
             {FlowStepType.LLM: handler},
         )
-        ctx = await engine.execute("simple question")
+        await engine.execute("simple question")
 
         # refine_question should be skipped
         assert handler.calls == ["llm:intent", "llm:answer"]
@@ -266,7 +261,7 @@ class TestFlowRoutingGoto:
                 FlowStepType.ANALYSIS: analysis_handler,
             },
         )
-        ctx = await engine.execute("fast question")
+        await engine.execute("fast question")
 
         # refine_question skipped, answer and analysis both execute
         assert handler.calls == ["llm:intent", "llm:answer"]
@@ -331,7 +326,7 @@ class TestFlowRoutingNoRouting:
                 FlowStepType.ANALYSIS: analysis_handler,
             },
         )
-        ctx = await engine.execute("any question")
+        await engine.execute("any question")
 
         assert handler.calls == [
             "llm:refine_question",

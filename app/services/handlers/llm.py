@@ -51,7 +51,7 @@ from app.models.workflow import (
     AggregatedEvidenceBundle,
     ComplianceReviewResult,
     IntentCatalogItem,
-    IntentResult,
+    QueryUnderstandingClarification,
     QueryUnderstandingOutput,
     ResolvedQuery,
 )
@@ -230,15 +230,12 @@ class LLMHandler:
 
         resolved_query = self._coerce_resolved_query(ctx, result)
         self._store_resolved_query(ctx, resolved_query)
-        if resolved_query.needs_clarification:
-            self._apply_query_clarification(ctx, resolved_query)
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
                 "llm:refine_question",
                 {
                     "refined_query": resolved_query.standalone_query,
                     "history_dependency": resolved_query.history_dependency,
-                    "needs_clarification": resolved_query.needs_clarification,
                     "model": model_name,
                 },
             )
@@ -286,11 +283,10 @@ class LLMHandler:
         output = self._coerce_query_understanding_output(ctx, result)
         self._store_resolved_query(ctx, output.resolved_query)
         ctx.intent = output.intent
+        clarification = output.clarification
 
-        if output.resolved_query.needs_clarification:
-            self._apply_query_clarification(ctx, output.resolved_query)
-        elif output.intent.needs_clarification:
-            self._apply_intent_clarification(ctx, output.intent)
+        if clarification is not None:
+            self._apply_query_understanding_clarification(ctx, clarification)
 
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(
@@ -298,10 +294,7 @@ class LLMHandler:
                 {
                     "refined_query": output.resolved_query.standalone_query,
                     "history_dependency": output.resolved_query.history_dependency,
-                    "needs_clarification": (
-                        output.resolved_query.needs_clarification
-                        or output.intent.needs_clarification
-                    ),
+                    "needs_clarification": clarification is not None,
                     "intent": output.intent.intent,
                     "confidence": output.intent.confidence,
                     "sub_intents": output.intent.sub_intents,
@@ -592,18 +585,20 @@ class LLMHandler:
             )
 
     @staticmethod
-    def _apply_query_clarification(
+    def _apply_query_understanding_clarification(
         ctx: FlowContext,
-        resolved_query: ResolvedQuery,
+        clarification: QueryUnderstandingClarification,
     ) -> None:
         questions = [
             question
-            for question in resolved_query.clarification_questions
+            for question in clarification.questions
             if question.strip()
         ]
-        fallback_question = "Could you clarify what you mean?"
         if not questions:
-            questions = [fallback_question]
+            if clarification.scope == "query_resolution":
+                questions = ["Could you clarify what you mean?"]
+            else:
+                questions = ["Could you clarify what you want this workflow to do?"]
 
         response = questions[0]
         ctx.llm_response = response
@@ -615,24 +610,11 @@ class LLMHandler:
             ],
         }
         ctx.metadata["stop_flow"] = True
-        ctx.metadata["stop_reason"] = "query_needs_clarification"
-
-    @staticmethod
-    def _apply_intent_clarification(
-        ctx: FlowContext,
-        intent: IntentResult,
-    ) -> None:
-        question = (
-            intent.clarification_question
-            or "Could you clarify what you want this workflow to do?"
-        )
-        ctx.llm_response = question
-        ctx.clarification_request = {
-            "response": question,
-            "quick_questions": [{"question": question, "options": []}],
-        }
-        ctx.metadata["stop_flow"] = True
-        ctx.metadata["stop_reason"] = "intent_needs_clarification"
+        if clarification.scope == "query_resolution":
+            stop_reason = "query_understanding_needs_query_clarification"
+        else:
+            stop_reason = "query_understanding_needs_intent_clarification"
+        ctx.metadata["stop_reason"] = stop_reason
 
     @staticmethod
     def _should_buffer_answer(ctx: FlowContext) -> bool:

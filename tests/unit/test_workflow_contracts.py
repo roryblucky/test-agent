@@ -22,7 +22,6 @@ def test_intent_result_accepts_legacy_payload() -> None:
     assert result.sub_intents == []
     assert result.candidate_skills == []
     assert result.required_data_sources == []
-    assert result.needs_clarification is False
 
 
 def test_flow_context_phase1_fields_default_empty() -> None:
