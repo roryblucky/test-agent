@@ -22,6 +22,7 @@ from app.models.domain import RefinedQuestion
 from app.models.workflow import (
     IntentResult,
     QueryUnderstandingClarification,
+    QueryUnderstandingClarificationQuestion,
     QueryUnderstandingOutput,
     ResolvedQuery,
 )
@@ -80,13 +81,10 @@ async def test_query_understanding_sets_resolved_query_and_intent() -> None:
             resolved_query=ResolvedQuery(
                 original_query="ignored",
                 standalone_query="What is the latest view on Microsoft?",
-                history_dependency="follow_up",
-                conversation_context_summary="Prior turn asked about Apple.",
             ),
             intent=IntentResult(
                 intent="market_outlook",
                 confidence=0.91,
-                candidate_skills=["wealth-skill"],
             ),
         )
     )
@@ -109,7 +107,6 @@ async def test_query_understanding_sets_resolved_query_and_intent() -> None:
                     {
                         "intent": "market_outlook",
                         "description": "Market outlook questions.",
-                        "candidateSkills": ["wealth-skill"],
                     }
                 ],
             },
@@ -119,19 +116,11 @@ async def test_query_understanding_sets_resolved_query_and_intent() -> None:
     assert result.resolved_query == ResolvedQuery(
         original_query="那微软呢？",
         standalone_query="What is the latest view on Microsoft?",
-        history_dependency="follow_up",
-        conversation_context_summary="Prior turn asked about Apple.",
     )
     assert result.refined_query == "What is the latest view on Microsoft?"
     assert result.intent == IntentResult(
         intent="market_outlook",
         confidence=0.91,
-        candidate_skills=["wealth-skill"],
-    )
-    assert result.metadata["history_dependency"] == "follow_up"
-    assert (
-        result.metadata["conversation_context_summary"]
-        == "Prior turn asked about Apple."
     )
     assert fake_agent.last_message_history is None
     assert fake_agent.last_model_settings == {"temperature": 0}
@@ -150,12 +139,43 @@ def test_query_understanding_instructions_define_language_and_catalog_rules() ->
     assert "zh-Hant" in QUERY_UNDERSTANDING_INSTRUCTIONS
     assert "yue-Hant" in QUERY_UNDERSTANDING_INSTRUCTIONS
     assert "<proper_noun_rules>" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "<platform_common_intents>" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "summarize_history" in QUERY_UNDERSTANDING_INSTRUCTIONS
     assert "<intent_catalog_rules>" in QUERY_UNDERSTANDING_INSTRUCTIONS
     assert "runtime <intent_catalog>" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "It may be empty" in QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert "Do not invent intents outside these two sources" in (
+        QUERY_UNDERSTANDING_INSTRUCTIONS
+    )
     assert "QueryUnderstandingOutput.clarification" in QUERY_UNDERSTANDING_INSTRUCTIONS
     assert "ResolvedQuery and IntentResult do not contain user clarification fields" in (
         QUERY_UNDERSTANDING_INSTRUCTIONS
     )
+    assert "question and option strings" in QUERY_UNDERSTANDING_INSTRUCTIONS
+
+
+@pytest.mark.asyncio
+async def test_query_understanding_default_runtime_catalog_is_empty() -> None:
+    """Platform common intents are static instructions, not runtime catalog items."""
+    fake_agent = FakeUnderstandingAgent(
+        QueryUnderstandingOutput(
+            resolved_query=ResolvedQuery(
+                original_query="ignored",
+                standalone_query="Summarize our previous conversation.",
+            ),
+            intent=IntentResult(intent="summarize_history", confidence=0.87),
+        )
+    )
+    handler = _handler(fake_agent)
+    ctx = FlowContext(query="总结一下我们刚才聊了什么")
+
+    await handler.handle(
+        ctx,
+        FlowStep(type=FlowStepType.LLM, mode="query_understanding", model="intent"),
+    )
+
+    assert fake_agent.last_prompt is not None
+    assert "<intent_catalog>\n[]\n</intent_catalog>" in fake_agent.last_prompt
 
 
 @pytest.mark.asyncio
@@ -218,7 +238,12 @@ async def test_query_understanding_query_clarification_stops_flow() -> None:
             intent=IntentResult(intent="market_outlook", confidence=0.55),
             clarification=QueryUnderstandingClarification(
                 scope="query_resolution",
-                questions=["你说的“这个”是指哪个资产？"],
+                questions=[
+                    QueryUnderstandingClarificationQuestion(
+                        question="你说的“这个”是指哪个资产？",
+                        options=["Microsoft", "Apple"],
+                    )
+                ],
                 reason="The referenced item is ambiguous.",
             ),
         )
@@ -240,6 +265,8 @@ async def test_query_understanding_query_clarification_stops_flow() -> None:
     response = QueryResponse.from_flow_context(result)
     assert response.clarification is not None
     assert response.clarification.response == result.llm_response
+    assert response.clarification.quick_questions is not None
+    assert response.clarification.quick_questions[0].options == ["Microsoft", "Apple"]
 
 
 @pytest.mark.asyncio
@@ -257,7 +284,12 @@ async def test_query_understanding_intent_selection_clarification_stops_flow() -
             ),
             clarification=QueryUnderstandingClarification(
                 scope="intent_selection",
-                questions=["你想看市场观点、目标价，还是新闻摘要？"],
+                questions=[
+                    QueryUnderstandingClarificationQuestion(
+                        question="你想看市场观点、目标价，还是新闻摘要？",
+                        options=["市场观点", "目标价", "新闻摘要"],
+                    )
+                ],
             ),
         )
     )
@@ -278,6 +310,12 @@ async def test_query_understanding_intent_selection_clarification_stops_flow() -
     response = QueryResponse.from_flow_context(result)
     assert response.clarification is not None
     assert response.clarification.response == result.llm_response
+    assert response.clarification.quick_questions is not None
+    assert response.clarification.quick_questions[0].options == [
+        "市场观点",
+        "目标价",
+        "新闻摘要",
+    ]
 
 
 @pytest.mark.asyncio

@@ -410,7 +410,7 @@ class FlowContext:
 class ResolvedQuery(BaseModel):
     original_query: str
     standalone_query: str
-    language: str = "zh-CN"
+    language: str = "zh-Hans"
 
     subject_text: str | None = None
     subject_type: str = "unknown"
@@ -439,9 +439,6 @@ class IntentResult(BaseModel):
     intent: str
     confidence: float
     sub_intents: list[str] = Field(default_factory=list)
-
-    candidate_skills: list[str] = Field(default_factory=list)
-    required_data_sources: list[str] = Field(default_factory=list)
 
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

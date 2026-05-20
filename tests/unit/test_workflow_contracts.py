@@ -20,8 +20,6 @@ def test_intent_result_accepts_legacy_payload() -> None:
 
     assert result.intent == "knowledge_query"
     assert result.sub_intents == []
-    assert result.candidate_skills == []
-    assert result.required_data_sources == []
 
 
 def test_flow_context_phase1_fields_default_empty() -> None:
@@ -89,7 +87,6 @@ def test_query_response_keeps_legacy_top_level_shape() -> None:
     ctx.intent = IntentResult(
         intent="knowledge_query",
         confidence=0.8,
-        candidate_skills=["generic-search"],
     )
     ctx.llm_response = "Legacy answer"
     ctx.tool_results.append(

@@ -52,6 +52,7 @@ from app.models.workflow import (
     ComplianceReviewResult,
     IntentCatalogItem,
     QueryUnderstandingClarification,
+    QueryUnderstandingClarificationQuestion,
     QueryUnderstandingOutput,
     ResolvedQuery,
 )
@@ -74,6 +75,12 @@ _COMPLIANCE_BLOCKED_RESPONSE = (
 _STREAMING_POLICY_APPROVED_ONLY = "approved_answer_only"
 _HISTORY_MAX_TURNS = 10
 _HISTORY_MAX_CHARS = 12_000
+_CONVERSATION_REFERENCE_INTENTS = {
+    "summarize_history",
+    "revise_previous",
+    "continue_previous",
+    "compare_previous",
+}
 
 
 def _build_step_settings(step: FlowStep) -> dict[str, Any] | None:
@@ -235,7 +242,6 @@ class LLMHandler:
                 "llm:refine_question",
                 {
                     "refined_query": resolved_query.standalone_query,
-                    "history_dependency": resolved_query.history_dependency,
                     "model": model_name,
                 },
             )
@@ -293,7 +299,6 @@ class LLMHandler:
                 "llm:query_understanding",
                 {
                     "refined_query": output.resolved_query.standalone_query,
-                    "history_dependency": output.resolved_query.history_dependency,
                     "needs_clarification": clarification is not None,
                     "intent": output.intent.intent,
                     "confidence": output.intent.confidence,
@@ -470,14 +475,29 @@ class LLMHandler:
         standalone_query = ctx.refined_query or (
             ctx.resolved_query.standalone_query if ctx.resolved_query else None
         )
+        conversation_reference = _conversation_reference_for_answer(ctx)
+        conversation_block = ""
+        if conversation_reference:
+            conversation_block = (
+                "\n\n"
+                "<conversation_reference>\n"
+                f"{conversation_reference}\n"
+                "</conversation_reference>\n"
+            )
         return (
             "<runtime_answer_input>\n"
+            "<runtime_rules>\n"
+            "- Use conversation_reference only when it is provided.\n"
+            "- conversation_reference is sanitized prior conversation approved for this run.\n"
+            "- Do not infer from prior conversation unless it appears in conversation_reference.\n"
+            "</runtime_rules>\n\n"
             "<original_user_query>\n"
             f"{ctx.query}\n"
             "</original_user_query>\n\n"
             "<standalone_query>\n"
             f"{standalone_query or ctx.query}\n"
             "</standalone_query>\n\n"
+            f"{conversation_block}"
             "<reference_data>\n"
             f"{reference_data}\n"
             "</reference_data>\n"
@@ -574,15 +594,6 @@ class LLMHandler:
     ) -> None:
         ctx.refined_query = resolved_query.standalone_query
         ctx.resolved_query = resolved_query
-        ctx.metadata["history_dependency"] = resolved_query.history_dependency
-        if resolved_query.conversation_context_summary:
-            ctx.metadata["conversation_context_summary"] = (
-                resolved_query.conversation_context_summary
-            )
-        if resolved_query.conversation_context:
-            ctx.metadata["conversation_context"] = (
-                resolved_query.conversation_context.model_dump()
-            )
 
     @staticmethod
     def _apply_query_understanding_clarification(
@@ -590,22 +601,27 @@ class LLMHandler:
         clarification: QueryUnderstandingClarification,
     ) -> None:
         questions = [
-            question
-            for question in clarification.questions
-            if question.strip()
+            question for question in clarification.questions if question.question.strip()
         ]
         if not questions:
             if clarification.scope == "query_resolution":
-                questions = ["Could you clarify what you mean?"]
+                fallback_question = "Could you clarify what you mean?"
             else:
-                questions = ["Could you clarify what you want this workflow to do?"]
+                fallback_question = (
+                    "Could you clarify what you want this workflow to do?"
+                )
+            questions = [
+                QueryUnderstandingClarificationQuestion(
+                    question=fallback_question,
+                )
+            ]
 
-        response = questions[0]
+        response = questions[0].question
         ctx.llm_response = response
         ctx.clarification_request = {
             "response": response,
             "quick_questions": [
-                {"question": question, "options": []}
+                {"question": question.question, "options": question.options}
                 for question in questions
             ],
         }
@@ -650,9 +666,20 @@ def _intent_catalog_for_step(step: FlowStep) -> list[IntentCatalogItem]:
         raise ValueError("step.settings.intentCatalog must be a list of intent items")
 
     return [
-        item if isinstance(item, IntentCatalogItem) else IntentCatalogItem.model_validate(item)
+        item
+        if isinstance(item, IntentCatalogItem)
+        else IntentCatalogItem.model_validate(item)
         for item in raw_items
     ]
+
+
+def _conversation_reference_for_answer(ctx: FlowContext) -> str:
+    """Return sanitized prior conversation only for conversation intents."""
+    if ctx.intent is None:
+        return ""
+    if ctx.intent.intent not in _CONVERSATION_REFERENCE_INTENTS:
+        return ""
+    return _sanitize_visible_message_history(ctx.message_history)
 
 
 def _dump_runtime_json(value: Any) -> str:

@@ -457,7 +457,6 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
         output=IntentResult(
             intent="market_outlook",
             confidence=0.94,
-            candidate_skills=["wealth-skill"],
         ),
     )
     answer_agent = FakeAgent(
@@ -531,7 +530,6 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
     assert ctx.intent == IntentResult(
         intent="market_outlook",
         confidence=0.94,
-        candidate_skills=["wealth-skill"],
     )
     assert ctx.planner_output is not None
     assert ctx.planner_output.can_continue_to_aggregation is True
@@ -626,7 +624,6 @@ async def test_query_understanding_planner_aggregation_answer_workflow(
             intent=IntentResult(
                 intent="market_outlook",
                 confidence=0.94,
-                candidate_skills=["wealth-skill"],
             ),
         ),
     )
@@ -702,7 +699,6 @@ async def test_query_understanding_planner_aggregation_answer_workflow(
     assert ctx.intent == IntentResult(
         intent="market_outlook",
         confidence=0.94,
-        candidate_skills=["wealth-skill"],
     )
     assert planner_agent.last_prompt is not None
     assert '"intent": "market_outlook"' in planner_agent.last_prompt

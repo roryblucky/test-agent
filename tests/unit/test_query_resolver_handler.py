@@ -21,7 +21,7 @@ from app.config.models import (
     TenantConfig,
 )
 from app.models.domain import RefinedQuestion
-from app.models.workflow import ConversationContext, ResolvedQuery
+from app.models.workflow import ResolvedQuery
 from app.services.flow_context import FlowContext
 from app.services.flow_engine import FlowEngine
 from app.services.handlers.llm import LLMHandler
@@ -100,42 +100,6 @@ async def test_query_resolver_uses_sanitized_history_runtime_prompt() -> None:
     assert "<latest_user_query>\n那微软呢？\n</latest_user_query>" in fake_agent.last_prompt
     assert "[user]\n苹果最近怎么看？" in fake_agent.last_prompt
     assert "[assistant]\n苹果需要基于最新证据判断。" in fake_agent.last_prompt
-
-
-@pytest.mark.asyncio
-async def test_query_resolver_persists_conversation_context_metadata() -> None:
-    """Typed resolver output is copied into FlowContext and metadata."""
-    conversation_context = ConversationContext(
-        usage="user_requested_summary",
-        content="The prior conversation discussed planner boundaries.",
-        source_turn_count=4,
-    )
-    fake_agent = FakeResolverAgent(
-        ResolvedQuery(
-            original_query="ignored",
-            standalone_query="Summarize the prior planner discussion.",
-            history_dependency="summarize_history",
-            conversation_context_summary="Prior discussion covered planner design.",
-            conversation_context=conversation_context,
-        )
-    )
-    handler = _handler(fake_agent)
-    ctx = FlowContext(query="总结一下刚才 planner 的讨论")
-
-    result = await handler.handle(
-        ctx,
-        FlowStep(type=FlowStepType.LLM, mode="refine_question", model="fast"),
-    )
-
-    assert result.resolved_query is not None
-    assert result.resolved_query.original_query == "总结一下刚才 planner 的讨论"
-    assert result.resolved_query.history_dependency == "summarize_history"
-    assert result.metadata["history_dependency"] == "summarize_history"
-    assert (
-        result.metadata["conversation_context_summary"]
-        == "Prior discussion covered planner design."
-    )
-    assert result.metadata["conversation_context"] == conversation_context.model_dump()
 
 
 @pytest.mark.asyncio

@@ -11,35 +11,10 @@ from typing import Any, Literal, Self
 
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
-HistoryDependency = Literal[
-    "none",
-    "follow_up",
-    "summarize_history",
-    "revise_previous",
-    "continue_previous",
-    "compare_previous",
-]
-ConversationContextUsage = Literal[
-    "none",
-    "understand_query",
-    "user_requested_summary",
-    "revise_previous",
-    "continue_previous",
-    "compare_previous",
-]
 QueryUnderstandingClarificationScope = Literal[
     "query_resolution",
     "intent_selection",
 ]
-
-
-class ConversationContext(BaseModel):
-    """Sanitized conversation material approved for downstream use."""
-
-    usage: ConversationContextUsage
-    content: str
-    source: Literal["chat_history"] = "chat_history"
-    source_turn_count: int = 0
 
 
 class ResolvedQuery(BaseModel):
@@ -47,11 +22,7 @@ class ResolvedQuery(BaseModel):
 
     original_query: str
     standalone_query: str
-    language: str = "zh-CN"
-
-    history_dependency: HistoryDependency = "none"
-    conversation_context_summary: str | None = None
-    conversation_context: ConversationContext | None = None
+    language: str = "zh-Hans"
 
     subject_text: str | None = None
     subject_type: str = "unknown"
@@ -73,9 +44,6 @@ class IntentResult(BaseModel):
     confidence: float
     sub_intents: list[str] = Field(default_factory=list)
 
-    candidate_skills: list[str] = Field(default_factory=list)
-    required_data_sources: list[str] = Field(default_factory=list)
-
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -86,17 +54,25 @@ class IntentCatalogItem(BaseModel):
     intent: str = Field(validation_alias=AliasChoices("intent", "name"))
     description: str
     sub_intents: list[str] = Field(default_factory=list, alias="subIntents")
-    candidate_skills: list[str] = Field(default_factory=list, alias="candidateSkills")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"populate_by_name": True}
+
+
+class QueryUnderstandingClarificationQuestion(BaseModel):
+    """User-facing clarification question with quick-select options."""
+
+    question: str
+    options: list[str] = Field(default_factory=list)
 
 
 class QueryUnderstandingClarification(BaseModel):
     """Unified user clarification request for query understanding."""
 
     scope: QueryUnderstandingClarificationScope
-    questions: list[str] = Field(default_factory=list)
+    questions: list[QueryUnderstandingClarificationQuestion] = Field(
+        default_factory=list
+    )
     reason: str | None = None
 
 

@@ -5,12 +5,21 @@ from typing import Any, Self
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.usage import RunUsage
 
 from app.config.models import FlowStep, FlowStepType
 from app.models.domain import Document
-from app.models.workflow import AggregatedEvidence, AggregatedEvidenceBundle
+from app.models.workflow import (
+    AggregatedEvidence,
+    AggregatedEvidenceBundle,
+    IntentResult,
+)
 from app.services.flow_context import FlowContext
 from app.services.handlers.llm import LLMHandler
 
@@ -104,6 +113,7 @@ async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
     assert fake_agent.last_prompt is not None
     assert "<runtime_answer_input>" in fake_agent.last_prompt
     assert "<original_user_query>\nquery\n</original_user_query>" in fake_agent.last_prompt
+    assert "<conversation_reference>" not in fake_agent.last_prompt
     assert "aggregated evidence content" in fake_agent.last_prompt
     assert "Standalone Query: standalone query" in fake_agent.last_prompt
     assert fake_agent.last_message_history is None
@@ -232,3 +242,49 @@ async def test_llm_answer_keeps_document_fallback_without_aggregation() -> None:
     assert not hasattr(fake_agent.last_deps, "reference_data")
     assert "Standalone Query: standalone query" in fake_agent.last_prompt
     assert "ranked document content" in fake_agent.last_prompt
+
+
+@pytest.mark.asyncio
+async def test_llm_answer_includes_conversation_reference_for_history_intent() -> None:
+    """Conversation intents receive sanitized prior chat as answer data."""
+    fake_agent = FakeAnswerAgent(output="history summary")
+    handler = _handler(fake_agent)
+    ctx = FlowContext(query="总结一下刚才的讨论")
+    ctx.intent = IntentResult(intent="summarize_history", confidence=0.94)
+    ctx.message_history = [
+        ModelRequest(parts=[UserPromptPart("我们讨论了 planner 的职责边界。")]),
+        ModelResponse(parts=[TextPart("Planner 只负责编排任务和工具。")]),
+    ]
+
+    result = await handler.handle(
+        ctx,
+        FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
+    )
+
+    assert result.llm_response == "history summary"
+    assert fake_agent.last_prompt is not None
+    assert "<conversation_reference>" in fake_agent.last_prompt
+    assert "[user]\n我们讨论了 planner 的职责边界。" in fake_agent.last_prompt
+    assert "[assistant]\nPlanner 只负责编排任务和工具。" in fake_agent.last_prompt
+
+
+@pytest.mark.asyncio
+async def test_llm_answer_omits_conversation_reference_for_normal_intent() -> None:
+    """Normal RAG intents do not expose chat history to answer synthesis."""
+    fake_agent = FakeAnswerAgent(output="normal answer")
+    handler = _handler(fake_agent)
+    ctx = FlowContext(query="微软怎么看？")
+    ctx.intent = IntentResult(intent="market_outlook", confidence=0.9)
+    ctx.message_history = [
+        ModelRequest(parts=[UserPromptPart("苹果怎么看？")]),
+        ModelResponse(parts=[TextPart("苹果的历史回答不应进入本次答案。")]),
+    ]
+
+    await handler.handle(
+        ctx,
+        FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
+    )
+
+    assert fake_agent.last_prompt is not None
+    assert "<conversation_reference>" not in fake_agent.last_prompt
+    assert "苹果的历史回答不应进入本次答案。" not in fake_agent.last_prompt

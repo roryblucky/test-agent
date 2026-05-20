@@ -217,7 +217,6 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
     ctx.intent = IntentResult(
         intent="knowledge_query",
         confidence=0.91,
-        candidate_skills=["generic-search"],
     )
     step = FlowStep(
         type=FlowStepType.AGENT,
@@ -232,7 +231,6 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
     assert '"original_query": "find evidence"' in (fake_agent.last_prompt or "")
     assert '"standalone_query": "find evidence"' in (fake_agent.last_prompt or "")
     assert '"intent": "knowledge_query"' in (fake_agent.last_prompt or "")
-    assert '"candidate_skills": [' in (fake_agent.last_prompt or "")
     assert "task_checklist" not in (fake_agent.last_prompt or "")
     assert "planned_tasks" in (fake_agent.last_prompt or "")
     assert result.planner_output == PlannerOutput(
