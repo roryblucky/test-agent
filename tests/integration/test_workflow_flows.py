@@ -28,7 +28,6 @@ from app.models.domain import (
 )
 from app.models.workflow import (
     AggregatedEvidenceBundle,
-    ComplianceReviewResult,
     IntentResult,
     NormalizedToolResultItem,
     PlannerOutput,
@@ -38,6 +37,7 @@ from app.models.workflow import (
     ToolObservation,
     ToolResultRecord,
 )
+from app.services.citation_extractor import QuoteExtractionItem, QuoteExtractionResult
 from app.services.flow_engine import FlowEngine
 from app.services.handlers.agent import AgentHandler
 from app.services.handlers.aggregation import AggregationHandler
@@ -217,8 +217,8 @@ def _tool_result() -> ToolResultRecord:
     )
 
 
-def _llm_handler() -> LLMHandler:
-    return LLMHandler(MagicMock())
+def _llm_handler(registry: Any | None = None) -> LLMHandler:
+    return LLMHandler(registry or MagicMock())
 
 
 def _supervisor_handler(
@@ -385,33 +385,10 @@ async def test_existing_rag_workflow_end_to_end(mock_emitter) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("review_output", "expected_answer", "expected_delta"),
-    [
-        (
-            ComplianceReviewResult(passed=True, reason="Looks compliant."),
-            "Draft wealth answer.",
-            "Draft wealth answer.",
-        ),
-        (
-            ComplianceReviewResult(
-                passed=False,
-                reason="Unsupported claim.",
-                violations=["unsupported_claim"],
-                safe_response="The answer could not be released.",
-            ),
-            "The answer could not be released.",
-            "The answer could not be released.",
-        ),
-    ],
-)
-async def test_planner_aggregation_and_review_workflow_end_to_end(
+async def test_planner_aggregation_and_citation_workflow_end_to_end(
     mock_emitter,
-    review_output: ComplianceReviewResult,
-    expected_answer: str,
-    expected_delta: str,
 ) -> None:
-    """Planner + aggregation flows buffer the draft answer until compliance approves it."""
+    """Planner + aggregation flows stream tokens, generate citations, and emit them in order."""
     tenant_id = "wealth-tenant"
 
     def _planner_setup(deps: Any) -> None:
@@ -460,16 +437,28 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
         ),
     )
     answer_agent = FakeAgent(
-        output="Draft wealth answer.",
-        chunks=["Draft wealth ", "answer."],
+        output="Draft wealth answer [1].",
+        chunks=["Draft wealth ", "answer [1]."],
     )
-    review_agent = FakeAgent(output=review_output)
 
-    llm_handler = _llm_handler()
+    quote_agent = FakeAgent(
+        output=QuoteExtractionResult(
+            extractions=[
+                QuoteExtractionItem(
+                    citation_index=1,
+                    quoted_passages=["Evidence one for wealth analysis."]
+                )
+            ]
+        )
+    )
+
+    mock_registry = MagicMock()
+    mock_registry.create_agent.return_value = quote_agent
+
+    llm_handler = _llm_handler(mock_registry)
     llm_handler._agent_cache[("refine_question", "fast")] = refine_agent
     llm_handler._agent_cache[("intent", "intent")] = intent_agent
     llm_handler._agent_cache[("answer", "pro")] = answer_agent
-    llm_handler._agent_cache[("compliance_review", "fast")] = review_agent
 
     agent_config = AgentConfig(
         llmType="pro",
@@ -482,7 +471,6 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
         FlowStep(type=FlowStepType.AGENT, mode="planner", agentConfig=agent_config),
         FlowStep(type=FlowStepType.AGGREGATION),
         FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
-        FlowStep(type=FlowStepType.LLM, mode="compliance_review", model="fast"),
         FlowStep(type=FlowStepType.MODERATION, mode="post"),
         FlowStep(type=FlowStepType.ANALYSIS),
     ]
@@ -523,7 +511,6 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
         "agent:planner",
         "aggregation",
         "llm:answer",
-        "llm:compliance_review",
         "moderation:post",
         "analysis",
     ]
@@ -554,10 +541,12 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
         "Evidence one for wealth analysis.",
         "Evidence two for wealth analysis.",
     ]
-    assert ctx.draft_answer == "Draft wealth answer."
-    assert ctx.llm_response == expected_answer
-    assert ctx.compliance_review == review_output
-    assert response.answer == expected_answer
+    assert ctx.llm_response == "Draft wealth answer [1]."
+    assert response.answer == "Draft wealth answer [1]."
+    assert len(response.citations) == 1
+    assert response.citations[0].index == 1
+    assert response.citations[0].evidence_id == "evidence:1:doc-1"
+
     assert answer_agent.last_prompt is not None
     assert "Evidence one for wealth analysis." in answer_agent.last_prompt
     assert not hasattr(answer_agent.last_deps, "reference_data")
@@ -568,17 +557,32 @@ async def test_planner_aggregation_and_review_workflow_end_to_end(
     assert isinstance(persisted_part, UserPromptPart)
     assert persisted_part.content == "Give me the wealth view."
     assert "Evidence one for wealth analysis." not in persisted_part.content
-    assert "Draft wealth answer." in review_agent.last_deps.reference_data
-    assert "Evidence two for wealth analysis." in review_agent.last_deps.reference_data
-    mock_emitter.emit_progress.assert_any_await("answer_buffering")
-    mock_emitter.emit_token.assert_not_awaited()
-    mock_emitter.emit_answer_delta.assert_any_await(expected_delta)
-    assert ctx.metadata["analysis"]["streaming_policy"] == "approved_answer_only"
-    assert (
-        ctx.metadata["analysis"]["planner_can_continue_to_aggregation"]
-        is True
-    )
-    assert ctx.metadata["analysis"]["compliance_passed"] == review_output.passed
+
+    # Verify event emission sequence
+    calls = mock_emitter.mock_calls
+    call_names = [call[0] for call in calls]
+
+    token_positions = [i for i, name in enumerate(call_names) if name == "emit_token"]
+    citation_positions = [i for i, name in enumerate(call_names) if name == "emit_citations"]
+    completed_positions = [
+        i for i, name in enumerate(call_names)
+        if name == "emit_step_completed" and calls[i][1][0] == "llm:answer"
+    ]
+
+    assert token_positions, "Should have streamed some tokens"
+    assert citation_positions, "Should have emitted citations"
+    assert completed_positions, "Should have completed llm:answer step"
+
+    for t_pos in token_positions:
+        for c_pos in citation_positions:
+            assert t_pos < c_pos, f"Token emission at {t_pos} must occur before citation emission at {c_pos}"
+
+    for c_pos in citation_positions:
+        for comp_pos in completed_positions:
+            assert c_pos < comp_pos, f"Citation emission at {c_pos} must occur before step completion at {comp_pos}"
+
+    assert ctx.metadata["analysis"]["streaming_policy"] == "token"
+    assert ctx.metadata["analysis"]["planner_can_continue_to_aggregation"] is True
     assert planner_agent.last_deps.available_tool_names == ["search_documents"]
     assert planner_agent.last_deps.flow_context.metadata["tenant_id"] == tenant_id
 

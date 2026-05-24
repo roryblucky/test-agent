@@ -127,66 +127,6 @@ async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
     assert isinstance(persisted_part, UserPromptPart)
     assert persisted_part.content == "query"
     mock_emitter.emit_token.assert_any_await("aggregated answer")
-    mock_emitter.emit_answer_delta.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_llm_answer_buffers_when_approved_answer_policy_enabled(
-    mock_emitter,
-) -> None:
-    """High-compliance answer step buffers draft text before review."""
-    fake_agent = FakeAnswerAgent(output="buffered draft")
-    handler = _handler(fake_agent)
-    ctx = FlowContext(query="query", emitter=mock_emitter)
-    ctx.metadata["streaming_policy"] = "approved_answer_only"
-    ctx.aggregated_evidence = AggregatedEvidenceBundle(
-        user_query="query",
-        standalone_query="query",
-        tenant_id="tenant-a",
-        selected_evidence=[_evidence("ev1", "approved evidence")],
-        synthesis_allowed=True,
-    )
-
-    result = await handler.handle(
-        ctx,
-        FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
-    )
-
-    assert result.llm_response == "buffered draft"
-    mock_emitter.emit_token.assert_not_awaited()
-    mock_emitter.emit_answer_delta.assert_not_awaited()
-    mock_emitter.emit_progress.assert_any_await("answer_buffering")
-    mock_emitter.emit_step_completed.assert_any_await(
-        "llm:answer",
-        {"model": "pro", "buffered": True},
-    )
-
-
-@pytest.mark.asyncio
-async def test_llm_answer_fail_closed_when_high_compliance_bundle_missing(
-    mock_emitter,
-) -> None:
-    """High-compliance synthesis requires an aggregation bundle."""
-    fake_agent = FakeAnswerAgent(output="should not be used")
-    handler = _handler(fake_agent)
-    ctx = FlowContext(query="query", emitter=mock_emitter)
-    ctx.metadata["streaming_policy"] = "approved_answer_only"
-    ctx.ranked_documents = [Document(id="doc1", content="ranked document content")]
-
-    result = await handler.handle(
-        ctx,
-        FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
-    )
-
-    assert result.llm_response.startswith(
-        "Unable to synthesize a high-compliance answer"
-    )
-    assert fake_agent.run_count == 0
-    mock_emitter.emit_token.assert_not_awaited()
-    mock_emitter.emit_progress.assert_any_await(
-        "answer_blocked_before_review",
-        {"reason": result.llm_response},
-    )
 
 
 @pytest.mark.asyncio

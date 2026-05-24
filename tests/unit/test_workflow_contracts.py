@@ -36,7 +36,6 @@ def test_flow_context_phase1_fields_default_empty() -> None:
     assert first.evidence_store == {}
     assert first.planner_output is None
     assert first.aggregated_evidence is None
-    assert first.compliance_review is None
 
     first.active_skills.append("search")
     assert second.active_skills == []

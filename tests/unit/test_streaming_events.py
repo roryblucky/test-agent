@@ -14,7 +14,7 @@ async def test_event_emitter_supports_phase7_events() -> None:
 
     await emitter.emit_progress("working", {"step": "planner"})
     await emitter.emit_tool_observation({"tool_name": "search", "status": "success"})
-    await emitter.emit_answer_delta("approved answer")
+    await emitter.emit_citations([{"index": 1, "evidence_id": "ev-1", "source": "doc"}])
     await emitter.close()
 
     events = []
@@ -31,5 +31,5 @@ async def test_event_emitter_supports_phase7_events() -> None:
             "type": "tool_observation",
             "data": {"tool_name": "search", "status": "success"},
         },
-        {"type": "answer_delta", "data": "approved answer"},
+        {"type": "citations", "data": [{"index": 1, "evidence_id": "ev-1", "source": "doc"}]},
     ]

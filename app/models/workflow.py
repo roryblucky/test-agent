@@ -255,6 +255,42 @@ class AggregatedEvidence(BaseModel):
     score: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    citation_index: int | None = None
+    source_type: str | None = None
+    page_number: int | None = None
+    section: str | None = None
+
+
+class CitationReference(BaseModel):
+    """Citation metadata for API/SSE rendering with highlight support."""
+
+    index: int
+    evidence_id: str
+    source: str
+    source_type: str | None = None
+
+    title: str | None = None
+    url: str | None = None
+    snippet: str | None = None
+
+    quoted_text: str | None = None
+    quoted_passages: list[str] = Field(default_factory=list)
+
+    page_number: int | None = None
+    section: str | None = None
+    published_at: datetime | None = None
+
+    highlight_content: str | None = None
+    highlight_spans: list[dict[str, int]] = Field(default_factory=list)
+    offset_encoding: Literal["utf-16"] = "utf-16"
+    attribution_status: Literal[
+        "located",
+        "fallback_located",
+        "unlocated",
+    ] = "unlocated"
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
 
 class ExcludedEvidence(BaseModel):
     """Evidence candidate excluded during aggregation."""
@@ -293,13 +329,3 @@ class AggregatedEvidenceBundle(BaseModel):
     def evidence(self) -> list[AggregatedEvidence]:
         """Compatibility alias for older callers."""
         return self.selected_evidence
-
-
-class ComplianceReviewResult(BaseModel):
-    """Structured compliance review result for buffered synthesis."""
-
-    passed: bool
-    reason: str | None = None
-    violations: list[str] = Field(default_factory=list)
-    required_changes: list[str] = Field(default_factory=list)
-    safe_response: str | None = None

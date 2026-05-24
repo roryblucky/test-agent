@@ -19,7 +19,6 @@ class AnalysisHandler:
         elapsed = time.time() - pipeline_start if pipeline_start else None
         planner_output = ctx.planner_output
         aggregated_evidence = ctx.aggregated_evidence
-        compliance_review = ctx.compliance_review
 
         analysis = {
             "pipeline_duration_seconds": round(elapsed, 3) if elapsed else None,
@@ -60,12 +59,6 @@ class AnalysisHandler:
             ),
             "synthesis_allowed": (
                 aggregated_evidence.synthesis_allowed if aggregated_evidence else None
-            ),
-            "compliance_passed": (
-                compliance_review.passed if compliance_review else None
-            ),
-            "compliance_violation_count": (
-                len(compliance_review.violations) if compliance_review else None
             ),
         }
 

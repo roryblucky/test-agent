@@ -1,5 +1,9 @@
 # Agentic Workflow Platform 演进设计方案
 
+> [!WARNING]
+> **重要变更公告 (2026-05-24)**:
+> 本文档中提及的 `compliance_review` 合规审查步骤、以及基于 `approved_answer_only` / `answer_delta` 的延迟合规流式缓冲设计，已由 **RAG Citation Attribution V4.2** 彻底废弃并进行了物理删除。所有流式逻辑目前统一采用 `token` 实时流式渲染加生成后 `citations` 溯源高亮的后处理设计。
+
 本文档描述如何将当前 repo 演进为一个“配置驱动、多租户、可选 Agent 的企业 Agentic Workflow Platform”。
 
 目标读者：
@@ -59,7 +63,7 @@
   - `refine_question`
   - `intent`
   - `answer`
-  - 未来可加 `compliance_review`
+  - `compliance_review` [DEPRECATED by RAG Citation Attribution V4.2]
 - `moderation`
   - `pre`
   - `post`

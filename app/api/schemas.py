@@ -12,6 +12,7 @@ from app.models.domain import (
     IntentResult,
     ModerationResult,
 )
+from app.models.workflow import CitationReference
 from app.services.flow_context import FlowContext
 
 
@@ -57,6 +58,7 @@ class QueryResponse(BaseModel):
     clarification: ClarificationRequest | None = None
     session_id: str | None = Field(None, alias="sessionId")
     metadata: dict[str, Any] = Field(default_factory=dict)
+    citations: list[CitationReference] = Field(default_factory=list)
 
     @classmethod
     def from_flow_context(cls, ctx: FlowContext) -> QueryResponse:
@@ -76,6 +78,13 @@ class QueryResponse(BaseModel):
                 "output_tokens": output_tokens,
             }
 
+        citations_raw = final_meta.pop("citations", [])
+        citations = [
+            c if isinstance(c, CitationReference)
+            else CitationReference.model_validate(c)
+            for c in citations_raw
+        ]
+
         return cls(
             query=ctx.query,
             refined_query=ctx.refined_query,
@@ -87,6 +96,7 @@ class QueryResponse(BaseModel):
             clarification=ctx.clarification_request,
             session_id=ctx.session_id,
             metadata=final_meta,
+            citations=citations,
         )
 
 

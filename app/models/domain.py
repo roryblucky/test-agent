@@ -25,6 +25,12 @@ class Document(BaseModel):
     metadata: dict[str, object] = Field(default_factory=dict)
     score: float | None = None
 
+    source_url: str | None = None
+    source_type: str | None = None
+    page_number: int | None = None
+    section_title: str | None = None
+
+
 
 class TokenUsage(BaseModel):
     """Token usage statistics from an LLM call."""

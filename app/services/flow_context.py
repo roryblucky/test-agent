@@ -16,7 +16,6 @@ from app.models.domain import (
 from app.models.workflow import (
     AggregatedEvidence,
     AggregatedEvidenceBundle,
-    ComplianceReviewResult,
     IntentResult,
     PlannerOutput,
     ResolvedQuery,
@@ -64,8 +63,6 @@ class FlowContext:
 
     # Answer / safety
     llm_response: str | None = None
-    draft_answer: Any | None = None
-    compliance_review: ComplianceReviewResult | None = None
     moderation_result: ModerationResult | None = None
     groundedness_result: GroundednessResult | None = None
     clarification_request: Any | None = None  # Using Any to avoid circular import with schemas

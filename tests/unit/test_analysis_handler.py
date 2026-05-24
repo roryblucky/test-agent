@@ -8,7 +8,6 @@ from app.config.models import FlowStep, FlowStepType
 from app.models.workflow import (
     AggregatedEvidence,
     AggregatedEvidenceBundle,
-    ComplianceReviewResult,
     PlannerOutput,
     ToolObservation,
     ToolResultRecord,
@@ -31,9 +30,9 @@ def _evidence(evidence_id: str) -> AggregatedEvidence:
 async def test_analysis_includes_phase7_streaming_and_review_fields(
     mock_emitter,
 ) -> None:
-    """Analysis captures streaming policy and high-compliance review status."""
+    """Analysis captures streaming policy and execution data."""
     ctx = FlowContext(query="query", session_id="session-a", emitter=mock_emitter)
-    ctx.metadata["streaming_policy"] = "approved_answer_only"
+    ctx.metadata["streaming_policy"] = "token"
     ctx.tool_observations.append(
         ToolObservation(
             tool_name="search",
@@ -63,10 +62,6 @@ async def test_analysis_includes_phase7_streaming_and_review_fields(
         synthesis_allowed=True,
         selected_evidence=[ctx.evidence_store["ev1"]],
     )
-    ctx.compliance_review = ComplianceReviewResult(
-        passed=False,
-        violations=["unsupported_claim"],
-    )
 
     result = await AnalysisHandler().handle(
         ctx,
@@ -74,7 +69,7 @@ async def test_analysis_includes_phase7_streaming_and_review_fields(
     )
 
     analysis = result.metadata["analysis"]
-    assert analysis["streaming_policy"] == "approved_answer_only"
+    assert analysis["streaming_policy"] == "token"
     assert analysis["tool_observation_count"] == 1
     assert analysis["tool_result_count"] == 1
     assert analysis["evidence_count"] == 1
@@ -84,6 +79,4 @@ async def test_analysis_includes_phase7_streaming_and_review_fields(
     assert analysis["planner_failed_task_count"] == 0
     assert analysis["aggregated_evidence_count"] == 1
     assert analysis["synthesis_allowed"] is True
-    assert analysis["compliance_passed"] is False
-    assert analysis["compliance_violation_count"] == 1
     mock_emitter.emit_step_completed.assert_any_await("analysis", analysis)

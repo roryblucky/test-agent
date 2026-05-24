@@ -2,8 +2,8 @@
 
 Defines a structured event protocol for streaming pipeline progress
 and results to the client.  Every flow step emits ``step_start`` and
-``step_completed`` events. Low-risk LLM steps may emit ``token`` events;
-high-compliance answer flows emit ``answer_delta`` only after approval.
+``step_completed`` events. LLM steps may emit ``token`` events, followed
+by ``citations`` events containing citation metadata.
 
 Event types
 -----------
@@ -19,8 +19,8 @@ Event types
      - A pipeline step has finished, includes step result payload.
    * - ``token``
      - A single LLM streaming token.
-   * - ``answer_delta``
-     - Approved answer text released after review.
+   * - ``citations``
+     - Citation metadata with highlight spans.
    * - ``progress``
      - Non-answer progress update.
    * - ``tool_observation``
@@ -51,7 +51,7 @@ class EventType(StrEnum):
     STEP_START = "step_start"
     STEP_COMPLETED = "step_completed"
     TOKEN = "token"
-    ANSWER_DELTA = "answer_delta"
+    CITATIONS = "citations"
     PROGRESS = "progress"
     TOOL_OBSERVATION = "tool_observation"
     THINKING = "thinking"
@@ -165,9 +165,9 @@ class EventEmitter:
         """Convenience: emit a single LLM streaming token."""
         await self.emit(StreamEvent(type=EventType.TOKEN, data=token))
 
-    async def emit_answer_delta(self, delta: str) -> None:
-        """Convenience: emit approved answer text."""
-        await self.emit(StreamEvent(type=EventType.ANSWER_DELTA, data=delta))
+    async def emit_citations(self, citations: list[dict]) -> None:
+        """Emit citation metadata with highlight spans."""
+        await self.emit(StreamEvent(type=EventType.CITATIONS, data=citations))
 
     async def emit_progress(self, message: str, data: Any = None) -> None:
         """Convenience: emit a non-answer progress event."""

@@ -171,24 +171,3 @@ async def test_legacy_rag_flow_regression(mock_emitter):
     assert retriever.calls == [("refined legacy query", 3)]
     assert ranker.calls == [("refined legacy query", ["doc1", "doc2"])]
     assert moderation.checked_texts == ["legacy query"]
-
-
-@pytest.mark.asyncio
-async def test_flow_engine_marks_compliance_review_streaming_policy(mock_handlers):
-    """A flow with compliance review uses approved-answer-only streaming."""
-    config = TenantConfig(
-        kmsAppName="Compliance App",
-        applicationId="compliance-app",
-        adGroups=["group1"],
-        flow_config=FlowConfig(
-            steps=[
-                FlowStep(type=FlowStepType.LLM, mode="answer"),
-                FlowStep(type=FlowStepType.LLM, mode="compliance_review"),
-            ]
-        ),
-        llm_config=LLMConfig(models={}),
-    )
-
-    ctx = await FlowEngine(config, mock_handlers).execute("test query")
-
-    assert ctx.metadata["streaming_policy"] == "approved_answer_only"

@@ -29,8 +29,7 @@ Actions:
 - ``skip_to``  — skip forward to a step by its ``type:mode`` label
 
 Every step emits ``step_start`` and ``step_completed`` SSE events with
-result payloads. Low-risk LLM answer steps emit ``token`` events, while
-compliance-review flows buffer answer text until approval.
+result payloads. LLM answer steps emit ``token`` events.
 On any step failure the pipeline **terminates immediately** (raises).
 """
 
@@ -75,9 +74,7 @@ class FlowEngine:
     ) -> None:
         self.steps = tenant_config.flow_config.steps
         self.handlers = handlers
-        self.streaming_policy = (
-            "approved_answer_only" if self._has_compliance_review_step() else "token"
-        )
+        self.streaming_policy = "token"
 
     async def execute(
         self,
@@ -270,9 +267,3 @@ class FlowEngine:
             if step.step_label == label:
                 return i
         raise ValueError(f"Routing target step label {label!r} not found in flow steps")
-
-    def _has_compliance_review_step(self) -> bool:
-        return any(
-            step.type == FlowStepType.LLM and step.mode == "compliance_review"
-            for step in self.steps
-        )

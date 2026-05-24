@@ -14,6 +14,7 @@ from app.models.workflow import (
     ExcludedEvidence,
     NormalizedToolResultItem,
 )
+from app.services.citation_extractor import safe_parse_page_number
 from app.services.flow_context import FlowContext
 
 
@@ -189,9 +190,14 @@ class AggregationHandler:
         selected = [
             evidence.model_copy(
                 update={
-                    "evidence_id": (
-                        f"evidence:{index}:{evidence.metadata['item_id']}"
-                    )
+                    "evidence_id": f"evidence:{index}:{evidence.metadata['item_id']}",
+                    "citation_index": index,
+                    "source_type": evidence.metadata.get("source_type") or evidence.source,
+                    "page_number": safe_parse_page_number(
+                        evidence.metadata.get("page_number")
+                        or evidence.metadata.get("pageNumber")
+                    ),
+                    "section": evidence.title,
                 }
             )
             for index, evidence in enumerate(selected, start=1)
