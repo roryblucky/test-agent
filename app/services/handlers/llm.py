@@ -652,7 +652,13 @@ def _format_aggregated_evidence(bundle: AggregatedEvidenceBundle) -> str:
             parts.append(f"URL: {item.url}")
         if item.published_at:
             parts.append(f"Published At: {item.published_at.isoformat()}")
-        parts.append(item.content)
+        if item.content:
+            parts.append(f"Content:\n{item.content}")
+        if item.structured_facts:
+            parts.append(
+                "Structured Facts:\n"
+                f"{json.dumps(item.structured_facts, ensure_ascii=False, sort_keys=True)}"
+            )
         lines.append("\n".join(parts))
 
     return "\n\n---\n\n".join(lines)

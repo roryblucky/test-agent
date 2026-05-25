@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -430,6 +431,19 @@ def build_evidence_index(
     return evidence_by_index
 
 
+def _citation_text(evidence: AggregatedEvidence) -> str:
+    """Return citeable text for document or structured evidence."""
+    if evidence.content:
+        return evidence.content
+    if evidence.structured_facts:
+        return json.dumps(
+            evidence.structured_facts,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    return ""
+
+
 async def build_citations(
     answer: str,
     evidence_items: list[AggregatedEvidence],
@@ -448,8 +462,9 @@ async def build_citations(
     usage = RunUsage()
     if registry:
         evidence_map = {
-            idx: ev.content
+            idx: evidence_text
             for idx, ev in evidence_by_index.items()
+            if (evidence_text := _citation_text(ev))
         }
         if evidence_map:
             llm_quotes, usage = await extract_quotes_with_llm(answer, evidence_map, registry)
@@ -461,8 +476,12 @@ async def build_citations(
         if evidence is None:
             continue
 
+        evidence_text = _citation_text(evidence)
+        if not evidence_text:
+            continue
+
         located = validate_and_locate_quotes(
-            evidence.content,
+            evidence_text,
             llm_quotes.get(claim.citation_index, []),
         )
 
@@ -470,12 +489,12 @@ async def build_citations(
         if not located:
             located = fallback_locate_supporting_windows(
                 claim.claim_text,
-                evidence.content,
+                evidence_text,
             )
             status = "fallback_located" if located else "unlocated"
 
         spans = [
-            span_to_utf16(evidence.content, span.start, span.end)
+            span_to_utf16(evidence_text, span.start, span.end)
             for span in located
         ]
         passages = [span.text for span in located]
@@ -487,13 +506,13 @@ async def build_citations(
             source_type=evidence.source_type,
             title=evidence.title,
             url=evidence.url,
-            snippet=evidence.content[:300],
+            snippet=evidence_text[:300],
             quoted_text=" ... ".join(passages) if passages else None,
             quoted_passages=passages,
             page_number=evidence.page_number,
             section=evidence.section,
             published_at=evidence.published_at,
-            highlight_content=evidence.content,
+            highlight_content=evidence_text,
             highlight_spans=spans,
             offset_encoding="utf-16",
             attribution_status=status,

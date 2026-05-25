@@ -11,6 +11,7 @@ from app.core.telemetry import trace_span
 from app.models.workflow import (
     AggregatedEvidence,
     AggregatedEvidenceBundle,
+    EvidenceRelevance,
     ExcludedEvidence,
     NormalizedToolResultItem,
 )
@@ -136,14 +137,24 @@ class AggregationHandler:
 
         for record in ctx.tool_results:
             for item in record.normalized_items:
-                content = item.content.strip()
+                content = item.content.strip() if item.content else ""
                 identity = (record.source, item.item_id)
-                if not content:
+
+                if item.item_type == "document_chunk" and not content:
                     excluded.append(
                         ExcludedEvidence(
                             tool_call_id=record.tool_call_id,
                             item_id=item.item_id,
                             reason="empty_content",
+                        )
+                    )
+                    continue
+                if item.item_type == "structured_record" and not item.structured_facts:
+                    excluded.append(
+                        ExcludedEvidence(
+                            tool_call_id=record.tool_call_id,
+                            item_id=item.item_id,
+                            reason="empty_structured_facts",
                         )
                     )
                     continue
@@ -169,11 +180,14 @@ class AggregationHandler:
                     evidence_id="pending",
                     source=record.source,
                     title=item.title,
-                    content=content,
+                    evidence_type=item.item_type,
+                    content=content or None,
+                    structured_facts=item.structured_facts,
+                    original_item_id=item.item_id,
                     url=item.url,
                     published_at=item.published_at,
                     tool_call_id=record.tool_call_id,
-                    relevance=self._relevance_from_score(item.score),
+                    relevance=self._relevance_for_item(item),
                     score=item.score,
                     metadata={**item.metadata, "item_id": item.item_id},
                 )
@@ -248,10 +262,14 @@ class AggregationHandler:
         if policy.date_field == "published_at":
             return AggregationHandler._normalize_datetime(item.published_at)
 
-        raw_value = getattr(item, policy.date_field, None)
-        if raw_value is None:
-            raw_value = item.metadata.get(policy.date_field)
-        return AggregationHandler._normalize_datetime(raw_value)
+        for raw_value in (
+            getattr(item, policy.date_field, None),
+            item.metadata.get(policy.date_field),
+            item.structured_facts.get(policy.date_field),
+        ):
+            if raw_value is not None:
+                return AggregationHandler._normalize_datetime(raw_value)
+        return None
 
     @staticmethod
     def _normalize_datetime(value: Any) -> datetime | None:
@@ -311,7 +329,16 @@ class AggregationHandler:
         return list(dict.fromkeys(values))
 
     @staticmethod
-    def _relevance_from_score(score: float | None) -> str:
+    def _relevance_for_item(item: NormalizedToolResultItem) -> EvidenceRelevance:
+        raw_relevance = item.metadata.get("relevance")
+        if raw_relevance in ("high", "medium", "low"):
+            return raw_relevance
+        if item.item_type == "structured_record":
+            return "high"
+        return AggregationHandler._relevance_from_score(item.score)
+
+    @staticmethod
+    def _relevance_from_score(score: float | None) -> EvidenceRelevance:
         if score is None:
             return "medium"
         if score >= 0.75:

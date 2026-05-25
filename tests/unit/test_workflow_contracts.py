@@ -76,6 +76,27 @@ def test_planner_output_derives_task_lists_from_planned_tasks() -> None:
     assert output.used_tools == ["search_documents", "rank_documents"]
 
 
+def test_structured_tool_result_item_accepts_facts_without_content() -> None:
+    """NL-to-SQL normalized records can carry typed facts without prose content."""
+    item = NormalizedToolResultItem(
+        item_id="row1",
+        item_type="structured_record",
+        structured_facts={"metric": "target_price", "value": 420},
+    )
+    evidence = AggregatedEvidence(
+        evidence_id="ev1",
+        source="watchlist",
+        evidence_type="structured_record",
+        tool_call_id="watchlist:1",
+        original_item_id=item.item_id,
+        structured_facts=item.structured_facts,
+    )
+
+    assert item.content is None
+    assert evidence.content is None
+    assert evidence.structured_facts == {"metric": "target_price", "value": 420}
+
+
 def test_query_response_keeps_legacy_top_level_shape() -> None:
     """API response keeps existing top-level fields even with Phase 1 context data."""
     ctx = FlowContext(

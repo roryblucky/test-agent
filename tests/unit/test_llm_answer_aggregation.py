@@ -88,6 +88,23 @@ def _evidence(evidence_id: str, content: str) -> AggregatedEvidence:
     )
 
 
+def _structured_evidence(evidence_id: str) -> AggregatedEvidence:
+    return AggregatedEvidence(
+        evidence_id=evidence_id,
+        source="watchlist",
+        evidence_type="structured_record",
+        content=None,
+        structured_facts={
+            "ticker": "700 HK",
+            "metric": "target_price",
+            "value": 420,
+            "currency": "HKD",
+        },
+        tool_call_id="watchlist:1",
+        original_item_id="row1",
+    )
+
+
 @pytest.mark.asyncio
 async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
     """When aggregation exists, answer prompt uses the evidence bundle."""
@@ -127,6 +144,31 @@ async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
     assert isinstance(persisted_part, UserPromptPart)
     assert persisted_part.content == "query"
     mock_emitter.emit_token.assert_any_await("aggregated answer")
+
+
+@pytest.mark.asyncio
+async def test_llm_answer_formats_structured_evidence_facts(mock_emitter) -> None:
+    """Structured records are passed to answer as structured facts."""
+    fake_agent = FakeAnswerAgent(output="structured answer")
+    handler = _handler(fake_agent)
+    ctx = FlowContext(query="query", emitter=mock_emitter)
+    ctx.aggregated_evidence = AggregatedEvidenceBundle(
+        user_query="query",
+        standalone_query="standalone query",
+        tenant_id="tenant-a",
+        selected_evidence=[_structured_evidence("ev1")],
+        synthesis_allowed=True,
+    )
+
+    await handler.handle(
+        ctx,
+        FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
+    )
+
+    assert fake_agent.last_prompt is not None
+    assert "Structured Facts:" in fake_agent.last_prompt
+    assert '"metric": "target_price"' in fake_agent.last_prompt
+    assert '"value": 420' in fake_agent.last_prompt
 
 
 @pytest.mark.asyncio

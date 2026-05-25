@@ -110,10 +110,12 @@ PlannerTaskStatus = Literal[
     "failed",
     "skipped",
 ]
+EvidenceItemType = Literal["document_chunk", "structured_record"]
 EvidenceRelevance = Literal["high", "medium", "low"]
 ExcludedEvidenceReason = Literal[
     "duplicate",
     "empty_content",
+    "empty_structured_facts",
     "low_relevance",
     "max_evidence_exceeded",
     "source_not_allowed",
@@ -159,7 +161,9 @@ class NormalizedToolResultItem(BaseModel):
     """A normalized tool result item stored for later evidence processing."""
 
     item_id: str
-    content: str
+    item_type: EvidenceItemType = "document_chunk"
+    content: str | None = None
+    structured_facts: dict[str, Any] = Field(default_factory=dict)
 
     title: str | None = None
     url: str | None = None
@@ -245,8 +249,12 @@ class AggregatedEvidence(BaseModel):
 
     evidence_id: str
     source: str
-    content: str
     tool_call_id: str
+
+    evidence_type: EvidenceItemType = "document_chunk"
+    content: str | None = None
+    structured_facts: dict[str, Any] = Field(default_factory=dict)
+    original_item_id: str | None = None
 
     title: str | None = None
     url: str | None = None

@@ -20,11 +20,13 @@ from app.services.handlers.aggregation import AggregationHandler
 def _tool_result(
     tool_call_id: str,
     item_id: str,
-    content: str = "Evidence content",
+    content: str | None = "Evidence content",
     score: float | None = 0.9,
     source: str = "search_documents",
     metadata: dict[str, Any] | None = None,
     published_at: datetime | None = None,
+    item_type: str = "document_chunk",
+    structured_facts: dict[str, Any] | None = None,
 ) -> ToolResultRecord:
     return ToolResultRecord(
         tool_call_id=tool_call_id,
@@ -33,7 +35,9 @@ def _tool_result(
         normalized_items=[
             NormalizedToolResultItem(
                 item_id=item_id,
+                item_type=item_type,
                 content=content,
+                structured_facts=structured_facts or {},
                 score=score,
                 published_at=published_at,
                 metadata=metadata or {},
@@ -220,6 +224,120 @@ async def test_aggregation_excludes_empty_content_and_duplicates() -> None:
 
 
 @pytest.mark.asyncio
+async def test_aggregation_keeps_structured_record_without_content() -> None:
+    """Structured records use structured_facts as the source of truth."""
+    ctx = FlowContext(query="original query")
+    ctx.tool_results.append(
+        _tool_result(
+            "watchlist:1",
+            "row1",
+            content=None,
+            score=None,
+            source="watchlist",
+            item_type="structured_record",
+            structured_facts={
+                "ticker": "700 HK",
+                "metric": "target_price",
+                "value": 420,
+                "currency": "HKD",
+            },
+        )
+    )
+    ctx.planner_output = PlannerOutput(
+        can_continue_to_aggregation=True,
+        reason="Planner completed required tasks.",
+        completed_tasks=["watchlist"],
+    )
+
+    result = await AggregationHandler().handle(
+        ctx,
+        FlowStep(type=FlowStepType.AGGREGATION),
+    )
+
+    bundle = result.aggregated_evidence
+    assert bundle is not None
+    assert len(bundle.selected_evidence) == 1
+    evidence = bundle.selected_evidence[0]
+    assert evidence.evidence_type == "structured_record"
+    assert evidence.content is None
+    assert evidence.structured_facts == {
+        "ticker": "700 HK",
+        "metric": "target_price",
+        "value": 420,
+        "currency": "HKD",
+    }
+    assert evidence.relevance == "high"
+    assert evidence.original_item_id == "row1"
+    assert bundle.excluded_evidence == []
+
+
+@pytest.mark.asyncio
+async def test_aggregation_allows_structured_record_relevance_override() -> None:
+    """Structured records default high but can carry explicit relevance metadata."""
+    ctx = FlowContext(query="original query")
+    ctx.tool_results.append(
+        _tool_result(
+            "watchlist:1",
+            "row1",
+            content=None,
+            score=None,
+            source="watchlist",
+            item_type="structured_record",
+            structured_facts={"metric": "target_price", "value": 420},
+            metadata={"relevance": "medium"},
+        )
+    )
+    ctx.planner_output = PlannerOutput(
+        can_continue_to_aggregation=True,
+        reason="Planner completed required tasks.",
+        completed_tasks=["watchlist"],
+    )
+
+    result = await AggregationHandler().handle(
+        ctx,
+        FlowStep(type=FlowStepType.AGGREGATION),
+    )
+
+    bundle = result.aggregated_evidence
+    assert bundle is not None
+    assert len(bundle.selected_evidence) == 1
+    assert bundle.selected_evidence[0].relevance == "medium"
+
+
+@pytest.mark.asyncio
+async def test_aggregation_excludes_structured_record_without_facts() -> None:
+    """Structured records must include normalized facts."""
+    ctx = FlowContext(query="original query")
+    ctx.tool_results.append(
+        _tool_result(
+            "watchlist:1",
+            "row1",
+            content=None,
+            score=None,
+            source="watchlist",
+            item_type="structured_record",
+        )
+    )
+    ctx.planner_output = PlannerOutput(
+        can_continue_to_aggregation=True,
+        reason="Planner completed required tasks.",
+        completed_tasks=["watchlist"],
+    )
+
+    result = await AggregationHandler().handle(
+        ctx,
+        FlowStep(type=FlowStepType.AGGREGATION),
+    )
+
+    bundle = result.aggregated_evidence
+    assert bundle is not None
+    assert bundle.selected_evidence == []
+    assert [item.reason for item in bundle.excluded_evidence] == [
+        "empty_structured_facts"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_aggregation_freshness_contract_excludes_stale_metadata_date() -> None:
     """Freshness is enforced only when a result item declares a contract."""
     ctx = FlowContext(query="original query")
@@ -297,6 +415,49 @@ async def test_aggregation_freshness_contract_excludes_missing_required_date() -
     assert bundle.selected_evidence == []
     assert [item.reason for item in bundle.excluded_evidence] == ["stale"]
     assert bundle.excluded_evidence[0].detail == "missing freshness date: as_of_date"
+
+
+@pytest.mark.asyncio
+async def test_aggregation_freshness_contract_reads_structured_facts_date() -> None:
+    """Freshness policy can use dates normalized inside structured facts."""
+    ctx = FlowContext(query="original query")
+    ctx.tool_results.append(
+        _tool_result(
+            "watchlist:1",
+            "row1",
+            content=None,
+            score=None,
+            source="watchlist",
+            item_type="structured_record",
+            structured_facts={
+                "metric": "target_price",
+                "value": 420,
+                "as_of_date": datetime.now(UTC).date().isoformat(),
+            },
+            metadata={
+                "freshness_policy": {
+                    "date_field": "as_of_date",
+                    "max_age_days": 1,
+                    "fail_if_missing_date": True,
+                },
+            },
+        )
+    )
+    ctx.planner_output = PlannerOutput(
+        can_continue_to_aggregation=True,
+        reason="Planner completed required tasks.",
+        completed_tasks=["watchlist"],
+    )
+
+    result = await AggregationHandler().handle(
+        ctx,
+        FlowStep(type=FlowStepType.AGGREGATION),
+    )
+
+    bundle = result.aggregated_evidence
+    assert bundle is not None
+    assert len(bundle.selected_evidence) == 1
+    assert bundle.excluded_evidence == []
 
 
 @pytest.mark.asyncio
