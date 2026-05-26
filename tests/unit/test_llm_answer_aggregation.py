@@ -132,6 +132,7 @@ async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
     assert "<original_user_query>\nquery\n</original_user_query>" in fake_agent.last_prompt
     assert "<conversation_reference>" not in fake_agent.last_prompt
     assert "aggregated evidence content" in fake_agent.last_prompt
+    assert "| type=document_chunk" in fake_agent.last_prompt
     assert "Standalone Query: standalone query" in fake_agent.last_prompt
     assert fake_agent.last_message_history is None
     assert fake_agent.last_deps is not None
@@ -166,9 +167,21 @@ async def test_llm_answer_formats_structured_evidence_facts(mock_emitter) -> Non
     )
 
     assert fake_agent.last_prompt is not None
+    assert "| type=structured_record" in fake_agent.last_prompt
     assert "Structured Facts:" in fake_agent.last_prompt
     assert '"metric": "target_price"' in fake_agent.last_prompt
     assert '"value": 420' in fake_agent.last_prompt
+
+
+def test_llm_answer_static_prompt_defines_evidence_usage_rules() -> None:
+    """Answer system prompt teaches the model how to use structured evidence."""
+    instructions = LLMHandler(MagicMock())._build_layered_instructions("answer")
+
+    assert "<evidence_usage_rules>" in instructions
+    assert "document_chunk" in instructions
+    assert "structured_record" in instructions
+    assert "Structured Facts as the source of truth" in instructions
+    assert "<citation_rules>" in instructions
 
 
 @pytest.mark.asyncio

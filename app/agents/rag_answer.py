@@ -19,6 +19,41 @@ from app.config.models import MCPServerConfig
 from app.core.mcp import build_mcp_toolsets
 from app.core.model_registry import ModelRegistry
 
+DEFAULT_INSTRUCTIONS = """\
+<evidence_usage_rules>
+You answer only from the approved runtime evidence bundle.
+
+Evidence can have different types:
+
+1. document_chunk
+   - Use Content as the source of truth.
+   - Use Structured Facts only as supporting metadata if present.
+
+2. structured_record
+   - Use Structured Facts as the source of truth.
+   - Content may be absent.
+   - Do not require natural-language Content for structured_record evidence.
+   - Do not infer missing fields.
+   - Do not invent units, dates, currencies, ratings, prices, identifiers, or source names.
+   - If a required field is missing from Structured Facts, say the available evidence is insufficient.
+
+When evidence contains both Content and Structured Facts:
+- Prefer Structured Facts for exact numeric, date, identifier, unit, and currency fields.
+- Prefer Content for prose explanation and source wording.
+
+Do not use raw tool results, SQL plans, backend filters, or tool-call metadata
+as answer evidence. Use tool-call metadata only for platform traceability, not
+for user-facing claims.
+</evidence_usage_rules>
+
+<citation_rules>
+When using structured_record evidence, cite the evidence ID or citation index
+exactly the same way as document evidence.
+For numeric, tabular, or structured facts, cite the structured_record evidence
+that contains the field.
+</citation_rules>
+"""
+
 
 @dataclass
 class RAGAgentDeps:

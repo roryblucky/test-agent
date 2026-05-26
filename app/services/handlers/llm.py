@@ -35,6 +35,9 @@ from app.agents.query_understanding import (
 from app.agents.query_understanding import (
     create_query_understanding_agent,
 )
+from app.agents.rag_answer import (
+    DEFAULT_INSTRUCTIONS as _ANSWER_INSTRUCTIONS,
+)
 from app.agents.rag_answer import create_rag_answer_agent
 from app.agents.refine_question import (
     DEFAULT_INSTRUCTIONS as _REFINE_INSTRUCTIONS,
@@ -121,6 +124,9 @@ class LLMHandler:
         "intent": _INTENT_INSTRUCTIONS,
         "query_understanding": _QUERY_UNDERSTANDING_INSTRUCTIONS,
     }
+    _MODE_EXTRA_INSTRUCTIONS: dict[str, str] = {
+        "answer": _ANSWER_INSTRUCTIONS,
+    }
 
     def _build_layered_instructions(self, mode: str) -> str:
         """Build a **static** layered prompt for API-level prompt caching.
@@ -137,9 +143,11 @@ class LLMHandler:
         For ``answer``, the default enterprise assistant identity is used.
         """
         identity = self._MODE_IDENTITY.get(mode)  # None → default identity
+        extra_instructions = self._MODE_EXTRA_INSTRUCTIONS.get(mode)
         return LayeredPromptBuilder.build_from_config(
             tenant_config=self.tenant_config,
             identity=identity,
+            extra_instructions=extra_instructions,
         )
 
     def warmup(self, steps: list[FlowStep]) -> None:
@@ -633,6 +641,7 @@ def _format_aggregated_evidence(bundle: AggregatedEvidenceBundle) -> str:
     for item in bundle.selected_evidence:
         if isinstance(item.citation_index, int):
             header = f"[Evidence [{item.citation_index}] | source={item.source}"
+            header += f" | type={item.evidence_type}"
             header += f" | relevance={item.relevance}"
             if item.score is not None:
                 header += f" | score={item.score}"
@@ -640,6 +649,7 @@ def _format_aggregated_evidence(bundle: AggregatedEvidenceBundle) -> str:
             parts = [header, f"Cite as: [{item.citation_index}]"]
         else:
             header = f"[Evidence {item.evidence_id} | source={item.source}"
+            header += f" | type={item.evidence_type}"
             header += f" | relevance={item.relevance}"
             if item.score is not None:
                 header += f" | score={item.score}"
