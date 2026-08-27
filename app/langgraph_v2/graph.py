@@ -14,7 +14,7 @@ class TracerState(TypedDict):
     """Typed state for the ingress-to-finalization tracer graph."""
 
     query: str
-    session_id: str
+    conversation_id: str
     client_request_id: str | None
     events: list[dict[str, Any]]
 
@@ -48,7 +48,7 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     events = list(state["events"])
     response = TracerQueryResponse(
         query=state["query"],
-        session_id=state["session_id"],
+        conversation_id=state["conversation_id"],
         metadata={"steps_executed": ["query", "finalization"]},
     )
     events.extend(
@@ -66,7 +66,7 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
             ).model_dump(exclude_none=True),
             TracerStreamEvent(
                 type="done",
-                data=response.model_dump(),
+                data=response.model_dump(by_alias=True),
                 sequence=5,
             ).model_dump(exclude_none=True),
         ]

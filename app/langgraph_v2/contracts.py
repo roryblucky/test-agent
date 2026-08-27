@@ -14,7 +14,7 @@ class V2QueryRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     query: str = Field(min_length=1)
-    session_id: str | None = Field(default=None, alias="sessionId")
+    conversation_id: str | None = Field(default=None, alias="sessionId")
     client_request_id: str | None = Field(
         default=None,
         alias="clientRequestId",
@@ -35,7 +35,7 @@ class TracerQueryResponse(BaseModel):
     moderation: None = None
     groundedness: None = None
     clarification: None = None
-    session_id: str
+    conversation_id: str = Field(serialization_alias="session_id")
     metadata: dict[str, Any] = Field(default_factory=dict)
     citations: list[Any] = Field(default_factory=list)
 

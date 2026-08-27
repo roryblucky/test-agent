@@ -6,29 +6,25 @@
   "events": [
     {
       "type": "step_start",
-      "step": "query",
-      "sequence": 1
+      "step": "query"
     },
     {
       "type": "step_completed",
       "step": "query",
       "data": {
         "query": "What is LangGraph?"
-      },
-      "sequence": 2
+      }
     },
     {
       "type": "step_start",
-      "step": "finalization",
-      "sequence": 3
+      "step": "finalization"
     },
     {
       "type": "step_completed",
       "step": "finalization",
       "data": {
         "status": "completed"
-      },
-      "sequence": 4
+      }
     },
     {
       "type": "done",
@@ -49,8 +45,7 @@
           ]
         },
         "citations": []
-      },
-      "sequence": 5
+      }
     }
   ]
 }
