@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock
 
 import psycopg
@@ -23,18 +24,38 @@ def event_loop():
 
 
 @pytest.fixture(scope="session")
-def langgraph_v2_test_database_url() -> str:
-    """Require an explicitly named, disposable PostgreSQL test database."""
+def langgraph_v2_test_database_url() -> Iterator[str]:
+    """Provide an empty test-only database and remove migration artifacts."""
     database_url = require_disposable_postgres_url(os.environ)
     try:
-        with psycopg.connect(database_url, connect_timeout=3):
-            pass
+        with psycopg.connect(database_url, connect_timeout=3) as connection:
+            existing_object = connection.execute(
+                """
+                SELECT n.nspname, c.relname
+                FROM pg_class AS c
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+                  AND n.nspname NOT LIKE 'pg_toast%'
+                LIMIT 1
+                """
+            ).fetchone()
     except psycopg.OperationalError as error:
         pytest.fail(
             "LANGGRAPH_V2_TEST_DATABASE_URL points to an unavailable disposable "
             f"PostgreSQL database: {error}"
         )
-    return database_url
+    if existing_object is not None:
+        pytest.fail(
+            "LANGGRAPH_V2_TEST_DATABASE_URL must point to an empty disposable "
+            f"database; found {existing_object[0]}.{existing_object[1]}."
+        )
+
+    try:
+        yield database_url
+    finally:
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            connection.execute("DROP SCHEMA IF EXISTS langgraph_v2 CASCADE")
+            connection.execute("DROP TABLE IF EXISTS public.alembic_version")
 
 
 @pytest.fixture

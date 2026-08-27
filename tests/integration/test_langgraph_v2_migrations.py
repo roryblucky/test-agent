@@ -1,20 +1,9 @@
 from __future__ import annotations
 
-import os
-
 import psycopg
-import pytest
 
 from alembic import command
 from app.langgraph_v2.migrations import build_alembic_config
-
-pytestmark = pytest.mark.skipif(
-    "LANGGRAPH_V2_TEST_DATABASE_URL" not in os.environ,
-    reason=(
-        "set LANGGRAPH_V2_TEST_DATABASE_URL to an empty disposable PostgreSQL "
-        "database whose name contains a standalone 'test' segment"
-    ),
-)
 
 
 def test_application_base_revision_upgrades_and_downgrades(
