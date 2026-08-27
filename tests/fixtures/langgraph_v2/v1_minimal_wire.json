@@ -1,0 +1,56 @@
+{
+  "request": {
+    "query": "What is LangGraph?",
+    "sessionId": "conversation-123"
+  },
+  "events": [
+    {
+      "type": "step_start",
+      "step": "query",
+      "sequence": 1
+    },
+    {
+      "type": "step_completed",
+      "step": "query",
+      "data": {
+        "query": "What is LangGraph?"
+      },
+      "sequence": 2
+    },
+    {
+      "type": "step_start",
+      "step": "finalization",
+      "sequence": 3
+    },
+    {
+      "type": "step_completed",
+      "step": "finalization",
+      "data": {
+        "status": "completed"
+      },
+      "sequence": 4
+    },
+    {
+      "type": "done",
+      "data": {
+        "query": "What is LangGraph?",
+        "refined_query": null,
+        "intent": null,
+        "answer": null,
+        "documents": [],
+        "moderation": null,
+        "groundedness": null,
+        "clarification": null,
+        "session_id": "conversation-123",
+        "metadata": {
+          "steps_executed": [
+            "query",
+            "finalization"
+          ]
+        },
+        "citations": []
+      },
+      "sequence": 5
+    }
+  ]
+}
