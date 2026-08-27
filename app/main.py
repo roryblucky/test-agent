@@ -18,6 +18,7 @@ from app.core.audit_middleware import AuditMiddleware
 from app.core.http_client_pool import HttpClientPool
 from app.core.rate_limit_middleware import TenantRateLimitMiddleware
 from app.langgraph_v2.api import register_tracer_routes
+from app.langgraph_v2.postgres import postgres_lifespan
 from app.services.tenant_manager import TenantManager
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info("KMS started — tenants: %s", app.state.tenant_manager.tenant_ids)
 
-    yield
+    async with postgres_lifespan(app):
+        yield
 
     # Shutdown — close Redis session store if active
     from app.api.router import _session_store
