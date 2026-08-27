@@ -31,11 +31,28 @@ def langgraph_v2_test_database_url() -> Iterator[str]:
         with psycopg.connect(database_url, connect_timeout=3) as connection:
             existing_object = connection.execute(
                 """
-                SELECT n.nspname, c.relname
-                FROM pg_class AS c
-                JOIN pg_namespace AS n ON n.oid = c.relnamespace
-                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-                  AND n.nspname NOT LIKE 'pg_toast%'
+                SELECT object_kind, object_name
+                FROM (
+                    SELECT 'schema' AS object_kind, nspname AS object_name
+                    FROM pg_namespace
+                    WHERE nspname NOT IN ('public', 'information_schema')
+                      AND nspname NOT LIKE 'pg_%'
+                    UNION ALL
+                    SELECT 'relation', c.relname
+                    FROM pg_class AS c
+                    JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public'
+                    UNION ALL
+                    SELECT 'function', p.proname
+                    FROM pg_proc AS p
+                    JOIN pg_namespace AS n ON n.oid = p.pronamespace
+                    WHERE n.nspname = 'public'
+                    UNION ALL
+                    SELECT 'type', t.typname
+                    FROM pg_type AS t
+                    JOIN pg_namespace AS n ON n.oid = t.typnamespace
+                    WHERE n.nspname = 'public'
+                ) AS user_objects
                 LIMIT 1
                 """
             ).fetchone()
@@ -47,7 +64,7 @@ def langgraph_v2_test_database_url() -> Iterator[str]:
     if existing_object is not None:
         pytest.fail(
             "LANGGRAPH_V2_TEST_DATABASE_URL must point to an empty disposable "
-            f"database; found {existing_object[0]}.{existing_object[1]}."
+            f"database; found {existing_object[0]} {existing_object[1]!r}."
         )
 
     try:
