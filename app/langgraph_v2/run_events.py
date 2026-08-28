@@ -558,18 +558,37 @@ class RunEventRepository:
                         (tenant_id, run_id),
                     )
                 if completes_run and not conflict:
-                    await connection.execute(
-                        """
-                        UPDATE langgraph_v2.runs
-                        SET status = %s, terminal_outcome = %s,
-                            completed_at = COALESCE(completed_at, now())
-                        WHERE tenant_id = %s AND run_id = %s
-                        """,
-                        (terminal_status, Jsonb(event.data), tenant_id, run_id),
+                    await _set_terminal_status_in_transaction(
+                        connection,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        status=terminal_status,
+                        outcome=event.data,
                     )
         if conflict:
             raise EventInvariantConflict(event.event_key)
         return EventRecord.model_validate(row)
+
+
+async def _set_terminal_status_in_transaction(
+    connection: Any,
+    *,
+    tenant_id: str,
+    run_id: UUID,
+    status: TerminalStatus,
+    outcome: Any,
+) -> None:
+    """Apply one terminal Run transition inside the caller's transaction."""
+    completed_at = "COALESCE(completed_at, now())" if status == "completed" else "NULL"
+    await connection.execute(
+        f"""
+        UPDATE langgraph_v2.runs
+        SET status = %s, terminal_outcome = %s,
+            completed_at = {completed_at}
+        WHERE tenant_id = %s AND run_id = %s
+        """,
+        (status, Jsonb(outcome), tenant_id, run_id),
+    )
 
 
 def _canonical_envelope(event: EventInput) -> str:

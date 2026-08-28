@@ -21,6 +21,7 @@ from app.langgraph_v2.run_events import (
     EventRecord,
     RunNotFound,
     _canonical_envelope,
+    _set_terminal_status_in_transaction,
 )
 
 PhaseName = Literal[
@@ -334,21 +335,15 @@ class PhaseResultRepository:
                             (event for event in phase.events if event.type == "error"),
                             None,
                         )
-                        await cursor.execute(
-                            """
-                            UPDATE langgraph_v2.runs
-                            SET status = 'failed', terminal_outcome = %s,
-                                completed_at = NULL
-                            WHERE tenant_id = %s AND run_id = %s
-                            """,
-                            (
-                                Jsonb(
-                                    terminal_event.data
-                                    if terminal_event is not None
-                                    else phase.normalized_result
-                                ),
-                                tenant_id,
-                                run_id,
+                        await _set_terminal_status_in_transaction(
+                            connection,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            status="failed",
+                            outcome=(
+                                terminal_event.data
+                                if terminal_event is not None
+                                else phase.normalized_result
                             ),
                         )
 

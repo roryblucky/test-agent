@@ -104,6 +104,7 @@ def canonical_query(query: str) -> str:
 
 async def _finalize(state: TracerState) -> TracerStateUpdate:
     events = list(state["events"])
+    sequence_start = len(events) + 1
     response = TracerQueryResponse(
         query=state["query"],
         conversation_id=state["conversation_id"],
@@ -115,20 +116,20 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
                 event_key="phase:finalization:step_start:1",
                 type="step_start",
                 step="finalization",
-                sequence=3,
+                sequence=sequence_start,
             ).model_dump(exclude_none=True),
             TracerStreamEvent(
                 event_key="phase:finalization:step_completed:1",
                 type="step_completed",
                 step="finalization",
                 data={"status": "completed"},
-                sequence=4,
+                sequence=sequence_start + 1,
             ).model_dump(exclude_none=True),
             TracerStreamEvent(
                 event_key="lifecycle:completed:0",
                 type="done",
                 data=response.model_dump(by_alias=True),
-                sequence=5,
+                sequence=sequence_start + 2,
             ).model_dump(exclude_none=True),
         ]
     )
@@ -141,9 +142,10 @@ async def _pre_moderation_without_journal(
 ) -> tuple[list[dict[str, Any]], ModerationDecision]:
     """Run the provider for an unconfigured in-memory graph."""
     decision = await provider.check(state["query"])
+    sequence_start = len(state["events"]) + 1
     events = [
-        _event_state(event, index)
-        for index, event in enumerate(pre_moderation_events(decision), 1)
+        _event_state(event, sequence_start + index)
+        for index, event in enumerate(pre_moderation_events(decision))
     ]
     return events, decision
 

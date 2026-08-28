@@ -108,6 +108,20 @@ async def test_captured_legacy_moderation_error_fixture() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_in_memory_graph_sequences_events_additively() -> None:
+    result = await build_tracer_graph().ainvoke(
+        {
+            "query": "hello",
+            "conversation_id": "conversation-1",
+            "client_request_id": None,
+            "events": [],
+        }
+    )
+
+    assert [event["sequence"] for event in result["events"]] == list(range(1, 8))
+
+
 def test_enabled_tracer_preserves_the_minimal_stream_contract(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
