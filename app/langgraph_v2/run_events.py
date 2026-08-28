@@ -412,6 +412,26 @@ class RunEventRepository:
             completes_run=True,
         )
 
+    async def fail_run(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        event: EventInput,
+        owner_instance_id: str,
+        execution_epoch: int,
+    ) -> EventRecord:
+        """Atomically append a terminal error Event and fail its Run."""
+        return await self._persist_event(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            event=event,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+            completes_run=True,
+            terminal_status="failed",
+        )
+
     async def _persist_event(
         self,
         *,
@@ -421,6 +441,7 @@ class RunEventRepository:
         owner_instance_id: str,
         execution_epoch: int,
         completes_run: bool,
+        terminal_status: str = "completed",
     ) -> EventRecord:
         canonical_envelope = _canonical_envelope(event)
         conflict = False
@@ -529,11 +550,11 @@ class RunEventRepository:
                     await connection.execute(
                         """
                         UPDATE langgraph_v2.runs
-                        SET status = 'completed', terminal_outcome = %s,
+                        SET status = %s, terminal_outcome = %s,
                             completed_at = COALESCE(completed_at, now())
                         WHERE tenant_id = %s AND run_id = %s
                         """,
-                        (Jsonb(event.data), tenant_id, run_id),
+                        (terminal_status, Jsonb(event.data), tenant_id, run_id),
                     )
         if conflict:
             raise EventInvariantConflict(event.event_key)

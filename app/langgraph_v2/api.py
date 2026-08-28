@@ -86,6 +86,14 @@ async def _persist_result_events(
                 owner_instance_id=owner_instance_id,
                 execution_epoch=execution_epoch,
             )
+        elif event.type == "error":
+            persisted = await repository.fail_run(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event=event_input,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+            )
         else:
             persisted = await repository.append_event(
                 tenant_id=tenant_id,

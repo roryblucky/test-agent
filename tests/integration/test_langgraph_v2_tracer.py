@@ -112,8 +112,21 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
     assert response.headers["x-conversation-id"] == "conversation-123"
     assert response.text.endswith("\n\n")
     actual_events = parse_sse(response.text)
-    assert [event.pop("sequence") for event in actual_events] == [1, 2, 3, 4, 5]
-    assert actual_events == fixture["events"]
+    assert [event.pop("sequence") for event in actual_events] == list(range(1, 8))
+    assert actual_events[:2] == fixture["events"][:2]
+    assert [event["step"] for event in actual_events[2:6]] == [
+        "pre_moderation",
+        "pre_moderation",
+        "finalization",
+        "finalization",
+    ]
+    assert actual_events[-1]["type"] == fixture["events"][-1]["type"]
+    assert actual_events[-1]["data"]["query"] == fixture["events"][-1]["data"]["query"]
+    assert actual_events[-1]["data"]["metadata"]["steps_executed"] == [
+        "query",
+        "pre_moderation",
+        "finalization",
+    ]
 
 
 def test_request_header_and_generated_conversation_variants(
@@ -140,6 +153,43 @@ def test_request_header_and_generated_conversation_variants(
     UUID(conversation_id)
     assert parse_sse(generated.text)[-1]["data"]["session_id"] == conversation_id
     assert invalid_client_id.status_code == 422
+
+
+def test_flagged_query_emits_error_before_finalization(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "please blocked this", "sessionId": "conversation-1"},
+            headers={"X-Application-Id": "tenant-a"},
+        )
+
+    delivered = parse_sse(response.text)
+    assert response.status_code == 200
+    assert [event["step"] for event in delivered[:-1]] == [
+        "query",
+        "query",
+        "pre_moderation",
+        "pre_moderation",
+    ]
+    assert delivered[-1]["type"] == "error"
+    assert delivered[-1]["data"]["message"] == (
+        "Your query was flagged by content moderation."
+    )
+    assert all(event["step"] != "finalization" for event in delivered)
+
+    run_id = UUID(response.headers["x-run-id"])
+
+    async def read_status() -> str:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            return (await RunEventRepository(pool).get_run("tenant-a", run_id)).status
+
+    assert asyncio.run(read_status()) == "failed"
 
 
 @pytest.mark.asyncio
@@ -534,7 +584,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     delivered = parse_sse(response.text)
     assert response.status_code == 200
-    assert [event["sequence"] for event in delivered] == [3, 4, 5]
+    assert [event["sequence"] for event in delivered] == [5, 6, 7]
 
     async def read_run_and_events() -> tuple[str, int, list, Any]:
         async with AsyncConnectionPool(
@@ -550,7 +600,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     status, epoch, events, phase = asyncio.run(read_run_and_events())
     assert (status, epoch) == ("completed", 2)
-    assert [event.sequence for event in events] == [1, 2, 3, 4, 5]
+    assert [event.sequence for event in events] == list(range(1, 8))
     assert phase is not None
     assert phase.normalized_result == {
         "query": "authoritative",
@@ -671,10 +721,12 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
 
     assert run.status == "completed"
     assert run.terminal_outcome == delivered[-1]["data"]
-    assert [event.sequence for event in persisted] == [1, 2, 3, 4, 5]
+    assert [event.sequence for event in persisted] == list(range(1, 8))
     assert [event.event_key for event in persisted] == [
         "phase:query:step_start:1",
         "phase:query:step_completed:1",
+        "phase:pre_moderation:step_start:1",
+        "phase:pre_moderation:step_completed:1",
         "phase:finalization:step_start:1",
         "phase:finalization:step_completed:1",
         "lifecycle:completed:0",

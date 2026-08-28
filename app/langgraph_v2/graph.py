@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
-from typing import Any, TypedDict, cast
+from typing import Any, NotRequired, TypedDict, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -11,6 +11,12 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
+from app.langgraph_v2.pre_moderation import (
+    MockModerationProvider,
+    ModerationDecision,
+    ModerationProvider,
+    run_pre_moderation,
+)
 from app.langgraph_v2.run_events import EventInput, EventRecord
 
 
@@ -21,12 +27,16 @@ class TracerState(TypedDict):
     conversation_id: str
     client_request_id: str | None
     events: list[dict[str, Any]]
+    halted: NotRequired[bool]
+    moderation: NotRequired[dict[str, Any]]
 
 
 class TracerStateUpdate(TypedDict, total=False):
     """Partial state update returned by one tracer node."""
 
     events: list[dict[str, Any]]
+    halted: bool
+    moderation: dict[str, Any]
 
 
 async def _query(
@@ -96,7 +106,7 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     response = TracerQueryResponse(
         query=state["query"],
         conversation_id=state["conversation_id"],
-        metadata={"steps_executed": ["query", "finalization"]},
+        metadata={"steps_executed": ["query", "pre_moderation", "finalization"]},
     )
     events.extend(
         [
@@ -124,9 +134,49 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     return {"events": events}
 
 
+async def _pre_moderation_without_journal(
+    state: TracerState,
+    provider: ModerationProvider,
+) -> tuple[list[dict[str, Any]], ModerationDecision]:
+    """Run the provider for an unconfigured in-memory graph."""
+    decision = await provider.check(state["query"])
+    events = [
+        TracerStreamEvent(
+            event_key="phase:pre_moderation:step_start:1",
+            type="step_start",
+            step="pre_moderation",
+            sequence=1,
+        ).model_dump(exclude_none=True),
+        TracerStreamEvent(
+            event_key="phase:pre_moderation:step_completed:1",
+            type="step_completed",
+            step="pre_moderation",
+            data=decision.model_dump(exclude_none=True),
+            sequence=2,
+        ).model_dump(exclude_none=True),
+    ]
+    if decision.is_flagged:
+        events.append(
+            TracerStreamEvent(
+                event_key="phase:pre_moderation:error:1",
+                type="error",
+                step="pre_moderation",
+                data={"message": "Your query was flagged by content moderation."},
+                sequence=3,
+            ).model_dump(exclude_none=True)
+        )
+    return events, decision
+
+
+def _next_after_pre_moderation(state: TracerState) -> str:
+    """Stop the graph on a flagged query before any later phase."""
+    return "end" if state.get("halted", False) else "finalization"
+
+
 def build_tracer_graph(
     checkpointer: BaseCheckpointSaver | None = None,
     phase_context: PhaseExecutionContext | None = None,
+    moderation_provider: ModerationProvider | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
@@ -135,9 +185,39 @@ def build_tracer_graph(
         return await _query(state, phase_context=phase_context)
 
     builder.add_node("query", query_node)
+    selected_moderation_provider = moderation_provider or MockModerationProvider()
+
+    async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
+        if phase_context is None:
+            events, decision = await _pre_moderation_without_journal(
+                state, selected_moderation_provider
+            )
+        else:
+            events, halted, decision = await run_pre_moderation(
+                state,
+                context=phase_context,
+                provider=selected_moderation_provider,
+            )
+            return {
+                "events": [*state["events"], *events],
+                "halted": halted,
+                "moderation": decision.model_dump(exclude_none=True),
+            }
+        return {
+            "events": [*state["events"], *events],
+            "halted": decision.is_flagged,
+            "moderation": decision.model_dump(exclude_none=True),
+        }
+
+    builder.add_node("pre_moderation", pre_moderation_node)
     builder.add_node("finalization", _finalize)
     builder.add_edge(START, "query")
-    builder.add_edge("query", "finalization")
+    builder.add_edge("query", "pre_moderation")
+    builder.add_conditional_edges(
+        "pre_moderation",
+        _next_after_pre_moderation,
+        {"finalization": "finalization", "end": END},
+    )
     builder.add_edge("finalization", END)
     return builder.compile(checkpointer=checkpointer)
 
