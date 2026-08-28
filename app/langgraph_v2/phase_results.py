@@ -14,7 +14,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
-from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.run_events import (
     ClaimFenced,
     EventInput,
@@ -61,7 +61,7 @@ class PhaseResultInput(BaseModel):
 
     phase_name: PhaseName
     normalized_result: Any = None
-    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    artifact_refs: list[ArtifactRef] = Field(default_factory=list)
     events: tuple[EventInput, ...] = ()
     terminal_status: Literal["failed"] | None = None
 
@@ -89,7 +89,7 @@ class PhaseResultRecord(BaseModel):
     phase_name: PhaseName
     execution_epoch: int
     normalized_result: Any = None
-    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    artifact_refs: list[ArtifactRef] = Field(default_factory=list)
     event_keys: tuple[str, ...] = ()
     events: tuple[EventRecord, ...] = ()
     canonical_result: str

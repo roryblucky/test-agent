@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, TypedDict
 from uuid import UUID, uuid4
 
 from psycopg.rows import dict_row
@@ -25,8 +25,15 @@ class ArtifactRecord(BaseModel):
     created_at: datetime
 
 
-class ArtifactStore(Protocol):
-    """Narrow tenant-scoped Artifact persistence seam used by graph nodes."""
+class ArtifactRef(TypedDict):
+    """Stable reference carried through graph state and PhaseResults."""
+
+    artifact_id: str
+    artifact_type: str
+
+
+class ArtifactWriter(Protocol):
+    """Minimal write seam required by retrieval orchestration."""
 
     async def create(
         self,
@@ -38,6 +45,9 @@ class ArtifactStore(Protocol):
     ) -> ArtifactRecord:
         """Create or idempotently reuse one Artifact."""
         ...
+
+class ArtifactStore(ArtifactWriter, Protocol):
+    """Tenant-scoped Artifact seam including response-boundary reads."""
 
     async def get(self, *, tenant_id: str, artifact_id: UUID) -> ArtifactRecord:
         """Read one Artifact within a Tenant boundary."""

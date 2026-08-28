@@ -48,8 +48,9 @@ async def test_retrieval_persists_artifacts_and_replays_without_second_call(
             phase_context=PhaseExecutionContext(
                 repository=PhaseResultRepository(pool), tenant_id="tenant-a", run_id=run.run_id,
                 owner_instance_id="i1", execution_epoch=run.execution_epoch,
+                artifact_repository=ArtifactRepository(pool),
             ),
-            artifact_repository=ArtifactRepository(pool), retriever=retriever,
+            retriever=retriever,
         )
         state = {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
         first = await graph.ainvoke(state)
@@ -145,7 +146,7 @@ async def test_retrieval_replays_after_commit_window_crash(
             owner_instance_id="i1", execution_epoch=run.execution_epoch,
             artifact_repository=ArtifactRepository(pool),
         )
-        graph = build_tracer_graph(phase_context=context, artifact_repository=context.artifact_repository, retriever=retriever)
+        graph = build_tracer_graph(phase_context=context, retriever=retriever)
         state = {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
         with pytest.raises(RuntimeError, match="crash after retrieval commit"):
             await graph.ainvoke(state)

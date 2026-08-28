@@ -8,7 +8,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, Field
 
-from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactRef, ArtifactWriter
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
@@ -43,14 +43,14 @@ async def run_retrieval(
     state: Mapping[str, Any],
     *,
     context: PhaseExecutionContext,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactWriter,
     retriever: Retriever,
 ) -> tuple[list[EventRecord], list[dict[str, Any]], list[Document], bool, str | None]:
     """Journal retrieval output and persist referenced Artifacts."""
     async def invoke() -> PhaseResultInput:
         try:
             result = await retriever.retrieve(state.get("refined_query", state["query"]))
-            refs: list[dict[str, Any]] = []
+            refs: list[ArtifactRef] = []
             for index, document in enumerate(result.documents):
                 artifact = await artifacts.create(
                     tenant_id=context.tenant_id,

@@ -9,7 +9,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.pre_moderation import (
@@ -41,7 +41,7 @@ class TracerState(TypedDict):
     refined_query: NotRequired[str]
     refinement_error: NotRequired[str]
     retrieval_error: NotRequired[str]
-    artifact_refs: NotRequired[list[dict[str, Any]]]
+    artifact_refs: NotRequired[list[ArtifactRef]]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -53,7 +53,7 @@ class TracerStateUpdate(TypedDict, total=False):
     refined_query: str
     refinement_error: str
     retrieval_error: str
-    artifact_refs: list[dict[str, Any]]
+    artifact_refs: list[ArtifactRef]
 
 
 async def _query(
@@ -186,7 +186,6 @@ def build_tracer_graph(
     phase_context: PhaseExecutionContext | None = None,
     moderation_provider: ModerationProvider | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
-    artifact_repository: ArtifactStore | None = None,
     retriever: Retriever | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
@@ -199,7 +198,7 @@ def build_tracer_graph(
     selected_moderation_provider = moderation_provider or MockModerationProvider()
     selected_refinement_actor = refinement_actor or MockQuestionRefinementActor()
     selected_retriever = retriever or MockRetriever()
-    selected_artifact_repository = artifact_repository or (
+    selected_artifact_repository = (
         phase_context.artifact_repository if phase_context is not None else None
     )
 
