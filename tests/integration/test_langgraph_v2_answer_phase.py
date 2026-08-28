@@ -86,6 +86,18 @@ class _RankedInlineAnswer:
         return AnswerResult(answer="World claim [1].")
 
 
+class _MalformedCitationAnswer:
+    calls = 0
+
+    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+        self.calls += 1
+        del query, documents
+        return AnswerResult(
+            answer="Malformed [x] [0] []",
+            citations=[AnswerCitation(index=1, quoted_text="hello")],
+        )
+
+
 @pytest.mark.asyncio
 async def test_answer_receives_ranked_documents_and_replays_without_model_call(
     langgraph_v2_migrated_database_url: str,
@@ -394,3 +406,29 @@ async def test_inline_citation_uses_reranked_artifact_position(
 
     assert actor.calls == 1
     assert result["citations"][0].evidence_id == reranking.artifact_refs[0]["artifact_id"]
+
+
+@pytest.mark.asyncio
+async def test_malformed_inline_references_do_not_fallback_to_structured_citations(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        actor = _MalformedCitationAnswer()
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(), answer_actor=actor
+        )
+        result = await graph.ainvoke(
+            {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
+        )
+
+    assert actor.calls == 1
+    assert result["citations"] == []
