@@ -25,6 +25,7 @@ from app.langgraph_v2.checkpointing import (
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
+from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.run_events import (
     CLAIM_HEARTBEAT_INTERVAL_SECONDS,
     ClaimFenced,
@@ -118,7 +119,10 @@ class TracerGraph(Protocol):
         ...
 
 
-def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
+def create_tracer_router(
+    graph: TracerGraph | None = None,
+    refinement_actor: QuestionRefinementActor | None = None,
+) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
     router = APIRouter(tags=["LangGraph v2 tracer"])
 
@@ -153,6 +157,11 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
             configured_checkpointer = getattr(
                 http_request.app.state,
                 "langgraph_v2_checkpointer",
+                None,
+            )
+            configured_refinement_actor = refinement_actor or getattr(
+                http_request.app.state,
+                "langgraph_v2_refinement_actor",
                 None,
             )
             selected_graph = graph or tracer_graph
@@ -190,6 +199,7 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
                     ),
+                    refinement_actor=configured_refinement_actor,
                 )
                 graph_config = initial_checkpoint_config(
                     thread_id=thread_id_for(
@@ -197,6 +207,17 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
                         conversation_id,
                     ),
                     checkpoint_ns=checkpoint_ns,
+                )
+            elif graph is None and configured_refinement_actor is not None:
+                selected_graph = build_tracer_graph(
+                    phase_context=PhaseExecutionContext(
+                        repository=PhaseResultRepository(pool),
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                    ),
+                    refinement_actor=configured_refinement_actor,
                 )
             heartbeat_task = asyncio.create_task(
                 _refresh_claim(
@@ -278,6 +299,11 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
             configured_checkpointer = getattr(
                 http_request.app.state, "langgraph_v2_checkpointer", None
             )
+            configured_refinement_actor = refinement_actor or getattr(
+                http_request.app.state,
+                "langgraph_v2_refinement_actor",
+                None,
+            )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None and configured_checkpointer is not None:
@@ -312,6 +338,7 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
                     ),
+                    refinement_actor=configured_refinement_actor,
                 )
                 graph_config = exact_checkpoint_config(
                     thread_id=thread_id_for(x_application_id, claim.conversation_id),
@@ -365,11 +392,12 @@ def register_tracer_routes(
     *,
     enabled: bool,
     graph: TracerGraph | None = None,
+    refinement_actor: QuestionRefinementActor | None = None,
     resume_enabled: bool = False,
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
-        router = create_tracer_router(graph)
+        router = create_tracer_router(graph, refinement_actor)
         if not resume_enabled:
             router.routes = [
                 route

@@ -37,6 +37,7 @@ class TracerState(TypedDict):
     halted: NotRequired[bool]
     moderation: NotRequired[dict[str, Any]]
     refined_query: NotRequired[str]
+    refinement_error: NotRequired[str]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -46,6 +47,7 @@ class TracerStateUpdate(TypedDict, total=False):
     halted: bool
     moderation: dict[str, Any]
     refined_query: str
+    refinement_error: str
 
 
 async def _query(
@@ -168,7 +170,7 @@ async def _pre_moderation_without_journal(
 
 def _next_after_pre_moderation(state: TracerState) -> str:
     """Stop the graph on a flagged query before any later phase."""
-    return "end" if state.get("halted", False) else "finalization"
+    return "end" if state.get("halted", False) else "question_refinement"
 
 
 def build_tracer_graph(
@@ -242,7 +244,7 @@ def build_tracer_graph(
         if result is not None:
             update["refined_query"] = result.standalone_query
         if error is not None:
-            update["moderation"] = {"error": error}
+            update["refinement_error"] = error
         return update
 
     builder.add_node("question_refinement", question_refinement_node)
@@ -252,7 +254,7 @@ def build_tracer_graph(
     builder.add_conditional_edges(
         "pre_moderation",
         _next_after_pre_moderation,
-        {"finalization": "question_refinement", "end": END},
+        {"question_refinement": "question_refinement", "end": END},
     )
     builder.add_conditional_edges(
         "question_refinement",

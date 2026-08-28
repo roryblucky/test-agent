@@ -10,6 +10,7 @@ from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRep
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
     PydanticAIQuestionRefinementActor,
+    run_question_refinement,
 )
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.workflow import ResolvedQuery
@@ -145,6 +146,55 @@ async def test_refinement_replay_does_not_reinvoke_actor_or_duplicate_events(
             "phase:query:step_completed:1",
             "phase:pre_moderation:step_start:1",
             "phase:pre_moderation:step_completed:1",
+            "phase:question_refinement:step_start:1",
+            "phase:question_refinement:step_completed:1",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_refinement_replays_after_commit_before_checkpoint(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class CountingActor:
+        calls = 0
+
+        async def refine(self, query: str) -> ResolvedQuery:
+            self.calls += 1
+            return ResolvedQuery(original_query=query, standalone_query="standalone")
+
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        actor = CountingActor()
+
+        first_events, _, first, _ = await run_question_refinement(
+            _state(), context=context, actor=actor
+        )
+        replayed_events, _, replayed, _ = await run_question_refinement(
+            _state(), context=context, actor=actor
+        )
+
+        assert actor.calls == 1
+        assert first == replayed
+        assert [event.event_key for event in first_events] == [
+            "phase:question_refinement:step_start:1",
+            "phase:question_refinement:step_completed:1",
+        ]
+        assert [event.event_key for event in replayed_events] == [
             "phase:question_refinement:step_start:1",
             "phase:question_refinement:step_completed:1",
         ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Protocol
 
+from pydantic import Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
@@ -12,6 +13,12 @@ from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.workflow import ResolvedQuery
 
 REFINEMENT_ERROR_MESSAGE = "Question refinement failed."
+
+
+class V2ResolvedQuery(ResolvedQuery):
+    """V2 refinement output requiring a non-empty standalone question."""
+
+    standalone_query: str = Field(min_length=1)
 
 
 class QuestionRefinementActor(Protocol):
@@ -33,7 +40,7 @@ class MockQuestionRefinementActor:
 class PydanticAIQuestionRefinementActor:
     """Adapt a PydanticAI Agent to the v2 actor protocol."""
 
-    def __init__(self, agent: Agent[Any, ResolvedQuery]) -> None:
+    def __init__(self, agent: Agent[Any, V2ResolvedQuery]) -> None:
         self._agent = agent
 
     async def refine(self, query: str) -> ResolvedQuery:
@@ -51,7 +58,7 @@ def build_question_refinement_actor(
     """Create a role-configured PydanticAI refinement actor."""
     agent = registry.create_agent(
         model_name,
-        output_type=ResolvedQuery,
+        output_type=V2ResolvedQuery,
         instructions=instructions or "Return a standalone question as structured JSON.",
     )
     return PydanticAIQuestionRefinementActor(agent)
@@ -101,7 +108,9 @@ async def run_question_refinement(
 
     async def invoke() -> PhaseResultInput:
         try:
-            result = await actor.refine(state["query"])
+            result = V2ResolvedQuery.model_validate(
+                (await actor.refine(state["query"])).model_dump()
+            )
         except Exception as exc:
             message = str(exc) or REFINEMENT_ERROR_MESSAGE
             return PhaseResultInput(
@@ -129,6 +138,6 @@ async def run_question_refinement(
     return (
         list(result.events),
         False,
-        ResolvedQuery.model_validate(result.normalized_result),
+        V2ResolvedQuery.model_validate(result.normalized_result),
         None,
     )
