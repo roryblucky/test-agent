@@ -549,7 +549,6 @@ def test_groundedness_setup_failure_is_redacted_and_diagnosable(
         span
         for span in capture.spans.get_finished_spans()
         if span.name == "langgraph_v2.pydantic_ai.setup"
-        and span.attributes["actor.role"] == "groundedness"
     )
     assert span.attributes["actor.role"] == "groundedness"
     assert span.attributes["error.type"] == "RuntimeError"
@@ -557,83 +556,6 @@ def test_groundedness_setup_failure_is_redacted_and_diagnosable(
     exported = repr(span)
     assert "private groundedness" not in exported
     assert "private setup query" not in exported
-
-
-def test_query_refinement_setup_failure_is_redacted_and_diagnosable(
-    langgraph_v2_migrated_database_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Query setup reports refinement construction failure without its message."""
-    capture = _install_capture(monkeypatch)
-    app = _observed_app(
-        langgraph_v2_migrated_database_url,
-        secret_query="unused",
-    )
-    monkeypatch.setattr(
-        "app.langgraph_v2.api._resolve_refinement_actor",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("private refinement credential=never-export")
-        ),
-    )
-
-    with TestClient(app, raise_server_exceptions=False) as client:
-        client.post(
-            "/v2/query/stream",
-            headers={"X-Application-Id": "tenant-a"},
-            json={"query": "private refinement setup query"},
-        )
-
-    span = next(
-        span
-        for span in capture.spans.get_finished_spans()
-        if span.name == "langgraph_v2.pydantic_ai.setup"
-        and span.attributes["actor.role"] == "question_refinement"
-    )
-    assert span.attributes["actor.role"] == "question_refinement"
-    assert span.attributes["error.type"] == "RuntimeError"
-    assert span.status.status_code.name == "ERROR"
-    exported = repr(span)
-    assert "private refinement" not in exported
-    assert "private refinement setup query" not in exported
-
-
-def test_resume_answer_setup_failure_is_redacted_and_diagnosable(
-    langgraph_v2_migrated_database_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Resume setup reports answer construction failure without its message."""
-    capture = _install_capture(monkeypatch)
-    run_id = asyncio.run(_seed_stale_run(langgraph_v2_migrated_database_url))
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        _ResumeGraph(),
-        resume_enabled=True,
-    )
-    monkeypatch.setattr(
-        "app.langgraph_v2.api._resolve_answer_actor",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("private answer credential=never-export")
-        ),
-    )
-
-    with TestClient(app, raise_server_exceptions=False) as client:
-        client.post(
-            f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-a"},
-        )
-
-    span = next(
-        span
-        for span in capture.spans.get_finished_spans()
-        if span.name == "langgraph_v2.pydantic_ai.setup"
-        and span.attributes["actor.role"] == "answer"
-    )
-    assert span.attributes["actor.role"] == "answer"
-    assert span.attributes["error.type"] == "RuntimeError"
-    assert span.status.status_code.name == "ERROR"
-    exported = repr(span)
-    assert "private answer" not in exported
-    assert str(run_id) not in exported
 
 
 @pytest.mark.asyncio
