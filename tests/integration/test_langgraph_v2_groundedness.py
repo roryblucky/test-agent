@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
+from unittest.mock import patch
 
 import pytest
+from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerCitation, AnswerResult
@@ -14,6 +16,7 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.domain import Document
+from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
 class _Retriever:
@@ -217,3 +220,35 @@ async def test_groundedness_rejects_out_of_range_scores(
 
     assert result.get("groundedness") is None
     assert "less than or equal to 1" in result["groundedness_error"]
+
+
+@pytest.mark.asyncio
+async def test_groundedness_actor_setup_failure_terminalizes_run(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+    )
+    with patch(
+        "app.langgraph_v2.api._resolve_groundedness_actor",
+        side_effect=RuntimeError("groundedness model is unavailable"),
+    ):
+        with TestClient(app) as client:
+            response = client.post(
+                "/v2/query/stream",
+                json={"query": "hello"},
+                headers={"X-Application-Id": "tenant-a"},
+            )
+
+    events = parse_sse(response.text)
+    assert response.status_code == 200
+    assert events[-1]["type"] == "error"
+    assert events[-1]["data"] == "groundedness model is unavailable"
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        run = await RunEventRepository(pool).get_run(
+            "tenant-a", UUID(response.headers["x-run-id"])
+        )
+    assert run.status == "failed"
