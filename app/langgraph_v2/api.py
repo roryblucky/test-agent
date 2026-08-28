@@ -849,14 +849,30 @@ def create_tracer_router(
                 "langgraph_v2_checkpointer",
                 None,
             )
-            configured_refinement_actor = _resolve_refinement_actor(
-                http_request.app,
-                x_application_id,
-                refinement_actor,
-            )
-            configured_answer_actor = _resolve_answer_actor(
-                http_request.app, x_application_id, answer_actor
-            )
+            with observe(
+                "pydantic_ai.setup",
+                run_id=run_id,
+                conversation_id=conversation_id,
+                execution_epoch=claim.execution_epoch,
+                attributes={"actor.role": "question_refinement"},
+            ):
+                configured_refinement_actor = _resolve_refinement_actor(
+                    http_request.app,
+                    x_application_id,
+                    refinement_actor,
+                )
+            with observe(
+                "pydantic_ai.setup",
+                run_id=run_id,
+                conversation_id=conversation_id,
+                execution_epoch=claim.execution_epoch,
+                attributes={"actor.role": "answer"},
+            ):
+                configured_answer_actor = _resolve_answer_actor(
+                    http_request.app,
+                    x_application_id,
+                    answer_actor,
+                )
             try:
                 with observe(
                     "pydantic_ai.setup",
@@ -1062,14 +1078,30 @@ def create_tracer_router(
         configured_checkpointer = getattr(
             http_request.app.state, "langgraph_v2_checkpointer", None
         )
-        configured_refinement_actor = _resolve_refinement_actor(
-            http_request.app,
-            x_application_id,
-            refinement_actor,
-        )
-        configured_answer_actor = _resolve_answer_actor(
-            http_request.app, x_application_id, answer_actor
-        )
+        with observe(
+            "pydantic_ai.setup",
+            run_id=run_id,
+            conversation_id=claim.conversation_id,
+            execution_epoch=claim.execution_epoch,
+            attributes={"actor.role": "question_refinement"},
+        ):
+            configured_refinement_actor = _resolve_refinement_actor(
+                http_request.app,
+                x_application_id,
+                refinement_actor,
+            )
+        with observe(
+            "pydantic_ai.setup",
+            run_id=run_id,
+            conversation_id=claim.conversation_id,
+            execution_epoch=claim.execution_epoch,
+            attributes={"actor.role": "answer"},
+        ):
+            configured_answer_actor = _resolve_answer_actor(
+                http_request.app,
+                x_application_id,
+                answer_actor,
+            )
         try:
             with observe(
                 "pydantic_ai.setup",
