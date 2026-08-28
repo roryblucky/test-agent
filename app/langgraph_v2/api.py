@@ -15,6 +15,11 @@ from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 
+from app.langgraph_v2.answer import (
+    ANSWER_CHUNK_INTERVAL_MS,
+    AnswerActor,
+    build_answer_actor,
+)
 from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
@@ -65,7 +70,7 @@ def _resolve_refinement_actor(
     if configured is not None:
         return configured
     manager = getattr(app.state, "tenant_manager", None)
-    if manager is None:
+    if manager is None or not hasattr(manager, "get_model_registry"):
         return None
     return build_question_refinement_actor(manager.get_model_registry(tenant_id))
 
@@ -76,6 +81,23 @@ def _resolve_provider_bundle(app: FastAPI, tenant_id: str) -> V2ProviderBundle |
     if manager is None or not hasattr(manager, "get_providers"):
         return None
     return adapt_tenant_providers(manager.get_providers(tenant_id))
+
+
+def _resolve_answer_actor(
+    app: FastAPI,
+    tenant_id: str,
+    injected: AnswerActor | None,
+) -> AnswerActor | None:
+    """Resolve an injected actor or build the tenant's PydanticAI answer actor."""
+    if injected is not None:
+        return injected
+    configured = getattr(app.state, "langgraph_v2_answer_actor", None)
+    if configured is not None:
+        return configured
+    manager = getattr(app.state, "tenant_manager", None)
+    if manager is None or not hasattr(manager, "get_model_registry"):
+        return None
+    return build_answer_actor(manager.get_model_registry(tenant_id))
 
 
 def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
@@ -152,9 +174,11 @@ async def _persist_result_events(
     owner_instance_id: str,
     execution_epoch: int,
     suppress_sse_for_event_keys: set[str] | None = None,
+    answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
 ) -> AsyncIterator[str]:
     """Persist graph Events and serialize newly published SSE frames."""
     prior_keys = suppress_sse_for_event_keys or set()
+    answer_chunk_count = 0
     for raw_event in result["events"]:
         event = TracerStreamEvent.model_validate(raw_event)
         event_input = EventInput(
@@ -187,6 +211,10 @@ async def _persist_result_events(
                 owner_instance_id=owner_instance_id,
                 execution_epoch=execution_epoch,
             )
+        if event.type == "token" and event.step == "llm:answer":
+            if answer_chunk_count:
+                await asyncio.sleep(answer_chunk_interval_ms / 1000)
+            answer_chunk_count += 1
         if event.event_key not in prior_keys:
             yield event.model_copy(update={"sequence": persisted.sequence}).to_sse()
 
@@ -209,8 +237,12 @@ def create_tracer_router(
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
     moderation_provider: ModerationProvider | None = None,
+    answer_actor: AnswerActor | None = None,
+    answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
 ) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
+    if not 200 <= answer_chunk_interval_ms <= 500:
+        raise ValueError("answer_chunk_interval_ms must be between 200 and 500")
     router = APIRouter(tags=["LangGraph v2 tracer"])
 
     @router.post("/v2/query/stream")
@@ -251,6 +283,9 @@ def create_tracer_router(
                 http_request.app,
                 x_application_id,
                 refinement_actor,
+            )
+            configured_answer_actor = _resolve_answer_actor(
+                http_request.app, x_application_id, answer_actor
             )
             (
                 configured_retriever,
@@ -314,6 +349,7 @@ def create_tracer_router(
                     retriever=configured_retriever,
                     ranker=configured_ranker,
                     moderation_provider=configured_moderation,
+                    answer_actor=configured_answer_actor,
                 )
             heartbeat_task = asyncio.create_task(
                 _refresh_claim(
@@ -342,6 +378,7 @@ def create_tracer_router(
                     result=result,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
+                    answer_chunk_interval_ms=answer_chunk_interval_ms,
                 ):
                     yield frame
             finally:
@@ -401,6 +438,9 @@ def create_tracer_router(
                 x_application_id,
                 refinement_actor,
             )
+            configured_answer_actor = _resolve_answer_actor(
+                http_request.app, x_application_id, answer_actor
+            )
             (
                 configured_retriever,
                 configured_ranker,
@@ -451,6 +491,7 @@ def create_tracer_router(
                     retriever=configured_retriever,
                     ranker=configured_ranker,
                     moderation_provider=configured_moderation,
+                    answer_actor=configured_answer_actor,
                 )
                 graph_config = exact_checkpoint_config(
                     thread_id=thread_id_for(x_application_id, claim.conversation_id),
@@ -483,6 +524,7 @@ def create_tracer_router(
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     suppress_sse_for_event_keys=prior_events,
+                    answer_chunk_interval_ms=answer_chunk_interval_ms,
                 ):
                     yield frame
             finally:
@@ -530,12 +572,20 @@ def register_tracer_routes(
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
     moderation_provider: ModerationProvider | None = None,
+    answer_actor: AnswerActor | None = None,
+    answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
     resume_enabled: bool = False,
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
         router = create_tracer_router(
-            graph, refinement_actor, retriever, ranker, moderation_provider
+            graph,
+            refinement_actor,
+            retriever,
+            ranker,
+            moderation_provider,
+            answer_actor,
+            answer_chunk_interval_ms,
         )
         if not resume_enabled:
             router.routes = [

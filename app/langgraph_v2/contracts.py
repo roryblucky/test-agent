@@ -30,7 +30,7 @@ class TracerQueryResponse(BaseModel):
     query: str
     refined_query: str | None = None
     intent: None = None
-    answer: None = None
+    answer: str | None = None
     documents: list[Any] = Field(default_factory=list)
     moderation: None = None
     groundedness: None = None
@@ -44,7 +44,7 @@ class TracerStreamEvent(BaseModel):
     """One additive-sequence SSE event produced by the v2 tracer."""
 
     event_key: str = Field(min_length=1)
-    type: Literal["step_start", "step_completed", "error", "done"]
+    type: Literal["step_start", "step_completed", "token", "error", "done"]
     sequence: int = Field(ge=1)
     step: str | None = None
     data: Any = None

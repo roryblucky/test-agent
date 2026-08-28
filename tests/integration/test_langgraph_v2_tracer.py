@@ -18,6 +18,7 @@ from psycopg_pool import AsyncConnectionPool
 
 import app.langgraph_v2.api as api_module
 from app.api.schemas import QueryResponse
+from app.langgraph_v2.answer import ANSWER_CHUNK_INTERVAL_MS, AnswerActor
 from app.langgraph_v2.api import TracerGraph, register_tracer_routes
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
@@ -55,6 +56,7 @@ def persistent_tracer_app(
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
     moderation_provider: ModerationProvider | None = None,
+    answer_actor: AnswerActor | None = None,
 ) -> FastAPI:
     """Create the test-only tracer with its real application database pool."""
 
@@ -75,6 +77,8 @@ def persistent_tracer_app(
         retriever=retriever,
         ranker=ranker,
         moderation_provider=moderation_provider,
+        answer_actor=answer_actor,
+        answer_chunk_interval_ms=ANSWER_CHUNK_INTERVAL_MS,
         resume_enabled=resume_enabled,
     )
     return app

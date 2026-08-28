@@ -9,6 +9,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from app.langgraph_v2.answer import AnswerActor, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
@@ -45,6 +46,10 @@ class TracerState(TypedDict):
     reranking_error: NotRequired[str]
     artifact_refs: NotRequired[list[ArtifactRef]]
     ranked_refs: NotRequired[list[ArtifactRef]]
+    answer: NotRequired[str]
+    answer_usage: NotRequired[dict[str, Any]]
+    citations: NotRequired[list[Any]]
+    answer_error: NotRequired[str]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -59,6 +64,10 @@ class TracerStateUpdate(TypedDict, total=False):
     reranking_error: str
     artifact_refs: list[ArtifactRef]
     ranked_refs: list[ArtifactRef]
+    answer: str
+    answer_usage: dict[str, Any]
+    citations: list[Any]
+    answer_error: str
 
 
 async def _query(
@@ -126,20 +135,25 @@ def canonical_query(query: str) -> str:
 async def _finalize(state: TracerState) -> TracerStateUpdate:
     events = list(state["events"])
     sequence_start = len(events) + 1
+    steps = [
+        "query",
+        "pre_moderation",
+        "question_refinement",
+        "retrieval",
+        "reranking",
+    ]
+    if "answer" in state:
+        steps.append("answer")
+    steps.append("finalization")
     response = TracerQueryResponse(
         query=state["query"],
         conversation_id=state["conversation_id"],
         metadata={
-            "steps_executed": [
-                "query",
-                "pre_moderation",
-                "question_refinement",
-                "retrieval",
-                "reranking",
-                "finalization",
-            ]
+            "steps_executed": steps
         },
         refined_query=state.get("refined_query"),
+        answer=state.get("answer"),
+        citations=state.get("citations", []),
         documents=[],
     )
     events.extend(
@@ -194,6 +208,7 @@ def build_tracer_graph(
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
+    answer_actor: AnswerActor | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
@@ -312,6 +327,32 @@ def build_tracer_graph(
         return update
 
     builder.add_node("reranking", reranking_node)
+
+    if answer_actor is not None and selected_artifact_repository is not None:
+
+        async def answer_node(state: TracerState) -> TracerStateUpdate:
+            events, result, halted, error = await run_answer(
+                state,
+                context=phase_context,
+                artifacts=selected_artifact_repository,
+                actor=answer_actor,
+            )
+            update: TracerStateUpdate = {
+                "events": [
+                    *state["events"],
+                    *[_event_state(event, event.sequence) for event in events],
+                ],
+                "halted": halted,
+            }
+            if result is not None:
+                update["answer"] = result.answer
+                update["answer_usage"] = result.usage
+                update["citations"] = result.citations
+            if error is not None:
+                update["answer_error"] = error
+            return update
+
+        builder.add_node("answer", answer_node)
     builder.add_node("finalization", _finalize)
     builder.add_edge(START, "query")
     builder.add_edge("query", "pre_moderation")
@@ -330,11 +371,26 @@ def build_tracer_graph(
         lambda state: "end" if state.get("halted", False) else "reranking",
         {"reranking": "reranking", "end": END},
     )
+    reranking_routes = {"finalization": "finalization", "end": END}
+    if answer_actor is not None and selected_artifact_repository is not None:
+        reranking_routes["answer"] = "answer"
     builder.add_conditional_edges(
         "reranking",
-        lambda state: "end" if state.get("halted", False) else "finalization",
-        {"finalization": "finalization", "end": END},
+        lambda state: (
+            "end"
+            if state.get("halted", False)
+            else "answer"
+            if answer_actor is not None and selected_artifact_repository is not None
+            else "finalization"
+        ),
+        reranking_routes,
     )
+    if answer_actor is not None and selected_artifact_repository is not None:
+        builder.add_conditional_edges(
+            "answer",
+            lambda state: "end" if state.get("halted", False) else "finalization",
+            {"finalization": "finalization", "end": END},
+        )
     builder.add_edge("finalization", END)
     return builder.compile(checkpointer=checkpointer)
 
