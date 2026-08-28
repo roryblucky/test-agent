@@ -49,11 +49,15 @@ class PydanticAIGroundednessActor:
     def __init__(self, agent: Agent[Any, GroundednessOutput]) -> None:
         self._agent = agent
 
-    async def evaluate(self, answer: str, documents: list[Document]) -> GroundednessAssessment:
+    async def evaluate(
+        self, answer: str, documents: list[Document]
+    ) -> GroundednessAssessment:
         """Evaluate the answer against the supplied evidence text."""
         evidence = "\n\n".join(document.content for document in documents)
         with observe("pydantic_ai.invoke", attributes={"actor.role": "groundedness"}):
-            result = await self._agent.run(f"Answer:\n{answer}\n\nEvidence:\n{evidence}")
+            result = await self._agent.run(
+                f"Answer:\n{answer}\n\nEvidence:\n{evidence}"
+            )
         usage = result.usage()
         usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
         return GroundednessAssessment(
@@ -72,7 +76,8 @@ def build_groundedness_actor(
     agent = registry.create_agent(
         model_name,
         output_type=GroundednessOutput,
-        instructions=instructions or "Assess whether the answer is supported by the evidence.",
+        instructions=instructions
+        or "Assess whether the answer is supported by the evidence.",
     )
     return PydanticAIGroundednessActor(agent)
 

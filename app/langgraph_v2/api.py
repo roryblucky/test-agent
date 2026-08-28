@@ -13,7 +13,6 @@ from typing import Annotated, Any, Protocol, cast
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.runnables import RunnableConfig
-from opentelemetry.context import Context
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import (
@@ -40,12 +39,7 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.live_events import LiveEventWakeups
-from app.langgraph_v2.observability import (
-    activate_context,
-    context_for_span,
-    observe,
-    safe_span_attribute,
-)
+from app.langgraph_v2.observability import observe, safe_span_attribute
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.provider_adapters import (
@@ -431,15 +425,13 @@ async def _persist_graph_result(
             run_id=run_id,
             execution_epoch=execution_epoch,
             attributes={"cancellation.operation": "apply"},
-        ) as cancellation_span:
-            cancellation = await cancellation_repository.apply_if_requested(
+        ):
+            await cancellation_repository.apply_if_requested(
                 tenant_id=tenant_id,
                 run_id=run_id,
                 owner_instance_id=owner_instance_id,
                 execution_epoch=execution_epoch,
             )
-            if cancellation is not None:
-                safe_span_attribute(cancellation_span, "run.status", "cancelled")
     finally:
         if not graph_task.done():
             graph_task.cancel()
@@ -526,7 +518,6 @@ async def _observed_stream(
     conversation_id: str | None = None,
     execution_epoch: int | None = None,
     attributes: dict[str, str | bool | int | float] | None = None,
-    parent_context: Context | None = None,
 ) -> AsyncIterator[str]:
     """Keep a redacted operation span open for one SSE response body."""
     with observe(
@@ -535,7 +526,6 @@ async def _observed_stream(
         conversation_id=conversation_id,
         execution_epoch=execution_epoch,
         attributes=attributes,
-        parent_context=parent_context,
     ):
         async for frame in stream:
             yield frame
@@ -927,7 +917,6 @@ def create_tracer_router(
             run_id=run_id,
         )
         message_repository = ConversationMessageRepository(pool)
-        recovery_context: Context | None = None
         try:
             with observe(
                 "recovery.resume",
@@ -942,8 +931,6 @@ def create_tracer_router(
                 safe_span_attribute(
                     recovery_span, "execution.epoch", claim.execution_epoch
                 )
-                safe_span_attribute(recovery_span, "run.status", "running")
-                recovery_context = context_for_span(recovery_span)
         except RunNotFound as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
         except ResumeConflict as error:
@@ -1053,32 +1040,30 @@ def create_tracer_router(
                     and event.event_key.startswith("phase:answer:token:")
                 )
             }
-            assert recovery_context is not None
-            with activate_context(recovery_context):
-                await _start_execution_or_interrupt(
-                    runtime,
-                    _execute_graph_run(
-                        selected_graph,
-                        None,
-                        graph_config,
-                        repository,
-                        cancellation_repository,
-                        cancellation_observer,
-                        message_repository,
-                        tenant_id=x_application_id,
-                        run_id=run_id,
-                        conversation_id=claim.conversation_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                        answer_chunk_interval_ms=answer_chunk_interval_ms,
-                        initial_sent_keys=initial_sent_keys,
-                    ),
+            await _start_execution_or_interrupt(
+                runtime,
+                _execute_graph_run(
+                    selected_graph,
+                    None,
+                    graph_config,
                     repository,
+                    cancellation_repository,
+                    cancellation_observer,
+                    message_repository,
                     tenant_id=x_application_id,
                     run_id=run_id,
+                    conversation_id=claim.conversation_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
-                )
+                    answer_chunk_interval_ms=answer_chunk_interval_ms,
+                    initial_sent_keys=initial_sent_keys,
+                ),
+                repository,
+                tenant_id=x_application_id,
+                run_id=run_id,
+                owner_instance_id=claim.owner_instance_id,
+                execution_epoch=claim.execution_epoch,
+            )
 
         async def event_generator() -> AsyncIterator[str]:
             async for frame in _follow_persisted_events(
@@ -1102,7 +1087,6 @@ def create_tracer_router(
                     "http.request.method": "POST",
                     "http.route": "/v2/runs/{run_id}/resume/stream",
                 },
-                parent_context=recovery_context,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
