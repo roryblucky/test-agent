@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Coroutine
 from contextlib import suppress
 from typing import Annotated, Any, Protocol, cast
 
-from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
@@ -47,6 +47,7 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementActor,
     build_question_refinement_actor,
 )
+from app.langgraph_v2.replay import PersistedEventReplay
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import (
@@ -955,6 +956,47 @@ def create_tracer_router(
             headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
         )
 
+    @router.get("/v2/runs/{run_id}/stream")
+    async def replay_stream(
+        run_id: uuid.UUID,
+        http_request: Request,
+        x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+        after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
+    ) -> StreamingResponse:
+        """Replay the current durable Event snapshot and then close."""
+        configured_pool = getattr(
+            http_request.app.state, "langgraph_v2_postgres_pool", None
+        )
+        if configured_pool is None:
+            raise HTTPException(
+                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
+            )
+        replay = PersistedEventReplay(RunEventRepository(configured_pool))
+        try:
+            events = await replay.snapshot(
+                tenant_id=x_application_id,
+                run_id=run_id,
+                after_sequence=after_sequence,
+            )
+        except RunNotFound as error:
+            raise HTTPException(status_code=404, detail="Run not found") from error
+
+        async def event_generator() -> AsyncIterator[str]:
+            for event in events:
+                yield TracerStreamEvent(
+                    event_key=event.event_key,
+                    type=cast(Any, event.type),
+                    step=event.step,
+                    data=event.data,
+                    sequence=event.sequence,
+                ).to_sse()
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
+        )
+
     @router.get("/v2/artifacts/{artifact_id}")
     async def get_artifact(
         artifact_id: uuid.UUID,
@@ -994,6 +1036,7 @@ def register_tracer_routes(
     answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     resume_enabled: bool = False,
+    replay_enabled: bool = False,
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
@@ -1009,10 +1052,15 @@ def register_tracer_routes(
             answer_chunk_interval_ms,
             history_token_budget,
         )
+        disabled_control_paths: set[str] = set()
         if not resume_enabled:
+            disabled_control_paths.add("/v2/runs/{run_id}/resume/stream")
+        if not replay_enabled:
+            disabled_control_paths.add("/v2/runs/{run_id}/stream")
+        if disabled_control_paths:
             router.routes = [
                 route
                 for route in router.routes
-                if getattr(route, "path", None) != "/v2/runs/{run_id}/resume/stream"
+                if getattr(route, "path", None) not in disabled_control_paths
             ]
         app.include_router(router)

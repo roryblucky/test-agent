@@ -274,6 +274,30 @@ class RunEventRepository:
                 rows = await cursor.fetchall()
         return [EventRecord.model_validate(row) for row in rows]
 
+    async def list_events_after(
+        self,
+        tenant_id: str,
+        run_id: UUID,
+        *,
+        after_sequence: int,
+    ) -> list[EventRecord]:
+        """Return this Run's durable Event snapshot strictly after a sequence."""
+        await self.get_run(tenant_id, run_id)
+        async with self._pool.connection() as connection:
+            async with connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT tenant_id, run_id, sequence, event_key, type, step,
+                           data, created_at
+                    FROM langgraph_v2.events
+                    WHERE tenant_id = %s AND run_id = %s AND sequence > %s
+                    ORDER BY sequence
+                    """,
+                    (tenant_id, run_id, after_sequence),
+                )
+                rows = await cursor.fetchall()
+        return [EventRecord.model_validate(row) for row in rows]
+
     async def heartbeat(
         self,
         *,
