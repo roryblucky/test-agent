@@ -83,6 +83,48 @@ class RunEventRepository:
     def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
         self._pool = pool
 
+    async def _lock_and_validate_claim(
+        self,
+        cursor: Any,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+    ) -> None:
+        """Lock a Run and reject missing, expired, or replaced claims."""
+        await cursor.execute(
+            """
+            SELECT status, owner_instance_id, execution_epoch
+            FROM langgraph_v2.runs
+            WHERE tenant_id = %s AND run_id = %s
+            FOR UPDATE
+            """,
+            (tenant_id, run_id),
+        )
+        claim = await cursor.fetchone()
+        if claim is not None:
+            await cursor.execute(
+                """
+                SELECT expires_at > clock_timestamp() AS claim_active
+                FROM langgraph_v2.runs
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                (tenant_id, run_id),
+            )
+            claim_active = await cursor.fetchone()
+        else:
+            claim_active = None
+        if (
+            claim is None
+            or claim["status"] != "running"
+            or claim["owner_instance_id"] != owner_instance_id
+            or claim["execution_epoch"] != execution_epoch
+            or claim_active is None
+            or not claim_active["claim_active"]
+        ):
+            raise ClaimFenced(str(run_id))
+
     async def create_run(
         self,
         *,
@@ -169,37 +211,13 @@ class RunEventRepository:
         async with self._pool.connection() as connection:
             async with connection.transaction():
                 async with connection.cursor(row_factory=dict_row) as cursor:
-                    await cursor.execute(
-                        """
-                        SELECT status, owner_instance_id, execution_epoch
-                        FROM langgraph_v2.runs
-                        WHERE tenant_id = %s AND run_id = %s
-                        FOR UPDATE
-                        """,
-                        (tenant_id, run_id),
+                    await self._lock_and_validate_claim(
+                        cursor,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        owner_instance_id=owner_instance_id,
+                        execution_epoch=execution_epoch,
                     )
-                    claim = await cursor.fetchone()
-                    if claim is not None:
-                        await cursor.execute(
-                            """
-                            SELECT expires_at > clock_timestamp() AS claim_active
-                            FROM langgraph_v2.runs
-                            WHERE tenant_id = %s AND run_id = %s
-                            """,
-                            (tenant_id, run_id),
-                        )
-                        claim_active = await cursor.fetchone()
-                    else:
-                        claim_active = None
-                if (
-                    claim is None
-                    or claim["status"] != "running"
-                    or claim["owner_instance_id"] != owner_instance_id
-                    or claim["execution_epoch"] != execution_epoch
-                    or claim_active is None
-                    or not claim_active["claim_active"]
-                ):
-                    raise ClaimFenced(str(run_id))
                 async with connection.cursor(row_factory=dict_row) as cursor:
                     await cursor.execute(
                         """
@@ -256,37 +274,13 @@ class RunEventRepository:
         async with self._pool.connection() as connection:
             async with connection.transaction():
                 async with connection.cursor(row_factory=dict_row) as cursor:
-                    await cursor.execute(
-                        """
-                        SELECT status, owner_instance_id, execution_epoch
-                        FROM langgraph_v2.runs
-                        WHERE tenant_id = %s AND run_id = %s
-                        FOR UPDATE
-                        """,
-                        (tenant_id, run_id),
+                    await self._lock_and_validate_claim(
+                        cursor,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        owner_instance_id=owner_instance_id,
+                        execution_epoch=execution_epoch,
                     )
-                    claim = await cursor.fetchone()
-                    if claim is not None:
-                        await cursor.execute(
-                            """
-                            SELECT expires_at > clock_timestamp() AS claim_active
-                            FROM langgraph_v2.runs
-                            WHERE tenant_id = %s AND run_id = %s
-                            """,
-                            (tenant_id, run_id),
-                        )
-                        claim_active = await cursor.fetchone()
-                    else:
-                        claim_active = None
-                if (
-                    claim is None
-                    or claim["status"] != "running"
-                    or claim["owner_instance_id"] != owner_instance_id
-                    or claim["execution_epoch"] != execution_epoch
-                    or claim_active is None
-                    or not claim_active["claim_active"]
-                ):
-                    raise ClaimFenced(str(run_id))
                 async with connection.cursor(row_factory=dict_row) as cursor:
                     await cursor.execute(
                         """
