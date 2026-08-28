@@ -419,3 +419,82 @@ async def test_replaced_claim_epoch_rejects_stale_owner_writes(
                     data={"status": "completed"},
                 ),
             )
+
+
+@pytest.mark.asyncio
+async def test_claim_expiry_is_rechecked_after_waiting_for_run_lock(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=2,
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        created = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+
+        with psycopg.connect(
+            langgraph_v2_migrated_database_url,
+            autocommit=False,
+        ) as connection:
+            for operation in ("heartbeat", "append", "complete"):
+                connection.execute(
+                    """
+                    SELECT run_id
+                    FROM langgraph_v2.runs
+                    WHERE tenant_id = %s AND run_id = %s
+                    FOR UPDATE
+                    """,
+                    ("tenant-a", run_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE langgraph_v2.runs
+                    SET expires_at = clock_timestamp() + interval '50 milliseconds'
+                    WHERE tenant_id = %s AND run_id = %s
+                    """,
+                    ("tenant-a", run_id),
+                )
+
+                if operation == "heartbeat":
+                    pending = repository.heartbeat(
+                        tenant_id="tenant-a",
+                        run_id=run_id,
+                        owner_instance_id="instance-a",
+                        execution_epoch=created.execution_epoch,
+                    )
+                elif operation == "append":
+                    pending = repository.append_event(
+                        tenant_id="tenant-a",
+                        run_id=run_id,
+                        event=EventInput(
+                            event_key="phase:query:lock_wait:1",
+                            type="step_start",
+                            step="query",
+                        ),
+                        owner_instance_id="instance-a",
+                        execution_epoch=created.execution_epoch,
+                    )
+                else:
+                    pending = repository.complete_run(
+                        tenant_id="tenant-a",
+                        run_id=run_id,
+                        event=EventInput(
+                            event_key="lifecycle:lock_wait:0",
+                            type="done",
+                            data={"status": "completed"},
+                        ),
+                        owner_instance_id="instance-a",
+                        execution_epoch=created.execution_epoch,
+                    )
+                task = asyncio.create_task(pending)
+                await asyncio.sleep(0.1)
+                connection.commit()
+                with pytest.raises(ClaimFenced):
+                    await task

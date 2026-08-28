@@ -81,7 +81,7 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
                 raise RuntimeError("LangGraph v2 PostgreSQL is not configured")
             pool = cast(AsyncConnectionPool[Any], configured_pool)
             repository = RunEventRepository(pool)
-            await repository.create_run(
+            claim = await repository.create_run(
                 tenant_id=x_application_id,
                 run_id=run_id,
                 conversation_id=conversation_id,
@@ -92,8 +92,8 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
                     repository,
                     x_application_id,
                     run_id,
-                    _INSTANCE_ID,
-                    1,
+                    claim.owner_instance_id,
+                    claim.execution_epoch,
                 )
             )
             try:
@@ -118,16 +118,16 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
                             tenant_id=x_application_id,
                             run_id=run_id,
                             event=event_input,
-                            owner_instance_id=_INSTANCE_ID,
-                            execution_epoch=1,
+                            owner_instance_id=claim.owner_instance_id,
+                            execution_epoch=claim.execution_epoch,
                         )
                     else:
                         persisted = await repository.append_event(
                             tenant_id=x_application_id,
                             run_id=run_id,
                             event=event_input,
-                            owner_instance_id=_INSTANCE_ID,
-                            execution_epoch=1,
+                            owner_instance_id=claim.owner_instance_id,
+                            execution_epoch=claim.execution_epoch,
                         )
                     yield event.model_copy(
                         update={"sequence": persisted.sequence}

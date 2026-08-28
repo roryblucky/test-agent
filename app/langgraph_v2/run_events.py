@@ -99,7 +99,7 @@ class RunEventRepository:
                         owner_instance_id, execution_epoch, heartbeat_at,
                         expires_at
                     ) VALUES (%s, %s, %s, 'running', %s, %s, now(),
-                              now() + (%s * interval '1 second'))
+                    clock_timestamp() + (%s * interval '1 second'))
                     RETURNING tenant_id, run_id, conversation_id, status,
                               terminal_outcome, created_at, completed_at,
                               owner_instance_id, execution_epoch, heartbeat_at,
@@ -169,13 +169,13 @@ class RunEventRepository:
                 await cursor.execute(
                     """
                     UPDATE langgraph_v2.runs
-                    SET heartbeat_at = now(),
-                        expires_at = now() + (%s * interval '1 second')
+                    SET heartbeat_at = clock_timestamp(),
+                        expires_at = clock_timestamp() + (%s * interval '1 second')
                     WHERE tenant_id = %s AND run_id = %s
                       AND status = 'running'
                       AND owner_instance_id = %s
                       AND execution_epoch = %s
-                      AND expires_at > now()
+                      AND expires_at > clock_timestamp()
                     RETURNING tenant_id, run_id, conversation_id, status,
                               terminal_outcome, created_at, completed_at,
                               owner_instance_id, execution_epoch, heartbeat_at,
@@ -273,7 +273,7 @@ class RunEventRepository:
                 run_cursor = await connection.execute(
                     """
                     SELECT next_event_sequence, status, owner_instance_id,
-                           execution_epoch, expires_at <= now()
+                           execution_epoch, expires_at <= clock_timestamp()
                     FROM langgraph_v2.runs
                     WHERE tenant_id = %s AND run_id = %s
                     FOR UPDATE
