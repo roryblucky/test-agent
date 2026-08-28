@@ -712,65 +712,6 @@ async def _resume_claim(
             return claim, context_for_span(recovery_span)
 
 
-def _admit_query(
-    app: FastAPI,
-    *,
-    tenant_id: str,
-    requested_conversation_id: str | None,
-) -> tuple[LocalRunRuntime, uuid.UUID, str, Context]:
-    """Validate a query and establish its HTTP trace before streaming."""
-    with observe(
-        "http.request",
-        attributes={
-            "http.request.method": "POST",
-            "http.route": "/v2/query/stream",
-        },
-    ) as http_span:
-        _ensure_tenant_available(app, tenant_id)
-        runtime = _local_runtime(app)
-        if not runtime.accepting:
-            raise HTTPException(
-                status_code=503,
-                detail="LangGraph v2 is shutting down",
-            )
-        return (
-            runtime,
-            uuid.uuid4(),
-            requested_conversation_id or str(uuid.uuid4()),
-            context_for_span(http_span),
-        )
-
-
-async def _prepare_replay(
-    app: FastAPI,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-) -> tuple[RunEventRepository, LiveEventWakeups, Context]:
-    """Validate replay ownership under an HTTP span before streaming."""
-    with observe(
-        "http.request",
-        run_id=run_id,
-        attributes={
-            "http.request.method": "GET",
-            "http.route": "/v2/runs/{run_id}/stream",
-        },
-    ) as http_span:
-        configured_pool = getattr(app.state, "langgraph_v2_postgres_pool", None)
-        if configured_pool is None:
-            raise HTTPException(
-                status_code=500,
-                detail="LangGraph v2 PostgreSQL is not configured",
-            )
-        wakeups = _live_events(app)
-        repository = RunEventRepository(configured_pool, live_events=wakeups)
-        try:
-            await repository.get_run(tenant_id, run_id)
-        except RunNotFound as error:
-            raise HTTPException(status_code=404, detail="Run not found") from error
-        return repository, wakeups, context_for_span(http_span)
-
-
 def create_tracer_router(
     graph: TracerGraph | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
@@ -798,10 +739,15 @@ def create_tracer_router(
     ) -> StreamingResponse:
         """Run the deterministic tracer and return its events as SSE."""
         del x_user_groups
-        runtime, run_id, conversation_id, http_context = _admit_query(
-            http_request.app,
-            tenant_id=x_application_id,
-            requested_conversation_id=payload.conversation_id,
+        _ensure_tenant_available(http_request.app, x_application_id)
+        runtime = _local_runtime(http_request.app)
+        if not runtime.accepting:
+            raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
+        run_id = uuid.uuid4()
+        conversation_id = (
+            payload.conversation_id
+            if payload.conversation_id is not None
+            else str(uuid.uuid4())
         )
 
         async def event_generator() -> AsyncIterator[str]:
@@ -983,14 +929,13 @@ def create_tracer_router(
         return StreamingResponse(
             _observed_stream(
                 event_generator(),
-                operation="http.stream",
+                operation="http.request",
                 run_id=run_id,
                 conversation_id=conversation_id,
                 attributes={
                     "http.request.method": "POST",
                     "http.route": "/v2/query/stream",
                 },
-                parent_context=http_context,
             ),
             media_type="text/event-stream",
             headers={
@@ -1208,11 +1153,19 @@ def create_tracer_router(
         after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
     ) -> StreamingResponse:
         """Replay and then follow one Run from the requested sequence cursor."""
-        repository, wakeups, http_context = await _prepare_replay(
-            http_request.app,
-            tenant_id=x_application_id,
-            run_id=run_id,
+        configured_pool = getattr(
+            http_request.app.state, "langgraph_v2_postgres_pool", None
         )
+        if configured_pool is None:
+            raise HTTPException(
+                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
+            )
+        wakeups = _live_events(http_request.app)
+        repository = RunEventRepository(configured_pool, live_events=wakeups)
+        try:
+            await repository.get_run(x_application_id, run_id)
+        except RunNotFound as error:
+            raise HTTPException(status_code=404, detail="Run not found") from error
 
         async def event_generator() -> AsyncIterator[str]:
             async for frame in _follow_persisted_events(
@@ -1227,13 +1180,12 @@ def create_tracer_router(
         return StreamingResponse(
             _observed_stream(
                 event_generator(),
-                operation="http.stream",
+                operation="http.request",
                 run_id=run_id,
                 attributes={
                     "http.request.method": "GET",
                     "http.route": "/v2/runs/{run_id}/stream",
                 },
-                parent_context=http_context,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
