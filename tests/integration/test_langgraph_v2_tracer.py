@@ -4,12 +4,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib import reload
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 
 import app.langgraph_v2.api as api_module
@@ -35,6 +36,7 @@ def parse_sse(response_text: str) -> list[dict]:
 def persistent_tracer_app(
     database_url: str,
     graph: TracerGraph | None = None,
+    resume_enabled: bool = False,
 ) -> FastAPI:
     """Create the test-only tracer with its real application database pool."""
 
@@ -47,7 +49,9 @@ def persistent_tracer_app(
             yield
 
     app = FastAPI(lifespan=lifespan)
-    register_tracer_routes(app, enabled=True, graph=graph)
+    register_tracer_routes(
+        app, enabled=True, graph=graph, resume_enabled=resume_enabled
+    )
     return app
 
 
@@ -71,9 +75,9 @@ async def test_captured_fixture_matches_the_legacy_wire_implementation() -> None
 
     legacy_frames = [line async for line in emitter]
 
-    assert [json.loads(line.removeprefix("data: ")) for line in legacy_frames] == fixture[
-        "events"
-    ]
+    assert [
+        json.loads(line.removeprefix("data: ")) for line in legacy_frames
+    ] == fixture["events"]
 
 
 def test_enabled_tracer_preserves_the_minimal_stream_contract(
@@ -136,7 +140,10 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
         def __init__(self) -> None:
             self.received_state: TracerState | None = None
 
-        async def ainvoke(self, state: TracerState) -> dict:
+        async def ainvoke(
+            self, state: TracerState, config: RunnableConfig | None = None
+        ) -> dict:
+            del config
             self.received_state = state
             return {
                 "events": [
@@ -184,11 +191,99 @@ def test_main_registers_the_tracer_only_when_the_feature_flag_is_enabled(
 
     monkeypatch.setenv("LANGGRAPH_V2_TRACER_ENABLED", "1")
     enabled_app = reload(main_module).app
-    assert "/v2/query/stream" in {route.path for route in enabled_app.routes}
+    assert "/v2/query/stream" in {
+        getattr(route, "path", None) for route in enabled_app.routes
+    }
 
     monkeypatch.delenv("LANGGRAPH_V2_TRACER_ENABLED")
     disabled_app = reload(main_module).app
-    assert "/v2/query/stream" not in {route.path for route in disabled_app.routes}
+    assert "/v2/query/stream" not in {
+        getattr(route, "path", None) for route in disabled_app.routes
+    }
+
+
+def test_resume_route_is_default_off() -> None:
+    app = FastAPI()
+    register_tracer_routes(app, enabled=True)
+    assert "/v2/runs/{run_id}/resume/stream" not in {
+        getattr(route, "path", None) for route in app.routes
+    }
+
+
+def test_resume_route_returns_404_for_missing_or_cross_tenant_run(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
+    run_id = UUID("00000000-0000-0000-0000-000000000001")
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/runs/{run_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a"},
+        )
+    assert response.status_code == 404
+
+
+def test_resume_route_runs_injected_graph_for_stale_run(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class ResumeGraph:
+        async def ainvoke(
+            self, state: TracerState, config: RunnableConfig | None = None
+        ) -> dict:
+            del config
+            return {
+                "events": [
+                    {
+                        "event_key": "recovery:completed:2",
+                        "type": "done",
+                        "data": {"source": state["query"]},
+                        "sequence": 1,
+                    }
+                ]
+            }
+
+    async def seed_run() -> UUID:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            repository = RunEventRepository(pool)
+            run_id = uuid4()
+            run = await repository.create_run(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                conversation_id="conversation-1",
+                owner_instance_id="instance-a",
+            )
+            await repository.update_checkpoint_pointer(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+                checkpoint_id="checkpoint-1",
+                checkpoint_ns="namespace-1",
+            )
+            with psycopg.connect(
+                langgraph_v2_migrated_database_url, autocommit=True
+            ) as connection:
+                connection.execute(
+                    "UPDATE langgraph_v2.runs SET expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id = %s AND run_id = %s",
+                    ("tenant-a", run_id),
+                )
+            return run_id
+
+    run_id = asyncio.run(seed_run())
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        ResumeGraph(),
+        resume_enabled=True,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/runs/{run_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a"},
+        )
+    assert response.status_code == 200
+    assert parse_sse(response.text)[0]["type"] == "done"
 
 
 def test_completed_tracer_persists_its_run_and_every_delivered_event(
@@ -230,9 +325,7 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
         "phase:finalization:step_completed:1",
         "lifecycle:completed:0",
     ]
-    assert [event.type for event in persisted] == [
-        event["type"] for event in delivered
-    ]
+    assert [event.type for event in persisted] == [event["type"] for event in delivered]
 
 
 def test_long_running_request_refreshes_its_claim(
@@ -242,7 +335,10 @@ def test_long_running_request_refreshes_its_claim(
     monkeypatch.setattr(api_module, "CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
 
     class SlowGraph:
-        async def ainvoke(self, state: TracerState) -> dict:
+        async def ainvoke(
+            self, state: TracerState, config: RunnableConfig | None = None
+        ) -> dict:
+            del config
             await asyncio.sleep(0.05)
             return {
                 "events": [
@@ -320,8 +416,7 @@ def test_persistence_failure_emits_no_unpersisted_event(
     finally:
         with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
             connection.execute(
-                "DROP TRIGGER IF EXISTS reject_event_insert "
-                "ON langgraph_v2.events"
+                "DROP TRIGGER IF EXISTS reject_event_insert ON langgraph_v2.events"
             )
             connection.execute(
                 "DROP FUNCTION IF EXISTS langgraph_v2.reject_event_insert()"

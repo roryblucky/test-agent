@@ -69,13 +69,20 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         conn: Any,
         *,
         checkpoint_namespace: str,
+        read_namespace: str | None = None,
         pointer_writer: CheckpointPointerWriter,
     ) -> None:
         super().__init__(conn)
         self._checkpoint_namespace = checkpoint_namespace
+        self._read_namespace = read_namespace or checkpoint_namespace
         self._pointer_writer = pointer_writer
 
-    def _scoped_config(self, config: RunnableConfig) -> RunnableConfig:
+    def _scoped_config(
+        self,
+        config: RunnableConfig,
+        *,
+        namespace: str | None = None,
+    ) -> RunnableConfig:
         """Keep the application namespace while LangGraph runs a root graph.
 
         LangGraph reserves the root graph namespace as ``""``.  The saver
@@ -83,7 +90,7 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         translating only the checkpoint persistence config.
         """
         configurable = dict(config.get("configurable", {}))
-        configurable["checkpoint_ns"] = self._checkpoint_namespace
+        configurable["checkpoint_ns"] = namespace or self._checkpoint_namespace
         return {**config, "configurable": configurable}
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
@@ -93,7 +100,9 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
                 "checkpoint.exact",
                 bool(config.get("configurable", {}).get("checkpoint_id")),
             )
-            return await super().aget_tuple(self._scoped_config(config))
+            return await super().aget_tuple(
+                self._scoped_config(config, namespace=self._read_namespace)
+            )
 
     async def aput(
         self,

@@ -12,6 +12,7 @@ from app.langgraph_v2.run_events import (
     EventInput,
     EventInvariantConflict,
     EventNotFound,
+    ResumeConflict,
     RunEventRepository,
     RunNotFound,
 )
@@ -51,6 +52,124 @@ async def test_run_and_event_are_persisted_and_read_back(
         assert appended.sequence == 1
         assert await repository.get_run("tenant-a", run_id) == created
         assert await repository.list_events("tenant-a", run_id) == [appended]
+
+
+@pytest.mark.asyncio
+async def test_resume_claims_expired_run_once_and_fences_old_owner(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=4
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        created = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        with psycopg.connect(
+            langgraph_v2_migrated_database_url, autocommit=True
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET expires_at = clock_timestamp() - interval '1 second'
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                ("tenant-a", run_id),
+            )
+        resumed = await repository.resume_run(
+            tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-b"
+        )
+        assert resumed.execution_epoch == created.execution_epoch + 1
+        assert resumed.owner_instance_id == "instance-b"
+        with pytest.raises(ResumeConflict):
+            await repository.resume_run(
+                tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-c"
+            )
+        with pytest.raises(ClaimFenced):
+            await repository.append_event(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                event=EventInput(event_key="old", type="step_start"),
+                owner_instance_id="instance-a",
+                execution_epoch=created.execution_epoch,
+            )
+
+
+@pytest.mark.asyncio
+async def test_resume_concurrent_requests_have_one_winner(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=4
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        with psycopg.connect(
+            langgraph_v2_migrated_database_url, autocommit=True
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET expires_at = clock_timestamp() - interval '1 second'
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                ("tenant-a", run_id),
+            )
+        results = await asyncio.gather(
+            repository.resume_run(
+                tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-b"
+            ),
+            repository.resume_run(
+                tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-c"
+            ),
+            return_exceptions=True,
+        )
+        assert sum(not isinstance(item, ResumeConflict) for item in results) == 1
+        assert (await repository.get_run("tenant-a", run_id)).execution_epoch == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_claims_interrupted_run_without_active_owner(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        with psycopg.connect(
+            langgraph_v2_migrated_database_url, autocommit=True
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET status = 'interrupted', owner_instance_id = '',
+                    expires_at = clock_timestamp() + interval '30 seconds'
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                ("tenant-a", run_id),
+            )
+        resumed = await repository.resume_run(
+            tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-b"
+        )
+        assert resumed.status == "running"
+        assert resumed.execution_epoch == 2
 
 
 @pytest.mark.asyncio
@@ -236,9 +355,7 @@ async def test_terminal_event_retry_is_atomic_and_idempotent(
             await repository.complete_run(
                 tenant_id="tenant-a",
                 run_id=run_id,
-                event=terminal.model_copy(
-                    update={"data": {"answer": "different"}}
-                ),
+                event=terminal.model_copy(update={"data": {"answer": "different"}}),
                 owner_instance_id="local",
                 execution_epoch=1,
             )

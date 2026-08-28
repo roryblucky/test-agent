@@ -33,6 +33,10 @@ class ClaimFenced(RuntimeError):
     """The supplied owner and execution epoch cannot write this Run."""
 
 
+class ResumeConflict(RuntimeError):
+    """A Run cannot be resumed in its current state."""
+
+
 CLAIM_LEASE_SECONDS = 30
 CLAIM_HEARTBEAT_INTERVAL_SECONDS = CLAIM_LEASE_SECONDS // 3
 
@@ -179,6 +183,68 @@ class RunEventRepository:
                 row = await cursor.fetchone()
         if row is None:
             raise RunNotFound(str(run_id))
+        return RunRecord.model_validate(row)
+
+    async def resume_run(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+    ) -> RunRecord:
+        """Atomically claim a stale or interrupted Run for a new epoch."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT tenant_id, run_id, conversation_id, status,
+                               terminal_outcome, created_at, completed_at,
+                               owner_instance_id, execution_epoch, heartbeat_at,
+                               expires_at, checkpoint_id, checkpoint_ns,
+                               expires_at > clock_timestamp() AS claim_active
+                        FROM langgraph_v2.runs
+                        WHERE tenant_id = %s AND run_id = %s
+                        FOR UPDATE
+                        """,
+                        (tenant_id, run_id),
+                    )
+                    row = await cursor.fetchone()
+                    if row is None:
+                        raise RunNotFound(str(run_id))
+                    resumable = (
+                        row["status"] == "running" and not row["claim_active"]
+                    ) or (
+                        row["status"] == "interrupted"
+                        and row["owner_instance_id"] == ""
+                    )
+                    if not resumable:
+                        raise ResumeConflict(str(run_id))
+                    await cursor.execute(
+                        """
+                        UPDATE langgraph_v2.runs
+                        SET status = 'running', owner_instance_id = %s,
+                            execution_epoch = execution_epoch + 1,
+                            heartbeat_at = clock_timestamp(),
+                            expires_at = clock_timestamp() +
+                                (%s * interval '1 second')
+                        WHERE tenant_id = %s AND run_id = %s
+                        RETURNING tenant_id, run_id, conversation_id, status,
+                                  terminal_outcome, created_at, completed_at,
+                                  owner_instance_id, execution_epoch,
+                                  heartbeat_at, expires_at, checkpoint_id,
+                                  checkpoint_ns
+                        """,
+                        (
+                            owner_instance_id,
+                            CLAIM_LEASE_SECONDS,
+                            tenant_id,
+                            run_id,
+                        ),
+                    )
+                    row = await cursor.fetchone()
+        if row is None:
+            raise ResumeConflict(str(run_id))
         return RunRecord.model_validate(row)
 
     async def list_events(self, tenant_id: str, run_id: UUID) -> list[EventRecord]:
