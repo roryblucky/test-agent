@@ -59,6 +59,18 @@ from app.services.exceptions import TenantNotFoundError
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
 
 
+async def _pace_answer_chunk(
+    event: TracerStreamEvent | Any,
+    answer_chunk_count: list[int],
+    answer_chunk_interval_ms: int,
+) -> None:
+    """Apply the bounded answer-chunk interval to one newly delivered token."""
+    if event.type == "token" and event.step == "llm:answer":
+        if answer_chunk_count[0]:
+            await asyncio.sleep(answer_chunk_interval_ms / 1000)
+        answer_chunk_count[0] += 1
+
+
 def _resolve_refinement_actor(
     app: FastAPI,
     tenant_id: str,
@@ -195,7 +207,7 @@ async def _persist_result_events(
 ) -> AsyncIterator[str]:
     """Persist graph Events and serialize newly published SSE frames."""
     prior_keys = suppress_sse_for_event_keys or set()
-    answer_chunk_count = 0
+    answer_chunk_count = [0]
     for raw_event in result["events"]:
         event = TracerStreamEvent.model_validate(raw_event)
         event_input = EventInput(
@@ -228,14 +240,8 @@ async def _persist_result_events(
                 owner_instance_id=owner_instance_id,
                 execution_epoch=execution_epoch,
             )
-        if (
-            event.type == "token"
-            and event.step == "llm:answer"
-            and event.event_key not in prior_keys
-        ):
-            if answer_chunk_count:
-                await asyncio.sleep(answer_chunk_interval_ms / 1000)
-            answer_chunk_count += 1
+        if event.event_key not in prior_keys:
+            await _pace_answer_chunk(event, answer_chunk_count, answer_chunk_interval_ms)
         if event.event_key not in prior_keys:
             yield event.model_copy(update={"sequence": persisted.sequence}).to_sse()
 
@@ -266,10 +272,7 @@ async def _stream_unseen_events(
         if event.event_key in sent_keys:
             continue
         sent_keys.add(event.event_key)
-        if event.type == "token" and event.step == "llm:answer":
-            if answer_chunk_count[0]:
-                await asyncio.sleep(answer_chunk_interval_ms / 1000)
-            answer_chunk_count[0] += 1
+        await _pace_answer_chunk(event, answer_chunk_count, answer_chunk_interval_ms)
         yield TracerStreamEvent(
             event_key=event.event_key,
             type=cast(Any, event.type),

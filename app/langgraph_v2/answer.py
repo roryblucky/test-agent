@@ -24,14 +24,12 @@ class AnswerOutput(BaseModel):
     """Validated structured answer returned by the PydanticAI actor."""
 
     answer: str = Field(min_length=1)
-    citations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AnswerResult(BaseModel):
     """Answer output plus stable model usage metadata."""
 
     answer: str = Field(min_length=1)
-    citations: list[Any] = Field(default_factory=list)
     usage: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -65,7 +63,6 @@ class PydanticAIAnswerActor:
         output = AnswerOutput.model_validate(result.output)
         return AnswerResult(
             answer=output.answer,
-            citations=output.citations,
             usage=usage_payload,
         )
 
@@ -168,7 +165,6 @@ async def run_answer(
                 phase_name="answer",
                 normalized_result={
                     "answer": normalized_answer,
-                    "citations": validated.citations,
                     "usage": validated.usage,
                 },
                 events=tuple(events),

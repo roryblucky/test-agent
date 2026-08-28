@@ -1,5 +1,7 @@
 import asyncio
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -145,3 +147,11 @@ def test_split_answer_chunks_normalizes_only_crlf() -> None:
 
     assert chunks == ["A\n", "B\rC"]
     assert "".join(chunks) == "A\nB\rC"
+
+
+def test_answer_chunk_golden_case() -> None:
+    fixture = json.loads(
+        (Path(__file__).parents[1] / "fixtures" / "langgraph_v2" / "v2_answer_wire.json").read_text()
+    )
+
+    assert split_answer_chunks(fixture["answer"]) == fixture["chunks"]

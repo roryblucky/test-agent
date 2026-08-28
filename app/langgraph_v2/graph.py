@@ -347,7 +347,7 @@ def build_tracer_graph(
             if result is not None:
                 update["answer"] = result.answer
                 update["answer_usage"] = result.usage
-                update["citations"] = result.citations
+                update["citations"] = []
             if error is not None:
                 update["answer_error"] = error
             if (
