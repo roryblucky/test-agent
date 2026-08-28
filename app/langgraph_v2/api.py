@@ -252,6 +252,33 @@ class TracerGraph(Protocol):
         ...
 
 
+async def _stream_unseen_events(
+    repository: RunEventRepository,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    sent_keys: set[str],
+    answer_chunk_count: list[int],
+    answer_chunk_interval_ms: int,
+) -> AsyncIterator[str]:
+    """Serialize newly journaled Events and pace answer chunks consistently."""
+    for event in await repository.list_events(tenant_id, run_id):
+        if event.event_key in sent_keys:
+            continue
+        sent_keys.add(event.event_key)
+        if event.type == "token" and event.step == "llm:answer":
+            if answer_chunk_count[0]:
+                await asyncio.sleep(answer_chunk_interval_ms / 1000)
+            answer_chunk_count[0] += 1
+        yield TracerStreamEvent(
+            event_key=event.event_key,
+            type=cast(Any, event.type),
+            step=event.step,
+            data=event.data,
+            sequence=event.sequence,
+        ).to_sse()
+
+
 async def _stream_graph_result(
     selected_graph: TracerGraph,
     state: TracerState | None,
@@ -272,42 +299,31 @@ async def _stream_graph_result(
     else:
         graph_task = asyncio.create_task(selected_graph.ainvoke(state, config=graph_config))
     sent_keys = set(initial_sent_keys or ())
-    answer_chunk_count = 0
+    answer_chunk_count = [0]
     while not graph_task.done():
         if forward_live_events:
-            for event in await repository.list_events(tenant_id, run_id):
-                if event.event_key not in sent_keys:
-                    sent_keys.add(event.event_key)
-                    if event.type == "token" and event.step == "llm:answer":
-                        if answer_chunk_count:
-                            await asyncio.sleep(answer_chunk_interval_ms / 1000)
-                        answer_chunk_count += 1
-                    yield TracerStreamEvent(
-                        event_key=event.event_key,
-                        type=cast(Any, event.type),
-                        step=event.step,
-                        data=event.data,
-                        sequence=event.sequence,
-                    ).to_sse()
+            async for frame in _stream_unseen_events(
+                repository,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sent_keys=sent_keys,
+                answer_chunk_count=answer_chunk_count,
+                answer_chunk_interval_ms=answer_chunk_interval_ms,
+            ):
+                yield frame
         await asyncio.sleep(0.01)
     try:
         result = await graph_task
     except AnswerCancelled:
-        for event in await repository.list_events(tenant_id, run_id):
-            if event.event_key in sent_keys:
-                continue
-            sent_keys.add(event.event_key)
-            if event.type == "token" and event.step == "llm:answer":
-                if answer_chunk_count:
-                    await asyncio.sleep(answer_chunk_interval_ms / 1000)
-                answer_chunk_count += 1
-            yield TracerStreamEvent(
-                event_key=event.event_key,
-                type=cast(Any, event.type),
-                step=event.step,
-                data=event.data,
-                sequence=event.sequence,
-            ).to_sse()
+        async for frame in _stream_unseen_events(
+            repository,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sent_keys=sent_keys,
+            answer_chunk_count=answer_chunk_count,
+            answer_chunk_interval_ms=answer_chunk_interval_ms,
+        ):
+            yield frame
         return
     if not forward_live_events:
         sent_keys.update(
