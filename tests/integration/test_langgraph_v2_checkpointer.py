@@ -109,6 +109,73 @@ async def test_committed_checkpoint_is_read_by_a_fresh_saver(
 
 
 @pytest.mark.asyncio
+async def test_resume_graph_reads_exact_prior_namespace_before_writing_new_epoch(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=3,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        run = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        old_namespace = checkpoint_namespace_for(
+            "tenant-a", str(run_id), run.execution_epoch
+        )
+        await _setup_saver(pool)
+        old_ids: list[str] = []
+
+        async def old_pointer(checkpoint_id: str, _: str) -> None:
+            old_ids.append(checkpoint_id)
+
+        old_graph = build_tracer_graph(
+            FencedAsyncPostgresSaver(
+                pool,
+                checkpoint_namespace=old_namespace,
+                pointer_writer=old_pointer,
+            )
+        )
+        await old_graph.ainvoke(
+            _state("authoritative", "conversation-1"),
+            config=initial_checkpoint_config(
+                thread_id=thread_id_for("tenant-a", "conversation-1"),
+                checkpoint_ns=old_namespace,
+            ),
+        )
+        assert old_ids
+
+        new_namespace = checkpoint_namespace_for("tenant-a", str(run_id), 2)
+
+        async def noop_pointer(_: str, __: str) -> None:
+            return None
+
+        resumed_graph = build_tracer_graph(
+            FencedAsyncPostgresSaver(
+                pool,
+                checkpoint_namespace=new_namespace,
+                read_namespace=old_namespace,
+                pointer_writer=noop_pointer,
+            )
+        )
+        resumed = await resumed_graph.ainvoke(
+            None,
+            config=exact_checkpoint_config(
+                thread_id=thread_id_for("tenant-a", "conversation-1"),
+                checkpoint_ns="",
+                checkpoint_id=old_ids[-1],
+            ),
+        )
+        assert resumed["query"] == "authoritative"
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_namespace_prevents_cross_tenant_lookup(
     langgraph_v2_migrated_database_url: str,
 ) -> None:

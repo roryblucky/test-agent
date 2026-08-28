@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from importlib import reload
 from pathlib import Path
@@ -18,7 +19,7 @@ from app.api.schemas import QueryResponse
 from app.langgraph_v2.api import TracerGraph, register_tracer_routes
 from app.langgraph_v2.graph import TracerState
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.run_events import EventInput, RunEventRepository
 from app.services.events import EventEmitter
 
 FIXTURE_PATH = (
@@ -213,14 +214,169 @@ def test_resume_route_is_default_off() -> None:
 def test_resume_route_returns_404_for_missing_or_cross_tenant_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    async def seed_other_tenant() -> UUID:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            repository = RunEventRepository(pool)
+            run_id = uuid4()
+            run = await repository.create_run(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                conversation_id="conversation-1",
+                owner_instance_id="instance-a",
+            )
+            await repository.update_checkpoint_pointer(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+                checkpoint_id="checkpoint-1",
+                checkpoint_ns="namespace-1",
+            )
+            return run_id
+
     app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
-    run_id = UUID("00000000-0000-0000-0000-000000000001")
+    run_id = asyncio.run(seed_other_tenant())
+    with TestClient(app) as client:
+        cross_tenant = client.post(
+            f"/v2/runs/{run_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-b"},
+        )
+        missing = client.post(
+            f"/v2/runs/{uuid4()}/resume/stream",
+            headers={"X-Application-Id": "tenant-a"},
+        )
+    assert cross_tenant.status_code == 404
+    assert missing.status_code == 404
+
+
+def test_resume_route_returns_409_for_an_active_owner(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async def seed_active_run() -> UUID:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            repository = RunEventRepository(pool)
+            run_id = uuid4()
+            run = await repository.create_run(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                conversation_id="conversation-1",
+                owner_instance_id="instance-a",
+            )
+            await repository.update_checkpoint_pointer(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+                checkpoint_id="checkpoint-1",
+                checkpoint_ns="namespace-1",
+            )
+            return run_id
+
+    run_id = asyncio.run(seed_active_run())
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
     with TestClient(app) as client:
         response = client.post(
             f"/v2/runs/{run_id}/resume/stream",
             headers={"X-Application-Id": "tenant-a"},
         )
-    assert response.status_code == 404
+    assert response.status_code == 409
+
+
+def test_resume_replays_existing_event_without_duplicate_publication(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class ReplayGraph:
+        async def ainvoke(
+            self, state: TracerState | None, config: RunnableConfig | None = None
+        ) -> dict:
+            del state, config
+            return {
+                "events": [
+                    {
+                        "event_key": "phase:query:step_start:1",
+                        "type": "step_start",
+                        "step": "query",
+                        "sequence": 1,
+                    },
+                    {
+                        "event_key": "recovery:completed:2",
+                        "type": "done",
+                        "data": {"source": "recovered"},
+                        "sequence": 2,
+                    },
+                ]
+            }
+
+    async def seed_run() -> UUID:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            repository = RunEventRepository(pool)
+            run_id = uuid4()
+            run = await repository.create_run(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                conversation_id="conversation-1",
+                owner_instance_id="instance-a",
+            )
+            await repository.update_checkpoint_pointer(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+                checkpoint_id="checkpoint-1",
+                checkpoint_ns="namespace-1",
+            )
+            await repository.append_event(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                event=EventInput(
+                    event_key="phase:query:step_start:1",
+                    type="step_start",
+                    step="query",
+                ),
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+            )
+            with psycopg.connect(
+                langgraph_v2_migrated_database_url, autocommit=True
+            ) as connection:
+                connection.execute(
+                    "UPDATE langgraph_v2.runs SET expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id = %s AND run_id = %s",
+                    ("tenant-a", run_id),
+                )
+            return run_id
+
+    run_id = asyncio.run(seed_run())
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        ReplayGraph(),
+        resume_enabled=True,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/runs/{run_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a"},
+        )
+    delivered = parse_sse(response.text)
+    assert [event["type"] for event in delivered] == ["done"]
+    assert [event["sequence"] for event in delivered] == [2]
+
+    async def read_events() -> list:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            return await RunEventRepository(pool).list_events("tenant-a", run_id)
+
+    persisted = asyncio.run(read_events())
+    assert [event.event_key for event in persisted] == [
+        "phase:query:step_start:1",
+        "recovery:completed:2",
+    ]
 
 
 def test_resume_route_runs_injected_graph_for_stale_run(
@@ -284,6 +440,88 @@ def test_resume_route_runs_injected_graph_for_stale_run(
         )
     assert response.status_code == 200
     assert parse_sse(response.text)[0]["type"] == "done"
+
+
+def test_concurrent_resume_requests_have_one_http_winner(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class SlowResumeGraph:
+        async def ainvoke(
+            self, state: TracerState | None, config: RunnableConfig | None = None
+        ) -> dict:
+            del state, config
+            await asyncio.sleep(0.05)
+            return {
+                "events": [
+                    {
+                        "event_key": "recovery:completed:1",
+                        "type": "done",
+                        "data": {"source": "concurrent-recovery"},
+                        "sequence": 1,
+                    }
+                ]
+            }
+
+    async def seed_run() -> UUID:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            repository = RunEventRepository(pool)
+            run_id = uuid4()
+            run = await repository.create_run(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                conversation_id="conversation-1",
+                owner_instance_id="instance-a",
+            )
+            await repository.update_checkpoint_pointer(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+                checkpoint_id="checkpoint-1",
+                checkpoint_ns="namespace-1",
+            )
+            with psycopg.connect(
+                langgraph_v2_migrated_database_url, autocommit=True
+            ) as connection:
+                connection.execute(
+                    "UPDATE langgraph_v2.runs SET expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id = %s AND run_id = %s",
+                    ("tenant-a", run_id),
+                )
+            return run_id
+
+    run_id = asyncio.run(seed_run())
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        SlowResumeGraph(),
+        resume_enabled=True,
+    )
+    with TestClient(app) as client:
+
+        def resume() -> int:
+            return client.post(
+                f"/v2/runs/{run_id}/resume/stream",
+                headers={"X-Application-Id": "tenant-a"},
+            ).status_code
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            statuses = list(executor.map(lambda _: resume(), range(2)))
+
+    assert sorted(statuses) == [200, 409]
+
+    async def read_run_and_events() -> tuple[str, int, list]:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            repository = RunEventRepository(pool)
+            recovered = await repository.get_run("tenant-a", run_id)
+            events = await repository.list_events("tenant-a", run_id)
+            return recovered.status, recovered.execution_epoch, events
+
+    status, epoch, events = asyncio.run(read_run_and_events())
+    assert (status, epoch) == ("completed", 2)
+    assert [event.event_key for event in events] == ["recovery:completed:1"]
 
 
 def test_completed_tracer_persists_its_run_and_every_delivered_event(
