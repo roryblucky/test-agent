@@ -26,6 +26,7 @@ from app.langgraph_v2.checkpointing import (
     initial_checkpoint_config,
     thread_id_for,
 )
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
@@ -227,13 +228,13 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
                 "refined_query": "What is LangGraph?",
                 "documents": [],
                 "metadata": {
-                        "steps_executed": [
-                            "query",
-                            "pre_moderation",
-                            "question_refinement",
-                            "retrieval",
-                            "reranking",
-                            "finalization",
+                    "steps_executed": [
+                        "query",
+                        "pre_moderation",
+                        "question_refinement",
+                        "retrieval",
+                        "reranking",
+                        "finalization",
                     ]
                 },
             },
@@ -863,12 +864,14 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
             max_size=2,
         ) as pool:
             repository = RunEventRepository(pool)
+            messages = ConversationMessageRepository(pool)
             return (
                 await repository.get_run("tenant-a", run_id),
                 await repository.list_events("tenant-a", run_id),
+                await messages.list_messages("tenant-a", "conversation-1"),
             )
 
-    run, persisted = asyncio.run(load_persisted_result())
+    run, persisted, messages = asyncio.run(load_persisted_result())
 
     assert run.status == "completed"
     assert run.terminal_outcome == delivered[-1]["data"]
@@ -889,6 +892,9 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
         "lifecycle:completed:0",
     ]
     assert [event.type for event in persisted] == [event["type"] for event in delivered]
+    assert [(message.role, message.content) for message in messages] == [
+        ("user", "hello")
+    ]
 
 
 def test_long_running_request_refreshes_its_claim(

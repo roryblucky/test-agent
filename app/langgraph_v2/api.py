@@ -30,6 +30,7 @@ from app.langgraph_v2.checkpointing import (
     thread_id_for,
 )
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
@@ -214,9 +215,11 @@ async def _refresh_claim(
 
 async def _persist_result_events(
     repository: RunEventRepository,
+    message_repository: ConversationMessageRepository,
     *,
     tenant_id: str,
     run_id: uuid.UUID,
+    conversation_id: str,
     result: dict[str, Any],
     owner_instance_id: str,
     execution_epoch: int,
@@ -242,6 +245,16 @@ async def _persist_result_events(
                 owner_instance_id=owner_instance_id,
                 execution_epoch=execution_epoch,
             )
+            if isinstance(event.data, dict) and isinstance(
+                event.data.get("answer"), str
+            ):
+                await message_repository.persist_assistant_message_after_completion(
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    run_id=run_id,
+                    content=event.data["answer"],
+                    idempotency_key=f"run:{run_id}:assistant",
+                )
         elif event.type == "error":
             persisted = await repository.fail_run(
                 tenant_id=tenant_id,
@@ -336,9 +349,11 @@ async def _stream_graph_result(
     state: TracerState | None,
     graph_config: RunnableConfig | None,
     repository: RunEventRepository,
+    message_repository: ConversationMessageRepository,
     *,
     tenant_id: str,
     run_id: uuid.UUID,
+    conversation_id: str,
     owner_instance_id: str,
     execution_epoch: int,
     answer_chunk_interval_ms: int,
@@ -390,8 +405,10 @@ async def _stream_graph_result(
         )
     async for frame in _persist_result_events(
         repository,
+        message_repository,
         tenant_id=tenant_id,
         run_id=run_id,
+        conversation_id=conversation_id,
         result=result,
         owner_instance_id=owner_instance_id,
         execution_epoch=execution_epoch,
@@ -439,11 +456,23 @@ def create_tracer_router(
                 raise RuntimeError("LangGraph v2 PostgreSQL is not configured")
             pool = cast(AsyncConnectionPool[Any], configured_pool)
             repository = RunEventRepository(pool)
+            message_repository = ConversationMessageRepository(pool)
             claim = await repository.create_run(
                 tenant_id=x_application_id,
                 run_id=run_id,
                 conversation_id=conversation_id,
                 owner_instance_id=_INSTANCE_ID,
+            )
+            await message_repository.resolve_conversation(
+                tenant_id=x_application_id,
+                conversation_id=conversation_id,
+            )
+            await message_repository.persist_user_message(
+                tenant_id=x_application_id,
+                conversation_id=conversation_id,
+                run_id=run_id,
+                content=payload.query,
+                idempotency_key=f"run:{run_id}:user",
             )
             configured_checkpointer = getattr(
                 http_request.app.state,
@@ -561,8 +590,10 @@ def create_tracer_router(
                     state,
                     graph_config,
                     repository,
+                    message_repository,
                     tenant_id=x_application_id,
                     run_id=run_id,
+                    conversation_id=conversation_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,
@@ -601,6 +632,7 @@ def create_tracer_router(
             )
         pool = cast(AsyncConnectionPool[Any], configured_pool)
         repository = RunEventRepository(pool)
+        message_repository = ConversationMessageRepository(pool)
         try:
             claim = await repository.resume_run(
                 tenant_id=x_application_id,
@@ -718,8 +750,10 @@ def create_tracer_router(
                     None,
                     graph_config,
                     repository,
+                    message_repository,
                     tenant_id=x_application_id,
                     run_id=run_id,
+                    conversation_id=claim.conversation_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,

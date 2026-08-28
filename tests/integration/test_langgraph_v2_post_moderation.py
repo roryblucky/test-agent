@@ -7,12 +7,13 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult
 from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.run_events import EventInput, RunEventRepository
 from app.models.domain import Document
 
 
@@ -75,6 +76,15 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             conversation_id="c1",
             owner_instance_id="i1",
         )
+        messages = ConversationMessageRepository(pool)
+        await messages.resolve_conversation(tenant_id="tenant-a", conversation_id="c1")
+        await messages.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="c1",
+            run_id=run.run_id,
+            content="hello",
+            idempotency_key=f"run:{run.run_id}:user",
+        )
         moderation = _SafeModeration()
         context = PhaseExecutionContext(
             repository=PhaseResultRepository(pool),
@@ -92,6 +102,26 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             answer_actor=_Answer(),
         )
         result = await graph.ainvoke(_state())
+        done = result["events"][-1]
+        await runs.complete_run(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            event=EventInput(
+                event_key=done["event_key"],
+                type=done["type"],
+                data=done["data"],
+            ),
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        await messages.persist_assistant_message_after_completion(
+            tenant_id="tenant-a",
+            conversation_id="c1",
+            run_id=run.run_id,
+            content=result["answer"],
+            idempotency_key=f"run:{run.run_id}:assistant",
+        )
+        persisted_messages = await messages.list_messages("tenant-a", "c1")
 
     assert moderation.calls == 2
     assert result["answer"] == "generated answer"
@@ -103,6 +133,10 @@ async def test_safe_answer_passes_post_moderation_unchanged(
     ] == ["moderation:post", "moderation:post"]
     assert result["events"][-1]["type"] == "done"
     assert result["events"][-1]["data"]["answer"] == "generated answer"
+    assert [message.content for message in persisted_messages] == [
+        "hello",
+        "generated answer",
+    ]
 
 
 @pytest.mark.asyncio
@@ -118,6 +152,15 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
             run_id=uuid4(),
             conversation_id="c1",
             owner_instance_id="i1",
+        )
+        messages = ConversationMessageRepository(pool)
+        await messages.resolve_conversation(tenant_id="tenant-a", conversation_id="c1")
+        await messages.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="c1",
+            run_id=run.run_id,
+            content="hello",
+            idempotency_key=f"run:{run.run_id}:user",
         )
         context = PhaseExecutionContext(
             repository=PhaseResultRepository(pool),
@@ -135,6 +178,26 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
             answer_actor=_Answer(),
         )
         result = await graph.ainvoke(_state())
+        done = result["events"][-1]
+        await runs.complete_run(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            event=EventInput(
+                event_key=done["event_key"],
+                type=done["type"],
+                data=done["data"],
+            ),
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        await messages.persist_assistant_message_after_completion(
+            tenant_id="tenant-a",
+            conversation_id="c1",
+            run_id=run.run_id,
+            content=result["answer"],
+            idempotency_key=f"run:{run.run_id}:assistant",
+        )
+        persisted_messages = await messages.list_messages("tenant-a", "c1")
 
     assert result["answer"] == (
         "The generated response was flagged by content moderation and has been removed."
@@ -145,6 +208,11 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
     )
     assert result["events"][-1]["type"] == "done"
     assert result["events"][-1]["data"]["answer"] == result["answer"]
+    assert [message.content for message in persisted_messages] == [
+        "hello",
+        "The generated response was flagged by content moderation and has been removed.",
+    ]
+    assert all(message.content != "generated answer" for message in persisted_messages)
 
 
 @pytest.mark.asyncio
