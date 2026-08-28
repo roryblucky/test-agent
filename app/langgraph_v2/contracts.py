@@ -37,7 +37,6 @@ class TracerQueryResponse(BaseModel):
     documents: list[Any] = Field(default_factory=list)
     moderation: dict[str, Any] | None = None
     groundedness: GroundednessResult | None = None
-    usage: dict[str, Any] = Field(default_factory=dict)
     clarification: None = None
     conversation_id: str = Field(serialization_alias="session_id")
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -48,9 +47,7 @@ class TracerStreamEvent(BaseModel):
     """One additive-sequence SSE event produced by the v2 tracer."""
 
     event_key: str = Field(min_length=1)
-    type: Literal[
-        "step_start", "step_completed", "token", "citations", "error", "done"
-    ]
+    type: Literal["step_start", "step_completed", "token", "citations", "error", "done"]
     sequence: int = Field(ge=1)
     step: str | None = None
     data: Any = None

@@ -1,0 +1,46 @@
+{
+  "query": "hello",
+  "refined_query": "hello",
+  "intent": null,
+  "answer": "grounded answer",
+  "documents": [
+    {
+      "id": "d1",
+      "content": "hello",
+      "metadata": {},
+      "score": null,
+      "source_url": "https://example.test/d1",
+      "source_type": "mock",
+      "page_number": null,
+      "section_title": null
+    }
+  ],
+  "moderation": {
+    "is_flagged": false,
+    "categories": {}
+  },
+  "groundedness": null,
+  "clarification": null,
+  "session_id": "c1",
+  "metadata": {
+    "steps_executed": [
+      "query",
+      "pre_moderation",
+      "question_refinement",
+      "retrieval",
+      "reranking",
+      "answer",
+      "moderation:post",
+      "finalization"
+    ],
+    "usage": {
+      "requests": 1,
+      "request_tokens": 0,
+      "response_tokens": 3,
+      "total_tokens": 3,
+      "input_tokens": 0,
+      "output_tokens": 3
+    }
+  },
+  "citations": []
+}

@@ -388,10 +388,17 @@ def build_tracer_graph(
             context=phase_context,
             artifacts=selected_artifact_repository,
         )
+        done_event = TracerStreamEvent(
+            event_key="lifecycle:completed:0",
+            type="done",
+            data=response.model_dump(by_alias=True),
+            sequence=len(state["events"]) + len(events) + 1,
+        )
         return {
             "events": [
                 *state["events"],
                 *[_event_state(event, event.sequence) for event in events],
+                done_event.model_dump(exclude_none=True),
             ],
             "final_response": response,
         }

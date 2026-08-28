@@ -31,6 +31,22 @@ def _steps(state: Mapping[str, Any]) -> list[str]:
     return steps
 
 
+def _legacy_usage(usage: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Map answer usage to the legacy metadata shape."""
+    if not usage:
+        return None
+    input_tokens = int(usage.get("input_tokens", usage.get("request_tokens", 0)))
+    output_tokens = int(usage.get("output_tokens", usage.get("response_tokens", 0)))
+    return {
+        "requests": int(usage.get("requests", 1)),
+        "request_tokens": input_tokens,
+        "response_tokens": output_tokens,
+        "total_tokens": int(usage.get("total_tokens", input_tokens + output_tokens)),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
 async def run_finalization(
     state: Mapping[str, Any],
     *,
@@ -63,12 +79,8 @@ async def run_finalization(
             documents=[document.model_dump(mode="json") for document in documents],
             moderation=state.get("moderation") if "answer" in state else None,
             groundedness=state.get("groundedness"),
-            usage=state.get("answer_usage", {}),
             citations=state.get("citations", []),
         )
-        done_data = response.model_dump(by_alias=True)
-        if "answer" not in state:
-            done_data.pop("usage", None)
         events = (
             EventInput(
                 event_key="phase:finalization:step_start:1",
@@ -81,15 +93,14 @@ async def run_finalization(
                 step="finalization",
                 data={"status": "completed"},
             ),
-            EventInput(
-                event_key="lifecycle:completed:0",
-                type="done",
-                data=done_data,
-            ),
         )
+        normalized = response.model_dump(mode="json")
+        usage = _legacy_usage(state.get("answer_usage", {}))
+        if usage is not None:
+            normalized["metadata"]["usage"] = usage
         return PhaseResultInput(
             phase_name="finalization",
-            normalized_result=response.model_dump(mode="json"),
+            normalized_result=normalized,
             events=events,
         )
 
@@ -116,13 +127,13 @@ def finalize_in_memory(state: Mapping[str, Any]) -> dict[str, Any]:
         answer=state.get("answer"),
         moderation=state.get("moderation") if "answer" in state else None,
         groundedness=state.get("groundedness"),
-        usage=state.get("answer_usage", {}),
         citations=state.get("citations", []),
         documents=[],
     )
     done_data = response.model_dump(by_alias=True)
-    if "answer" not in state:
-        done_data.pop("usage", None)
+    usage = _legacy_usage(state.get("answer_usage", {}))
+    if usage is not None:
+        done_data["metadata"]["usage"] = usage
     events = [
         TracerStreamEvent(
             event_key="phase:finalization:step_start:1",

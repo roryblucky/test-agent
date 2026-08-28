@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult
@@ -107,7 +110,23 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     assert done["answer"] == "grounded answer"
     assert done["documents"][0]["id"] == "d1"
     assert done["moderation"]["is_flagged"] is False
-    assert done["usage"] == {"output_tokens": 3}
+    assert done["metadata"]["usage"] == {
+        "requests": 1,
+        "request_tokens": 0,
+        "response_tokens": 3,
+        "total_tokens": 3,
+        "input_tokens": 0,
+        "output_tokens": 3,
+    }
+    expected = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "langgraph_v2"
+            / "v2_finalization_wire.json"
+        ).read_text()
+    )
+    assert done == expected
     assert result["final_response"].model_dump(by_alias=True) == done
     assert answer.calls == 1
     assert moderation.calls == 2
@@ -138,12 +157,14 @@ async def test_finalization_replays_after_commit_window_without_duplicate_done(
         )
         answer = _Answer()
         moderation = _Moderation()
+        repository = CrashAfterFinalizationCommit(pool)
         graph = build_tracer_graph(
+            checkpointer=MemorySaver(),
             phase_context=_context(
                 pool,
                 run.run_id,
                 run.execution_epoch,
-                CrashAfterFinalizationCommit(pool),
+                repository,
             ),
             moderation_provider=moderation,
             retriever=_Retriever(),
@@ -151,12 +172,19 @@ async def test_finalization_replays_after_commit_window_without_duplicate_done(
             answer_actor=answer,
         )
         with pytest.raises(RuntimeError, match="crash after finalization commit"):
-            await graph.ainvoke(_state())
-        recovered = await graph.ainvoke(_state())
+            await graph.ainvoke(
+                _state(), config={"configurable": {"thread_id": "task16-crash"}}
+            )
+        recovered = await graph.ainvoke(
+            None, config={"configurable": {"thread_id": "task16-crash"}}
+        )
+        phase = await repository.get_completed("tenant-a", run.run_id, "finalization")
 
     assert answer.calls == 1
     assert moderation.calls == 2
     assert recovered["events"][-1]["type"] == "done"
+    assert phase is not None
+    assert all(event.type != "done" for event in phase.events)
     assert sum(event["type"] == "done" for event in recovered["events"]) == 1
     assert len({event["event_key"] for event in recovered["events"]}) == len(
         recovered["events"]
