@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
@@ -221,7 +220,7 @@ async def run_answer(
             chunks = split_answer_chunks(validated.answer)
             normalized_answer = "".join(chunks)
             citations = await build_inline_citations(normalized_answer, refs, documents)
-            if not re.search(r"\[[^\]]*\]", normalized_answer):
+            if "[" not in normalized_answer and "]" not in normalized_answer:
                 citations = bind_answer_citations(validated.citations, refs, documents)
             events: list[EventInput] = [
                 EventInput(

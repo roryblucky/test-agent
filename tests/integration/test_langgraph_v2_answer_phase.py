@@ -93,7 +93,7 @@ class _MalformedCitationAnswer:
         self.calls += 1
         del query, documents
         return AnswerResult(
-            answer="Malformed [x] [0] []",
+            answer="Malformed [x] [0] [] and unmatched [1",
             citations=[AnswerCitation(index=1, quoted_text="hello")],
         )
 
