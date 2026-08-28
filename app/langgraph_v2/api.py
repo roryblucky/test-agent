@@ -211,7 +211,11 @@ async def _persist_result_events(
                 owner_instance_id=owner_instance_id,
                 execution_epoch=execution_epoch,
             )
-        if event.type == "token" and event.step == "llm:answer":
+        if (
+            event.type == "token"
+            and event.step == "llm:answer"
+            and event.event_key not in prior_keys
+        ):
             if answer_chunk_count:
                 await asyncio.sleep(answer_chunk_interval_ms / 1000)
             answer_chunk_count += 1
@@ -229,6 +233,58 @@ class TracerGraph(Protocol):
     ) -> dict[str, Any]:
         """Run one graph invocation and return its final state."""
         ...
+
+
+async def _stream_graph_result(
+    selected_graph: TracerGraph,
+    state: TracerState | None,
+    graph_config: RunnableConfig | None,
+    repository: RunEventRepository,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    owner_instance_id: str,
+    execution_epoch: int,
+    answer_chunk_interval_ms: int,
+    initial_sent_keys: set[str] | None = None,
+    forward_live_events: bool = True,
+) -> AsyncIterator[str]:
+    """Run a graph while forwarding already-journaled Events as they commit."""
+    if graph_config is None:
+        graph_task = asyncio.create_task(selected_graph.ainvoke(state))
+    else:
+        graph_task = asyncio.create_task(selected_graph.ainvoke(state, config=graph_config))
+    sent_keys = set(initial_sent_keys or ())
+    while not graph_task.done():
+        if forward_live_events:
+            for event in await repository.list_events(tenant_id, run_id):
+                if event.event_key not in sent_keys:
+                    sent_keys.add(event.event_key)
+                    yield TracerStreamEvent(
+                        event_key=event.event_key,
+                        type=cast(Any, event.type),
+                        step=event.step,
+                        data=event.data,
+                        sequence=event.sequence,
+                    ).to_sse()
+        await asyncio.sleep(0.01)
+    result = await graph_task
+    if not forward_live_events:
+        sent_keys.update(
+            event.event_key
+            for event in await repository.list_events(tenant_id, run_id)
+        )
+    async for frame in _persist_result_events(
+        repository,
+        tenant_id=tenant_id,
+        run_id=run_id,
+        result=result,
+        owner_instance_id=owner_instance_id,
+        execution_epoch=execution_epoch,
+        suppress_sse_for_event_keys=sent_keys,
+        answer_chunk_interval_ms=answer_chunk_interval_ms,
+    ):
+        yield frame
 
 
 def create_tracer_router(
@@ -367,15 +423,13 @@ def create_tracer_router(
                     "client_request_id": payload.client_request_id,
                     "events": [],
                 }
-                if graph_config is None:
-                    result = await selected_graph.ainvoke(state)
-                else:
-                    result = await selected_graph.ainvoke(state, config=graph_config)
-                async for frame in _persist_result_events(
+                async for frame in _stream_graph_result(
+                    selected_graph,
+                    state,
+                    graph_config,
                     repository,
                     tenant_id=x_application_id,
                     run_id=run_id,
-                    result=result,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,
@@ -508,23 +562,23 @@ def create_tracer_router(
                 )
             )
             try:
-                if graph_config is None:
-                    result = await selected_graph.ainvoke(None)
-                else:
-                    result = await selected_graph.ainvoke(None, config=graph_config)
-                prior_events = {
-                    event.event_key
-                    for event in await repository.list_events(x_application_id, run_id)
-                }
-                async for frame in _persist_result_events(
+                async for frame in _stream_graph_result(
+                    selected_graph,
+                    None,
+                    graph_config,
                     repository,
                     tenant_id=x_application_id,
                     run_id=run_id,
-                    result=result,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
-                    suppress_sse_for_event_keys=prior_events,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,
+                    initial_sent_keys={
+                        event.event_key
+                        for event in await repository.list_events(
+                            x_application_id, run_id
+                        )
+                    },
+                    forward_live_events=False,
                 ):
                     yield frame
             finally:

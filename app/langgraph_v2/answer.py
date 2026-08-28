@@ -43,6 +43,10 @@ class AnswerActor(Protocol):
         ...
 
 
+class AnswerCancelled(RuntimeError):
+    """Raised when cancellation is observed before answer publication."""
+
+
 class PydanticAIAnswerActor:
     """Adapt a PydanticAI Agent with structured answer output."""
 
@@ -186,6 +190,8 @@ async def run_answer(
                 terminal_status="failed",
             )
 
+    if context.cancellation_check is not None and await context.cancellation_check():
+        raise AnswerCancelled("answer generation cancelled before publication")
     result = await context.repository.get_or_invoke(
         tenant_id=context.tenant_id,
         run_id=context.run_id,

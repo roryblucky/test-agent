@@ -106,6 +106,7 @@ class PhaseExecutionContext:
     owner_instance_id: str
     execution_epoch: int
     artifact_repository: ArtifactStore | None = None
+    cancellation_check: Callable[[], Awaitable[bool]] | None = None
 
 
 PhaseInvoker = Callable[[], Awaitable[PhaseResultInput]]
