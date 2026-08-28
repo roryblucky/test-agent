@@ -10,12 +10,12 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
-from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence, CitationReference
-from app.services.citation_extractor import build_citations
+from app.services.citation_extractor import build_citations, extract_claims
 
 ANSWER_CHUNK_INTERVAL_MS = 250
 ANSWER_CHUNK_MAX_CODEPOINTS = 240
@@ -54,7 +54,7 @@ class BoundAnswerResult(BaseModel):
 
 def bind_answer_citations(
     citations: list[AnswerCitation],
-    refs: list[Mapping[str, Any]],
+    refs: list[ArtifactRef],
     documents: list[Document],
 ) -> list[CitationReference]:
     """Bind indexed model citations to ranked Artifacts with quote validation."""
@@ -90,7 +90,7 @@ def bind_answer_citations(
 
 async def build_inline_citations(
     answer: str,
-    refs: list[Mapping[str, Any]],
+    refs: list[ArtifactRef],
     documents: list[Document],
 ) -> list[CitationReference]:
     """Extract ``[n]`` references and map them through ranked ArtifactRefs."""
@@ -220,7 +220,7 @@ async def run_answer(
             chunks = split_answer_chunks(validated.answer)
             normalized_answer = "".join(chunks)
             citations = await build_inline_citations(normalized_answer, refs, documents)
-            if not citations:
+            if not extract_claims(normalized_answer):
                 citations = bind_answer_citations(validated.citations, refs, documents)
             events: list[EventInput] = [
                 EventInput(

@@ -16,6 +16,8 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.domain import Document
+from app.models.workflow import AggregatedEvidence
+from app.services.citation_extractor import build_citations
 from app.services.events import EventEmitter
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
@@ -70,7 +72,18 @@ class _InlineCitationAnswer:
     async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
         self.calls += 1
         del query, documents
-        return AnswerResult(answer="Supported claim [1]. Unknown claim [99].")
+        return AnswerResult(
+            answer="Supported claim [1]. Malformed [x] [0] []. Unknown claim [99]."
+        )
+
+
+class _RankedInlineAnswer:
+    calls = 0
+
+    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+        self.calls += 1
+        del query, documents
+        return AnswerResult(answer="World claim [1].")
 
 
 @pytest.mark.asyncio
@@ -165,10 +178,12 @@ async def test_answer_reuses_atomic_commit_after_crash_window(
         with pytest.raises(RuntimeError, match="crash after answer commit"):
             await graph.ainvoke(state)
         recovered = await graph.ainvoke(state)
+        retrieval = await context.repository.get_completed("tenant-a", run.run_id, "retrieval")
 
     assert actor.calls == 1
-    assert recovered["answer"] == "Supported claim [1]. Unknown claim [99]."
+    assert recovered["answer"] == "Supported claim [1]. Malformed [x] [0] []. Unknown claim [99]."
     assert [citation.index for citation in recovered["citations"]] == [1]
+    assert recovered["citations"][0].evidence_id == retrieval.artifact_refs[0]["artifact_id"]
     assert len({event["event_key"] for event in recovered["events"]}) == len(recovered["events"])
 
 
@@ -290,9 +305,10 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     answer_events = [
         event for event in result["events"] if event["event_key"].startswith("phase:answer:")
     ]
-    assert [event["type"] for event in answer_events] == [
-        "step_start", "token", "token", "citations", "step_completed"
-    ]
+    assert answer_events[0]["type"] == "step_start"
+    assert answer_events[-1]["type"] == "step_completed"
+    assert all(event["type"] == "token" for event in answer_events[1:-2])
+    assert answer_events[-2]["type"] == "citations"
     citation_fixture = json.loads(
         (
             Path(__file__).parents[1]
@@ -301,17 +317,80 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
             / "v1_citations_wire.json"
         ).read_text()
     )
-    citation_event = answer_events[3]
+    citation_event = answer_events[-2]
     assert citation_event["type"] == citation_fixture["event"]["type"]
     assert set(citation_fixture["event"]["data"][0]) <= set(citation_event["data"][0])
 
+    legacy_citations, _ = await build_citations(
+        "Supported claim [1].",
+        [
+            AggregatedEvidence(
+                evidence_id="legacy:evidence:1",
+                source="d1",
+                tool_call_id="legacy",
+                content="hello",
+                citation_index=1,
+            )
+        ],
+    )
+    assert legacy_citations
+    assert {
+        key: legacy_citations[0].model_dump(mode="json")[key]
+        for key in citation_fixture["event"]["data"][0]
+    } == citation_fixture["event"]["data"][0]
     legacy_emitter = EventEmitter()
-    await legacy_emitter.emit_citations(citation_fixture["event"]["data"])
+    await legacy_emitter.emit_citations(
+        [citation.model_dump(mode="json") for citation in legacy_citations]
+    )
     await legacy_emitter.close()
     legacy_frames = [frame async for frame in legacy_emitter]
     legacy_wire = json.loads(legacy_frames[0].removeprefix("data: ").strip())
-    assert legacy_wire == citation_fixture["event"]
+    assert legacy_wire["type"] == citation_fixture["event"]["type"]
+    assert legacy_wire["data"] == [citation.model_dump(mode="json") for citation in legacy_citations]
     assert citation_event["data"][0]["index"] == legacy_wire["data"][0]["index"]
     assert citation_event["data"][0]["source"] == legacy_wire["data"][0]["source"]
     assert citation_event["data"][0]["evidence_id"] != legacy_wire["data"][0]["evidence_id"]
     assert "highlight_spans" in citation_event["data"][0]
+
+
+@pytest.mark.asyncio
+async def test_inline_citation_uses_reranked_artifact_position(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class TwoRetriever:
+        async def retrieve(self, query: str) -> RetrievalResult:
+            del query
+            return RetrievalResult(
+                documents=[
+                    Document(id="d1", content="hello"),
+                    Document(id="d2", content="world"),
+                ]
+            )
+
+    class ReverseRanker:
+        async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
+            del query
+            return RerankingResult(documents=list(reversed(documents)))
+
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        actor = _RankedInlineAnswer()
+        repository = PhaseResultRepository(pool)
+        context = PhaseExecutionContext(
+            repository=repository, artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            phase_context=context, retriever=TwoRetriever(), ranker=ReverseRanker(), answer_actor=actor
+        )
+        result = await graph.ainvoke(
+            {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
+        )
+        reranking = await repository.get_completed("tenant-a", run.run_id, "reranking")
+
+    assert actor.calls == 1
+    assert result["citations"][0].evidence_id == reranking.artifact_refs[0]["artifact_id"]
