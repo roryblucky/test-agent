@@ -14,6 +14,7 @@ from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
+from app.models.workflow import CitationReference
 
 ANSWER_CHUNK_INTERVAL_MS = 250
 ANSWER_CHUNK_MAX_CODEPOINTS = 240
@@ -28,10 +29,9 @@ class AnswerOutput(BaseModel):
 
 
 class AnswerCitation(BaseModel):
-    """A model citation bound to one retrieved Artifact."""
+    """A model citation request referring to ordered evidence by index."""
 
     index: int = Field(ge=1)
-    artifact_id: str | None = Field(default=None, min_length=1)
     quoted_text: str | None = None
 
 
@@ -41,6 +41,14 @@ class AnswerResult(BaseModel):
     answer: str = Field(min_length=1)
     usage: dict[str, Any] = Field(default_factory=dict)
     citations: list[AnswerCitation] = Field(default_factory=list)
+
+
+class BoundAnswerResult(BaseModel):
+    """Answer result with citations bound to durable Artifact provenance."""
+
+    answer: str = Field(min_length=1)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    citations: list[CitationReference] = Field(default_factory=list)
 
 
 class AnswerActor(Protocol):
@@ -121,7 +129,7 @@ async def run_answer(
     context: PhaseExecutionContext,
     artifacts: ArtifactStore,
     actor: AnswerActor,
-) -> tuple[list[EventRecord], AnswerResult | None, bool, str | None]:
+) -> tuple[list[EventRecord], BoundAnswerResult | None, bool, str | None]:
     """Hydrate ranked evidence, journal the answer and all chunks atomically."""
 
     async def invoke() -> PhaseResultInput:
@@ -148,22 +156,33 @@ async def run_answer(
             validated = AnswerResult.model_validate(answer)
             chunks = split_answer_chunks(validated.answer)
             normalized_answer = "".join(chunks)
-            citations: list[AnswerCitation] = []
-            seen_citations: set[tuple[int, str]] = set()
+            citations: list[CitationReference] = []
+            seen_citations: set[int] = set()
             for citation in validated.citations:
-                if citation.artifact_id is None:
-                    if citation.index > len(refs):
-                        continue
-                    artifact_id = refs[citation.index - 1]["artifact_id"]
-                else:
-                    artifact_id = citation.artifact_id
-                    if artifact_id not in {ref["artifact_id"] for ref in refs}:
-                        continue
-                key = (citation.index, artifact_id)
-                if key in seen_citations:
+                if citation.index > len(refs) or citation.index in seen_citations:
                     continue
-                seen_citations.add(key)
-                citations.append(citation.model_copy(update={"artifact_id": artifact_id}))
+                seen_citations.add(citation.index)
+                ref = refs[citation.index - 1]
+                document = documents[citation.index - 1]
+                source = document.source_url or document.id
+                citations.append(
+                    CitationReference(
+                        index=citation.index,
+                        evidence_id=ref["artifact_id"],
+                        source=source,
+                        source_type=document.source_type,
+                        title=document.section_title,
+                        url=document.source_url,
+                        snippet=citation.quoted_text,
+                        quoted_text=citation.quoted_text,
+                        page_number=document.page_number,
+                        section=document.section_title,
+                        attribution_status=(
+                            "located" if citation.quoted_text else "unlocated"
+                        ),
+                        metadata={"artifact_id": ref["artifact_id"]},
+                    )
+                )
             events: list[EventInput] = [
                 EventInput(
                     event_key="phase:answer:step_start:1",
@@ -246,7 +265,7 @@ async def run_answer(
         return list(result.events), None, True, str(result.normalized_result["error"])
     return (
         list(result.events),
-        AnswerResult.model_validate(result.normalized_result),
+        BoundAnswerResult.model_validate(result.normalized_result),
         False,
         None,
     )

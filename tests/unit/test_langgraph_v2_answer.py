@@ -155,3 +155,39 @@ def test_answer_chunk_golden_case() -> None:
     )
 
     assert split_answer_chunks(fixture["answer"]) == fixture["chunks"]
+
+
+@pytest.mark.asyncio
+async def test_answer_tokens_are_delivered_before_post_moderation_boundary() -> None:
+    run_id = UUID("00000000-0000-0000-0000-000000000002")
+    created_at = datetime.now(UTC)
+    events = [
+        EventRecord(
+            tenant_id="tenant-a", run_id=run_id, sequence=1,
+            event_key="phase:answer:token:0", type="token", data="answer",
+            created_at=created_at,
+        ),
+        EventRecord(
+            tenant_id="tenant-a", run_id=run_id, sequence=2,
+            event_key="phase:moderation:post:step_start:1", type="step_start",
+            step="moderation:post", created_at=created_at,
+        ),
+    ]
+
+    class Repository:
+        async def list_events(self, tenant_id: str, requested_run_id: UUID) -> list[EventRecord]:
+            assert tenant_id == "tenant-a"
+            assert requested_run_id == run_id
+            return events
+
+    frames = [
+        frame
+        async for frame in _stream_unseen_events(
+            Repository(), tenant_id="tenant-a", run_id=run_id,
+            sent_keys=set(), answer_chunk_count=[0], answer_chunk_interval_ms=250,
+        )
+    ]
+
+    assert frames[0].index('"type": "token"') < frames[1].index(
+        '"step": "moderation:post"'
+    )

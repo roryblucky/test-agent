@@ -241,7 +241,7 @@ async def test_answer_citation_subresult_is_bound_and_replayed(
 
     assert actor.calls == 1
     assert first["citations"] == second["citations"]
-    assert first["citations"][0]["artifact_id"]
+    assert first["citations"][0]["evidence_id"]
     assert first["citations"][0]["quoted_text"] == "evidence"
     answer_events = [event for event in first["events"] if event["event_key"].startswith("phase:answer:")]
     assert [event["type"] for event in answer_events] == [

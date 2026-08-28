@@ -29,6 +29,7 @@ from app.langgraph_v2.question_refinement import (
 from app.langgraph_v2.reranking import MockRanker, Ranker, run_reranking
 from app.langgraph_v2.retrieval import MockRetriever, Retriever, run_retrieval
 from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.models.workflow import CitationReference
 
 
 class TracerState(TypedDict):
@@ -48,7 +49,7 @@ class TracerState(TypedDict):
     ranked_refs: NotRequired[list[ArtifactRef]]
     answer: NotRequired[str]
     answer_usage: NotRequired[dict[str, Any]]
-    citations: NotRequired[list[Any]]
+    citations: NotRequired[list[CitationReference]]
     answer_error: NotRequired[str]
 
 
@@ -66,7 +67,7 @@ class TracerStateUpdate(TypedDict, total=False):
     ranked_refs: list[ArtifactRef]
     answer: str
     answer_usage: dict[str, Any]
-    citations: list[Any]
+    citations: list[CitationReference]
     answer_error: str
 
 

@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.models.workflow import CitationReference
+
 
 class V2QueryRequest(BaseModel):
     """Legacy-compatible query input with optional additive idempotency data."""
@@ -37,7 +39,7 @@ class TracerQueryResponse(BaseModel):
     clarification: None = None
     conversation_id: str = Field(serialization_alias="session_id")
     metadata: dict[str, Any] = Field(default_factory=dict)
-    citations: list[Any] = Field(default_factory=list)
+    citations: list[CitationReference] = Field(default_factory=list)
 
 
 class TracerStreamEvent(BaseModel):
