@@ -2,7 +2,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from importlib import reload
 from pathlib import Path
 from typing import Any, cast
@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -26,6 +26,7 @@ from app.langgraph_v2.checkpointing import (
     initial_checkpoint_config,
     thread_id_for,
 )
+from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
@@ -35,6 +36,7 @@ from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
+from app.langgraph_v2.runtime import LocalRunRuntime
 from app.services.events import EventEmitter
 
 FIXTURE_PATH = (
@@ -83,6 +85,28 @@ def persistent_tracer_app(
         resume_enabled=resume_enabled,
     )
     return app
+
+
+def v2_stream_endpoint(app: FastAPI) -> Any:
+    """Return the public stream endpoint for direct subscriber lifecycle tests."""
+    return next(
+        route.endpoint
+        for route in app.router.routes
+        if getattr(route, "path", None) == "/v2/query/stream"
+    )
+
+
+def stream_request(app: FastAPI) -> Request:
+    """Build only the ASGI Request boundary needed by the stream endpoint."""
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v2/query/stream",
+            "headers": [],
+            "app": app,
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -394,6 +418,111 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
         "client_request_id": None,
         "events": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_closing_the_public_sse_subscription_keeps_its_run_executing(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class BlockingGraph:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.completed = asyncio.Event()
+
+        async def ainvoke(
+            self, state: TracerState | None, config: RunnableConfig | None = None
+        ) -> dict[str, Any]:
+            del state, config
+            self.started.set()
+            await self.release.wait()
+            self.completed.set()
+            return {
+                "events": [
+                    {
+                        "event_key": "lifecycle:completed:0",
+                        "type": "done",
+                        "data": {"source": "detached-fake"},
+                        "sequence": 1,
+                    }
+                ]
+            }
+
+    graph = BlockingGraph()
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            stream_request(app),
+            x_application_id="tenant-a",
+        )
+        subscriber = response.body_iterator
+        pending_read = asyncio.create_task(anext(subscriber))
+        await graph.started.wait()
+        pending_read.cancel()
+        with suppress(asyncio.CancelledError):
+            await pending_read
+        await subscriber.aclose()
+
+        graph.release.set()
+        for _ in range(100):
+            if graph.completed.is_set() and app.state.langgraph_v2_runtime.active_task_count == 0:
+                break
+            await asyncio.sleep(0.01)
+
+        assert graph.completed.is_set()
+        assert app.state.langgraph_v2_runtime.active_task_count == 0
+        run = await RunEventRepository(app.state.langgraph_v2_postgres_pool).get_run(
+            "tenant-a", UUID(response.headers["x-run-id"])
+        )
+        assert run.status == "completed"
+        assert [event.type for event in await RunEventRepository(
+            app.state.langgraph_v2_postgres_pool
+        ).list_events("tenant-a", run.run_id)] == ["done"]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_interrupts_unfinished_locally_owned_runs(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class BlockingGraph:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def ainvoke(
+            self, state: TracerState | None, config: RunnableConfig | None = None
+        ) -> dict[str, Any]:
+            del state, config
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    graph = BlockingGraph()
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    app.state.langgraph_v2_runtime = LocalRunRuntime(shutdown_grace_seconds=0)
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            stream_request(app),
+            x_application_id="tenant-a",
+        )
+        subscriber = response.body_iterator
+        pending_read = asyncio.create_task(anext(subscriber))
+        await graph.started.wait()
+        pending_read.cancel()
+        with suppress(asyncio.CancelledError):
+            await pending_read
+        await subscriber.aclose()
+        run_id = UUID(response.headers["x-run-id"])
+
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        run = await RunEventRepository(pool).get_run("tenant-a", run_id)
+    assert run.status == "interrupted"
+    assert run.owner_instance_id == ""
+    assert app.state.langgraph_v2_runtime.accepting is False
+    assert app.state.langgraph_v2_runtime.active_task_count == 0
 
 
 def test_main_registers_the_tracer_only_when_the_feature_flag_is_enabled(

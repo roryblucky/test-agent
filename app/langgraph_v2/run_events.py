@@ -312,6 +312,32 @@ class RunEventRepository:
             raise ClaimFenced(str(run_id))
         return RunRecord.model_validate(row)
 
+    async def interrupt_runs_owned_by(
+        self,
+        owner_instance_id: str,
+    ) -> list[RunRecord]:
+        """Release every unfinished Run still owned by one shutting-down instance."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE langgraph_v2.runs
+                        SET status = 'interrupted', owner_instance_id = '',
+                            heartbeat_at = clock_timestamp(),
+                            expires_at = clock_timestamp()
+                        WHERE owner_instance_id = %s AND status = 'running'
+                        RETURNING tenant_id, run_id, conversation_id, status,
+                                  terminal_outcome, created_at, completed_at,
+                                  owner_instance_id, execution_epoch,
+                                  heartbeat_at, expires_at, checkpoint_id,
+                                  checkpoint_ns
+                        """,
+                        (owner_instance_id,),
+                    )
+                    rows = await cursor.fetchall()
+        return [RunRecord.model_validate(row) for row in rows]
+
     async def get_event(
         self,
         tenant_id: str,

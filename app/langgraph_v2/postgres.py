@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from typing import Any, Self
@@ -11,6 +12,10 @@ from fastapi import FastAPI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
+
+from app.langgraph_v2.run_events import RunEventRepository
+
+_INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
 
 
 class V2PostgresConfig(BaseModel):
@@ -87,6 +92,10 @@ async def postgres_lifespan(
         app.state.langgraph_v2_checkpointer = checkpointer
         yield
     finally:
+        runtime = getattr(app.state, "langgraph_v2_runtime", None)
+        if runtime is not None:
+            await runtime.stop_and_wait_for_checkpoint_boundary()
+            await RunEventRepository(pool).interrupt_runs_owned_by(_INSTANCE_ID)
         await pool.close()
         app.state.langgraph_v2_postgres_pool = None
         app.state.langgraph_v2_checkpointer = None

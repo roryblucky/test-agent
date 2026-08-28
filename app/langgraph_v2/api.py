@@ -57,6 +57,7 @@ from app.langgraph_v2.run_events import (
     RunEventRepository,
     RunNotFound,
 )
+from app.langgraph_v2.runtime import LocalRunRuntime
 from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
@@ -329,12 +330,20 @@ async def _stream_unseen_events(
     sent_keys: set[str],
     answer_chunk_count: list[int],
     answer_chunk_interval_ms: int,
+    suppress_replayed_phase_events: bool = False,
 ) -> AsyncIterator[str]:
     """Serialize newly journaled Events and pace answer chunks consistently."""
     for event in await repository.list_events(tenant_id, run_id):
         if event.event_key in sent_keys:
             continue
         sent_keys.add(event.event_key)
+        if (
+            suppress_replayed_phase_events
+            and event.event_key.startswith("phase:")
+            and event.type != "token"
+            and not event.event_key.startswith("phase:finalization:")
+        ):
+            continue
         await _pace_answer_chunk(event, answer_chunk_count, answer_chunk_interval_ms)
         yield TracerStreamEvent(
             event_key=event.event_key,
@@ -419,6 +428,115 @@ async def _stream_graph_result(
         yield frame
 
 
+async def _execute_graph_run(
+    selected_graph: TracerGraph,
+    state: TracerState | None,
+    graph_config: RunnableConfig | None,
+    repository: RunEventRepository,
+    message_repository: ConversationMessageRepository,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    conversation_id: str,
+    owner_instance_id: str,
+    execution_epoch: int,
+    answer_chunk_interval_ms: int,
+    initial_sent_keys: set[str] | None = None,
+) -> None:
+    """Execute a Run independently of any one SSE subscriber."""
+    heartbeat_task = asyncio.create_task(
+        _refresh_claim(
+            repository,
+            tenant_id,
+            run_id,
+            owner_instance_id,
+            execution_epoch,
+        )
+    )
+    try:
+        async for _ in _stream_graph_result(
+            selected_graph,
+            state,
+            graph_config,
+            repository,
+            message_repository,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+            answer_chunk_interval_ms=answer_chunk_interval_ms,
+            initial_sent_keys=initial_sent_keys,
+            forward_live_events=False,
+        ):
+            pass
+    except (AnswerCancelled, ClaimFenced):
+        return
+    except Exception as exc:
+        try:
+            await _persist_setup_failure(
+                repository,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+                message=str(exc) or "LangGraph execution failed.",
+            )
+        except ClaimFenced:
+            return
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
+async def _subscribe_to_run(
+    repository: RunEventRepository,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    answer_chunk_interval_ms: int,
+    initial_sent_keys: set[str] | None = None,
+    suppress_replayed_phase_events: bool = False,
+) -> AsyncIterator[str]:
+    """Stream durable Events without owning or cancelling graph execution."""
+    sent_keys = set(initial_sent_keys or ())
+    answer_chunk_count = [0]
+    while True:
+        async for frame in _stream_unseen_events(
+            repository,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sent_keys=sent_keys,
+            answer_chunk_count=answer_chunk_count,
+            answer_chunk_interval_ms=answer_chunk_interval_ms,
+            suppress_replayed_phase_events=suppress_replayed_phase_events,
+        ):
+            yield frame
+        if (await repository.get_run(tenant_id, run_id)).status != "running":
+            async for frame in _stream_unseen_events(
+                repository,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sent_keys=sent_keys,
+                answer_chunk_count=answer_chunk_count,
+                answer_chunk_interval_ms=answer_chunk_interval_ms,
+                suppress_replayed_phase_events=suppress_replayed_phase_events,
+            ):
+                yield frame
+            return
+        await asyncio.sleep(0.01)
+
+
+def _local_runtime(app: FastAPI) -> LocalRunRuntime:
+    """Return the instance-local runtime used to retain detached executions."""
+    runtime = getattr(app.state, "langgraph_v2_runtime", None)
+    if runtime is None:
+        runtime = LocalRunRuntime()
+        app.state.langgraph_v2_runtime = runtime
+    return cast(LocalRunRuntime, runtime)
+
+
 def create_tracer_router(
     graph: TracerGraph | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
@@ -447,6 +565,9 @@ def create_tracer_router(
         """Run the deterministic tracer and return its events as SSE."""
         del x_user_groups
         _ensure_tenant_available(http_request.app, x_application_id)
+        runtime = _local_runtime(http_request.app)
+        if not runtime.accepting:
+            raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
         run_id = uuid.uuid4()
         conversation_id = (
             payload.conversation_id
@@ -579,23 +700,14 @@ def create_tracer_router(
                     answer_actor=configured_answer_actor,
                     groundedness_actor=configured_groundedness_actor,
                 )
-            heartbeat_task = asyncio.create_task(
-                _refresh_claim(
-                    repository,
-                    x_application_id,
-                    run_id,
-                    claim.owner_instance_id,
-                    claim.execution_epoch,
-                )
-            )
-            try:
-                state: TracerState = {
-                    "query": payload.query,
-                    "conversation_id": conversation_id,
-                    "client_request_id": payload.client_request_id,
-                    "events": [],
-                }
-                async for frame in _stream_graph_result(
+            state: TracerState = {
+                "query": payload.query,
+                "conversation_id": conversation_id,
+                "client_request_id": payload.client_request_id,
+                "events": [],
+            }
+            runtime.start(
+                _execute_graph_run(
                     selected_graph,
                     state,
                     graph_config,
@@ -607,12 +719,15 @@ def create_tracer_router(
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,
-                ):
-                    yield frame
-            finally:
-                heartbeat_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await heartbeat_task
+                )
+            )
+            async for frame in _subscribe_to_run(
+                repository,
+                tenant_id=x_application_id,
+                run_id=run_id,
+                answer_chunk_interval_ms=answer_chunk_interval_ms,
+            ):
+                yield frame
 
         return StreamingResponse(
             event_generator(),
@@ -633,6 +748,9 @@ def create_tracer_router(
     ) -> StreamingResponse:
         """Resume one stale or interrupted Run from its exact checkpoint."""
         _ensure_tenant_available(http_request.app, x_application_id)
+        runtime = _local_runtime(http_request.app)
+        if not runtime.accepting:
+            raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
         configured_pool = getattr(
             http_request.app.state, "langgraph_v2_postgres_pool", None
         )
@@ -747,17 +865,16 @@ def create_tracer_router(
                     checkpoint_ns="",
                     checkpoint_id=previous_checkpoint_id,
                 )
-            heartbeat_task = asyncio.create_task(
-                _refresh_claim(
-                    repository,
-                    x_application_id,
-                    run_id,
-                    claim.owner_instance_id,
-                    claim.execution_epoch,
+            initial_sent_keys = {
+                event.event_key
+                for event in await repository.list_events(x_application_id, run_id)
+                if not (
+                    event.type == "token"
+                    and event.event_key.startswith("phase:answer:token:")
                 )
-            )
-            try:
-                async for frame in _stream_graph_result(
+            }
+            runtime.start(
+                _execute_graph_run(
                     selected_graph,
                     None,
                     graph_config,
@@ -769,23 +886,18 @@ def create_tracer_router(
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,
-                    initial_sent_keys={
-                        event.event_key
-                        for event in await repository.list_events(
-                            x_application_id, run_id
-                        )
-                        if not (
-                            event.type == "token"
-                            and event.event_key.startswith("phase:answer:token:")
-                        )
-                    },
-                    forward_live_events=False,
-                ):
-                    yield frame
-            finally:
-                heartbeat_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await heartbeat_task
+                    initial_sent_keys=initial_sent_keys,
+                )
+            )
+            async for frame in _subscribe_to_run(
+                repository,
+                tenant_id=x_application_id,
+                run_id=run_id,
+                answer_chunk_interval_ms=answer_chunk_interval_ms,
+                initial_sent_keys=initial_sent_keys,
+                suppress_replayed_phase_events=True,
+            ):
+                yield frame
 
         return StreamingResponse(
             event_generator(),
@@ -835,6 +947,7 @@ def register_tracer_routes(
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
+        _local_runtime(app)
         router = create_tracer_router(
             graph,
             refinement_actor,
