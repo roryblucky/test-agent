@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, MagicMock
 import psycopg
 import pytest
 
+from alembic import command
 from app.core.model_registry import ModelRegistry
+from app.langgraph_v2.migrations import build_alembic_config
 from app.providers.base import BaseRankerProvider, BaseRetrieverProvider
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
@@ -73,6 +75,19 @@ def langgraph_v2_test_database_url() -> Iterator[str]:
         with psycopg.connect(database_url, autocommit=True) as connection:
             connection.execute("DROP SCHEMA IF EXISTS langgraph_v2 CASCADE")
             connection.execute("DROP TABLE IF EXISTS public.alembic_version")
+
+
+@pytest.fixture
+def langgraph_v2_migrated_database_url(
+    langgraph_v2_test_database_url: str,
+) -> Iterator[str]:
+    """Apply all application migrations for one integration test."""
+    config = build_alembic_config(langgraph_v2_test_database_url)
+    command.upgrade(config, "head")
+    try:
+        yield langgraph_v2_test_database_url
+    finally:
+        command.downgrade(config, "base")
 
 
 @pytest.fixture

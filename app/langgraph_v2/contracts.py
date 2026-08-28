@@ -43,6 +43,7 @@ class TracerQueryResponse(BaseModel):
 class TracerStreamEvent(BaseModel):
     """One additive-sequence SSE event produced by the v2 tracer."""
 
+    event_key: str = Field(min_length=1)
     type: Literal["step_start", "step_completed", "done"]
     sequence: int = Field(ge=1)
     step: str | None = None
@@ -50,5 +51,5 @@ class TracerStreamEvent(BaseModel):
 
     def to_sse(self) -> str:
         r"""Serialize the event using the established ``data: JSON\n\n`` frame."""
-        payload = self.model_dump(exclude_none=True)
+        payload = self.model_dump(exclude={"event_key"}, exclude_none=True)
         return f"data: {json.dumps(payload, default=str)}\n\n"

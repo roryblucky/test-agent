@@ -6,11 +6,13 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Protocol, cast
 
-from fastapi import APIRouter, FastAPI, Header
+from fastapi import APIRouter, FastAPI, Header, Request
 from fastapi.responses import StreamingResponse
+from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, tracer_graph
+from app.langgraph_v2.run_events import EventInput, RunEventRepository
 
 
 class TracerGraph(Protocol):
@@ -27,26 +29,62 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
 
     @router.post("/v2/query/stream")
     async def query_stream(
-        request: V2QueryRequest,
+        payload: V2QueryRequest,
+        http_request: Request,
         x_application_id: Annotated[str, Header(alias="X-Application-Id")],
         x_user_groups: Annotated[str, Header(alias="X-User-Groups")] = "",
     ) -> StreamingResponse:
         """Run the deterministic tracer and return its events as SSE."""
-        del x_application_id, x_user_groups
-        run_id = str(uuid.uuid4())
-        conversation_id = request.conversation_id or str(uuid.uuid4())
+        del x_user_groups
+        run_id = uuid.uuid4()
+        conversation_id = payload.conversation_id or str(uuid.uuid4())
 
         async def event_generator() -> AsyncIterator[str]:
+            configured_pool = getattr(
+                http_request.app.state,
+                "langgraph_v2_postgres_pool",
+                None,
+            )
+            if configured_pool is None:
+                raise RuntimeError("LangGraph v2 PostgreSQL is not configured")
+            pool = cast(AsyncConnectionPool[Any], configured_pool)
+            repository = RunEventRepository(pool)
+            await repository.create_run(
+                tenant_id=x_application_id,
+                run_id=run_id,
+                conversation_id=conversation_id,
+            )
             result = await graph.ainvoke(
                 {
-                    "query": request.query,
+                    "query": payload.query,
                     "conversation_id": conversation_id,
-                    "client_request_id": request.client_request_id,
+                    "client_request_id": payload.client_request_id,
                     "events": [],
                 }
             )
             for raw_event in result["events"]:
-                yield TracerStreamEvent.model_validate(raw_event).to_sse()
+                event = TracerStreamEvent.model_validate(raw_event)
+                event_input = EventInput(
+                    event_key=event.event_key,
+                    type=event.type,
+                    step=event.step,
+                    data=event.data,
+                )
+                if event.type == "done":
+                    persisted = await repository.complete_run(
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        event=event_input,
+                    )
+                else:
+                    persisted = await repository.append_event(
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        event=event_input,
+                    )
+                yield event.model_copy(
+                    update={"sequence": persisted.sequence}
+                ).to_sse()
 
         return StreamingResponse(
             event_generator(),
@@ -54,7 +92,7 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
-                "X-Run-Id": run_id,
+                "X-Run-Id": str(run_id),
                 "X-Conversation-Id": conversation_id,
             },
         )

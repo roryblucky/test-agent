@@ -30,11 +30,13 @@ async def _query(state: TracerState) -> TracerStateUpdate:
     return {
         "events": [
             TracerStreamEvent(
+                event_key="phase:query:step_start:1",
                 type="step_start",
                 step="query",
                 sequence=1,
             ).model_dump(exclude_none=True),
             TracerStreamEvent(
+                event_key="phase:query:step_completed:1",
                 type="step_completed",
                 step="query",
                 data={"query": query},
@@ -54,17 +56,20 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     events.extend(
         [
             TracerStreamEvent(
+                event_key="phase:finalization:step_start:1",
                 type="step_start",
                 step="finalization",
                 sequence=3,
             ).model_dump(exclude_none=True),
             TracerStreamEvent(
+                event_key="phase:finalization:step_completed:1",
                 type="step_completed",
                 step="finalization",
                 data={"status": "completed"},
                 sequence=4,
             ).model_dump(exclude_none=True),
             TracerStreamEvent(
+                event_key="lifecycle:completed:0",
                 type="done",
                 data=response.model_dump(by_alias=True),
                 sequence=5,

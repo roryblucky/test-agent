@@ -1,0 +1,237 @@
+from __future__ import annotations
+
+import asyncio
+from uuid import uuid4
+
+import pytest
+from psycopg_pool import AsyncConnectionPool
+
+from app.langgraph_v2.run_events import (
+    EventInput,
+    EventInvariantConflict,
+    RunEventRepository,
+    RunNotFound,
+)
+
+
+@pytest.mark.asyncio
+async def test_run_and_event_are_persisted_and_read_back(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=2,
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+
+        created = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+        )
+        appended = await repository.append_event(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            event=EventInput(
+                event_key="phase:query:step_start:1",
+                type="step_start",
+                step="query",
+            ),
+        )
+
+        assert created.status == "running"
+        assert appended.sequence == 1
+        assert await repository.get_run("tenant-a", run_id) == created
+        assert await repository.list_events("tenant-a", run_id) == [appended]
+
+
+@pytest.mark.asyncio
+async def test_run_and_event_access_conceals_another_tenants_run(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=2,
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+        )
+
+        with pytest.raises(RunNotFound):
+            await repository.get_run("tenant-b", run_id)
+        with pytest.raises(RunNotFound):
+            await repository.list_events("tenant-b", run_id)
+        with pytest.raises(RunNotFound):
+            await repository.append_event(
+                tenant_id="tenant-b",
+                run_id=run_id,
+                event=EventInput(
+                    event_key="phase:query:step_start:1",
+                    type="step_start",
+                    step="query",
+                ),
+            )
+        with pytest.raises(RunNotFound):
+            await repository.complete_run(
+                tenant_id="tenant-b",
+                run_id=run_id,
+                event=EventInput(
+                    event_key="lifecycle:completed:0",
+                    type="done",
+                    data={"status": "completed"},
+                ),
+            )
+
+
+@pytest.mark.asyncio
+async def test_event_append_is_idempotent_and_conflicts_fail_the_run(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=2,
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+        )
+        first = await repository.append_event(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            event=EventInput(
+                event_key="phase:query:step_completed:1",
+                type="step_completed",
+                step="query",
+                data={"b": 2, "a": 1},
+            ),
+        )
+
+        repeated = await repository.append_event(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            event=EventInput(
+                event_key="phase:query:step_completed:1",
+                type="step_completed",
+                step="query",
+                data={"a": 1, "b": 2},
+            ),
+        )
+
+        assert repeated == first
+        with pytest.raises(EventInvariantConflict):
+            await repository.append_event(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                event=EventInput(
+                    event_key="phase:query:step_completed:1",
+                    type="step_completed",
+                    step="query",
+                    data={"a": 999, "b": 2},
+                ),
+            )
+
+        assert (await repository.get_run("tenant-a", run_id)).status == "failed"
+        events = await repository.list_events("tenant-a", run_id)
+        assert events == [first]
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_retry_is_atomic_and_idempotent(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=2,
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+        )
+        terminal = EventInput(
+            event_key="lifecycle:completed:0",
+            type="done",
+            data={"answer": None, "session_id": "conversation-1"},
+        )
+
+        first = await repository.complete_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            event=terminal,
+        )
+        repeated = await repository.complete_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            event=terminal,
+        )
+
+        completed = await repository.get_run("tenant-a", run_id)
+        assert repeated == first
+        assert completed.status == "completed"
+        assert completed.terminal_outcome == terminal.data
+        assert completed.completed_at is not None
+        assert await repository.list_events("tenant-a", run_id) == [first]
+
+        with pytest.raises(EventInvariantConflict):
+            await repository.complete_run(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                event=terminal.model_copy(
+                    update={"data": {"answer": "different"}}
+                ),
+            )
+        assert (await repository.get_run("tenant-a", run_id)).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_event_appends_allocate_one_ordered_sequence(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=4,
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+        )
+
+        await asyncio.gather(
+            *(
+                repository.append_event(
+                    tenant_id="tenant-a",
+                    run_id=run_id,
+                    event=EventInput(
+                        event_key=f"phase:query:progress:{ordinal}",
+                        type="step_completed",
+                        step="query",
+                        data={"ordinal": ordinal},
+                    ),
+                )
+                for ordinal in range(1, 9)
+            )
+        )
+
+        persisted = await repository.list_events("tenant-a", run_id)
+        assert [event.sequence for event in persisted] == list(range(1, 9))
+        assert {event.event_key for event in persisted} == {
+            f"phase:query:progress:{ordinal}" for ordinal in range(1, 9)
+        }

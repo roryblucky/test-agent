@@ -1,4 +1,7 @@
+import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from importlib import reload
 from pathlib import Path
 from uuid import UUID
@@ -6,10 +9,13 @@ from uuid import UUID
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from psycopg_pool import AsyncConnectionPool
 
 from app.api.schemas import QueryResponse
-from app.langgraph_v2.api import register_tracer_routes
+from app.langgraph_v2.api import TracerGraph, register_tracer_routes
 from app.langgraph_v2.graph import TracerState
+from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
+from app.langgraph_v2.run_events import RunEventRepository
 from app.services.events import EventEmitter
 
 FIXTURE_PATH = (
@@ -22,6 +28,25 @@ def parse_sse(response_text: str) -> list[dict]:
         json.loads(frame.removeprefix("data: "))
         for frame in response_text.strip().split("\n\n")
     ]
+
+
+def persistent_tracer_app(
+    database_url: str,
+    graph: TracerGraph | None = None,
+) -> FastAPI:
+    """Create the test-only tracer with its real application database pool."""
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        async with postgres_lifespan(
+            app,
+            config=V2PostgresConfig(database_url=database_url),
+        ):
+            yield
+
+    app = FastAPI(lifespan=lifespan)
+    register_tracer_routes(app, enabled=True, graph=graph)
+    return app
 
 
 @pytest.mark.asyncio
@@ -49,10 +74,11 @@ async def test_captured_fixture_matches_the_legacy_wire_implementation() -> None
     ]
 
 
-def test_enabled_tracer_preserves_the_minimal_stream_contract() -> None:
+def test_enabled_tracer_preserves_the_minimal_stream_contract(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
     fixture = json.loads(FIXTURE_PATH.read_text())
-    app = FastAPI()
-    register_tracer_routes(app, enabled=True)
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         response = client.post(
@@ -74,9 +100,10 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract() -> None:
     assert actual_events == fixture["events"]
 
 
-def test_request_header_and_generated_conversation_variants() -> None:
-    app = FastAPI()
-    register_tracer_routes(app, enabled=True)
+def test_request_header_and_generated_conversation_variants(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         missing_tenant = client.post("/v2/query/stream", json={"query": "hello"})
@@ -100,7 +127,9 @@ def test_request_header_and_generated_conversation_variants() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_adapter_accepts_a_deterministic_graph_fake() -> None:
+async def test_http_adapter_accepts_a_deterministic_graph_fake(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
     class DeterministicGraphFake:
         def __init__(self) -> None:
             self.received_state: TracerState | None = None
@@ -109,14 +138,23 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake() -> None:
             self.received_state = state
             return {
                 "events": [
-                    {"type": "step_start", "step": "fake", "sequence": 1},
-                    {"type": "done", "data": {"source": "fake"}, "sequence": 2},
+                    {
+                        "event_key": "phase:fake:step_start:1",
+                        "type": "step_start",
+                        "step": "fake",
+                        "sequence": 1,
+                    },
+                    {
+                        "event_key": "lifecycle:completed:0",
+                        "type": "done",
+                        "data": {"source": "fake"},
+                        "sequence": 2,
+                    },
                 ]
             }
 
     graph = DeterministicGraphFake()
-    app = FastAPI()
-    register_tracer_routes(app, enabled=True, graph=graph)
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
 
     with TestClient(app) as client:
         response = client.post(
@@ -149,3 +187,47 @@ def test_main_registers_the_tracer_only_when_the_feature_flag_is_enabled(
     monkeypatch.delenv("LANGGRAPH_V2_TRACER_ENABLED")
     disabled_app = reload(main_module).app
     assert "/v2/query/stream" not in {route.path for route in disabled_app.routes}
+
+
+def test_completed_tracer_persists_its_run_and_every_delivered_event(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "conversation-1"},
+            headers={"X-Application-Id": "tenant-a"},
+        )
+
+    delivered = parse_sse(response.text)
+    run_id = UUID(response.headers["x-run-id"])
+
+    async def load_persisted_result() -> tuple:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url,
+            min_size=1,
+            max_size=2,
+        ) as pool:
+            repository = RunEventRepository(pool)
+            return (
+                await repository.get_run("tenant-a", run_id),
+                await repository.list_events("tenant-a", run_id),
+            )
+
+    run, persisted = asyncio.run(load_persisted_result())
+
+    assert run.status == "completed"
+    assert run.terminal_outcome == delivered[-1]["data"]
+    assert [event.sequence for event in persisted] == [1, 2, 3, 4, 5]
+    assert [event.event_key for event in persisted] == [
+        "phase:query:step_start:1",
+        "phase:query:step_completed:1",
+        "phase:finalization:step_start:1",
+        "phase:finalization:step_completed:1",
+        "lifecycle:completed:0",
+    ]
+    assert [event.type for event in persisted] == [
+        event["type"] for event in delivered
+    ]
