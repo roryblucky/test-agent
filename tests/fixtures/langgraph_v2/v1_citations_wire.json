@@ -4,8 +4,8 @@
     "data": [
       {
         "index": 1,
-        "evidence_id": "evidence:1",
-        "source": "document"
+        "evidence_id": "legacy:evidence:1",
+        "source": "d1"
       }
     ]
   },

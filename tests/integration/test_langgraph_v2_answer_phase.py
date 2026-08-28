@@ -16,6 +16,7 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.domain import Document
+from app.services.events import EventEmitter
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
@@ -150,7 +151,7 @@ async def test_answer_reuses_atomic_commit_after_crash_window(
         run = await runs.create_run(
             tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
-        actor = _AnswerActor()
+        actor = _InlineCitationAnswer()
         context = PhaseExecutionContext(
             repository=CrashAfterAnswerCommit(pool),
             artifact_repository=ArtifactRepository(pool),
@@ -166,7 +167,8 @@ async def test_answer_reuses_atomic_commit_after_crash_window(
         recovered = await graph.ainvoke(state)
 
     assert actor.calls == 1
-    assert recovered["answer"] == "One. Two\nThree; four"
+    assert recovered["answer"] == "Supported claim [1]. Unknown claim [99]."
+    assert [citation.index for citation in recovered["citations"]] == [1]
     assert len({event["event_key"] for event in recovered["events"]}) == len(recovered["events"])
 
 
@@ -302,3 +304,14 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     citation_event = answer_events[3]
     assert citation_event["type"] == citation_fixture["event"]["type"]
     assert set(citation_fixture["event"]["data"][0]) <= set(citation_event["data"][0])
+
+    legacy_emitter = EventEmitter()
+    await legacy_emitter.emit_citations(citation_fixture["event"]["data"])
+    await legacy_emitter.close()
+    legacy_frames = [frame async for frame in legacy_emitter]
+    legacy_wire = json.loads(legacy_frames[0].removeprefix("data: ").strip())
+    assert legacy_wire == citation_fixture["event"]
+    assert citation_event["data"][0]["index"] == legacy_wire["data"][0]["index"]
+    assert citation_event["data"][0]["source"] == legacy_wire["data"][0]["source"]
+    assert citation_event["data"][0]["evidence_id"] != legacy_wire["data"][0]["evidence_id"]
+    assert "highlight_spans" in citation_event["data"][0]
