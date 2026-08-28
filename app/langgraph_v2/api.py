@@ -92,6 +92,36 @@ def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
         raise HTTPException(status_code=404, detail="Tenant not found") from error
 
 
+def _resolve_phase_providers(
+    app: FastAPI,
+    tenant_id: str,
+    *,
+    retriever: Retriever | None,
+    ranker: Ranker | None,
+    moderation_provider: ModerationProvider | None,
+) -> tuple[Retriever | None, Ranker | None, ModerationProvider | None]:
+    """Resolve injected, app-level, and tenant-scoped v2 providers once."""
+    configured_retriever = retriever or getattr(
+        app.state, "langgraph_v2_retriever", None
+    )
+    configured_ranker = ranker or getattr(app.state, "langgraph_v2_ranker", None)
+    configured_moderation = moderation_provider or getattr(
+        app.state, "langgraph_v2_moderation_provider", None
+    )
+    provider_bundle = _resolve_provider_bundle(app, tenant_id)
+    if provider_bundle is not None:
+        configured_retriever = (
+            configured_retriever or provider_bundle.retriever or MissingRetriever()
+        )
+        configured_ranker = configured_ranker or provider_bundle.ranker or MissingRanker()
+        configured_moderation = (
+            configured_moderation
+            or provider_bundle.moderation
+            or MissingModeration()
+        )
+    return configured_retriever, configured_ranker, configured_moderation
+
+
 async def _refresh_claim(
     repository: RunEventRepository,
     tenant_id: str,
@@ -222,28 +252,17 @@ def create_tracer_router(
                 x_application_id,
                 refinement_actor,
             )
-            configured_retriever = retriever or getattr(
-                http_request.app.state, "langgraph_v2_retriever", None
+            (
+                configured_retriever,
+                configured_ranker,
+                configured_moderation,
+            ) = _resolve_phase_providers(
+                http_request.app,
+                x_application_id,
+                retriever=retriever,
+                ranker=ranker,
+                moderation_provider=moderation_provider,
             )
-            configured_ranker = ranker or getattr(
-                http_request.app.state, "langgraph_v2_ranker", None
-            )
-            configured_moderation = moderation_provider or getattr(
-                http_request.app.state, "langgraph_v2_moderation_provider", None
-            )
-            provider_bundle = _resolve_provider_bundle(
-                http_request.app, x_application_id
-            )
-            if provider_bundle is not None:
-                configured_retriever = (
-                    configured_retriever or provider_bundle.retriever or MissingRetriever()
-                )
-                configured_ranker = configured_ranker or provider_bundle.ranker or MissingRanker()
-                configured_moderation = (
-                    configured_moderation
-                    or provider_bundle.moderation
-                    or MissingModeration()
-                )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None:
@@ -382,28 +401,17 @@ def create_tracer_router(
                 x_application_id,
                 refinement_actor,
             )
-            configured_retriever = retriever or getattr(
-                http_request.app.state, "langgraph_v2_retriever", None
+            (
+                configured_retriever,
+                configured_ranker,
+                configured_moderation,
+            ) = _resolve_phase_providers(
+                http_request.app,
+                x_application_id,
+                retriever=retriever,
+                ranker=ranker,
+                moderation_provider=moderation_provider,
             )
-            configured_ranker = ranker or getattr(
-                http_request.app.state, "langgraph_v2_ranker", None
-            )
-            configured_moderation = moderation_provider or getattr(
-                http_request.app.state, "langgraph_v2_moderation_provider", None
-            )
-            provider_bundle = _resolve_provider_bundle(
-                http_request.app, x_application_id
-            )
-            if provider_bundle is not None:
-                configured_retriever = (
-                    configured_retriever or provider_bundle.retriever or MissingRetriever()
-                )
-                configured_ranker = configured_ranker or provider_bundle.ranker or MissingRanker()
-                configured_moderation = (
-                    configured_moderation
-                    or provider_bundle.moderation
-                    or MissingModeration()
-                )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None and configured_checkpointer is not None:
