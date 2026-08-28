@@ -18,6 +18,7 @@ from psycopg_pool import AsyncConnectionPool
 from app.langgraph_v2.answer import (
     ANSWER_CHUNK_INTERVAL_MS,
     AnswerActor,
+    AnswerCancelled,
     build_answer_actor,
 )
 from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
@@ -289,7 +290,25 @@ async def _stream_graph_result(
                         sequence=event.sequence,
                     ).to_sse()
         await asyncio.sleep(0.01)
-    result = await graph_task
+    try:
+        result = await graph_task
+    except AnswerCancelled:
+        for event in await repository.list_events(tenant_id, run_id):
+            if event.event_key in sent_keys:
+                continue
+            sent_keys.add(event.event_key)
+            if event.type == "token" and event.step == "llm:answer":
+                if answer_chunk_count:
+                    await asyncio.sleep(answer_chunk_interval_ms / 1000)
+                answer_chunk_count += 1
+            yield TracerStreamEvent(
+                event_key=event.event_key,
+                type=cast(Any, event.type),
+                step=event.step,
+                data=event.data,
+                sequence=event.sequence,
+            ).to_sse()
+        return
     if not forward_live_events:
         sent_keys.update(
             event.event_key
@@ -604,6 +623,9 @@ def create_tracer_router(
                         event.event_key
                         for event in await repository.list_events(
                             x_application_id, run_id
+                        )
+                        if not (
+                            event.type == "token" and event.step == "llm:answer"
                         )
                     },
                     forward_live_events=False,
