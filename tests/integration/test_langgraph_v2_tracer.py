@@ -90,6 +90,24 @@ async def test_captured_fixture_matches_the_legacy_wire_implementation() -> None
     ] == fixture["events"]
 
 
+@pytest.mark.asyncio
+async def test_captured_legacy_moderation_error_fixture() -> None:
+    fixture = json.loads(
+        (FIXTURE_PATH.parent / "v1_moderation_error_wire.json").read_text()
+    )
+    emitter = EventEmitter()
+    await emitter.emit_step_start("moderation:pre")
+    await emitter.emit_error(
+        "Content flagged by moderation: query contains blocked term: blocked"
+    )
+
+    legacy_frames = [line async for line in emitter]
+
+    assert [json.loads(line.removeprefix("data: ")) for line in legacy_frames] == (
+        fixture["events"]
+    )
+
+
 def test_enabled_tracer_preserves_the_minimal_stream_contract(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -113,19 +131,47 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
     assert response.text.endswith("\n\n")
     actual_events = parse_sse(response.text)
     assert [event.pop("sequence") for event in actual_events] == list(range(1, 8))
-    assert actual_events[:2] == fixture["events"][:2]
-    assert [event["step"] for event in actual_events[2:6]] == [
-        "pre_moderation",
-        "pre_moderation",
-        "finalization",
-        "finalization",
-    ]
-    assert actual_events[-1]["type"] == fixture["events"][-1]["type"]
-    assert actual_events[-1]["data"]["query"] == fixture["events"][-1]["data"]["query"]
-    assert actual_events[-1]["data"]["metadata"]["steps_executed"] == [
-        "query",
-        "pre_moderation",
-        "finalization",
+    assert actual_events == [
+        {
+            "type": "step_start",
+            "step": "query",
+        },
+        {
+            "type": "step_completed",
+            "step": "query",
+            "data": {"query": "What is LangGraph?"},
+        },
+        {
+            "type": "step_start",
+            "step": "moderation:pre",
+        },
+        {
+            "type": "step_completed",
+            "step": "moderation:pre",
+            "data": {"is_flagged": False, "mode": "pre"},
+        },
+        {
+            "type": "step_start",
+            "step": "finalization",
+        },
+        {
+            "type": "step_completed",
+            "step": "finalization",
+            "data": {"status": "completed"},
+        },
+        {
+            "type": "done",
+            "data": {
+                **fixture["events"][-1]["data"],
+                "metadata": {
+                    "steps_executed": [
+                        "query",
+                        "pre_moderation",
+                        "finalization",
+                    ]
+                },
+            },
+        },
     ]
 
 
@@ -172,10 +218,12 @@ def test_flagged_query_emits_error_before_finalization(
     assert [event["step"] for event in delivered[:-1]] == [
         "query",
         "query",
-        "pre_moderation",
+        "moderation:pre",
     ]
     assert delivered[-1]["type"] == "error"
-    assert delivered[-1]["data"] == "Your query was flagged by content moderation."
+    assert delivered[-1]["data"] == (
+        "Content flagged by moderation: query contains blocked term: blocked"
+    )
     assert all(event.get("step") != "finalization" for event in delivered)
 
     run_id = UUID(response.headers["x-run-id"])
@@ -206,7 +254,7 @@ def test_failed_moderation_error_retry_is_idempotent(
             event = EventInput(
                 event_key="phase:pre_moderation:error:1",
                 type="error",
-                data="Your query was flagged by content moderation.",
+                data="Content flagged by moderation: query contains blocked term: blocked",
             )
             first = await repository.fail_run(
                 tenant_id="tenant-a",

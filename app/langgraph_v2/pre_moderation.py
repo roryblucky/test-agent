@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, Field
 
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
-from app.langgraph_v2.run_events import EventInput
+from app.langgraph_v2.run_events import EventInput, EventRecord
 
 
 class ModerationDecision(BaseModel):
@@ -19,7 +19,10 @@ class ModerationDecision(BaseModel):
     reason: str | None = None
 
 
-MODERATION_ERROR_MESSAGE = "Your query was flagged by content moderation."
+def moderation_error_message(decision: ModerationDecision) -> str:
+    """Match the legacy ContentFlaggedError message."""
+    detail = decision.reason or decision.categories
+    return f"Content flagged by moderation: {detail}"
 
 
 def pre_moderation_events(decision: ModerationDecision) -> tuple[EventInput, ...]:
@@ -28,7 +31,7 @@ def pre_moderation_events(decision: ModerationDecision) -> tuple[EventInput, ...
         EventInput(
             event_key="phase:pre_moderation:step_start:1",
             type="step_start",
-            step="pre_moderation",
+            step="moderation:pre",
         )
     ]
     if not decision.is_flagged:
@@ -36,8 +39,8 @@ def pre_moderation_events(decision: ModerationDecision) -> tuple[EventInput, ...
             EventInput(
                 event_key="phase:pre_moderation:step_completed:1",
                 type="step_completed",
-                step="pre_moderation",
-                data=decision.model_dump(exclude_none=True),
+                step="moderation:pre",
+                data={"is_flagged": False, "mode": "pre"},
             )
         )
     else:
@@ -45,7 +48,7 @@ def pre_moderation_events(decision: ModerationDecision) -> tuple[EventInput, ...
             EventInput(
                 event_key="phase:pre_moderation:error:1",
                 type="error",
-                data=MODERATION_ERROR_MESSAGE,
+                data=moderation_error_message(decision),
             )
         )
     return tuple(events)
@@ -86,7 +89,7 @@ async def run_pre_moderation(
     *,
     context: PhaseExecutionContext,
     provider: ModerationProvider,
-) -> tuple[list[dict[str, Any]], bool, ModerationDecision]:
+) -> tuple[list[EventRecord], bool, ModerationDecision]:
     """Journal and return the pre-moderation Events and halt decision."""
 
     async def invoke() -> PhaseResultInput:
@@ -108,16 +111,7 @@ async def run_pre_moderation(
     )
     decision = ModerationDecision.model_validate(result.normalized_result)
     return (
-        [
-            {
-                "event_key": event.event_key,
-                "type": event.type,
-                "step": event.step,
-                "data": event.data,
-                "sequence": event.sequence,
-            }
-            for event in result.events
-        ],
+        list(result.events),
         decision.is_flagged,
         decision,
     )

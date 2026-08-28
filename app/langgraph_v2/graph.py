@@ -179,7 +179,10 @@ def build_tracer_graph(
                 provider=selected_moderation_provider,
             )
             return {
-                "events": [*state["events"], *events],
+                "events": [
+                    *state["events"],
+                    *[_event_state(event, event.sequence) for event in events],
+                ],
                 "halted": halted,
                 "moderation": decision.model_dump(exclude_none=True),
             }

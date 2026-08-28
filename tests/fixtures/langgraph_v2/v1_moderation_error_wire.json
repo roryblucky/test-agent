@@ -1,0 +1,9 @@
+{
+  "events": [
+    {"type": "step_start", "step": "moderation:pre"},
+    {
+      "type": "error",
+      "data": "Content flagged by moderation: query contains blocked term: blocked"
+    }
+  ]
+}
