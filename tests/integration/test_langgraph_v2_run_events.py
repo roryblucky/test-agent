@@ -153,6 +153,7 @@ async def test_resume_concurrent_requests_have_one_winner(
         )
         winners = [item for item in results if isinstance(item, RunRecord)]
         assert len(winners) == 1
+        assert sum(isinstance(item, ResumeConflict) for item in results) == 1
         winner = winners[0]
         await repository.complete_run(
             tenant_id="tenant-a",
@@ -212,6 +213,7 @@ async def test_resume_concurrent_interrupted_run_has_one_winner(
         )
         winners = [item for item in results if isinstance(item, RunRecord)]
         assert len(winners) == 1
+        assert sum(isinstance(item, ResumeConflict) for item in results) == 1
         winner = winners[0]
         await repository.complete_run(
             tenant_id="tenant-a",
