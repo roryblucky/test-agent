@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.answer import AnswerResult
+from app.langgraph_v2.answer import AnswerCitation, AnswerResult
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessResult
@@ -28,7 +28,10 @@ class _Ranker:
 
 class _Answer:
     async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
-        return AnswerResult(answer="answer")
+        return AnswerResult(
+            answer="answer [1]",
+            citations=[AnswerCitation(index=1, quoted_text=query)],
+        )
 
 
 class _Groundedness:
@@ -36,9 +39,22 @@ class _Groundedness:
 
     async def evaluate(self, answer: str, documents: list[Document]) -> GroundednessResult:
         self.calls += 1
-        assert answer == "answer"
+        assert answer == "answer [1]"
         assert documents[0].id == "d1"
         return GroundednessResult(is_grounded=False, score=0.2, details="advisory")
+
+
+class _UncitedAnswer:
+    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+        del query, documents
+        return AnswerResult(answer="answer without a source")
+
+
+class _EmptyDocumentGroundedness:
+    async def evaluate(self, answer: str, documents: list[Document]) -> GroundednessResult:
+        assert answer == "answer without a source"
+        assert documents == []
+        return GroundednessResult(is_grounded=False, score=0.0, details="uncited")
 
 
 @pytest.mark.asyncio
@@ -65,7 +81,7 @@ async def test_low_groundedness_is_advisory_and_replayed(
         second = await graph.ainvoke(state)
 
     assert evaluator.calls == 1
-    assert first["answer"] == second["answer"] == "answer"
+    assert first["answer"] == second["answer"] == "answer [1]"
     assert first["groundedness"] == second["groundedness"]
     assert first["groundedness"].score == 0.2
     assert any(event.get("step") == "groundedness" for event in first["events"])
@@ -104,3 +120,100 @@ async def test_groundedness_failure_is_explicit_and_replayed(
     assert evaluator.calls == 1
     assert first["groundedness_error"] == second["groundedness_error"] == "evaluator unavailable"
     assert any(event["type"] == "error" for event in first["events"])
+
+
+@pytest.mark.asyncio
+async def test_groundedness_uses_only_cited_documents(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(),
+            answer_actor=_UncitedAnswer(), groundedness_actor=_EmptyDocumentGroundedness(),
+        )
+        result = await graph.ainvoke(
+            {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
+        )
+
+    assert result["groundedness"].score == 0.0
+
+
+@pytest.mark.asyncio
+async def test_groundedness_reuses_atomic_commit_after_crash_window(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class CrashAfterGroundednessCommit(PhaseResultRepository):
+        crashed = False
+
+        async def commit(self, **kwargs):  # type: ignore[no-untyped-def]
+            result = await super().commit(**kwargs)
+            if kwargs["phase"].phase_name == "groundedness" and not self.crashed:
+                self.crashed = True
+                raise RuntimeError("crash after groundedness commit")
+            return result
+
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        evaluator = _Groundedness()
+        context = PhaseExecutionContext(
+            repository=CrashAfterGroundednessCommit(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(),
+            answer_actor=_Answer(), groundedness_actor=evaluator,
+        )
+        state = {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
+        with pytest.raises(RuntimeError, match="crash after groundedness commit"):
+            await graph.ainvoke(state)
+        recovered = await graph.ainvoke(state)
+        events = await runs.list_events("tenant-a", run.run_id)
+
+    assert evaluator.calls == 1
+    assert recovered["groundedness"].score == 0.2
+    assert len({event.event_key for event in events}) == len(events)
+    assert sum(event.event_key == "phase:groundedness:step_completed:1" for event in events) == 1
+
+
+@pytest.mark.asyncio
+async def test_groundedness_rejects_out_of_range_scores(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class InvalidScore:
+        async def evaluate(self, answer: str, documents: list[Document]) -> GroundednessResult:
+            del answer, documents
+            return GroundednessResult(is_grounded=True, score=2.0)
+
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(),
+            answer_actor=_Answer(), groundedness_actor=InvalidScore(),
+        )
+        result = await graph.ainvoke(
+            {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
+        )
+
+    assert result.get("groundedness") is None
+    assert "less than or equal to 1" in result["groundedness_error"]

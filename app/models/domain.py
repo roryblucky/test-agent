@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 from app.models.workflow import IntentResult
@@ -62,6 +64,7 @@ class GroundednessResult(BaseModel):
     is_grounded: bool
     score: float
     details: str | None = None
+    usage: dict[str, Any] = Field(default_factory=dict)
 
 
 class RefinedQuestion(BaseModel):

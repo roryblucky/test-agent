@@ -264,6 +264,35 @@ async def _persist_result_events(
             yield event.model_copy(update={"sequence": persisted.sequence}).to_sse()
 
 
+async def _persist_setup_failure(
+    repository: RunEventRepository,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    owner_instance_id: str,
+    execution_epoch: int,
+    message: str,
+) -> str:
+    """Terminalize a Run when role actor construction fails before graph start."""
+    event = await repository.fail_run(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        event=EventInput(
+            event_key="lifecycle:groundedness_setup:error:0",
+            type="error",
+            data=message,
+        ),
+        owner_instance_id=owner_instance_id,
+        execution_epoch=execution_epoch,
+    )
+    return TracerStreamEvent(
+        event_key=event.event_key,
+        type="error",
+        data=message,
+        sequence=event.sequence,
+    ).to_sse()
+
+
 class TracerGraph(Protocol):
     """Minimal graph invocation seam used by the test-only HTTP adapter."""
 
@@ -425,9 +454,20 @@ def create_tracer_router(
             configured_answer_actor = _resolve_answer_actor(
                 http_request.app, x_application_id, answer_actor
             )
-            configured_groundedness_actor = _resolve_groundedness_actor(
-                http_request.app, x_application_id, groundedness_actor
-            )
+            try:
+                configured_groundedness_actor = _resolve_groundedness_actor(
+                    http_request.app, x_application_id, groundedness_actor
+                )
+            except Exception as exc:
+                yield await _persist_setup_failure(
+                    repository,
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                    owner_instance_id=claim.owner_instance_id,
+                    execution_epoch=claim.execution_epoch,
+                    message=str(exc) or "Groundedness actor construction failed.",
+                )
+                return
             (
                 configured_retriever,
                 configured_ranker,
@@ -584,9 +624,20 @@ def create_tracer_router(
             configured_answer_actor = _resolve_answer_actor(
                 http_request.app, x_application_id, answer_actor
             )
-            configured_groundedness_actor = _resolve_groundedness_actor(
-                http_request.app, x_application_id, groundedness_actor
-            )
+            try:
+                configured_groundedness_actor = _resolve_groundedness_actor(
+                    http_request.app, x_application_id, groundedness_actor
+                )
+            except Exception as exc:
+                yield await _persist_setup_failure(
+                    repository,
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                    owner_instance_id=claim.owner_instance_id,
+                    execution_epoch=claim.execution_epoch,
+                    message=str(exc) or "Groundedness actor construction failed.",
+                )
+                return
             (
                 configured_retriever,
                 configured_ranker,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -45,7 +46,12 @@ class PydanticAIGroundednessActor:
         """Evaluate the answer against the supplied evidence text."""
         evidence = "\n\n".join(document.content for document in documents)
         result = await self._agent.run(f"Answer:\n{answer}\n\nEvidence:\n{evidence}")
-        return GroundednessResult.model_validate(result.output.model_dump())
+        usage = result.usage()
+        usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
+        return GroundednessResult(
+            **result.output.model_dump(),
+            usage=usage_payload,
+        )
 
 
 def build_groundedness_actor(
@@ -74,10 +80,18 @@ async def run_groundedness(
 
     async def invoke() -> PhaseResultInput:
         try:
+            citations = state.get("citations", [])
+            cited_ids = {
+                citation.evidence_id
+                if hasattr(citation, "evidence_id")
+                else citation.get("evidence_id")
+                for citation in citations
+            }
             refs = [
                 ref
                 for ref in state.get("ranked_refs", state.get("artifact_refs", []))
                 if ref.get("artifact_type") == "document"
+                and ref.get("artifact_id") in cited_ids
             ]
             documents = [
                 Document.model_validate(
@@ -90,8 +104,11 @@ async def run_groundedness(
                 )
                 for ref in refs
             ]
+            actor_result = await actor.evaluate(state.get("answer", ""), documents)
+            raw_result = actor_result.model_dump()
+            output = GroundednessOutput.model_validate(raw_result)
             result = GroundednessResult.model_validate(
-                await actor.evaluate(state.get("answer", ""), documents)
+                {**output.model_dump(), "usage": raw_result.get("usage", {})}
             )
             return PhaseResultInput(
                 phase_name="groundedness",
