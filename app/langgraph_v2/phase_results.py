@@ -18,6 +18,7 @@ from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.live_events import LiveEventWakeups
+from app.langgraph_v2.observability import observe
 from app.langgraph_v2.run_events import (
     CancellationObserved,
     ClaimFenced,
@@ -197,23 +198,31 @@ class PhaseResultRepository:
         reject_cancellation: bool = False,
     ) -> PhaseResultRecord:
         """Reuse a completed result, otherwise invoke and atomically commit it."""
-        _validate_phase_name(phase_name)
-        existing = await self.get_completed(tenant_id, run_id, phase_name)
-        if existing is not None:
-            return existing
-        candidate = await invoke()
-        if candidate.phase_name != phase_name:
-            raise ValueError("invoked PhaseResult name does not match requested phase")
-        if before_commit is not None:
-            await before_commit()
-        return await self.commit(
-            tenant_id=tenant_id,
+        with observe(
+            "persistence.phase_result",
             run_id=run_id,
-            owner_instance_id=owner_instance_id,
             execution_epoch=execution_epoch,
-            phase=candidate,
-            reject_cancellation=reject_cancellation,
-        )
+            attributes={"persistence.kind": "phase_result"},
+        ):
+            _validate_phase_name(phase_name)
+            existing = await self.get_completed(tenant_id, run_id, phase_name)
+            if existing is not None:
+                return existing
+            candidate = await invoke()
+            if candidate.phase_name != phase_name:
+                raise ValueError(
+                    "invoked PhaseResult name does not match requested phase"
+                )
+            if before_commit is not None:
+                await before_commit()
+            return await self.commit(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+                phase=candidate,
+                reject_cancellation=reject_cancellation,
+            )
 
     async def commit(
         self,

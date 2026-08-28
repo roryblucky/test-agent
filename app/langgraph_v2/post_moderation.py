@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from app.langgraph_v2.observability import observe
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.pre_moderation import ModerationDecision, ModerationProvider
 from app.langgraph_v2.run_events import EventInput, EventRecord
@@ -44,7 +45,13 @@ async def run_post_moderation(
                 terminal_status="failed",
             )
         try:
-            decision = await provider.check(answer)
+            with observe(
+                "provider.invoke",
+                run_id=context.run_id,
+                execution_epoch=context.execution_epoch,
+                attributes={"provider.role": "moderation.post"},
+            ):
+                decision = await provider.check(answer)
         except Exception as exc:
             message = str(exc) or "Post-moderation failed."
             return PhaseResultInput(

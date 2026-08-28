@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
+from app.langgraph_v2.observability import observe
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 
@@ -94,7 +95,13 @@ async def run_pre_moderation(
 
     async def invoke() -> PhaseResultInput:
         try:
-            decision = await provider.check(state["query"])
+            with observe(
+                "provider.invoke",
+                run_id=context.run_id,
+                execution_epoch=context.execution_epoch,
+                attributes={"provider.role": "moderation.pre"},
+            ):
+                decision = await provider.check(state["query"])
         except Exception as exc:
             message = str(exc) or "Moderation failed."
             return PhaseResultInput(
