@@ -492,6 +492,7 @@ async def _execute_graph_run(
 
 async def _subscribe_to_run(
     repository: RunEventRepository,
+    execution_task: asyncio.Task[None],
     *,
     tenant_id: str,
     run_id: uuid.UUID,
@@ -513,6 +514,19 @@ async def _subscribe_to_run(
             suppress_replayed_phase_events=suppress_replayed_phase_events,
         ):
             yield frame
+        if execution_task.done():
+            execution_task.result()
+            async for frame in _stream_unseen_events(
+                repository,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                sent_keys=sent_keys,
+                answer_chunk_count=answer_chunk_count,
+                answer_chunk_interval_ms=answer_chunk_interval_ms,
+                suppress_replayed_phase_events=suppress_replayed_phase_events,
+            ):
+                yield frame
+            return
         if (await repository.get_run(tenant_id, run_id)).status != "running":
             async for frame in _stream_unseen_events(
                 repository,
@@ -706,7 +720,7 @@ def create_tracer_router(
                 "client_request_id": payload.client_request_id,
                 "events": [],
             }
-            runtime.start(
+            execution_task = runtime.start(
                 _execute_graph_run(
                     selected_graph,
                     state,
@@ -723,6 +737,7 @@ def create_tracer_router(
             )
             async for frame in _subscribe_to_run(
                 repository,
+                execution_task,
                 tenant_id=x_application_id,
                 run_id=run_id,
                 answer_chunk_interval_ms=answer_chunk_interval_ms,
@@ -873,7 +888,7 @@ def create_tracer_router(
                     and event.event_key.startswith("phase:answer:token:")
                 )
             }
-            runtime.start(
+            execution_task = runtime.start(
                 _execute_graph_run(
                     selected_graph,
                     None,
@@ -891,6 +906,7 @@ def create_tracer_router(
             )
             async for frame in _subscribe_to_run(
                 repository,
+                execution_task,
                 tenant_id=x_application_id,
                 run_id=run_id,
                 answer_chunk_interval_ms=answer_chunk_interval_ms,
