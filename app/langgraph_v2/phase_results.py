@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
+from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.run_events import (
     ClaimFenced,
     EventInput,
@@ -120,8 +121,14 @@ PhasePreCommitCheck = Callable[[], Awaitable[None]]
 class PhaseResultRepository:
     """Persist and reuse one normalized result per Run phase."""
 
-    def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
+    def __init__(
+        self,
+        pool: AsyncConnectionPool[Any],
+        *,
+        live_events: LiveEventWakeups | None = None,
+    ) -> None:
         self._pool = pool
+        self._live_events = live_events
 
     async def get_completed(
         self,
@@ -362,6 +369,8 @@ class PhaseResultRepository:
             raise conflict
         if result_row is None:
             raise RuntimeError("PhaseResult commit returned no row")
+        if self._live_events is not None:
+            await self._live_events.publish(tenant_id, run_id)
         record = PhaseResultRecord.model_validate(result_row)
         if not record.event_keys:
             return record

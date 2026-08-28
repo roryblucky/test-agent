@@ -9,6 +9,7 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import ValidationError
 
 from app.langgraph_v2.graph import build_tracer_graph, canonical_query
+from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.phase_results import (
     ALLOWED_PHASE_NAMES,
     PhaseExecutionContext,
@@ -84,6 +85,36 @@ async def test_phase_result_commit_is_atomic_and_idempotent(
         assert events[0].sequence == 1
         assert "owner_instance_id" not in first.canonical_result
         assert "attempt" not in first.canonical_result
+
+
+@pytest.mark.asyncio
+async def test_phase_result_commit_wakes_local_event_follower(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        runs = RunEventRepository(pool)
+        wakeups = LiveEventWakeups()
+        phases = PhaseResultRepository(pool, live_events=wakeups)
+        run = await runs.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+
+        async with wakeups.subscribe("tenant-a", run.run_id) as subscription:
+            generation = subscription.generation
+            await phases.commit(
+                tenant_id="tenant-a",
+                run_id=run.run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+                phase=_phase_input(),
+            )
+
+            assert subscription.generation == generation + 1
 
 
 @pytest.mark.asyncio

@@ -641,9 +641,8 @@ def create_tracer_router(
             if configured_pool is None:
                 raise RuntimeError("LangGraph v2 PostgreSQL is not configured")
             pool = cast(AsyncConnectionPool[Any], configured_pool)
-            repository = RunEventRepository(
-                pool, live_events=_live_events(http_request.app)
-            )
+            wakeups = _live_events(http_request.app)
+            repository = RunEventRepository(pool, live_events=wakeups)
             message_repository = ConversationMessageRepository(pool)
             claim = await repository.create_run(
                 tenant_id=x_application_id,
@@ -704,7 +703,7 @@ def create_tracer_router(
             graph_config: RunnableConfig | None = None
             if graph is None:
                 phase_context = PhaseExecutionContext(
-                    repository=PhaseResultRepository(pool),
+                    repository=PhaseResultRepository(pool, live_events=wakeups),
                     artifact_repository=ArtifactRepository(pool),
                     message_repository=message_repository,
                     history_token_budget=history_token_budget,
@@ -911,7 +910,7 @@ def create_tracer_router(
                         pointer_writer=write_checkpoint_pointer,
                     ),
                     phase_context=PhaseExecutionContext(
-                        repository=PhaseResultRepository(pool),
+                        repository=PhaseResultRepository(pool, live_events=wakeups),
                         artifact_repository=ArtifactRepository(pool),
                         message_repository=message_repository,
                         history_token_budget=history_token_budget,
@@ -965,6 +964,7 @@ def create_tracer_router(
                 owner_instance_id=claim.owner_instance_id,
                 execution_epoch=claim.execution_epoch,
             )
+
         async def event_generator() -> AsyncIterator[str]:
             async for frame in _follow_persisted_events(
                 repository,

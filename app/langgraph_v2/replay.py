@@ -56,44 +56,84 @@ class PersistedEventFollower:
     ) -> AsyncIterator[EventRecord]:
         """Yield each Event once, then close as soon as the Run is not running."""
         cursor = after_sequence
-        followed_epoch: int | None = None
-        while True:
-            # Read the local generation before PostgreSQL so a producer cannot
-            # signal in the replay-to-wait handoff without waking this follower.
-            generation = self._wakeups.generation(tenant_id, run_id)
-            events = await self._repository.list_events_after(
-                tenant_id,
-                run_id,
-                after_sequence=cursor,
-            )
-            for event in events:
-                cursor = event.sequence
-                yield event
-            if events:
-                # A producer can commit the next Event while the caller is
-                # consuming this batch.  Reconcile its sequence before looking
-                # at terminal state, or that boundary Event could be skipped.
-                continue
-
-            run = await self._repository.get_run(tenant_id, run_id)
-            if followed_epoch is None:
-                followed_epoch = run.execution_epoch
-            elif run.execution_epoch != followed_epoch:
-                # An explicit recovery owns the next epoch.  This follower
-                # observes only the epoch it attached to and never competes.
-                return
-            if run.status != "running":
-                return
-            if run.expires_at <= datetime.now(UTC):
-                await self._repository.interrupt_expired_run(
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    observed_execution_epoch=run.execution_epoch,
+        attached_run = await self._repository.get_run(tenant_id, run_id)
+        followed_epoch = attached_run.execution_epoch
+        async with self._wakeups.subscribe(tenant_id, run_id) as subscription:
+            while True:
+                # Read the local generation before PostgreSQL so a producer cannot
+                # signal in the replay-to-wait handoff without waking this follower.
+                generation = subscription.generation
+                run_before = await self._repository.get_run(tenant_id, run_id)
+                events = await self._repository.list_events_after(
+                    tenant_id,
+                    run_id,
+                    after_sequence=cursor,
                 )
-                continue
-            await self._wakeups.wait(
-                tenant_id,
-                run_id,
-                generation,
-                timeout_seconds=self._poll_interval_seconds,
-            )
+                run_after = await self._repository.get_run(tenant_id, run_id)
+
+                if (
+                    run_before.execution_epoch != followed_epoch
+                    or run_after.execution_epoch != followed_epoch
+                ):
+                    # Re-read after observing the epoch transition.  Its durable
+                    # interruption Event is now visible, but no Event from the
+                    # replacement epoch may escape through this old follower.
+                    events = await self._repository.list_events_after(
+                        tenant_id,
+                        run_id,
+                        after_sequence=cursor,
+                    )
+                    for event in _events_through_interruption(events, followed_epoch):
+                        yield event
+                    return
+
+                for event in events:
+                    cursor = event.sequence
+                    yield event
+
+                if run_after.status != "running":
+                    # Status and its terminal Event are committed atomically, but
+                    # the commit may land between the Event and status reads.
+                    final_events = await self._repository.list_events_after(
+                        tenant_id,
+                        run_id,
+                        after_sequence=cursor,
+                    )
+                    final_run = await self._repository.get_run(tenant_id, run_id)
+                    if final_run.execution_epoch != followed_epoch:
+                        final_events = await self._repository.list_events_after(
+                            tenant_id,
+                            run_id,
+                            after_sequence=cursor,
+                        )
+                        final_events = _events_through_interruption(
+                            final_events, followed_epoch
+                        )
+                    for event in final_events:
+                        yield event
+                    return
+
+                if run_after.expires_at <= datetime.now(UTC):
+                    await self._repository.interrupt_expired_run(
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        observed_execution_epoch=followed_epoch,
+                    )
+                    continue
+                if events:
+                    continue
+                await subscription.wait(
+                    generation,
+                    timeout_seconds=self._poll_interval_seconds,
+                )
+
+
+def _events_through_interruption(
+    events: list[EventRecord], followed_epoch: int
+) -> list[EventRecord]:
+    """Keep the old epoch's boundary Event and fence all later Events."""
+    interruption_key = f"lifecycle:interrupted:{followed_epoch}"
+    for index, event in enumerate(events):
+        if event.event_key == interruption_key:
+            return events[: index + 1]
+    return []

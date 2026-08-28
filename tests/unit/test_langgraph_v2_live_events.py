@@ -14,37 +14,44 @@ from app.langgraph_v2.live_events import LiveEventWakeups
 async def test_local_notification_wakes_waiter_for_its_run() -> None:
     wakeups = LiveEventWakeups()
     run_id = uuid4()
-    generation = wakeups.generation("tenant-a", run_id)
-    waiter = asyncio.create_task(
-        wakeups.wait("tenant-a", run_id, generation, timeout_seconds=1)
-    )
+    async with wakeups.subscribe("tenant-a", run_id) as subscription:
+        generation = subscription.generation
+        waiter = asyncio.create_task(subscription.wait(generation, timeout_seconds=1))
 
-    await asyncio.sleep(0)
-    await wakeups.publish("tenant-a", run_id)
+        await asyncio.sleep(0)
+        await wakeups.publish("tenant-a", run_id)
 
-    assert await waiter > generation
+        assert await waiter > generation
 
 
 @pytest.mark.asyncio
 async def test_wait_returns_after_bounded_poll_timeout_without_notification() -> None:
     wakeups = LiveEventWakeups()
     run_id = uuid4()
-    generation = wakeups.generation("tenant-a", run_id)
+    async with wakeups.subscribe("tenant-a", run_id) as subscription:
+        generation = subscription.generation
 
-    assert (
-        await wakeups.wait("tenant-a", run_id, generation, timeout_seconds=0.001)
-        == generation
-    )
+        assert await subscription.wait(generation, timeout_seconds=0.001) == generation
 
 
 @pytest.mark.asyncio
 async def test_wait_does_not_miss_notification_before_subscription() -> None:
     wakeups = LiveEventWakeups()
     run_id = uuid4()
-    generation = wakeups.generation("tenant-a", run_id)
-    await wakeups.publish("tenant-a", run_id)
+    async with wakeups.subscribe("tenant-a", run_id) as subscription:
+        generation = subscription.generation
+        await wakeups.publish("tenant-a", run_id)
 
-    assert (
-        await wakeups.wait("tenant-a", run_id, generation, timeout_seconds=1)
-        == generation + 1
-    )
+        assert await subscription.wait(generation, timeout_seconds=1) == generation + 1
+
+
+@pytest.mark.asyncio
+async def test_inactive_runs_do_not_retain_local_wakeup_state() -> None:
+    wakeups = LiveEventWakeups()
+    run_id = uuid4()
+
+    async with wakeups.subscribe("tenant-a", run_id):
+        assert len(wakeups._slots) == 1
+
+    await wakeups.publish("tenant-a", run_id)
+    assert wakeups._slots == {}

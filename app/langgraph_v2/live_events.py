@@ -4,14 +4,47 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections import defaultdict
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
 import redis.asyncio as aioredis
 
 _CHANNEL = "langgraph_v2:run-events"
+
+
+@dataclass
+class _WakeupSlot:
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    generation: int = 0
+    subscribers: int = 0
+
+
+class LiveEventSubscription:
+    """One bounded, Run-scoped local wakeup subscription."""
+
+    def __init__(self, slot: _WakeupSlot) -> None:
+        self._slot = slot
+
+    @property
+    def generation(self) -> int:
+        """Return the current best-effort signal generation."""
+        return self._slot.generation
+
+    async def wait(self, observed_generation: int, *, timeout_seconds: float) -> int:
+        """Wait for a signal, or return after bounded polling latency."""
+        async with self._slot.condition:
+            if self._slot.generation != observed_generation:
+                return self._slot.generation
+            try:
+                await asyncio.wait_for(
+                    self._slot.condition.wait(), timeout=timeout_seconds
+                )
+            except TimeoutError:
+                pass
+            return self._slot.generation
 
 
 class LiveEventWakeups:
@@ -26,8 +59,8 @@ class LiveEventWakeups:
         *,
         redis_url: str | None = None,
     ) -> None:
-        self._generations: defaultdict[tuple[str, UUID], int] = defaultdict(int)
-        self._conditions: dict[tuple[str, UUID], asyncio.Condition] = {}
+        self._slots: dict[tuple[str, UUID], _WakeupSlot] = {}
+        self._slots_lock = asyncio.Lock()
         self._redis_url = redis_url
         self._redis: Any | None = None
         self._pubsub: Any | None = None
@@ -54,9 +87,22 @@ class LiveEventWakeups:
                 await self._redis.aclose()
             self._redis = None
 
-    def generation(self, tenant_id: str, run_id: UUID) -> int:
-        """Return the current local wakeup generation for a Run."""
-        return self._generations[(tenant_id, run_id)]
+    @asynccontextmanager
+    async def subscribe(
+        self, tenant_id: str, run_id: UUID
+    ) -> AsyncIterator[LiveEventSubscription]:
+        """Retain local state only while at least one follower is active."""
+        key = (tenant_id, run_id)
+        async with self._slots_lock:
+            slot = self._slots.setdefault(key, _WakeupSlot())
+            slot.subscribers += 1
+        try:
+            yield LiveEventSubscription(slot)
+        finally:
+            async with self._slots_lock:
+                slot.subscribers -= 1
+                if slot.subscribers == 0 and self._slots.get(key) is slot:
+                    self._slots.pop(key)
 
     async def publish(self, tenant_id: str, run_id: UUID) -> None:
         """Wake local followers and best-effort relay the wakeup remotely."""
@@ -73,39 +119,15 @@ class LiveEventWakeups:
             # PostgreSQL polling is the loss-tolerant fallback.
             return
 
-    async def wait(
-        self,
-        tenant_id: str,
-        run_id: UUID,
-        observed_generation: int,
-        *,
-        timeout_seconds: float,
-    ) -> int:
-        """Wait for a local signal, or return after bounded polling latency."""
-        key = (tenant_id, run_id)
-        condition = self._condition_for(key)
-        async with condition:
-            if self._generations[key] != observed_generation:
-                return self._generations[key]
-            try:
-                await asyncio.wait_for(condition.wait(), timeout=timeout_seconds)
-            except TimeoutError:
-                pass
-            return self._generations[key]
-
-    def _condition_for(self, key: tuple[str, UUID]) -> asyncio.Condition:
-        condition = self._conditions.get(key)
-        if condition is None:
-            condition = asyncio.Condition()
-            self._conditions[key] = condition
-        return condition
-
     async def _wake_local(self, tenant_id: str, run_id: UUID) -> None:
         key = (tenant_id, run_id)
-        condition = self._condition_for(key)
-        async with condition:
-            self._generations[key] += 1
-            condition.notify_all()
+        async with self._slots_lock:
+            slot = self._slots.get(key)
+        if slot is None:
+            return
+        async with slot.condition:
+            slot.generation += 1
+            slot.condition.notify_all()
 
     def _redis_client(self) -> Any:
         if self._redis is None:

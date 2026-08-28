@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -16,7 +17,14 @@ from app.langgraph_v2.api import register_tracer_routes
 from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.replay import PersistedEventFollower
-from app.langgraph_v2.run_events import EventInput, RunEventRepository
+from app.langgraph_v2.run_events import (
+    EventInput,
+    EventRecord,
+    RunEventRepository,
+    RunRecord,
+)
+
+LiveEndpoint = Callable[[UUID, Request, str, int], Awaitable[Any]]
 
 
 async def _seed(repository: RunEventRepository) -> tuple[UUID, str, int]:
@@ -41,11 +49,14 @@ async def _seed(repository: RunEventRepository) -> tuple[UUID, str, int]:
     return run.run_id, run.owner_instance_id, event.sequence
 
 
-def _live_endpoint(app: FastAPI):
-    return next(
-        route.endpoint
-        for route in app.routes
-        if getattr(route, "path", None) == "/v2/runs/{run_id}/stream"
+def _live_endpoint(app: FastAPI) -> LiveEndpoint:
+    return cast(
+        LiveEndpoint,
+        next(
+            route.endpoint
+            for route in app.routes
+            if getattr(route, "path", None) == "/v2/runs/{run_id}/stream"
+        ),
     )
 
 
@@ -254,7 +265,178 @@ async def test_only_one_expiry_cas_wins_and_losers_replay_its_event(
         )
 
         assert sum(event is not None for event in (first, second)) == 1
-        assert [event.event_key for event in await repository.list_events("tenant-a", run_id)] == [
+        assert [
+            event.event_key
+            for event in await repository.list_events("tenant-a", run_id)
+        ] == [
             "phase:query:step_completed:1",
             "lifecycle:interrupted:1",
         ]
+
+
+class _CompleteAfterEventRead(RunEventRepository):
+    def __init__(
+        self, repository: RunEventRepository, *, run_id: UUID, owner: str
+    ) -> None:
+        self._repository = repository
+        self._run_id = run_id
+        self._owner = owner
+        self._completed = False
+
+    async def get_run(self, tenant_id: str, run_id: UUID) -> RunRecord:
+        return await self._repository.get_run(tenant_id, run_id)
+
+    async def list_events_after(
+        self, tenant_id: str, run_id: UUID, *, after_sequence: int
+    ) -> list[EventRecord]:
+        events = await self._repository.list_events_after(
+            tenant_id, run_id, after_sequence=after_sequence
+        )
+        if not self._completed:
+            self._completed = True
+            await self._repository.complete_run(
+                tenant_id=tenant_id,
+                run_id=self._run_id,
+                owner_instance_id=self._owner,
+                execution_epoch=1,
+                event=EventInput(
+                    event_key="lifecycle:completed:0",
+                    type="done",
+                    data={"status": "completed"},
+                ),
+            )
+        return events
+
+    async def interrupt_expired_run(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        observed_execution_epoch: int,
+    ) -> EventRecord | None:
+        return await self._repository.interrupt_expired_run(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            observed_execution_epoch=observed_execution_epoch,
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_event_committed_at_snapshot_boundary_is_not_skipped(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id, owner, _ = await _seed(repository)
+        racing_repository = _CompleteAfterEventRead(
+            repository, run_id=run_id, owner=owner
+        )
+        follower = PersistedEventFollower(
+            racing_repository,
+            LiveEventWakeups(),
+            poll_interval_seconds=0.001,
+        ).follow(tenant_id="tenant-a", run_id=run_id, after_sequence=1)
+
+        terminal = await anext(follower)
+        assert terminal.event_key == "lifecycle:completed:0"
+        with pytest.raises(StopAsyncIteration):
+            await anext(follower)
+
+
+class _ResumeAfterFirstRunRead(RunEventRepository):
+    def __init__(self, repository: RunEventRepository) -> None:
+        self._repository = repository
+        self._transitioned = False
+
+    async def get_run(self, tenant_id: str, run_id: UUID) -> RunRecord:
+        run = await self._repository.get_run(tenant_id, run_id)
+        if not self._transitioned:
+            self._transitioned = True
+            await self._repository.interrupt_expired_run(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                observed_execution_epoch=run.execution_epoch,
+            )
+            resumed = await self._repository.resume_run(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                owner_instance_id="replacement",
+            )
+            await self._repository.append_event(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                owner_instance_id=resumed.owner_instance_id,
+                execution_epoch=resumed.execution_epoch,
+                event=EventInput(
+                    event_key="phase:replacement:step_completed:1",
+                    type="step_completed",
+                    step="replacement",
+                    data={"epoch": resumed.execution_epoch},
+                ),
+            )
+        return run
+
+    async def list_events_after(
+        self, tenant_id: str, run_id: UUID, *, after_sequence: int
+    ) -> list[EventRecord]:
+        return await self._repository.list_events_after(
+            tenant_id, run_id, after_sequence=after_sequence
+        )
+
+    async def interrupt_expired_run(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        observed_execution_epoch: int,
+    ) -> EventRecord | None:
+        return await self._repository.interrupt_expired_run(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            observed_execution_epoch=observed_execution_epoch,
+        )
+
+
+@pytest.mark.asyncio
+async def test_old_follower_emits_interruption_but_not_replacement_epoch_events(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id, owner, _ = await _seed(repository)
+        await repository.update_checkpoint_pointer(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            owner_instance_id=owner,
+            execution_epoch=1,
+            checkpoint_id="checkpoint-1",
+            checkpoint_ns="tenant-a:run:1",
+        )
+        async with pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET expires_at = clock_timestamp() - interval '1 second'
+                WHERE tenant_id = 'tenant-a' AND run_id = %s
+                """,
+                (run_id,),
+            )
+        racing_repository = _ResumeAfterFirstRunRead(repository)
+        follower = PersistedEventFollower(
+            racing_repository,
+            LiveEventWakeups(),
+            poll_interval_seconds=0.001,
+        ).follow(tenant_id="tenant-a", run_id=run_id, after_sequence=1)
+
+        interruption = await anext(follower)
+        assert interruption.event_key == "lifecycle:interrupted:1"
+        with pytest.raises(StopAsyncIteration):
+            await anext(follower)
+        assert [
+            event.event_key
+            for event in await repository.list_events("tenant-a", run_id)
+        ][-1] == "phase:replacement:step_completed:1"
