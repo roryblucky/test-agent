@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
+import psycopg
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.run_events import (
+    ClaimFenced,
     EventInput,
     EventInvariantConflict,
     EventNotFound,
@@ -257,3 +259,77 @@ async def test_concurrent_event_appends_allocate_one_ordered_sequence(
         assert {event.event_key for event in persisted} == {
             f"phase:query:progress:{ordinal}" for ordinal in range(1, 9)
         }
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_rejects_heartbeat_and_writes(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=2,
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        created = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+            lease_seconds=30,
+        )
+        refreshed = await repository.heartbeat(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            owner_instance_id="instance-a",
+            execution_epoch=created.execution_epoch,
+            lease_seconds=30,
+        )
+        assert refreshed.expires_at > refreshed.heartbeat_at
+
+        with psycopg.connect(
+            langgraph_v2_migrated_database_url,
+            autocommit=True,
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET expires_at = now() - interval '1 second'
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                ("tenant-a", run_id),
+            )
+
+        with pytest.raises(ClaimFenced):
+            await repository.heartbeat(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id="instance-a",
+                execution_epoch=created.execution_epoch,
+                lease_seconds=30,
+            )
+        with pytest.raises(ClaimFenced):
+            await repository.append_event(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                event=EventInput(
+                    event_key="phase:query:step_start:1",
+                    type="step_start",
+                    step="query",
+                ),
+                owner_instance_id="instance-a",
+                execution_epoch=created.execution_epoch,
+            )
+        with pytest.raises(ClaimFenced):
+            await repository.complete_run(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                event=EventInput(
+                    event_key="lifecycle:completed:0",
+                    type="done",
+                    data={"status": "completed"},
+                ),
+                owner_instance_id="instance-a",
+                execution_epoch=created.execution_epoch,
+            )

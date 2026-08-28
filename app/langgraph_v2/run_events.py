@@ -29,6 +29,10 @@ class EventInvariantConflict(RuntimeError):
     """A stable Event key was reused with a different canonical envelope."""
 
 
+class ClaimFenced(RuntimeError):
+    """The supplied owner and execution epoch cannot write this Run."""
+
+
 class EventInput(BaseModel):
     """One producer-keyed Event to append to a Run."""
 
@@ -48,6 +52,10 @@ class RunRecord(BaseModel):
     terminal_outcome: Any = None
     created_at: datetime
     completed_at: datetime | None = None
+    owner_instance_id: str
+    execution_epoch: int
+    heartbeat_at: datetime
+    expires_at: datetime
 
 
 class EventRecord(BaseModel):
@@ -75,6 +83,9 @@ class RunEventRepository:
         tenant_id: str,
         run_id: UUID,
         conversation_id: str,
+        owner_instance_id: str = "local",
+        execution_epoch: int = 1,
+        lease_seconds: int = 30,
     ) -> RunRecord:
         """Create a directly executing Run in the running state."""
         async with self._pool.connection() as connection:
@@ -82,12 +93,24 @@ class RunEventRepository:
                 await cursor.execute(
                     """
                     INSERT INTO langgraph_v2.runs (
-                        tenant_id, run_id, conversation_id, status
-                    ) VALUES (%s, %s, %s, 'running')
+                        tenant_id, run_id, conversation_id, status,
+                        owner_instance_id, execution_epoch, heartbeat_at,
+                        expires_at
+                    ) VALUES (%s, %s, %s, 'running', %s, %s, now(),
+                              now() + (%s * interval '1 second'))
                     RETURNING tenant_id, run_id, conversation_id, status,
-                              terminal_outcome, created_at, completed_at
+                              terminal_outcome, created_at, completed_at,
+                              owner_instance_id, execution_epoch, heartbeat_at,
+                              expires_at
                     """,
-                    (tenant_id, run_id, conversation_id),
+                    (
+                        tenant_id,
+                        run_id,
+                        conversation_id,
+                        owner_instance_id,
+                        execution_epoch,
+                        lease_seconds,
+                    ),
                 )
                 row = await cursor.fetchone()
         return RunRecord.model_validate(row)
@@ -99,7 +122,9 @@ class RunEventRepository:
                 await cursor.execute(
                     """
                     SELECT tenant_id, run_id, conversation_id, status,
-                           terminal_outcome, created_at, completed_at
+                           terminal_outcome, created_at, completed_at,
+                           owner_instance_id, execution_epoch, heartbeat_at,
+                           expires_at
                     FROM langgraph_v2.runs
                     WHERE tenant_id = %s AND run_id = %s
                     """,
@@ -127,6 +152,46 @@ class RunEventRepository:
                 )
                 rows = await cursor.fetchall()
         return [EventRecord.model_validate(row) for row in rows]
+
+    async def heartbeat(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+        lease_seconds: int = 30,
+    ) -> RunRecord:
+        """Refresh a matching, non-expired claim while its Run is running."""
+        async with self._pool.connection() as connection:
+            async with connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    UPDATE langgraph_v2.runs
+                    SET heartbeat_at = now(),
+                        expires_at = now() + (%s * interval '1 second')
+                    WHERE tenant_id = %s AND run_id = %s
+                      AND status = 'running'
+                      AND owner_instance_id = %s
+                      AND execution_epoch = %s
+                      AND expires_at > now()
+                    RETURNING tenant_id, run_id, conversation_id, status,
+                              terminal_outcome, created_at, completed_at,
+                              owner_instance_id, execution_epoch, heartbeat_at,
+                              expires_at
+                    """,
+                    (
+                        lease_seconds,
+                        tenant_id,
+                        run_id,
+                        owner_instance_id,
+                        execution_epoch,
+                    ),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            raise ClaimFenced(str(run_id))
+        return RunRecord.model_validate(row)
 
     async def get_event(
         self,
@@ -157,12 +222,16 @@ class RunEventRepository:
         tenant_id: str,
         run_id: UUID,
         event: EventInput,
+        owner_instance_id: str = "local",
+        execution_epoch: int = 1,
     ) -> EventRecord:
         """Append idempotently or fail the Run on a stable-key conflict."""
         return await self._persist_event(
             tenant_id=tenant_id,
             run_id=run_id,
             event=event,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
             completes_run=False,
         )
 
@@ -172,12 +241,16 @@ class RunEventRepository:
         tenant_id: str,
         run_id: UUID,
         event: EventInput,
+        owner_instance_id: str = "local",
+        execution_epoch: int = 1,
     ) -> EventRecord:
         """Atomically append the terminal Event and complete its Run."""
         return await self._persist_event(
             tenant_id=tenant_id,
             run_id=run_id,
             event=event,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
             completes_run=True,
         )
 
@@ -187,6 +260,8 @@ class RunEventRepository:
         tenant_id: str,
         run_id: UUID,
         event: EventInput,
+        owner_instance_id: str = "local",
+        execution_epoch: int = 1,
         completes_run: bool,
     ) -> EventRecord:
         canonical_envelope = _canonical_envelope(event)
@@ -196,7 +271,8 @@ class RunEventRepository:
             async with connection.transaction():
                 run_cursor = await connection.execute(
                     """
-                    SELECT next_event_sequence
+                    SELECT next_event_sequence, status, owner_instance_id,
+                           execution_epoch, expires_at
                     FROM langgraph_v2.runs
                     WHERE tenant_id = %s AND run_id = %s
                     FOR UPDATE
@@ -206,6 +282,14 @@ class RunEventRepository:
                 run_row = await run_cursor.fetchone()
                 if run_row is None:
                     raise RunNotFound(str(run_id))
+                if (
+                    run_row[1] not in {"running", "completed"}
+                    or run_row[2] != owner_instance_id
+                    or run_row[3] != execution_epoch
+                    or run_row[4] <= datetime.now(run_row[4].tzinfo)
+                    or (run_row[1] == "completed" and not completes_run)
+                ):
+                    raise ClaimFenced(str(run_id))
                 async with connection.cursor(row_factory=dict_row) as existing_cursor:
                     await existing_cursor.execute(
                         """

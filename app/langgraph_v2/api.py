@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import socket
 import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Protocol, cast
@@ -13,6 +15,8 @@ from psycopg_pool import AsyncConnectionPool
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, tracer_graph
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
+
+_INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
 
 
 class TracerGraph(Protocol):
@@ -53,6 +57,7 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
                 tenant_id=x_application_id,
                 run_id=run_id,
                 conversation_id=conversation_id,
+                owner_instance_id=_INSTANCE_ID,
             )
             result = await graph.ainvoke(
                 {
@@ -75,12 +80,14 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
                         tenant_id=x_application_id,
                         run_id=run_id,
                         event=event_input,
+                        owner_instance_id=_INSTANCE_ID,
                     )
                 else:
                     persisted = await repository.append_event(
                         tenant_id=x_application_id,
                         run_id=run_id,
                         event=event_input,
+                        owner_instance_id=_INSTANCE_ID,
                     )
                 yield event.model_copy(
                     update={"sequence": persisted.sequence}
