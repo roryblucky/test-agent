@@ -61,6 +61,7 @@ class PhaseResultInput(BaseModel):
     normalized_result: Any = None
     artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
     events: tuple[EventInput, ...] = ()
+    terminal_status: Literal["completed", "failed"] | None = None
 
     @model_validator(mode="after")
     def require_normalized_content(self) -> PhaseResultInput:
@@ -328,6 +329,32 @@ class PhaseResultRepository:
                                 run_id=run_id,
                                 event=event,
                             )
+                    if conflict is None and phase.terminal_status is not None:
+                        terminal_event = next(
+                            (event for event in phase.events if event.type == "error"),
+                            None,
+                        )
+                        await cursor.execute(
+                            """
+                            UPDATE langgraph_v2.runs
+                            SET status = %s, terminal_outcome = %s,
+                                completed_at = CASE WHEN %s = 'completed'
+                                    THEN COALESCE(completed_at, now())
+                                    ELSE NULL END
+                            WHERE tenant_id = %s AND run_id = %s
+                            """,
+                            (
+                                phase.terminal_status,
+                                Jsonb(
+                                    terminal_event.data
+                                    if terminal_event is not None
+                                    else phase.normalized_result
+                                ),
+                                phase.terminal_status,
+                                tenant_id,
+                                run_id,
+                            ),
+                        )
 
         if conflict is not None:
             raise conflict

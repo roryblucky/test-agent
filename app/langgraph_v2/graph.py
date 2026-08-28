@@ -15,6 +15,7 @@ from app.langgraph_v2.pre_moderation import (
     MockModerationProvider,
     ModerationDecision,
     ModerationProvider,
+    pre_moderation_events,
     run_pre_moderation,
 )
 from app.langgraph_v2.run_events import EventInput, EventRecord
@@ -141,30 +142,9 @@ async def _pre_moderation_without_journal(
     """Run the provider for an unconfigured in-memory graph."""
     decision = await provider.check(state["query"])
     events = [
-        TracerStreamEvent(
-            event_key="phase:pre_moderation:step_start:1",
-            type="step_start",
-            step="pre_moderation",
-            sequence=1,
-        ).model_dump(exclude_none=True),
-        TracerStreamEvent(
-            event_key="phase:pre_moderation:step_completed:1",
-            type="step_completed",
-            step="pre_moderation",
-            data=decision.model_dump(exclude_none=True),
-            sequence=2,
-        ).model_dump(exclude_none=True),
+        _event_state(event, index)
+        for index, event in enumerate(pre_moderation_events(decision), 1)
     ]
-    if decision.is_flagged:
-        events.append(
-            TracerStreamEvent(
-                event_key="phase:pre_moderation:error:1",
-                type="error",
-                step="pre_moderation",
-                data={"message": "Your query was flagged by content moderation."},
-                sequence=3,
-            ).model_dump(exclude_none=True)
-        )
     return events, decision
 
 

@@ -173,13 +173,10 @@ def test_flagged_query_emits_error_before_finalization(
         "query",
         "query",
         "pre_moderation",
-        "pre_moderation",
     ]
     assert delivered[-1]["type"] == "error"
-    assert delivered[-1]["data"]["message"] == (
-        "Your query was flagged by content moderation."
-    )
-    assert all(event["step"] != "finalization" for event in delivered)
+    assert delivered[-1]["data"] == "Your query was flagged by content moderation."
+    assert all(event.get("step") != "finalization" for event in delivered)
 
     run_id = UUID(response.headers["x-run-id"])
 
@@ -190,6 +187,46 @@ def test_flagged_query_emits_error_before_finalization(
             return (await RunEventRepository(pool).get_run("tenant-a", run_id)).status
 
     assert asyncio.run(read_status()) == "failed"
+
+
+def test_failed_moderation_error_retry_is_idempotent(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async def exercise() -> None:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            repository = RunEventRepository(pool)
+            run = await repository.create_run(
+                tenant_id="tenant-a",
+                run_id=uuid4(),
+                conversation_id="conversation-1",
+                owner_instance_id="instance-a",
+            )
+            event = EventInput(
+                event_key="phase:pre_moderation:error:1",
+                type="error",
+                data="Your query was flagged by content moderation.",
+            )
+            first = await repository.fail_run(
+                tenant_id="tenant-a",
+                run_id=run.run_id,
+                event=event,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+            )
+            repeated = await repository.fail_run(
+                tenant_id="tenant-a",
+                run_id=run.run_id,
+                event=event,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+            )
+            assert repeated == first
+            assert (await repository.get_run("tenant-a", run.run_id)).status == "failed"
+            assert await repository.list_events("tenant-a", run.run_id) == [first]
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.asyncio

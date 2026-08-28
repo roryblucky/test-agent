@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from psycopg.rows import dict_row
@@ -39,6 +39,7 @@ class ResumeConflict(RuntimeError):
 
 CLAIM_LEASE_SECONDS = 30
 CLAIM_HEARTBEAT_INTERVAL_SECONDS = CLAIM_LEASE_SECONDS // 3
+TerminalStatus = Literal["completed", "failed"]
 
 
 class EventInput(BaseModel):
@@ -95,6 +96,7 @@ class RunEventRepository:
         run_id: UUID,
         owner_instance_id: str,
         execution_epoch: int,
+        allow_failed: bool = False,
     ) -> None:
         """Lock a Run and reject missing, expired, or replaced claims."""
         await cursor.execute(
@@ -121,11 +123,14 @@ class RunEventRepository:
             claim_active = None
         if (
             claim is None
-            or claim["status"] != "running"
+            or (
+                claim["status"] != "running"
+                and not (allow_failed and claim["status"] == "failed")
+            )
             or claim["owner_instance_id"] != owner_instance_id
             or claim["execution_epoch"] != execution_epoch
             or claim_active is None
-            or not claim_active["claim_active"]
+            or (claim["status"] == "running" and not claim_active["claim_active"])
         ):
             raise ClaimFenced(str(run_id))
 
@@ -350,6 +355,7 @@ class RunEventRepository:
                         run_id=run_id,
                         owner_instance_id=owner_instance_id,
                         execution_epoch=execution_epoch,
+                        allow_failed=True,
                     )
                 async with connection.cursor(row_factory=dict_row) as cursor:
                     await cursor.execute(
@@ -441,7 +447,7 @@ class RunEventRepository:
         owner_instance_id: str,
         execution_epoch: int,
         completes_run: bool,
-        terminal_status: str = "completed",
+        terminal_status: TerminalStatus = "completed",
     ) -> EventRecord:
         canonical_envelope = _canonical_envelope(event)
         conflict = False
@@ -473,12 +479,10 @@ class RunEventRepository:
                     )
                     claim_row = await claim_cursor.fetchone()
                 if (
-                    run_row["status"] not in {"running", "completed"}
-                    or run_row["owner_instance_id"] != owner_instance_id
+                    run_row["owner_instance_id"] != owner_instance_id
                     or run_row["execution_epoch"] != execution_epoch
                     or claim_row is None
                     or claim_row["claim_expired"]
-                    or (run_row["status"] == "completed" and not completes_run)
                 ):
                     raise ClaimFenced(str(run_id))
                 async with connection.cursor(row_factory=dict_row) as existing_cursor:
@@ -514,7 +518,14 @@ class RunEventRepository:
                             ),
                         )
                         conflict = True
+                    elif run_row["status"] == "completed" and not completes_run:
+                        raise ClaimFenced(str(run_id))
                 else:
+                    if (
+                        run_row["status"] not in {"running", "completed"}
+                        or (run_row["status"] == "completed" and not completes_run)
+                    ):
+                        raise ClaimFenced(str(run_id))
                     sequence = run_row["next_event_sequence"]
                     async with connection.cursor(row_factory=dict_row) as event_cursor:
                         await event_cursor.execute(

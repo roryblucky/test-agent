@@ -19,6 +19,38 @@ class ModerationDecision(BaseModel):
     reason: str | None = None
 
 
+MODERATION_ERROR_MESSAGE = "Your query was flagged by content moderation."
+
+
+def pre_moderation_events(decision: ModerationDecision) -> tuple[EventInput, ...]:
+    """Build the stable stream Events for one moderation decision."""
+    events = [
+        EventInput(
+            event_key="phase:pre_moderation:step_start:1",
+            type="step_start",
+            step="pre_moderation",
+        )
+    ]
+    if not decision.is_flagged:
+        events.append(
+            EventInput(
+                event_key="phase:pre_moderation:step_completed:1",
+                type="step_completed",
+                step="pre_moderation",
+                data=decision.model_dump(exclude_none=True),
+            )
+        )
+    else:
+        events.append(
+            EventInput(
+                event_key="phase:pre_moderation:error:1",
+                type="error",
+                data=MODERATION_ERROR_MESSAGE,
+            )
+        )
+    return tuple(events)
+
+
 class ModerationProvider(Protocol):
     """Provider seam for checking the original user query."""
 
@@ -59,35 +91,11 @@ async def run_pre_moderation(
 
     async def invoke() -> PhaseResultInput:
         decision = await provider.check(state["query"])
-        events = [
-            EventInput(
-                event_key="phase:pre_moderation:step_start:1",
-                type="step_start",
-                step="pre_moderation",
-            ),
-            EventInput(
-                event_key="phase:pre_moderation:step_completed:1",
-                type="step_completed",
-                step="pre_moderation",
-                data=decision.model_dump(exclude_none=True),
-            ),
-        ]
-        if decision.is_flagged:
-            events.append(
-                EventInput(
-                    event_key="phase:pre_moderation:error:1",
-                    type="error",
-                    step="pre_moderation",
-                    data={
-                        "message": "Your query was flagged by content moderation.",
-                        "moderation": decision.model_dump(exclude_none=True),
-                    },
-                )
-            )
         return PhaseResultInput(
             phase_name="pre_moderation",
             normalized_result=decision.model_dump(exclude_none=True),
-            events=tuple(events),
+            events=pre_moderation_events(decision),
+            terminal_status="failed" if decision.is_flagged else None,
         )
 
     result = await context.repository.get_or_invoke(

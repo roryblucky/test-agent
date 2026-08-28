@@ -8,14 +8,16 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 from pydantic import ValidationError
 
-from app.langgraph_v2.graph import canonical_query
+from app.langgraph_v2.graph import build_tracer_graph, canonical_query
 from app.langgraph_v2.phase_results import (
     ALLOWED_PHASE_NAMES,
+    PhaseExecutionContext,
     PhaseName,
     PhaseResultConflict,
     PhaseResultInput,
     PhaseResultRepository,
 )
+from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.run_events import (
     ClaimFenced,
     EventInput,
@@ -126,6 +128,58 @@ async def test_phase_replay_reuses_result_without_invocation(
 
         assert replayed.normalized_result == {"artifacts": [{"artifact_id": "a-1"}]}
         assert invoked is False
+
+
+@pytest.mark.asyncio
+async def test_pre_moderation_replay_reuses_provider_result_and_events(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class CountingProvider:
+        calls = 0
+
+        async def check(self, text: str) -> ModerationDecision:
+            self.calls += 1
+            return ModerationDecision(is_flagged=False, reason=text)
+
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        provider = CountingProvider()
+        graph = build_tracer_graph(
+            phase_context=PhaseExecutionContext(
+                repository=PhaseResultRepository(pool),
+                tenant_id="tenant-a",
+                run_id=run.run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+            ),
+            moderation_provider=provider,
+        )
+        state = {
+            "query": "hello",
+            "conversation_id": "conversation-1",
+            "client_request_id": None,
+            "events": [],
+        }
+
+        await graph.ainvoke(state)
+        await graph.ainvoke(state)
+
+        assert provider.calls == 1
+        events = await runs.list_events("tenant-a", run.run_id)
+        assert [event.event_key for event in events] == [
+            "phase:query:step_start:1",
+            "phase:query:step_completed:1",
+            "phase:pre_moderation:step_start:1",
+            "phase:pre_moderation:step_completed:1",
+        ]
 
 
 @pytest.mark.asyncio
