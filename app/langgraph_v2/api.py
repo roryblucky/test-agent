@@ -6,7 +6,7 @@ import asyncio
 import os
 import socket
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from contextlib import suppress
 from typing import Annotated, Any, Protocol, cast
 
@@ -57,7 +57,7 @@ from app.langgraph_v2.run_events import (
     RunEventRepository,
     RunNotFound,
 )
-from app.langgraph_v2.runtime import LocalRunRuntime
+from app.langgraph_v2.runtime import LocalRunRuntime, RuntimeStopping
 from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
@@ -354,7 +354,7 @@ async def _stream_unseen_events(
         ).to_sse()
 
 
-async def _stream_graph_result(
+async def _persist_graph_result(
     selected_graph: TracerGraph,
     state: TracerState | None,
     graph_config: RunnableConfig | None,
@@ -368,43 +368,22 @@ async def _stream_graph_result(
     execution_epoch: int,
     answer_chunk_interval_ms: int,
     initial_sent_keys: set[str] | None = None,
-    forward_live_events: bool = True,
-) -> AsyncIterator[str]:
-    """Run a graph while forwarding already-journaled Events as they commit."""
+) -> None:
+    """Run a graph and persist its durable result independently of subscribers."""
     if graph_config is None:
         graph_task = asyncio.create_task(selected_graph.ainvoke(state))
     else:
         graph_task = asyncio.create_task(
             selected_graph.ainvoke(state, config=graph_config)
         )
-    sent_keys = set(initial_sent_keys or ())
-    answer_chunk_count = [0]
-    while not graph_task.done():
-        if forward_live_events:
-            async for frame in _stream_unseen_events(
-                repository,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                sent_keys=sent_keys,
-                answer_chunk_count=answer_chunk_count,
-                answer_chunk_interval_ms=answer_chunk_interval_ms,
-            ):
-                yield frame
-        await asyncio.sleep(0.01)
     try:
-        result = await graph_task
-    except AnswerCancelled:
-        async for frame in _stream_unseen_events(
-            repository,
-            tenant_id=tenant_id,
-            run_id=run_id,
-            sent_keys=sent_keys,
-            answer_chunk_count=answer_chunk_count,
-            answer_chunk_interval_ms=answer_chunk_interval_ms,
-        ):
-            yield frame
-        return
-    if not forward_live_events:
+        try:
+            while not graph_task.done():
+                await asyncio.sleep(0.01)
+            result = await graph_task
+        except AnswerCancelled:
+            return
+        sent_keys = set(initial_sent_keys or ())
         sent_keys.update(
             event["event_key"]
             for event in result["events"]
@@ -413,19 +392,24 @@ async def _stream_graph_result(
             and not event["event_key"].startswith("phase:finalization:")
             and event["event_key"] != "lifecycle:completed:0"
         )
-    async for frame in _persist_result_events(
-        repository,
-        message_repository,
-        tenant_id=tenant_id,
-        run_id=run_id,
-        conversation_id=conversation_id,
-        result=result,
-        owner_instance_id=owner_instance_id,
-        execution_epoch=execution_epoch,
-        suppress_sse_for_event_keys=sent_keys,
-        answer_chunk_interval_ms=answer_chunk_interval_ms,
-    ):
-        yield frame
+        async for _ in _persist_result_events(
+            repository,
+            message_repository,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            result=result,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+            suppress_sse_for_event_keys=sent_keys,
+            answer_chunk_interval_ms=answer_chunk_interval_ms,
+        ):
+            pass
+    finally:
+        if not graph_task.done():
+            graph_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await graph_task
 
 
 async def _execute_graph_run(
@@ -454,7 +438,7 @@ async def _execute_graph_run(
         )
     )
     try:
-        async for _ in _stream_graph_result(
+        await _persist_graph_result(
             selected_graph,
             state,
             graph_config,
@@ -467,9 +451,7 @@ async def _execute_graph_run(
             execution_epoch=execution_epoch,
             answer_chunk_interval_ms=answer_chunk_interval_ms,
             initial_sent_keys=initial_sent_keys,
-            forward_live_events=False,
-        ):
-            pass
+        )
     except (AnswerCancelled, ClaimFenced):
         return
     except Exception as exc:
@@ -549,6 +531,32 @@ def _local_runtime(app: FastAPI) -> LocalRunRuntime:
         runtime = LocalRunRuntime()
         app.state.langgraph_v2_runtime = runtime
     return cast(LocalRunRuntime, runtime)
+
+
+async def _start_execution_or_interrupt(
+    runtime: LocalRunRuntime,
+    execution: Coroutine[Any, Any, None],
+    repository: RunEventRepository,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    owner_instance_id: str,
+    execution_epoch: int,
+) -> asyncio.Task[None] | None:
+    """Register execution or release the just-claimed Run during shutdown."""
+    try:
+        return runtime.start(execution)
+    except RuntimeStopping:
+        try:
+            await repository.interrupt_run(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+            )
+        except ClaimFenced:
+            pass
+        return None
 
 
 def create_tracer_router(
@@ -720,7 +728,8 @@ def create_tracer_router(
                 "client_request_id": payload.client_request_id,
                 "events": [],
             }
-            execution_task = runtime.start(
+            execution_task = await _start_execution_or_interrupt(
+                runtime,
                 _execute_graph_run(
                     selected_graph,
                     state,
@@ -733,8 +742,15 @@ def create_tracer_router(
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,
-                )
+                ),
+                repository,
+                tenant_id=x_application_id,
+                run_id=run_id,
+                owner_instance_id=claim.owner_instance_id,
+                execution_epoch=claim.execution_epoch,
             )
+            if execution_task is None:
+                return
             async for frame in _subscribe_to_run(
                 repository,
                 execution_task,
@@ -791,32 +807,37 @@ def create_tracer_router(
         previous_checkpoint_id = cast(str, claim.checkpoint_id)
         previous_checkpoint_ns = cast(str, claim.checkpoint_ns)
 
-        async def event_generator() -> AsyncIterator[str]:
-            configured_checkpointer = getattr(
-                http_request.app.state, "langgraph_v2_checkpointer", None
+        configured_checkpointer = getattr(
+            http_request.app.state, "langgraph_v2_checkpointer", None
+        )
+        configured_refinement_actor = _resolve_refinement_actor(
+            http_request.app,
+            x_application_id,
+            refinement_actor,
+        )
+        configured_answer_actor = _resolve_answer_actor(
+            http_request.app, x_application_id, answer_actor
+        )
+        try:
+            configured_groundedness_actor = _resolve_groundedness_actor(
+                http_request.app, x_application_id, groundedness_actor
             )
-            configured_refinement_actor = _resolve_refinement_actor(
-                http_request.app,
-                x_application_id,
-                refinement_actor,
+        except Exception as exc:
+            await _persist_setup_failure(
+                repository,
+                tenant_id=x_application_id,
+                run_id=run_id,
+                owner_instance_id=claim.owner_instance_id,
+                execution_epoch=claim.execution_epoch,
+                message=str(exc) or "Groundedness actor construction failed.",
             )
-            configured_answer_actor = _resolve_answer_actor(
-                http_request.app, x_application_id, answer_actor
-            )
-            try:
-                configured_groundedness_actor = _resolve_groundedness_actor(
-                    http_request.app, x_application_id, groundedness_actor
-                )
-            except Exception as exc:
-                yield await _persist_setup_failure(
-                    repository,
-                    tenant_id=x_application_id,
-                    run_id=run_id,
-                    owner_instance_id=claim.owner_instance_id,
-                    execution_epoch=claim.execution_epoch,
-                    message=str(exc) or "Groundedness actor construction failed.",
-                )
+
+            async def completed_setup_failure() -> None:
                 return
+
+            execution_task = asyncio.create_task(completed_setup_failure())
+            initial_sent_keys: set[str] = set()
+        else:
             (
                 configured_retriever,
                 configured_ranker,
@@ -888,7 +909,8 @@ def create_tracer_router(
                     and event.event_key.startswith("phase:answer:token:")
                 )
             }
-            execution_task = runtime.start(
+            execution_task = await _start_execution_or_interrupt(
+                runtime,
                 _execute_graph_run(
                     selected_graph,
                     None,
@@ -902,8 +924,20 @@ def create_tracer_router(
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,
                     initial_sent_keys=initial_sent_keys,
-                )
+                ),
+                repository,
+                tenant_id=x_application_id,
+                run_id=run_id,
+                owner_instance_id=claim.owner_instance_id,
+                execution_epoch=claim.execution_epoch,
             )
+            if execution_task is None:
+                async def completed_interruption() -> None:
+                    return
+
+                execution_task = asyncio.create_task(completed_interruption())
+
+        async def event_generator() -> AsyncIterator[str]:
             async for frame in _subscribe_to_run(
                 repository,
                 execution_task,

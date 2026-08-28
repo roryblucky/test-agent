@@ -338,6 +338,45 @@ class RunEventRepository:
                     rows = await cursor.fetchall()
         return [RunRecord.model_validate(row) for row in rows]
 
+    async def interrupt_run(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+    ) -> RunRecord:
+        """Release one authoritative claim when local execution cannot start."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await self._lock_and_validate_claim(
+                        cursor,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        owner_instance_id=owner_instance_id,
+                        execution_epoch=execution_epoch,
+                    )
+                    await cursor.execute(
+                        """
+                        UPDATE langgraph_v2.runs
+                        SET status = 'interrupted', owner_instance_id = '',
+                            heartbeat_at = clock_timestamp(),
+                            expires_at = clock_timestamp()
+                        WHERE tenant_id = %s AND run_id = %s
+                        RETURNING tenant_id, run_id, conversation_id, status,
+                                  terminal_outcome, created_at, completed_at,
+                                  owner_instance_id, execution_epoch,
+                                  heartbeat_at, expires_at, checkpoint_id,
+                                  checkpoint_ns
+                        """,
+                        (tenant_id, run_id),
+                    )
+                    row = await cursor.fetchone()
+        if row is None:
+            raise ClaimFenced(str(run_id))
+        return RunRecord.model_validate(row)
+
     async def get_event(
         self,
         tenant_id: str,

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
+from collections.abc import Coroutine
+from typing import Any
 
 
 class RuntimeStopping(RuntimeError):
@@ -28,7 +29,7 @@ class LocalRunRuntime:
         """Return the number of locally owned executions not yet cleaned up."""
         return len(self._tasks)
 
-    def start(self, execution: Awaitable[None]) -> asyncio.Task[None]:
+    def start(self, execution: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         """Start and strongly retain one local execution until it finishes."""
         if not self._accepting:
             close = getattr(execution, "close", None)
