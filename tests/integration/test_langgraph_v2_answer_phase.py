@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.answer import AnswerResult
+from app.langgraph_v2.answer import AnswerCitation, AnswerResult
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
@@ -43,6 +43,24 @@ class _FailingAnswer:
     async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
         del query, documents
         raise RuntimeError("answer model unavailable")
+
+
+class _CitingAnswer:
+    calls = 0
+
+    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+        self.calls += 1
+        del query, documents
+        return AnswerResult(
+            answer="Cited answer.",
+            citations=[
+                AnswerCitation(
+                    index=1,
+                    quoted_text="evidence",
+                ),
+                AnswerCitation(index=2, quoted_text="nope"),
+            ],
+        )
 
 
 @pytest.mark.asyncio
@@ -194,3 +212,38 @@ def test_answer_chunks_are_streamed_before_finalization(
     finalization_position = next(index for index, event in enumerate(events) if event.get("step") == "finalization")
     assert token_positions
     assert max(token_positions) < finalization_position
+
+
+@pytest.mark.asyncio
+async def test_answer_citation_subresult_is_bound_and_replayed(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        actor = _CitingAnswer()
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(), answer_actor=actor
+        )
+        state = {
+            "query": "hello", "conversation_id": "c1", "client_request_id": None,
+            "events": [],
+        }
+        first = await graph.ainvoke(state)
+        second = await graph.ainvoke(state)
+
+    assert actor.calls == 1
+    assert first["citations"] == second["citations"]
+    assert first["citations"][0]["artifact_id"]
+    assert first["citations"][0]["quoted_text"] == "evidence"
+    answer_events = [event for event in first["events"] if event["event_key"].startswith("phase:answer:")]
+    assert [event["type"] for event in answer_events] == [
+        "step_start", "token", "citations", "step_completed"
+    ]

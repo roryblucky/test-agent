@@ -24,6 +24,15 @@ class AnswerOutput(BaseModel):
     """Validated structured answer returned by the PydanticAI actor."""
 
     answer: str = Field(min_length=1)
+    citations: list[AnswerCitation] = Field(default_factory=list)
+
+
+class AnswerCitation(BaseModel):
+    """A model citation bound to one retrieved Artifact."""
+
+    index: int = Field(ge=1)
+    artifact_id: str | None = Field(default=None, min_length=1)
+    quoted_text: str | None = None
 
 
 class AnswerResult(BaseModel):
@@ -31,6 +40,7 @@ class AnswerResult(BaseModel):
 
     answer: str = Field(min_length=1)
     usage: dict[str, Any] = Field(default_factory=dict)
+    citations: list[AnswerCitation] = Field(default_factory=list)
 
 
 class AnswerActor(Protocol):
@@ -64,6 +74,7 @@ class PydanticAIAnswerActor:
         return AnswerResult(
             answer=output.answer,
             usage=usage_payload,
+            citations=output.citations,
         )
 
 
@@ -137,6 +148,22 @@ async def run_answer(
             validated = AnswerResult.model_validate(answer)
             chunks = split_answer_chunks(validated.answer)
             normalized_answer = "".join(chunks)
+            citations: list[AnswerCitation] = []
+            seen_citations: set[tuple[int, str]] = set()
+            for citation in validated.citations:
+                if citation.artifact_id is None:
+                    if citation.index > len(refs):
+                        continue
+                    artifact_id = refs[citation.index - 1]["artifact_id"]
+                else:
+                    artifact_id = citation.artifact_id
+                    if artifact_id not in {ref["artifact_id"] for ref in refs}:
+                        continue
+                key = (citation.index, artifact_id)
+                if key in seen_citations:
+                    continue
+                seen_citations.add(key)
+                citations.append(citation.model_copy(update={"artifact_id": artifact_id}))
             events: list[EventInput] = [
                 EventInput(
                     event_key="phase:answer:step_start:1",
@@ -152,6 +179,16 @@ async def run_answer(
                 )
                 for index, chunk in enumerate(chunks)
             )
+            if citations:
+                events.append(
+                    EventInput(
+                        event_key="phase:answer:citations:1",
+                        type="citations",
+                        data=[
+                            citation.model_dump(mode="json") for citation in citations
+                        ],
+                    )
+                )
             events.append(
                 EventInput(
                     event_key="phase:answer:step_completed:1",
@@ -165,6 +202,7 @@ async def run_answer(
                 normalized_result={
                     "answer": normalized_answer,
                     "usage": validated.usage,
+                    "citations": [citation.model_dump(mode="json") for citation in citations],
                 },
                 events=tuple(events),
                 terminal_status=None,
