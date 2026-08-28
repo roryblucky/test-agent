@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
@@ -15,7 +16,7 @@ from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInp
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence, CitationReference
-from app.services.citation_extractor import build_citations, extract_claims
+from app.services.citation_extractor import build_citations
 
 ANSWER_CHUNK_INTERVAL_MS = 250
 ANSWER_CHUNK_MAX_CODEPOINTS = 240
@@ -98,7 +99,7 @@ async def build_inline_citations(
         AggregatedEvidence(
             evidence_id=ref["artifact_id"],
             source=document.source_url or document.id,
-            tool_call_id="langgraph_v2:answer",
+            tool_call_id=str(document.metadata.get("tool_call_id", "retrieval")),
             content=document.content,
             title=document.section_title,
             url=document.source_url,
@@ -220,7 +221,7 @@ async def run_answer(
             chunks = split_answer_chunks(validated.answer)
             normalized_answer = "".join(chunks)
             citations = await build_inline_citations(normalized_answer, refs, documents)
-            if not extract_claims(normalized_answer):
+            if not re.search(r"\[[^\]]*\]", normalized_answer):
                 citations = bind_answer_citations(validated.citations, refs, documents)
             events: list[EventInput] = [
                 EventInput(
