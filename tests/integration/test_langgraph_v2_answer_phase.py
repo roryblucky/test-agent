@@ -33,7 +33,6 @@ class _AnswerActor:
         documents: list[Document],
         history: Sequence[ConversationTurn],
     ) -> AnswerResult:
-        del history
         self.calls += 1
         assert query == "hello"
         assert [document.id for document in documents] == ["d1"]
@@ -135,15 +134,10 @@ class _MalformedCitationAnswer:
 async def test_answer_receives_ranked_documents_and_replays_without_model_call(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
         actor = _AnswerActor()
         context = PhaseExecutionContext(
@@ -160,12 +154,7 @@ async def test_answer_receives_ranked_documents_and_replays_without_model_call(
             ranker=_Ranker(),
             answer_actor=actor,
         )
-        state = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "client_request_id": None,
-            "events": [],
-        }
+        state = {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
 
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
@@ -179,18 +168,10 @@ async def test_answer_receives_ranked_documents_and_replays_without_model_call(
         if event["event_key"].startswith("phase:answer:")
     ]
     assert [event["type"] for event in answer_events] == [
-        "step_start",
-        "token",
-        "token",
-        "token",
-        "token",
-        "step_completed",
+        "step_start", "token", "token", "token", "token", "step_completed"
     ]
     assert [event["data"] for event in answer_events[1:-1]] == [
-        "One.",
-        " Two\n",
-        "Three;",
-        " four",
+        "One.", " Two\n", "Three;", " four"
     ]
 
     fixture = json.loads(
@@ -222,57 +203,32 @@ async def test_answer_reuses_atomic_commit_after_crash_window(
                 raise RuntimeError("crash after answer commit")
             return result
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
         actor = _InlineCitationAnswer()
         context = PhaseExecutionContext(
             repository=CrashAfterAnswerCommit(pool),
             artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
+            tenant_id="tenant-a", run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id, execution_epoch=run.execution_epoch,
         )
         graph = build_tracer_graph(
-            phase_context=context,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(), answer_actor=actor
         )
-        state = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "client_request_id": None,
-            "events": [],
-        }
+        state = {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
         with pytest.raises(RuntimeError, match="crash after answer commit"):
             await graph.ainvoke(state)
         recovered = await graph.ainvoke(state)
-        retrieval = await context.repository.get_completed(
-            "tenant-a", run.run_id, "retrieval"
-        )
+        retrieval = await context.repository.get_completed("tenant-a", run.run_id, "retrieval")
 
     assert actor.calls == 1
-    assert (
-        recovered["answer"]
-        == "Supported claim [1]. Malformed [x] [0] []. Unknown claim [99]."
-    )
+    assert recovered["answer"] == "Supported claim [1]. Malformed [x] [0] []. Unknown claim [99]."
     assert [citation.index for citation in recovered["citations"]] == [1]
-    assert (
-        recovered["citations"][0].evidence_id
-        == retrieval.artifact_refs[0]["artifact_id"]
-    )
-    assert len({event["event_key"] for event in recovered["events"]}) == len(
-        recovered["events"]
-    )
+    assert recovered["citations"][0].evidence_id == retrieval.artifact_refs[0]["artifact_id"]
+    assert len({event["event_key"] for event in recovered["events"]}) == len(recovered["events"])
 
 
 def test_answer_model_failure_fails_the_public_run(
@@ -286,9 +242,7 @@ def test_answer_model_failure_fails_the_public_run(
     )
     with TestClient(app) as client:
         response = client.post(
-            "/v2/query/stream",
-            json={"query": "hello"},
-            headers={"X-Application-Id": "tenant-a"},
+            "/v2/query/stream", json={"query": "hello"}, headers={"X-Application-Id": "tenant-a"}
         )
 
     events = parse_sse(response.text)
@@ -302,7 +256,9 @@ def test_answer_model_failure_fails_the_public_run(
             / "v1_answer_wire.json"
         ).read_text()
     )
-    assert {key: events[-1][key] for key in ("type", "data")} == fixture["error_event"]
+    assert {
+        key: events[-1][key] for key in ("type", "data")
+    } == fixture["error_event"]
     assert not any(event["type"] == "done" for event in events)
 
 
@@ -317,21 +273,13 @@ def test_answer_chunks_are_streamed_before_finalization(
     )
     with TestClient(app) as client:
         response = client.post(
-            "/v2/query/stream",
-            json={"query": "hello"},
-            headers={"X-Application-Id": "tenant-a"},
+            "/v2/query/stream", json={"query": "hello"}, headers={"X-Application-Id": "tenant-a"}
         )
 
     assert response.status_code == 200
     events = parse_sse(response.text)
-    token_positions = [
-        index for index, event in enumerate(events) if event["type"] == "token"
-    ]
-    finalization_position = next(
-        index
-        for index, event in enumerate(events)
-        if event.get("step") == "finalization"
-    )
+    token_positions = [index for index, event in enumerate(events) if event["type"] == "token"]
+    finalization_position = next(index for index, event in enumerate(events) if event.get("step") == "finalization")
     assert token_positions
     assert max(token_positions) < finalization_position
 
@@ -340,35 +288,22 @@ def test_answer_chunks_are_streamed_before_finalization(
 async def test_answer_citation_subresult_is_bound_and_replayed(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
         actor = _CitingAnswer()
         context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
+            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
         graph = build_tracer_graph(
-            phase_context=context,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(), answer_actor=actor
         )
         state = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "client_request_id": None,
+            "query": "hello", "conversation_id": "c1", "client_request_id": None,
             "events": [],
         }
         first = await graph.ainvoke(state)
@@ -378,16 +313,9 @@ async def test_answer_citation_subresult_is_bound_and_replayed(
     assert first["citations"] == second["citations"]
     assert first["citations"][0].evidence_id
     assert first["citations"][0].quoted_text == "hello"
-    answer_events = [
-        event
-        for event in first["events"]
-        if event["event_key"].startswith("phase:answer:")
-    ]
+    answer_events = [event for event in first["events"] if event["event_key"].startswith("phase:answer:")]
     assert [event["type"] for event in answer_events] == [
-        "step_start",
-        "token",
-        "citations",
-        "step_completed",
+        "step_start", "token", "citations", "step_completed"
     ]
 
 
@@ -395,35 +323,22 @@ async def test_answer_citation_subresult_is_bound_and_replayed(
 async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_indices(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
         actor = _InlineCitationAnswer()
         context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
+            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
         graph = build_tracer_graph(
-            phase_context=context,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(), answer_actor=actor
         )
         state = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "client_request_id": None,
+            "query": "hello", "conversation_id": "c1", "client_request_id": None,
             "events": [],
         }
         result = await graph.ainvoke(state)
@@ -432,9 +347,7 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     assert [citation.index for citation in result["citations"]] == [1]
     assert result["citations"][0].evidence_id
     answer_events = [
-        event
-        for event in result["events"]
-        if event["event_key"].startswith("phase:answer:")
+        event for event in result["events"] if event["event_key"].startswith("phase:answer:")
     ]
     assert answer_events[0]["type"] == "step_start"
     assert answer_events[-1]["type"] == "step_completed"
@@ -477,15 +390,10 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     legacy_frames = [frame async for frame in legacy_emitter]
     legacy_wire = json.loads(legacy_frames[0].removeprefix("data: ").strip())
     assert legacy_wire["type"] == citation_fixture["event"]["type"]
-    assert legacy_wire["data"] == [
-        citation.model_dump(mode="json") for citation in legacy_citations
-    ]
+    assert legacy_wire["data"] == [citation.model_dump(mode="json") for citation in legacy_citations]
     assert citation_event["data"][0]["index"] == legacy_wire["data"][0]["index"]
     assert citation_event["data"][0]["source"] == legacy_wire["data"][0]["source"]
-    assert (
-        citation_event["data"][0]["evidence_id"]
-        != legacy_wire["data"][0]["evidence_id"]
-    )
+    assert citation_event["data"][0]["evidence_id"] != legacy_wire["data"][0]["evidence_id"]
     assert "highlight_spans" in citation_event["data"][0]
 
 
@@ -508,84 +416,50 @@ async def test_inline_citation_uses_reranked_artifact_position(
             del query
             return RerankingResult(documents=list(reversed(documents)))
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
         actor = _RankedInlineAnswer()
         repository = PhaseResultRepository(pool)
         context = PhaseExecutionContext(
-            repository=repository,
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
+            repository=repository, artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
         graph = build_tracer_graph(
-            phase_context=context,
-            retriever=TwoRetriever(),
-            ranker=ReverseRanker(),
-            answer_actor=actor,
+            phase_context=context, retriever=TwoRetriever(), ranker=ReverseRanker(), answer_actor=actor
         )
         result = await graph.ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "client_request_id": None,
-                "events": [],
-            }
+            {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
         )
         reranking = await repository.get_completed("tenant-a", run.run_id, "reranking")
 
     assert actor.calls == 1
-    assert (
-        result["citations"][0].evidence_id == reranking.artifact_refs[0]["artifact_id"]
-    )
+    assert result["citations"][0].evidence_id == reranking.artifact_refs[0]["artifact_id"]
 
 
 @pytest.mark.asyncio
 async def test_malformed_inline_references_do_not_fallback_to_structured_citations(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
         actor = _MalformedCitationAnswer()
         context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
+            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
         graph = build_tracer_graph(
-            phase_context=context,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(), answer_actor=actor
         )
         result = await graph.ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "client_request_id": None,
-                "events": [],
-            }
+            {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
         )
 
     assert actor.calls == 1
