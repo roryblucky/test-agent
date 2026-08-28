@@ -165,31 +165,54 @@ class RunEventRepository:
     ) -> RunRecord:
         """Refresh a matching, non-expired claim while its Run is running."""
         async with self._pool.connection() as connection:
-            async with connection.cursor(row_factory=dict_row) as cursor:
-                await cursor.execute(
-                    """
-                    UPDATE langgraph_v2.runs
-                    SET heartbeat_at = clock_timestamp(),
-                        expires_at = clock_timestamp() + (%s * interval '1 second')
-                    WHERE tenant_id = %s AND run_id = %s
-                      AND status = 'running'
-                      AND owner_instance_id = %s
-                      AND execution_epoch = %s
-                      AND expires_at > clock_timestamp()
-                    RETURNING tenant_id, run_id, conversation_id, status,
-                              terminal_outcome, created_at, completed_at,
-                              owner_instance_id, execution_epoch, heartbeat_at,
-                              expires_at
-                    """,
-                    (
-                        CLAIM_LEASE_SECONDS,
-                        tenant_id,
-                        run_id,
-                        owner_instance_id,
-                        execution_epoch,
-                    ),
-                )
-                row = await cursor.fetchone()
+            async with connection.transaction():
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT status, owner_instance_id, execution_epoch
+                        FROM langgraph_v2.runs
+                        WHERE tenant_id = %s AND run_id = %s
+                        FOR UPDATE
+                        """,
+                        (tenant_id, run_id),
+                    )
+                    claim = await cursor.fetchone()
+                    if claim is not None:
+                        await cursor.execute(
+                            """
+                            SELECT expires_at > clock_timestamp() AS claim_active
+                            FROM langgraph_v2.runs
+                            WHERE tenant_id = %s AND run_id = %s
+                            """,
+                            (tenant_id, run_id),
+                        )
+                        claim_active = await cursor.fetchone()
+                    else:
+                        claim_active = None
+                if (
+                    claim is None
+                    or claim["status"] != "running"
+                    or claim["owner_instance_id"] != owner_instance_id
+                    or claim["execution_epoch"] != execution_epoch
+                    or claim_active is None
+                    or not claim_active["claim_active"]
+                ):
+                    raise ClaimFenced(str(run_id))
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE langgraph_v2.runs
+                        SET heartbeat_at = clock_timestamp(),
+                            expires_at = clock_timestamp() + (%s * interval '1 second')
+                        WHERE tenant_id = %s AND run_id = %s
+                        RETURNING tenant_id, run_id, conversation_id, status,
+                                  terminal_outcome, created_at, completed_at,
+                                  owner_instance_id, execution_epoch, heartbeat_at,
+                                  expires_at
+                        """,
+                        (CLAIM_LEASE_SECONDS, tenant_id, run_id),
+                    )
+                    row = await cursor.fetchone()
         if row is None:
             raise ClaimFenced(str(run_id))
         return RunRecord.model_validate(row)
@@ -274,8 +297,7 @@ class RunEventRepository:
                     await run_cursor.execute(
                         """
                         SELECT next_event_sequence, status, owner_instance_id,
-                               execution_epoch,
-                               expires_at <= clock_timestamp() AS claim_expired
+                               execution_epoch
                         FROM langgraph_v2.runs
                         WHERE tenant_id = %s AND run_id = %s
                         FOR UPDATE
@@ -285,11 +307,22 @@ class RunEventRepository:
                     run_row = await run_cursor.fetchone()
                 if run_row is None:
                     raise RunNotFound(str(run_id))
+                async with connection.cursor(row_factory=dict_row) as claim_cursor:
+                    await claim_cursor.execute(
+                        """
+                        SELECT expires_at <= clock_timestamp() AS claim_expired
+                        FROM langgraph_v2.runs
+                        WHERE tenant_id = %s AND run_id = %s
+                        """,
+                        (tenant_id, run_id),
+                    )
+                    claim_row = await claim_cursor.fetchone()
                 if (
                     run_row["status"] not in {"running", "completed"}
                     or run_row["owner_instance_id"] != owner_instance_id
                     or run_row["execution_epoch"] != execution_epoch
-                    or run_row["claim_expired"]
+                    or claim_row is None
+                    or claim_row["claim_expired"]
                     or (run_row["status"] == "completed" and not completes_run)
                 ):
                     raise ClaimFenced(str(run_id))

@@ -446,18 +446,19 @@ async def test_claim_expiry_is_rechecked_after_waiting_for_run_lock(
             for operation in ("heartbeat", "append", "complete"):
                 connection.execute(
                     """
+                    UPDATE langgraph_v2.runs
+                    SET expires_at = clock_timestamp() + interval '50 milliseconds'
+                    WHERE tenant_id = %s AND run_id = %s
+                    """,
+                    ("tenant-a", run_id),
+                )
+                connection.commit()
+                connection.execute(
+                    """
                     SELECT run_id
                     FROM langgraph_v2.runs
                     WHERE tenant_id = %s AND run_id = %s
                     FOR UPDATE
-                    """,
-                    ("tenant-a", run_id),
-                )
-                connection.execute(
-                    """
-                    UPDATE langgraph_v2.runs
-                    SET expires_at = clock_timestamp() + interval '50 milliseconds'
-                    WHERE tenant_id = %s AND run_id = %s
                     """,
                     ("tenant-a", run_id),
                 )
