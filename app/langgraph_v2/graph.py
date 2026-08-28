@@ -9,7 +9,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from app.langgraph_v2.answer import AnswerActor, run_answer
+from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
@@ -350,6 +350,12 @@ def build_tracer_graph(
                 update["citations"] = result.citations
             if error is not None:
                 update["answer_error"] = error
+            if (
+                not halted
+                and phase_context.cancellation_check is not None
+                and await phase_context.cancellation_check()
+            ):
+                raise AnswerCancelled("answer publication cancelled at graph boundary")
             return update
 
         builder.add_node("answer", answer_node)

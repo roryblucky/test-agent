@@ -100,6 +100,22 @@ def _resolve_answer_actor(
     return build_answer_actor(manager.get_model_registry(tenant_id))
 
 
+def _resolve_cancellation_check(
+    app: FastAPI,
+    tenant_id: str,
+    run_id: uuid.UUID,
+) -> Any:
+    """Resolve an optional persisted, tenant-scoped cancellation intent check."""
+    checker = getattr(app.state, "langgraph_v2_cancellation_check", None)
+    if checker is None:
+        return None
+
+    async def check() -> bool:
+        return bool(await checker(tenant_id, run_id))
+
+    return check
+
+
 def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
     """Validate a configured tenant before creating a running v2 Run."""
     manager = getattr(app.state, "tenant_manager", None)
@@ -370,7 +386,9 @@ def create_tracer_router(
                     run_id=run_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
-                    cancellation_check=http_request.is_disconnected,
+                    cancellation_check=_resolve_cancellation_check(
+                        http_request.app, x_application_id, run_id
+                    ),
                 )
                 saver: FencedAsyncPostgresSaver | None = None
                 if configured_checkpointer is not None:
@@ -547,7 +565,9 @@ def create_tracer_router(
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
-                        cancellation_check=http_request.is_disconnected,
+                        cancellation_check=_resolve_cancellation_check(
+                            http_request.app, x_application_id, run_id
+                        ),
                     ),
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
