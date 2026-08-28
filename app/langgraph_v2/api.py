@@ -182,11 +182,11 @@ def _resolve_phase_providers(
         configured_retriever = (
             configured_retriever or provider_bundle.retriever or MissingRetriever()
         )
-        configured_ranker = configured_ranker or provider_bundle.ranker or MissingRanker()
+        configured_ranker = (
+            configured_ranker or provider_bundle.ranker or MissingRanker()
+        )
         configured_moderation = (
-            configured_moderation
-            or provider_bundle.moderation
-            or MissingModeration()
+            configured_moderation or provider_bundle.moderation or MissingModeration()
         )
     return configured_retriever, configured_ranker, configured_moderation
 
@@ -259,7 +259,9 @@ async def _persist_result_events(
                 execution_epoch=execution_epoch,
             )
         if event.event_key not in prior_keys:
-            await _pace_answer_chunk(event, answer_chunk_count, answer_chunk_interval_ms)
+            await _pace_answer_chunk(
+                event, answer_chunk_count, answer_chunk_interval_ms
+            )
         if event.event_key not in prior_keys:
             yield event.model_copy(update={"sequence": persisted.sequence}).to_sse()
 
@@ -347,7 +349,9 @@ async def _stream_graph_result(
     if graph_config is None:
         graph_task = asyncio.create_task(selected_graph.ainvoke(state))
     else:
-        graph_task = asyncio.create_task(selected_graph.ainvoke(state, config=graph_config))
+        graph_task = asyncio.create_task(
+            selected_graph.ainvoke(state, config=graph_config)
+        )
     sent_keys = set(initial_sent_keys or ())
     answer_chunk_count = [0]
     while not graph_task.done():

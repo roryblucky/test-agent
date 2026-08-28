@@ -300,17 +300,31 @@ def test_public_v2_sse_matches_final_output_golden(
             / "v1_finalization_wire.json"
         ).read_text()
     )
+    v2_fixture = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "langgraph_v2"
+            / "v2_finalization_wire.json"
+        ).read_text()
+    )
     events = [
         json.loads(frame.removeprefix("data: "))
         for frame in response.text.strip().split("\n\n")
     ]
     stable_done = events[-1]
-    stable_done.pop("sequence", None)
     stable_done["data"]["citations"][0]["evidence_id"] = "__artifact_id__"
     stable_done["data"]["citations"][0]["metadata"]["artifact_id"] = "__artifact_id__"
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["x-run-id"]
     assert response.headers["x-conversation-id"] == "c1"
+    assert "sequence" in v2_fixture["intentional_additive_fields"]
+    assert all("sequence" in event for event in events), events
+    assert set(events[-1]["data"]) == set(v2_fixture["done_data_fields"])
+    for header in v2_fixture["required_response_headers"]:
+        assert header in response.headers
+    stable_done.pop("sequence", None)
     assert stable_done == fixture["event"]
 
 
