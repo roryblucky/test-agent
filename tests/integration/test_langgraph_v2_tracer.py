@@ -769,21 +769,30 @@ async def test_resume_stream_is_fenced_to_claim_captured_before_body_consumption
         assert replacement.execution_epoch == 3
 
 
-def test_main_registers_the_tracer_only_when_the_feature_flag_is_enabled(
+def test_main_registers_the_uat_route_set_only_when_the_feature_flag_is_enabled(
     monkeypatch,
 ) -> None:
     import app.main as main_module
 
     monkeypatch.setenv("LANGGRAPH_V2_TRACER_ENABLED", "1")
     enabled_app = reload(main_module).app
-    assert "/v2/query/stream" in {
-        getattr(route, "path", None) for route in enabled_app.routes
+    assert {
+        getattr(route, "path", None)
+        for route in enabled_app.routes
+        if getattr(route, "path", "").startswith("/v2/")
+    } == {
+        "/v2/query/stream",
+        "/v2/runs/{run_id}/stream",
+        "/v2/runs/{run_id}/resume/stream",
+        "/v2/runs/{run_id}/cancel",
     }
 
     monkeypatch.delenv("LANGGRAPH_V2_TRACER_ENABLED")
     disabled_app = reload(main_module).app
-    assert "/v2/query/stream" not in {
-        getattr(route, "path", None) for route in disabled_app.routes
+    assert not {
+        getattr(route, "path", None)
+        for route in disabled_app.routes
+        if getattr(route, "path", "").startswith("/v2/")
     }
 
 

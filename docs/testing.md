@@ -6,6 +6,29 @@ Run the default suite with:
 uv run pytest tests
 ```
 
+## LangGraph v2 UAT functional gate
+
+Before deploying the default-off v2 routes to UAT, run the functional gate
+against the disposable PostgreSQL database:
+
+```shell
+LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms_test_42' \
+  uv run pytest \
+  tests/integration/test_langgraph_v2_tracer.py \
+  tests/integration/test_langgraph_v2_history_stream.py \
+  tests/integration/test_langgraph_v2_replay.py \
+  tests/integration/test_langgraph_v2_live_follow.py \
+  tests/integration/test_langgraph_v2_cancellation.py \
+  tests/integration/test_langgraph_v2_finalization.py \
+  tests/integration/test_langgraph_v2_provider_adapter_integration.py
+```
+
+This gate covers the assembled route flag, Tenant isolation,
+persist-before-deliver, the Linear phases, history, replay/live following,
+explicit resume, and cancellation with deterministic dependencies. It is a
+functional gate only; admission, `429` capacity behavior, load, and production
+default enablement remain outside the Task 28 UAT scope.
+
 ## Disposable PostgreSQL fixture
 
 The LangGraph v2 migration test requires a running PostgreSQL database supplied

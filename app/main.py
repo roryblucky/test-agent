@@ -158,4 +158,8 @@ app.include_router(admin_router)
 register_tracer_routes(
     app,
     enabled=os.environ.get("LANGGRAPH_V2_TRACER_ENABLED") == "1",
+    resume_enabled=True,
+    replay_enabled=True,
+    cancellation_enabled=True,
+    artifact_lookup_enabled=False,
 )

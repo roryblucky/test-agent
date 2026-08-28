@@ -1139,8 +1139,9 @@ def register_tracer_routes(
     resume_enabled: bool = False,
     replay_enabled: bool = False,
     cancellation_enabled: bool = False,
+    artifact_lookup_enabled: bool = True,
 ) -> None:
-    """Register the test-only tracer routes when explicitly enabled."""
+    """Register the default-off v2 routes when explicitly enabled."""
     if enabled:
         _local_runtime(app)
         router = create_tracer_router(
@@ -1161,6 +1162,8 @@ def register_tracer_routes(
             disabled_control_paths.add("/v2/runs/{run_id}/stream")
         if not cancellation_enabled:
             disabled_control_paths.add("/v2/runs/{run_id}/cancel")
+        if not artifact_lookup_enabled:
+            disabled_control_paths.add("/v2/artifacts/{artifact_id}")
         if disabled_control_paths:
             router.routes = [
                 route
