@@ -80,9 +80,7 @@ async def run_reranking(
             input_keys = [_document_key(document) for document in documents]
             output_keys = [_document_key(document) for document in ranked.documents]
             if Counter(output_keys) != Counter(input_keys):
-                raise ValueError(
-                    "ranker must return every retrieved document exactly once"
-                )
+                raise ValueError("ranker must return every retrieved document exactly once")
             refs_by_key: dict[str, list[ArtifactRef]] = {}
             for document, ref in zip(documents, refs, strict=True):
                 refs_by_key.setdefault(_document_key(document), []).append(ref)

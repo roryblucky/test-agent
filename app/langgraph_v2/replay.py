@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from app.langgraph_v2.live_events import LiveEventWakeups
-from app.langgraph_v2.observability import observe
+from app.langgraph_v2.observability import observe, safe_span_attribute
 from app.langgraph_v2.run_events import (
     EventNotFound,
     EventRecord,
@@ -150,12 +150,18 @@ class PersistedEventFollower:
                             run_id=run_id,
                             execution_epoch=followed_epoch,
                             attributes={"recovery.operation": "interrupt_expired"},
-                        ):
+                        ) as recovery_span:
                             interrupted = await self._repository.interrupt_expired_run(
                                 tenant_id=tenant_id,
                                 run_id=run_id,
                                 observed_execution_epoch=followed_epoch,
                             )
+                            if interrupted is not None:
+                                safe_span_attribute(
+                                    recovery_span,
+                                    "run.status",
+                                    "interrupted",
+                                )
                         if interrupted is None:
                             # PostgreSQL is authoritative for lease expiry.  If the
                             # application clock reached expiry first (or another CAS

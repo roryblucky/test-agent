@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from threading import Lock
 from time import perf_counter
 from typing import Any
 from uuid import UUID
 
+from opentelemetry import context as otel_context
 from opentelemetry import metrics, trace
+from opentelemetry.context import Context
 from opentelemetry.metrics import Meter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.trace import Span, Status, StatusCode, Tracer
 
 _SAFE_ATTRIBUTE_KEYS = frozenset(
@@ -54,6 +59,27 @@ _TELEMETRY = V2Telemetry(
     tracer=trace.get_tracer("app.langgraph_v2"),
     meter=metrics.get_meter("app.langgraph_v2"),
 )
+_METER_PROVIDER_LOCK = Lock()
+_FALLBACK_METRIC_READER: InMemoryMetricReader | None = None
+
+
+def ensure_meter_provider() -> InMemoryMetricReader | None:
+    """Install a local SDK reader only when the process has no meter provider.
+
+    An application-configured provider always wins.  The fallback makes v2
+    metrics real and inspectable without requiring an external collector.
+    """
+    global _FALLBACK_METRIC_READER
+    with _METER_PROVIDER_LOCK:
+        if _FALLBACK_METRIC_READER is not None:
+            return _FALLBACK_METRIC_READER
+        provider = metrics.get_meter_provider()
+        if type(provider).__name__ != "_ProxyMeterProvider":
+            return None
+        reader = InMemoryMetricReader()
+        metrics.set_meter_provider(MeterProvider(metric_readers=[reader]))
+        _FALLBACK_METRIC_READER = reader
+        return reader
 
 
 @contextmanager
@@ -64,6 +90,7 @@ def observe(
     conversation_id: str | None = None,
     execution_epoch: int | None = None,
     attributes: Mapping[str, str | bool | int | float] | None = None,
+    parent_context: Context | None = None,
 ) -> Iterator[Span]:
     """Emit a redacted span and bounded metrics for one fixed operation.
 
@@ -87,6 +114,7 @@ def observe(
     outcome = "ok"
     with _TELEMETRY.tracer.start_as_current_span(
         f"langgraph_v2.{operation}",
+        context=parent_context,
         attributes=span_attributes,
         record_exception=False,
         set_status_on_exception=False,
@@ -105,6 +133,21 @@ def observe(
                 perf_counter() - started_at,
                 metric_attributes,
             )
+
+
+def context_for_span(span: Span) -> Context:
+    """Capture one safe propagation handle without serializing span content."""
+    return trace.set_span_in_context(span)
+
+
+@contextmanager
+def activate_context(context: Context) -> Iterator[None]:
+    """Explicitly propagate a captured trace context into a new async task."""
+    token = otel_context.attach(context)
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
 
 
 def safe_span_attribute(span: Span, key: str, value: Any) -> None:
