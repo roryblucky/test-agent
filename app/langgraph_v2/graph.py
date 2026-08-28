@@ -9,6 +9,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.pre_moderation import (
@@ -24,6 +25,7 @@ from app.langgraph_v2.question_refinement import (
     refinement_events,
     run_question_refinement,
 )
+from app.langgraph_v2.retrieval import MockRetriever, Retriever, run_retrieval
 from app.langgraph_v2.run_events import EventInput, EventRecord
 
 
@@ -38,6 +40,8 @@ class TracerState(TypedDict):
     moderation: NotRequired[dict[str, Any]]
     refined_query: NotRequired[str]
     refinement_error: NotRequired[str]
+    artifact_refs: NotRequired[list[dict[str, Any]]]
+    documents: NotRequired[list[dict[str, Any]]]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -48,6 +52,8 @@ class TracerStateUpdate(TypedDict, total=False):
     moderation: dict[str, Any]
     refined_query: str
     refinement_error: str
+    artifact_refs: list[dict[str, Any]]
+    documents: list[dict[str, Any]]
 
 
 async def _query(
@@ -123,10 +129,12 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
                 "query",
                 "pre_moderation",
                 "question_refinement",
+                "retrieval",
                 "finalization",
             ]
         },
         refined_query=state.get("refined_query"),
+        documents=state.get("documents", []),
     )
     events.extend(
         [
@@ -178,6 +186,8 @@ def build_tracer_graph(
     phase_context: PhaseExecutionContext | None = None,
     moderation_provider: ModerationProvider | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
+    artifact_repository: ArtifactRepository | None = None,
+    retriever: Retriever | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
@@ -188,6 +198,10 @@ def build_tracer_graph(
     builder.add_node("query", query_node)
     selected_moderation_provider = moderation_provider or MockModerationProvider()
     selected_refinement_actor = refinement_actor or MockQuestionRefinementActor()
+    selected_retriever = retriever or MockRetriever()
+    selected_artifact_repository = artifact_repository or (
+        phase_context.artifact_repository if phase_context is not None else None
+    )
 
     async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
         if phase_context is None:
@@ -248,6 +262,27 @@ def build_tracer_graph(
         return update
 
     builder.add_node("question_refinement", question_refinement_node)
+
+    async def retrieval_node(state: TracerState) -> TracerStateUpdate:
+        if phase_context is None or selected_artifact_repository is None:
+            return {"artifact_refs": [], "documents": []}
+        events, refs, documents, halted, error = await run_retrieval(
+            state,
+            context=phase_context,
+            artifacts=selected_artifact_repository,
+            retriever=selected_retriever,
+        )
+        update: TracerStateUpdate = {
+            "events": [*state["events"], *[_event_state(event, event.sequence) for event in events]],
+            "halted": halted,
+            "artifact_refs": refs,
+            "documents": [doc.model_dump(exclude_none=True) for doc in documents],
+        }
+        if error is not None:
+            update["refinement_error"] = error
+        return update
+
+    builder.add_node("retrieval", retrieval_node)
     builder.add_node("finalization", _finalize)
     builder.add_edge(START, "query")
     builder.add_edge("query", "pre_moderation")
@@ -259,8 +294,9 @@ def build_tracer_graph(
     builder.add_conditional_edges(
         "question_refinement",
         lambda state: "end" if state.get("halted", False) else "finalization",
-        {"finalization": "finalization", "end": END},
+        {"finalization": "retrieval", "end": END},
     )
+    builder.add_edge("retrieval", "finalization")
     builder.add_edge("finalization", END)
     return builder.compile(checkpointer=checkpointer)
 

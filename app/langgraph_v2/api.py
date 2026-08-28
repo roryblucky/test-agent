@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 
+from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
     checkpoint_namespace_for,
@@ -189,6 +190,7 @@ def create_tracer_router(
             if graph is None:
                 phase_context = PhaseExecutionContext(
                     repository=PhaseResultRepository(pool),
+                    artifact_repository=ArtifactRepository(pool),
                     tenant_id=x_application_id,
                     run_id=run_id,
                     owner_instance_id=claim.owner_instance_id,
@@ -346,6 +348,7 @@ def create_tracer_router(
                     ),
                     phase_context=PhaseExecutionContext(
                         repository=PhaseResultRepository(pool),
+                        artifact_repository=ArtifactRepository(pool),
                         tenant_id=x_application_id,
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
