@@ -58,7 +58,15 @@ class TracerStreamEvent(BaseModel):
     """One additive-sequence SSE event produced by the v2 tracer."""
 
     event_key: str = Field(min_length=1)
-    type: Literal["step_start", "step_completed", "token", "citations", "error", "done"]
+    type: Literal[
+        "step_start",
+        "step_completed",
+        "token",
+        "citations",
+        "error",
+        "done",
+        "stopped",
+    ]
     sequence: int = Field(ge=1)
     step: str | None = None
     data: Any = None

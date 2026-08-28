@@ -35,6 +35,10 @@ class ClaimFenced(RuntimeError):
     """The supplied owner and execution epoch cannot write this Run."""
 
 
+class CancellationObserved(RuntimeError):
+    """A durable cancellation intent blocks the next publication boundary."""
+
+
 class ResumeConflict(RuntimeError):
     """A Run cannot be resumed in its current state."""
 
@@ -626,6 +630,18 @@ class RunEventRepository:
                     or claim_row["claim_expired"]
                 ):
                     raise ClaimFenced(str(run_id))
+                if completes_run and terminal_status == "completed":
+                    async with connection.cursor() as cancellation_cursor:
+                        await cancellation_cursor.execute(
+                            """
+                            SELECT 1
+                            FROM langgraph_v2.cancellation_intents
+                            WHERE tenant_id = %s AND run_id = %s
+                            """,
+                            (tenant_id, run_id),
+                        )
+                        if await cancellation_cursor.fetchone() is not None:
+                            raise CancellationObserved(str(run_id))
                 async with connection.cursor(row_factory=dict_row) as existing_cursor:
                     await existing_cursor.execute(
                         """

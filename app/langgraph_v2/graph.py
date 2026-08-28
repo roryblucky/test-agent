@@ -32,7 +32,7 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import MockRanker, Ranker, run_reranking
 from app.langgraph_v2.retrieval import MockRetriever, Retriever, run_retrieval
-from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.langgraph_v2.run_events import CancellationObserved, EventInput, EventRecord
 from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
@@ -178,6 +178,16 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     return finalize_in_memory(state)
 
 
+async def _check_cancellation(context: PhaseExecutionContext | None) -> None:
+    """Stop before entering the next persistent graph node."""
+    if (
+        context is not None
+        and context.cancellation_check is not None
+        and await context.cancellation_check()
+    ):
+        raise CancellationObserved("cancellation observed at graph boundary")
+
+
 async def _pre_moderation_without_journal(
     state: TracerState,
     provider: ModerationProvider,
@@ -211,6 +221,7 @@ def build_tracer_graph(
     builder = StateGraph(TracerState)
 
     async def query_node(state: TracerState) -> TracerStateUpdate:
+        await _check_cancellation(phase_context)
         return await _query(state, phase_context=phase_context)
 
     builder.add_node("query", query_node)
@@ -223,6 +234,7 @@ def build_tracer_graph(
     )
 
     async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
+        await _check_cancellation(phase_context)
         if phase_context is None:
             events, decision = await _pre_moderation_without_journal(
                 state, selected_moderation_provider
@@ -250,6 +262,7 @@ def build_tracer_graph(
     builder.add_node("pre_moderation", pre_moderation_node)
 
     async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
+        await _check_cancellation(phase_context)
         if phase_context is None:
             result = await selected_refinement_actor.refine(
                 state["query"], state.get("history", [])
@@ -285,6 +298,7 @@ def build_tracer_graph(
     builder.add_node("question_refinement", question_refinement_node)
 
     async def retrieval_node(state: TracerState) -> TracerStateUpdate:
+        await _check_cancellation(phase_context)
         if phase_context is None or selected_artifact_repository is None:
             return {"artifact_refs": []}
         events, refs, _, halted, error = await run_retrieval(
@@ -308,6 +322,7 @@ def build_tracer_graph(
     builder.add_node("retrieval", retrieval_node)
 
     async def reranking_node(state: TracerState) -> TracerStateUpdate:
+        await _check_cancellation(phase_context)
         if phase_context is None or selected_artifact_repository is None:
             return {"ranked_refs": state.get("artifact_refs", [])}
         events, refs, halted, error = await run_reranking(
@@ -333,6 +348,7 @@ def build_tracer_graph(
     if answer_actor is not None and selected_artifact_repository is not None:
 
         async def answer_node(state: TracerState) -> TracerStateUpdate:
+            await _check_cancellation(phase_context)
             events, result, halted, error = await run_answer(
                 state,
                 context=phase_context,
@@ -365,6 +381,7 @@ def build_tracer_graph(
         if groundedness_actor is not None:
 
             async def groundedness_node(state: TracerState) -> TracerStateUpdate:
+                await _check_cancellation(phase_context)
                 events, result, halted, error = await run_groundedness(
                     state,
                     context=phase_context,
@@ -387,6 +404,7 @@ def build_tracer_graph(
             builder.add_node("groundedness", groundedness_node)
 
         async def post_moderation_node(state: TracerState) -> TracerStateUpdate:
+            await _check_cancellation(phase_context)
             events, decision, safe_answer, halted, error = await run_post_moderation(
                 state,
                 context=phase_context,
@@ -410,6 +428,7 @@ def build_tracer_graph(
         builder.add_node("post_moderation", post_moderation_node)
 
     async def finalization_node(state: TracerState) -> TracerStateUpdate:
+        await _check_cancellation(phase_context)
         if phase_context is None or selected_artifact_repository is None:
             return await _finalize(state)
         events, response = await run_finalization(

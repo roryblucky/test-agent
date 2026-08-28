@@ -18,11 +18,10 @@ from psycopg_pool import AsyncConnectionPool
 from app.langgraph_v2.answer import (
     ANSWER_CHUNK_INTERVAL_MS,
     AnswerActor,
-    AnswerCancelled,
     build_answer_actor,
 )
 from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
-from app.langgraph_v2.cancellation import CancellationRepository
+from app.langgraph_v2.cancellation import CancellationObserver, CancellationRepository
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
     checkpoint_namespace_for,
@@ -58,6 +57,7 @@ from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import (
     CLAIM_HEARTBEAT_INTERVAL_SECONDS,
+    CancellationObserved,
     ClaimFenced,
     EventInput,
     ResumeConflict,
@@ -128,14 +128,15 @@ def _resolve_cancellation_check(
     app: FastAPI,
     tenant_id: str,
     run_id: uuid.UUID,
+    observer: CancellationObserver,
 ) -> Any:
-    """Resolve an optional persisted, tenant-scoped cancellation intent check."""
+    """Combine the authoritative observer with an optional test seam."""
     checker = getattr(app.state, "langgraph_v2_cancellation_check", None)
     if checker is None:
-        return None
+        return observer.is_requested
 
     async def check() -> bool:
-        return bool(await checker(tenant_id, run_id))
+        return bool(await checker(tenant_id, run_id)) or await observer.is_requested()
 
     return check
 
@@ -366,6 +367,7 @@ async def _persist_graph_result(
     state: TracerState | None,
     graph_config: RunnableConfig | None,
     repository: RunEventRepository,
+    cancellation_repository: CancellationRepository,
     message_repository: ConversationMessageRepository,
     *,
     tenant_id: str,
@@ -384,12 +386,9 @@ async def _persist_graph_result(
             selected_graph.ainvoke(state, config=graph_config)
         )
     try:
-        try:
-            while not graph_task.done():
-                await asyncio.sleep(0.01)
-            result = await graph_task
-        except AnswerCancelled:
-            return
+        while not graph_task.done():
+            await asyncio.sleep(0.01)
+        result = await graph_task
         sent_keys = set(initial_sent_keys or ())
         sent_keys.update(
             event["event_key"]
@@ -412,10 +411,17 @@ async def _persist_graph_result(
             answer_chunk_interval_ms=answer_chunk_interval_ms,
         ):
             pass
+    except CancellationObserved:
+        await cancellation_repository.apply_if_requested(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+        )
     finally:
         if not graph_task.done():
             graph_task.cancel()
-        with suppress(asyncio.CancelledError):
+        with suppress(asyncio.CancelledError, CancellationObserved):
             await graph_task
 
 
@@ -424,6 +430,8 @@ async def _execute_graph_run(
     state: TracerState | None,
     graph_config: RunnableConfig | None,
     repository: RunEventRepository,
+    cancellation_repository: CancellationRepository,
+    cancellation_observer: CancellationObserver,
     message_repository: ConversationMessageRepository,
     *,
     tenant_id: str,
@@ -444,12 +452,14 @@ async def _execute_graph_run(
             execution_epoch,
         )
     )
+    await cancellation_observer.start()
     try:
         await _persist_graph_result(
             selected_graph,
             state,
             graph_config,
             repository,
+            cancellation_repository,
             message_repository,
             tenant_id=tenant_id,
             run_id=run_id,
@@ -459,7 +469,7 @@ async def _execute_graph_run(
             answer_chunk_interval_ms=answer_chunk_interval_ms,
             initial_sent_keys=initial_sent_keys,
         )
-    except (AnswerCancelled, ClaimFenced):
+    except (CancellationObserved, ClaimFenced):
         return
     except Exception as exc:
         try:
@@ -474,6 +484,7 @@ async def _execute_graph_run(
         except ClaimFenced:
             return
     finally:
+        await cancellation_observer.close()
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
@@ -650,6 +661,13 @@ def create_tracer_router(
             pool = cast(AsyncConnectionPool[Any], configured_pool)
             wakeups = _live_events(http_request.app)
             repository = RunEventRepository(pool, live_events=wakeups)
+            cancellation_repository = CancellationRepository(pool, wakeups=wakeups)
+            cancellation_observer = CancellationObserver(
+                cancellation_repository,
+                wakeups,
+                tenant_id=x_application_id,
+                run_id=run_id,
+            )
             message_repository = ConversationMessageRepository(pool)
             claim = await repository.create_run(
                 tenant_id=x_application_id,
@@ -719,7 +737,10 @@ def create_tracer_router(
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     cancellation_check=_resolve_cancellation_check(
-                        http_request.app, x_application_id, run_id
+                        http_request.app,
+                        x_application_id,
+                        run_id,
+                        cancellation_observer,
                     ),
                 )
                 saver: FencedAsyncPostgresSaver | None = None
@@ -778,6 +799,8 @@ def create_tracer_router(
                     state,
                     graph_config,
                     repository,
+                    cancellation_repository,
+                    cancellation_observer,
                     message_repository,
                     tenant_id=x_application_id,
                     run_id=run_id,
@@ -836,6 +859,13 @@ def create_tracer_router(
         pool = cast(AsyncConnectionPool[Any], configured_pool)
         wakeups = _live_events(http_request.app)
         repository = RunEventRepository(pool, live_events=wakeups)
+        cancellation_repository = CancellationRepository(pool, wakeups=wakeups)
+        cancellation_observer = CancellationObserver(
+            cancellation_repository,
+            wakeups,
+            tenant_id=x_application_id,
+            run_id=run_id,
+        )
         message_repository = ConversationMessageRepository(pool)
         try:
             claim = await repository.resume_run(
@@ -926,7 +956,10 @@ def create_tracer_router(
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
                         cancellation_check=_resolve_cancellation_check(
-                            http_request.app, x_application_id, run_id
+                            http_request.app,
+                            x_application_id,
+                            run_id,
+                            cancellation_observer,
                         ),
                     ),
                     refinement_actor=configured_refinement_actor,
@@ -956,6 +989,8 @@ def create_tracer_router(
                     None,
                     graph_config,
                     repository,
+                    cancellation_repository,
+                    cancellation_observer,
                     message_repository,
                     tenant_id=x_application_id,
                     run_id=run_id,

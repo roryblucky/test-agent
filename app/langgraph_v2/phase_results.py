@@ -19,6 +19,7 @@ from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.run_events import (
+    CancellationObserved,
     ClaimFenced,
     EventInput,
     EventInvariantConflict,
@@ -193,6 +194,7 @@ class PhaseResultRepository:
         phase_name: PhaseName,
         invoke: PhaseInvoker,
         before_commit: PhasePreCommitCheck | None = None,
+        reject_cancellation: bool = False,
     ) -> PhaseResultRecord:
         """Reuse a completed result, otherwise invoke and atomically commit it."""
         _validate_phase_name(phase_name)
@@ -210,6 +212,7 @@ class PhaseResultRepository:
             owner_instance_id=owner_instance_id,
             execution_epoch=execution_epoch,
             phase=candidate,
+            reject_cancellation=reject_cancellation,
         )
 
     async def commit(
@@ -220,6 +223,7 @@ class PhaseResultRepository:
         owner_instance_id: str,
         execution_epoch: int,
         phase: PhaseResultInput,
+        reject_cancellation: bool = False,
     ) -> PhaseResultRecord:
         """Commit a normalized result and all stable Events under one claim."""
         _validate_phase_name(phase.phase_name)
@@ -250,6 +254,17 @@ class PhaseResultRepository:
                         or run_row["expires_at"] <= await _database_now(cursor)
                     ):
                         raise ClaimFenced(str(run_id))
+                    if reject_cancellation:
+                        await cursor.execute(
+                            """
+                            SELECT 1
+                            FROM langgraph_v2.cancellation_intents
+                            WHERE tenant_id = %s AND run_id = %s
+                            """,
+                            (tenant_id, run_id),
+                        )
+                        if await cursor.fetchone() is not None:
+                            raise CancellationObserved(str(run_id))
 
                     await cursor.execute(
                         """

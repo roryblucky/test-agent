@@ -14,7 +14,7 @@ from pydantic_ai import Agent
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
-from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.langgraph_v2.run_events import CancellationObserved, EventInput, EventRecord
 from app.models.domain import Document
 from app.models.workflow import CitationReference
 
@@ -136,7 +136,7 @@ class AnswerActor(Protocol):
         ...
 
 
-class AnswerCancelled(RuntimeError):
+class AnswerCancelled(CancellationObserved):
     """Raised when cancellation is observed before answer publication."""
 
 
@@ -336,6 +336,7 @@ async def run_answer(
         phase_name="answer",
         invoke=invoke,
         before_commit=check_before_commit,
+        reject_cancellation=True,
     )
     if result.normalized_result.get("failed") is True:
         return list(result.events), None, True, str(result.normalized_result["error"])
