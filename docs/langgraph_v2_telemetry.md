@@ -15,4 +15,6 @@ variables remain supported by the exporter.
 
 Only bounded operation and outcome labels are exported. Queries, credentials,
 artifact bodies, answer bodies, chain-of-thought, Tenant IDs, and raw Run or
-Conversation IDs are never metric labels.
+Conversation IDs are never metric labels. Operation names come from a closed
+code-defined vocabulary; unknown names are rejected before spans or metrics are
+created.
