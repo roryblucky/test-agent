@@ -313,7 +313,7 @@ def test_phase_result_rejects_volatile_or_unstructured_content() -> None:
     with pytest.raises(ValidationError):
         PhaseResultInput(
             phase_name="query",
-            normalized_result={"query": "hello", "attempt": 1},
+            normalized_result={"query": "hello", "timestamp": "volatile"},
             events=(),
         )
     with pytest.raises(ValidationError):
@@ -326,11 +326,18 @@ def test_phase_result_rejects_volatile_or_unstructured_content() -> None:
         PhaseResultInput(
             phase_name="query",
             normalized_result={"query": "hello"},
+            artifact_refs=[{"artifact_id": "a-1", "timestamp_ms": 10}],
+            events=(),
+        )
+    with pytest.raises(ValidationError):
+        PhaseResultInput(
+            phase_name="query",
+            normalized_result={"query": "hello"},
             events=(
                 EventInput(
                     event_key="phase:query:step_completed:1",
                     type="step_completed",
-                    data={"duration_ms": 10},
+                    data={"timestamp": "volatile"},
                 ),
             ),
         )

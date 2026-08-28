@@ -452,6 +452,8 @@ def _validate_phase_name(phase_name: str) -> None:
 
 _VOLATILE_KEYS = frozenset(
     {
+        "timestamp",
+        "timestamp_ms",
         "duration",
         "duration_ms",
         "owner",
