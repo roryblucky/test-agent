@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from hashlib import sha256
 from hmac import new as hmac_new
+from secrets import token_bytes
 from threading import Lock
 from time import perf_counter
 from typing import Any
@@ -16,14 +16,9 @@ from uuid import UUID
 from opentelemetry import context as otel_context
 from opentelemetry import metrics, trace
 from opentelemetry.context import Context
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.metrics import Meter
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import (
-    ConsoleMetricExporter,
-    MetricReader,
-    PeriodicExportingMetricReader,
-)
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.trace import Span, Status, StatusCode, Tracer
 
 _SAFE_ATTRIBUTE_KEYS = frozenset(
@@ -42,7 +37,6 @@ _SAFE_ATTRIBUTE_KEYS = frozenset(
         "persistence.kind",
         "provider.role",
         "recovery.operation",
-        "recovery.run_count",
         "replay.mode",
         "run.id",
         "run.status",
@@ -71,42 +65,11 @@ _TELEMETRY = V2Telemetry(
     meter=metrics.get_meter("app.langgraph_v2"),
 )
 _METER_PROVIDER_LOCK = Lock()
-_FALLBACK_METRIC_READER: MetricReader | None = None
+_FALLBACK_METRIC_READER: InMemoryMetricReader | None = None
+_IDENTIFIER_KEY = token_bytes(32)
 _BOUNDED_OUTCOMES = frozenset(
     {"ok", "error", "completed", "failed", "cancelled", "fenced"}
 )
-_DEVELOPMENT_TELEMETRY_KEY = "langgraph-v2-local-development-key-only"
-
-
-@dataclass(frozen=True)
-class IdentifierRedactor:
-    """Keyed identifier redaction shared by every deployment instance."""
-
-    key: bytes = field(repr=False)
-
-    @classmethod
-    def from_environment(
-        cls,
-        environment: Mapping[str, str] = os.environ,
-    ) -> IdentifierRedactor:
-        """Load the deployment key or the documented local-development key."""
-        configured = environment.get("LANGGRAPH_V2_TELEMETRY_KEY")
-        key = (configured or _DEVELOPMENT_TELEMETRY_KEY).encode("utf-8")
-        if len(key) < 32:
-            raise ValueError("LANGGRAPH_V2_TELEMETRY_KEY must be at least 32 bytes")
-        return cls(key=key)
-
-    def redact(self, value: UUID | str) -> str:
-        """Return a stable opaque token under this deployment key."""
-        digest = hmac_new(
-            self.key,
-            str(value).encode("utf-8"),
-            sha256,
-        ).hexdigest()
-        return f"id:{digest}"
-
-
-_IDENTIFIER_REDACTOR = IdentifierRedactor.from_environment()
 
 
 @dataclass
@@ -117,28 +80,11 @@ class OperationObservation:
     outcome: str = "ok"
 
 
-def build_metric_reader(
-    environment: Mapping[str, str] = os.environ,
-) -> PeriodicExportingMetricReader:
-    """Build the configured externally visible metrics export pipeline."""
-    exporter_name = environment.get("LANGGRAPH_V2_METRICS_EXPORTER", "console")
-    if exporter_name == "console":
-        exporter = ConsoleMetricExporter()
-    elif exporter_name == "otlp":
-        endpoint = environment.get("LANGGRAPH_V2_OTLP_METRICS_ENDPOINT")
-        exporter = (
-            OTLPMetricExporter(endpoint=endpoint) if endpoint else OTLPMetricExporter()
-        )
-    else:
-        raise ValueError("LANGGRAPH_V2_METRICS_EXPORTER must be 'console' or 'otlp'")
-    return PeriodicExportingMetricReader(exporter)
-
-
-def ensure_meter_provider() -> MetricReader | None:
-    """Install an exporting SDK reader only when no host provider exists.
+def ensure_meter_provider() -> InMemoryMetricReader | None:
+    """Install a local SDK reader only when the process has no meter provider.
 
     An application-configured provider always wins.  The fallback makes v2
-    metrics operator-visible through console or configured OTLP export.
+    metrics real and inspectable without requiring an external collector.
     """
     global _FALLBACK_METRIC_READER
     with _METER_PROVIDER_LOCK:
@@ -147,7 +93,7 @@ def ensure_meter_provider() -> MetricReader | None:
         provider = metrics.get_meter_provider()
         if type(provider).__name__ != "_ProxyMeterProvider":
             return None
-        reader = build_metric_reader()
+        reader = InMemoryMetricReader()
         metrics.set_meter_provider(MeterProvider(metric_readers=[reader]))
         _FALLBACK_METRIC_READER = reader
         return reader
@@ -225,8 +171,13 @@ def set_operation_outcome(
 
 
 def redacted_identifier(value: UUID | str) -> str:
-    """Return a deployment-stable token without exporting caller input."""
-    return _IDENTIFIER_REDACTOR.redact(value)
+    """Return a process-stable opaque identifier without exporting caller input."""
+    digest = hmac_new(
+        _IDENTIFIER_KEY,
+        str(value).encode("utf-8"),
+        sha256,
+    ).hexdigest()
+    return f"id:{digest}"
 
 
 def context_for_span(observation: OperationObservation) -> Context:
@@ -242,11 +193,6 @@ def activate_context(context: Context) -> Iterator[None]:
         yield
     finally:
         otel_context.detach(token)
-
-
-def current_trace_context() -> Context:
-    """Capture the current request trace for a deferred SSE iterator."""
-    return otel_context.get_current()
 
 
 def safe_span_attribute(
