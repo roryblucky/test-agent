@@ -26,6 +26,7 @@ from app.langgraph_v2.checkpointing import (
     thread_id_for,
 )
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
 from app.services.events import EventEmitter
@@ -533,21 +534,28 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     delivered = parse_sse(response.text)
     assert response.status_code == 200
-    assert [event["sequence"] for event in delivered] == [1, 2, 3, 4, 5]
-    assert delivered[1]["data"]["query"] == "authoritative"
+    assert [event["sequence"] for event in delivered] == [3, 4, 5]
 
-    async def read_run_and_events() -> tuple[str, int, list]:
+    async def read_run_and_events() -> tuple[str, int, list, Any]:
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
             repository = RunEventRepository(pool)
             recovered = await repository.get_run("tenant-a", run_id)
             events = await repository.list_events("tenant-a", run_id)
-            return recovered.status, recovered.execution_epoch, events
+            phase = await PhaseResultRepository(pool).get_completed(
+                "tenant-a", run_id, "query"
+            )
+            return recovered.status, recovered.execution_epoch, events, phase
 
-    status, epoch, events = asyncio.run(read_run_and_events())
+    status, epoch, events, phase = asyncio.run(read_run_and_events())
     assert (status, epoch) == ("completed", 2)
     assert [event.sequence for event in events] == [1, 2, 3, 4, 5]
+    assert phase is not None
+    assert phase.normalized_result == {
+        "query": "authoritative",
+        "history_snapshot": [],
+    }
 
 
 def test_concurrent_resume_requests_have_one_http_winner(

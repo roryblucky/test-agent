@@ -23,6 +23,7 @@ def upgrade() -> None:
             execution_epoch BIGINT NOT NULL,
             normalized_result JSONB,
             artifact_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+            event_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
             canonical_result TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (tenant_id, run_id, phase_name),

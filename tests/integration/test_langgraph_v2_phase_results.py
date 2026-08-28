@@ -15,7 +15,12 @@ from app.langgraph_v2.phase_results import (
     PhaseResultInput,
     PhaseResultRepository,
 )
-from app.langgraph_v2.run_events import ClaimFenced, EventInput, RunEventRepository
+from app.langgraph_v2.run_events import (
+    ClaimFenced,
+    EventInput,
+    EventInvariantConflict,
+    RunEventRepository,
+)
 
 
 def _phase_input(
@@ -123,7 +128,7 @@ async def test_phase_replay_reuses_result_without_invocation(
 
 
 @pytest.mark.asyncio
-async def test_conflict_and_stale_epoch_cannot_replace_phase_result(
+async def test_conflict_marks_run_failed_without_replacing_phase_result(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -155,6 +160,89 @@ async def test_conflict_and_stale_epoch_cannot_replace_phase_result(
                 phase=_phase_input("answer", {"answer": "different", "citations": []}),
             )
 
+        persisted = await phases.get_completed("tenant-a", run.run_id, "answer")
+        assert persisted is not None
+        assert persisted.normalized_result == {"answer": "first", "citations": []}
+        assert (await runs.get_run("tenant-a", run.run_id)).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_event_conflict_rolls_back_the_phase_and_prior_events(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        runs = RunEventRepository(pool)
+        phases = PhaseResultRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        await runs.append_event(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            event=EventInput(
+                event_key="phase:retrieval:step_completed:2",
+                type="step_completed",
+                step="retrieval",
+                data={"value": "authoritative"},
+            ),
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        phase = PhaseResultInput(
+            phase_name="retrieval",
+            normalized_result={"documents": []},
+            events=(
+                EventInput(
+                    event_key="phase:retrieval:step_completed:1",
+                    type="step_completed",
+                    step="retrieval",
+                    data={"value": "new"},
+                ),
+                EventInput(
+                    event_key="phase:retrieval:step_completed:2",
+                    type="step_completed",
+                    step="retrieval",
+                    data={"value": "conflict"},
+                ),
+            ),
+        )
+
+        with pytest.raises(EventInvariantConflict):
+            await phases.commit(
+                tenant_id="tenant-a",
+                run_id=run.run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+                phase=phase,
+            )
+
+        assert await phases.get_completed("tenant-a", run.run_id, "retrieval") is None
+        events = await runs.list_events("tenant-a", run.run_id)
+        assert [event.event_key for event in events] == [
+            "phase:retrieval:step_completed:2"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_stale_epoch_cannot_commit_a_replacement(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        runs = RunEventRepository(pool)
+        phases = PhaseResultRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
         with psycopg.connect(
             langgraph_v2_migrated_database_url, autocommit=True
         ) as connection:
@@ -173,9 +261,20 @@ async def test_conflict_and_stale_epoch_cannot_replace_phase_result(
                 ),
             )
 
-        persisted = await phases.get_completed("tenant-a", run.run_id, "answer")
-        assert persisted is not None
-        assert persisted.normalized_result == {"answer": "first", "citations": []}
+
+def test_phase_result_rejects_volatile_or_unstructured_content() -> None:
+    with pytest.raises(ValidationError):
+        PhaseResultInput(
+            phase_name="query",
+            normalized_result={"query": "hello", "attempt": 1},
+            events=(),
+        )
+    with pytest.raises(ValidationError):
+        PhaseResultInput(
+            phase_name="query",
+            normalized_result="raw provider response",
+            events=(),
+        )
 
 
 def test_phase_names_are_exactly_the_nine_linear_phases() -> None:

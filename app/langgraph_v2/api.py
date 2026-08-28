@@ -24,6 +24,7 @@ from app.langgraph_v2.checkpointing import (
 )
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
+from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.run_events import (
     CLAIM_HEARTBEAT_INTERVAL_SECONDS,
     ClaimFenced,
@@ -173,7 +174,14 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
                         pool,
                         checkpoint_namespace=checkpoint_ns,
                         pointer_writer=write_checkpoint_pointer,
-                    )
+                    ),
+                    phase_context=PhaseExecutionContext(
+                        repository=PhaseResultRepository(pool),
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                    ),
                 )
                 graph_config = initial_checkpoint_config(
                     thread_id=thread_id_for(
@@ -288,7 +296,14 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
                         checkpoint_namespace=checkpoint_ns,
                         read_namespace=previous_checkpoint_ns,
                         pointer_writer=write_checkpoint_pointer,
-                    )
+                    ),
+                    phase_context=PhaseExecutionContext(
+                        repository=PhaseResultRepository(pool),
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                    ),
                 )
                 graph_config = exact_checkpoint_config(
                     thread_id=thread_id_for(x_application_id, claim.conversation_id),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -66,6 +67,12 @@ class PhaseResultInput(BaseModel):
         """Require structured output or references to durable Artifacts."""
         if self.normalized_result is None and not self.artifact_refs:
             raise ValueError("a PhaseResult needs normalized_result or artifact_refs")
+        if self.normalized_result is not None and not isinstance(
+            self.normalized_result, (dict, list)
+        ):
+            raise ValueError("normalized_result must be a structured object or list")
+        _assert_stable_content(self.normalized_result)
+        _assert_stable_content(self.artifact_refs)
         return self
 
 
@@ -78,8 +85,21 @@ class PhaseResultRecord(BaseModel):
     execution_epoch: int
     normalized_result: Any = None
     artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    event_keys: tuple[str, ...] = ()
+    events: tuple[EventRecord, ...] = ()
     canonical_result: str
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class PhaseExecutionContext:
+    """Claim-scoped dependencies made available to a LangGraph node."""
+
+    repository: PhaseResultRepository
+    tenant_id: str
+    run_id: UUID
+    owner_instance_id: str
+    execution_epoch: int
 
 
 PhaseInvoker = Callable[[], Awaitable[PhaseResultInput]]
@@ -104,8 +124,8 @@ class PhaseResultRepository:
                 await cursor.execute(
                     """
                     SELECT tenant_id, run_id, phase_name, execution_epoch,
-                           normalized_result, artifact_refs, canonical_result,
-                           created_at
+                           normalized_result, artifact_refs, event_keys,
+                           canonical_result, created_at
                     FROM langgraph_v2.phase_results
                     WHERE tenant_id = %s AND run_id = %s AND phase_name = %s
                     """,
@@ -114,7 +134,35 @@ class PhaseResultRepository:
                 row = await cursor.fetchone()
         if row is None:
             return None
-        return PhaseResultRecord.model_validate(row)
+        record = PhaseResultRecord.model_validate(row)
+        return record.model_copy(
+            update={"events": tuple(await self._read_events(tenant_id, run_id, record))}
+        )
+
+    async def _read_events(
+        self,
+        tenant_id: str,
+        run_id: UUID,
+        phase: PhaseResultRecord,
+    ) -> list[EventRecord]:
+        """Load the stable Events belonging to one journal entry."""
+        if not phase.event_keys:
+            return []
+        async with self._pool.connection() as connection:
+            async with connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT tenant_id, run_id, sequence, event_key, type, step,
+                           data, created_at
+                    FROM langgraph_v2.events
+                    WHERE tenant_id = %s AND run_id = %s
+                      AND event_key = ANY(%s)
+                    ORDER BY sequence
+                    """,
+                    (tenant_id, run_id, list(phase.event_keys)),
+                )
+                rows = await cursor.fetchall()
+        return [EventRecord.model_validate(row) for row in rows]
 
     async def get_or_invoke(
         self,
@@ -184,8 +232,8 @@ class PhaseResultRepository:
                     await cursor.execute(
                         """
                         SELECT tenant_id, run_id, phase_name, execution_epoch,
-                               normalized_result, artifact_refs, canonical_result,
-                               created_at
+                               normalized_result, artifact_refs, event_keys,
+                               canonical_result, created_at
                         FROM langgraph_v2.phase_results
                         WHERE tenant_id = %s AND run_id = %s AND phase_name = %s
                         FOR UPDATE
@@ -199,16 +247,45 @@ class PhaseResultRepository:
                                 connection, tenant_id, run_id, phase.phase_name
                             )
                             conflict = PhaseResultConflict(phase.phase_name)
-                    else:
+                        elif set(result_row["event_keys"]) != {
+                            event.event_key for event in phase.events
+                        }:
+                            await _fail_for_conflict(
+                                connection, tenant_id, run_id, phase.phase_name
+                            )
+                            conflict = PhaseResultConflict(phase.phase_name)
+                    for event in phase.events:
+                        if conflict is not None:
+                            break
+                        await cursor.execute(
+                            """
+                            SELECT canonical_envelope
+                            FROM langgraph_v2.events
+                            WHERE tenant_id = %s AND run_id = %s AND event_key = %s
+                            FOR UPDATE
+                            """,
+                            (tenant_id, run_id, event.event_key),
+                        )
+                        existing_event = await cursor.fetchone()
+                        if existing_event is not None and existing_event[
+                            "canonical_envelope"
+                        ] != _canonical_envelope(event):
+                            await _fail_for_conflict(
+                                connection, tenant_id, run_id, event.event_key
+                            )
+                            conflict = EventInvariantConflict(event.event_key)
+                    if conflict is None and result_row is None:
                         await cursor.execute(
                             """
                             INSERT INTO langgraph_v2.phase_results (
                                 tenant_id, run_id, phase_name, execution_epoch,
-                                normalized_result, artifact_refs, canonical_result
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                normalized_result, artifact_refs, event_keys,
+                                canonical_result
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                             RETURNING tenant_id, run_id, phase_name,
                                       execution_epoch, normalized_result,
-                                      artifact_refs, canonical_result, created_at
+                                      artifact_refs, event_keys, canonical_result,
+                                      created_at
                             """,
                             (
                                 tenant_id,
@@ -217,6 +294,7 @@ class PhaseResultRepository:
                                 execution_epoch,
                                 Jsonb(phase.normalized_result),
                                 Jsonb(phase.artifact_refs),
+                                Jsonb([event.event_key for event in phase.events]),
                                 canonical_result,
                             ),
                         )
@@ -224,25 +302,23 @@ class PhaseResultRepository:
 
                     if conflict is None:
                         for event in phase.events:
-                            try:
-                                await _persist_event_in_transaction(
-                                    cursor,
-                                    tenant_id=tenant_id,
-                                    run_id=run_id,
-                                    event=event,
-                                )
-                            except EventInvariantConflict as error:
-                                await _fail_for_conflict(
-                                    connection, tenant_id, run_id, event.event_key
-                                )
-                                conflict = error
-                                break
+                            await _persist_event_in_transaction(
+                                cursor,
+                                tenant_id=tenant_id,
+                                run_id=run_id,
+                                event=event,
+                            )
 
         if conflict is not None:
             raise conflict
         if result_row is None:
             raise RuntimeError("PhaseResult commit returned no row")
-        return PhaseResultRecord.model_validate(result_row)
+        record = PhaseResultRecord.model_validate(result_row)
+        if not record.event_keys:
+            return record
+        return record.model_copy(
+            update={"events": tuple(await self._read_events(tenant_id, run_id, record))}
+        )
 
 
 async def _database_now(cursor: Any) -> datetime:
@@ -352,3 +428,35 @@ def _canonical_result(phase: PhaseResultInput) -> str:
 def _validate_phase_name(phase_name: str) -> None:
     if phase_name not in ALLOWED_PHASE_NAMES:
         raise ValueError(f"unsupported PhaseResult name: {phase_name}")
+
+
+_VOLATILE_KEYS = frozenset(
+    {
+        "duration",
+        "duration_ms",
+        "owner",
+        "owner_instance_id",
+        "attempt",
+        "attempt_number",
+        "created_at",
+        "updated_at",
+        "started_at",
+        "completed_at",
+    }
+)
+
+
+def _assert_stable_content(value: Any) -> None:
+    """Reject volatile execution metadata from durable PhaseResult content."""
+    if isinstance(value, dict):
+        volatile = _VOLATILE_KEYS.intersection(value)
+        if volatile:
+            raise ValueError(
+                "volatile keys are not allowed in PhaseResult content: "
+                + ", ".join(sorted(volatile))
+            )
+        for nested in value.values():
+            _assert_stable_content(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _assert_stable_content(nested)

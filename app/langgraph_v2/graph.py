@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
+from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
+from app.langgraph_v2.run_events import EventInput, EventRecord
 
 
 class TracerState(TypedDict):
@@ -26,25 +28,60 @@ class TracerStateUpdate(TypedDict, total=False):
     events: list[dict[str, Any]]
 
 
-async def _query(state: TracerState) -> TracerStateUpdate:
+async def _query(
+    state: TracerState,
+    *,
+    phase_context: PhaseExecutionContext | None = None,
+) -> TracerStateUpdate:
     query = state["query"]
-    return {
-        "events": [
-            TracerStreamEvent(
-                event_key="phase:query:step_start:1",
-                type="step_start",
-                step="query",
-                sequence=1,
-            ).model_dump(exclude_none=True),
-            TracerStreamEvent(
-                event_key="phase:query:step_completed:1",
-                type="step_completed",
-                step="query",
-                data={"query": query},
-                sequence=2,
-            ).model_dump(exclude_none=True),
-        ]
-    }
+
+    async def invoke() -> PhaseResultInput:
+        return PhaseResultInput(
+            phase_name="query",
+            normalized_result={"query": query, "history_snapshot": []},
+            events=(
+                EventInput(
+                    event_key="phase:query:step_start:1",
+                    type="step_start",
+                    step="query",
+                ),
+                EventInput(
+                    event_key="phase:query:step_completed:1",
+                    type="step_completed",
+                    step="query",
+                    data={"query": query},
+                ),
+            ),
+        )
+
+    if phase_context is None:
+        phase = await invoke()
+        return {
+            "events": [
+                _event_state(event, index)
+                for index, event in enumerate(phase.events, 1)
+            ]
+        }
+    result = await phase_context.repository.get_or_invoke(
+        tenant_id=phase_context.tenant_id,
+        run_id=phase_context.run_id,
+        owner_instance_id=phase_context.owner_instance_id,
+        execution_epoch=phase_context.execution_epoch,
+        phase_name="query",
+        invoke=invoke,
+    )
+    return {"events": [_event_state(event, event.sequence) for event in result.events]}
+
+
+def _event_state(event: EventInput | EventRecord, sequence: int) -> dict[str, Any]:
+    """Convert journal or in-memory event data into graph state."""
+    return TracerStreamEvent(
+        event_key=event.event_key,
+        type=cast(Any, event.type),
+        step=event.step,
+        data=event.data,
+        sequence=sequence,
+    ).model_dump(exclude_none=True)
 
 
 async def _finalize(state: TracerState) -> TracerStateUpdate:
@@ -82,10 +119,15 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
 
 def build_tracer_graph(
     checkpointer: BaseCheckpointSaver | None = None,
+    phase_context: PhaseExecutionContext | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
-    builder.add_node("query", _query)
+
+    async def query_node(state: TracerState) -> TracerStateUpdate:
+        return await _query(state, phase_context=phase_context)
+
+    builder.add_node("query", query_node)
     builder.add_node("finalization", _finalize)
     builder.add_edge(START, "query")
     builder.add_edge("query", "finalization")
