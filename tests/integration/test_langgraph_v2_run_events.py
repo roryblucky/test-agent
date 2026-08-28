@@ -9,6 +9,7 @@ from psycopg_pool import AsyncConnectionPool
 from app.langgraph_v2.run_events import (
     EventInput,
     EventInvariantConflict,
+    EventNotFound,
     RunEventRepository,
     RunNotFound,
 )
@@ -64,8 +65,9 @@ async def test_run_and_event_access_conceals_another_tenants_run(
             conversation_id="conversation-1",
         )
 
-        with pytest.raises(RunNotFound):
+        with pytest.raises(RunNotFound) as missing_run:
             await repository.get_run("tenant-b", run_id)
+        assert missing_run.value.status_code == 404
         with pytest.raises(RunNotFound):
             await repository.list_events("tenant-b", run_id)
         with pytest.raises(RunNotFound):
@@ -78,6 +80,31 @@ async def test_run_and_event_access_conceals_another_tenants_run(
                     step="query",
                 ),
             )
+
+        persisted = await repository.append_event(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            event=EventInput(
+                event_key="lifecycle:started:0",
+                type="step_start",
+                data={"status": "running"},
+            ),
+        )
+        assert (
+            await repository.get_event(
+                "tenant-a",
+                run_id,
+                "lifecycle:started:0",
+            )
+            == persisted
+        )
+        with pytest.raises(EventNotFound) as missing_event:
+            await repository.get_event(
+                "tenant-b",
+                run_id,
+                "lifecycle:started:0",
+            )
+        assert missing_event.value.status_code == 404
         with pytest.raises(RunNotFound):
             await repository.complete_run(
                 tenant_id="tenant-b",
@@ -91,7 +118,7 @@ async def test_run_and_event_access_conceals_another_tenants_run(
 
 
 @pytest.mark.asyncio
-async def test_event_append_is_idempotent_and_conflicts_fail_the_run(
+async def test_lifecycle_event_retry_is_idempotent_and_conflicts_fail_the_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -110,9 +137,8 @@ async def test_event_append_is_idempotent_and_conflicts_fail_the_run(
             tenant_id="tenant-a",
             run_id=run_id,
             event=EventInput(
-                event_key="phase:query:step_completed:1",
-                type="step_completed",
-                step="query",
+                event_key="lifecycle:started:0",
+                type="step_start",
                 data={"b": 2, "a": 1},
             ),
         )
@@ -121,9 +147,8 @@ async def test_event_append_is_idempotent_and_conflicts_fail_the_run(
             tenant_id="tenant-a",
             run_id=run_id,
             event=EventInput(
-                event_key="phase:query:step_completed:1",
-                type="step_completed",
-                step="query",
+                event_key="lifecycle:started:0",
+                type="step_start",
                 data={"a": 1, "b": 2},
             ),
         )
@@ -134,9 +159,8 @@ async def test_event_append_is_idempotent_and_conflicts_fail_the_run(
                 tenant_id="tenant-a",
                 run_id=run_id,
                 event=EventInput(
-                    event_key="phase:query:step_completed:1",
-                    type="step_completed",
-                    step="query",
+                    event_key="lifecycle:started:0",
+                    type="step_start",
                     data={"a": 999, "b": 2},
                 ),
             )

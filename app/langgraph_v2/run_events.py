@@ -13,8 +13,18 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field
 
 
-class RunNotFound(LookupError):
+class RepositoryNotFound(LookupError):
+    """A tenant-scoped repository lookup maps to HTTP not-found semantics."""
+
+    status_code = 404
+
+
+class RunNotFound(RepositoryNotFound):
     """A Run is absent from the requested Tenant boundary."""
+
+
+class EventNotFound(RepositoryNotFound):
+    """An Event is absent from the requested Tenant boundary."""
 
 
 class EventInvariantConflict(RuntimeError):
@@ -119,6 +129,29 @@ class RunEventRepository:
                 )
                 rows = await cursor.fetchall()
         return [EventRecord.model_validate(row) for row in rows]
+
+    async def get_event(
+        self,
+        tenant_id: str,
+        run_id: UUID,
+        event_key: str,
+    ) -> EventRecord:
+        """Return one producer-keyed Event without crossing Tenant boundaries."""
+        async with self._pool.connection() as connection:
+            async with connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT tenant_id, run_id, sequence, event_key, type, step,
+                           data, created_at
+                    FROM langgraph_v2.events
+                    WHERE tenant_id = %s AND run_id = %s AND event_key = %s
+                    """,
+                    (tenant_id, run_id, event_key),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            raise EventNotFound(event_key)
+        return EventRecord.model_validate(row)
 
     async def append_event(
         self,

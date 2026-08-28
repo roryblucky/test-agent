@@ -6,6 +6,7 @@ from importlib import reload
 from pathlib import Path
 from uuid import UUID
 
+import psycopg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -231,3 +232,54 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
     assert [event.type for event in persisted] == [
         event["type"] for event in delivered
     ]
+
+
+def test_persistence_failure_emits_no_unpersisted_event(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
+        connection.execute(
+            """
+            CREATE FUNCTION langgraph_v2.reject_event_insert()
+            RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'forced event persistence failure';
+            END;
+            $$ LANGUAGE plpgsql
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER reject_event_insert
+            BEFORE INSERT ON langgraph_v2.events
+            FOR EACH ROW EXECUTE FUNCTION langgraph_v2.reject_event_insert()
+            """
+        )
+
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    try:
+        with TestClient(app) as client:
+            with pytest.raises(
+                psycopg.errors.RaiseException,
+                match="forced event persistence failure",
+            ):
+                client.post(
+                    "/v2/query/stream",
+                    json={"query": "hello"},
+                    headers={"X-Application-Id": "tenant-a"},
+                )
+
+        with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
+            event_count = connection.execute(
+                "SELECT count(*) FROM langgraph_v2.events"
+            ).fetchone()
+        assert event_count == (0,)
+    finally:
+        with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reject_event_insert "
+                "ON langgraph_v2.events"
+            )
+            connection.execute(
+                "DROP FUNCTION IF EXISTS langgraph_v2.reject_event_insert()"
+            )
