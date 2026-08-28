@@ -1,14 +1,19 @@
+import asyncio
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import (
+    AnswerCancelled,
     AnswerOutput,
     PydanticAIAnswerActor,
     build_answer_actor,
+    run_answer,
     split_answer_chunks,
 )
+from app.langgraph_v2.phase_results import PhaseExecutionContext
 from app.models.domain import Document
 
 
@@ -49,6 +54,27 @@ def test_build_answer_actor_uses_registry_model_and_output_type() -> None:
     built = build_answer_actor(Registry(), instructions="custom")
 
     assert isinstance(built, PydanticAIAnswerActor)
+
+
+@pytest.mark.asyncio
+async def test_answer_checks_cancellation_before_publication() -> None:
+    class Repository:
+        async def get_or_invoke(self, **kwargs: object) -> object:
+            raise AssertionError("cancelled answer must not invoke the repository")
+
+    context = PhaseExecutionContext(
+        repository=Repository(),  # type: ignore[arg-type]
+        tenant_id="tenant-a",
+        run_id=uuid4(),
+        owner_instance_id="instance-a",
+        execution_epoch=1,
+        cancellation_check=lambda: asyncio.sleep(0, result=True),
+    )
+
+    with pytest.raises(AnswerCancelled):
+        await run_answer(
+            {"query": "hello"}, context=context, artifacts=object(), actor=object()  # type: ignore[arg-type]
+        )
 
 
 def test_split_answer_chunks_preserves_text_and_prefers_boundaries() -> None:

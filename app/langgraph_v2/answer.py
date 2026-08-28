@@ -190,6 +190,10 @@ async def run_answer(
                 terminal_status="failed",
             )
 
+    async def check_before_commit() -> None:
+        if context.cancellation_check is not None and await context.cancellation_check():
+            raise AnswerCancelled("answer generation cancelled before publication")
+
     if context.cancellation_check is not None and await context.cancellation_check():
         raise AnswerCancelled("answer generation cancelled before publication")
     result = await context.repository.get_or_invoke(
@@ -199,6 +203,7 @@ async def run_answer(
         execution_epoch=context.execution_epoch,
         phase_name="answer",
         invoke=invoke,
+        before_commit=check_before_commit,
     )
     if result.normalized_result.get("failed") is True:
         return list(result.events), None, True, str(result.normalized_result["error"])

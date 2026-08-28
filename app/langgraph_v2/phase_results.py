@@ -110,6 +110,7 @@ class PhaseExecutionContext:
 
 
 PhaseInvoker = Callable[[], Awaitable[PhaseResultInput]]
+PhasePreCommitCheck = Callable[[], Awaitable[None]]
 
 
 class PhaseResultRepository:
@@ -180,6 +181,7 @@ class PhaseResultRepository:
         execution_epoch: int,
         phase_name: PhaseName,
         invoke: PhaseInvoker,
+        before_commit: PhasePreCommitCheck | None = None,
     ) -> PhaseResultRecord:
         """Reuse a completed result, otherwise invoke and atomically commit it."""
         _validate_phase_name(phase_name)
@@ -189,6 +191,8 @@ class PhaseResultRepository:
         candidate = await invoke()
         if candidate.phase_name != phase_name:
             raise ValueError("invoked PhaseResult name does not match requested phase")
+        if before_commit is not None:
+            await before_commit()
         return await self.commit(
             tenant_id=tenant_id,
             run_id=run_id,

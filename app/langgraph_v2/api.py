@@ -255,11 +255,16 @@ async def _stream_graph_result(
     else:
         graph_task = asyncio.create_task(selected_graph.ainvoke(state, config=graph_config))
     sent_keys = set(initial_sent_keys or ())
+    answer_chunk_count = 0
     while not graph_task.done():
         if forward_live_events:
             for event in await repository.list_events(tenant_id, run_id):
                 if event.event_key not in sent_keys:
                     sent_keys.add(event.event_key)
+                    if event.type == "token" and event.step == "llm:answer":
+                        if answer_chunk_count:
+                            await asyncio.sleep(answer_chunk_interval_ms / 1000)
+                        answer_chunk_count += 1
                     yield TracerStreamEvent(
                         event_key=event.event_key,
                         type=cast(Any, event.type),
@@ -273,6 +278,7 @@ async def _stream_graph_result(
         sent_keys.update(
             event.event_key
             for event in await repository.list_events(tenant_id, run_id)
+            if not (event.type == "token" and event.step == "llm:answer")
         )
     async for frame in _persist_result_events(
         repository,
@@ -364,6 +370,7 @@ def create_tracer_router(
                     run_id=run_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
+                    cancellation_check=http_request.is_disconnected,
                 )
                 saver: FencedAsyncPostgresSaver | None = None
                 if configured_checkpointer is not None:
@@ -540,6 +547,7 @@ def create_tracer_router(
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
+                        cancellation_check=http_request.is_disconnected,
                     ),
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
