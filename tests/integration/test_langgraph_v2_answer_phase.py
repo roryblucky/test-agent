@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -75,13 +77,31 @@ async def test_answer_receives_ranked_documents_and_replays_without_model_call(
     assert actor.calls == 1
     assert first["answer"] == "One. Two\nThree; four"
     assert second["answer"] == first["answer"]
-    answer_events = [event for event in first["events"] if event.get("step") == "llm:answer"]
+    answer_events = [
+        event
+        for event in first["events"]
+        if event["event_key"].startswith("phase:answer:")
+    ]
     assert [event["type"] for event in answer_events] == [
         "step_start", "token", "token", "token", "token", "step_completed"
     ]
     assert [event["data"] for event in answer_events[1:-1]] == [
         "One.", " Two\n", "Three;", " four"
     ]
+
+    fixture = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "langgraph_v2"
+            / "v1_answer_wire.json"
+        ).read_text()
+    )
+    assert [
+        {key: event[key] for key in ("type", "data")}
+        for event in answer_events
+        if event["type"] == "token"
+    ] == fixture["token_events"]
 
 
 @pytest.mark.asyncio
@@ -140,7 +160,17 @@ def test_answer_model_failure_fails_the_public_run(
     events = parse_sse(response.text)
     assert response.status_code == 200
     assert events[-1]["type"] == "error"
-    assert events[-1]["data"] == "answer model unavailable"
+    fixture = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "langgraph_v2"
+            / "v1_answer_wire.json"
+        ).read_text()
+    )
+    assert {
+        key: events[-1][key] for key in ("type", "data")
+    } == fixture["error_event"]
     assert not any(event["type"] == "done" for event in events)
 
 

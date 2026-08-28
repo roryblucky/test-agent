@@ -148,7 +148,6 @@ async def run_answer(
                 EventInput(
                     event_key=f"phase:answer:token:{index}",
                     type="token",
-                    step="llm:answer",
                     data=chunk,
                 )
                 for index, chunk in enumerate(chunks)
@@ -184,7 +183,6 @@ async def run_answer(
                     EventInput(
                         event_key="phase:answer:error:1",
                         type="error",
-                        step="llm:answer",
                         data=message,
                     ),
                 ),

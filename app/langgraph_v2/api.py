@@ -65,7 +65,7 @@ async def _pace_answer_chunk(
     answer_chunk_interval_ms: int,
 ) -> None:
     """Apply the bounded answer-chunk interval to one newly delivered token."""
-    if event.type == "token" and event.step == "llm:answer":
+    if event.type == "token" and event.event_key.startswith("phase:answer:token:"):
         if answer_chunk_count[0]:
             await asyncio.sleep(answer_chunk_interval_ms / 1000)
         answer_chunk_count[0] += 1
@@ -332,7 +332,10 @@ async def _stream_graph_result(
         sent_keys.update(
             event.event_key
             for event in await repository.list_events(tenant_id, run_id)
-            if not (event.type == "token" and event.step == "llm:answer")
+            if not (
+                event.type == "token"
+                and event.event_key.startswith("phase:answer:token:")
+            )
         )
     async for frame in _persist_result_events(
         repository,
@@ -644,7 +647,8 @@ def create_tracer_router(
                             x_application_id, run_id
                         )
                         if not (
-                            event.type == "token" and event.step == "llm:answer"
+                            event.type == "token"
+                            and event.event_key.startswith("phase:answer:token:")
                         )
                     },
                     forward_live_events=False,
