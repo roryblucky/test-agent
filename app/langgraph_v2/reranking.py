@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Protocol
 from uuid import UUID
@@ -66,10 +67,12 @@ async def run_reranking(
             ranked = await ranker.rank(documents)
             input_ids = [document.id for document in documents]
             output_ids = [document.id for document in ranked.documents]
-            if len(output_ids) != len(input_ids) or set(output_ids) != set(input_ids):
+            if Counter(output_ids) != Counter(input_ids):
                 raise ValueError("ranker must return every retrieved document exactly once")
-            ref_by_id = dict(zip(input_ids, refs, strict=True))
-            ordered_refs = [ref_by_id[document_id] for document_id in output_ids]
+            refs_by_id: dict[str, list[ArtifactRef]] = {}
+            for document_id, ref in zip(input_ids, refs, strict=True):
+                refs_by_id.setdefault(document_id, []).append(ref)
+            ordered_refs = [refs_by_id[document_id].pop(0) for document_id in output_ids]
             return PhaseResultInput(
                 phase_name="reranking",
                 normalized_result={"document_ids": output_ids},

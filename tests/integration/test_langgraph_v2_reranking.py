@@ -66,6 +66,43 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
         }
 
 
+@pytest.mark.asyncio
+async def test_ranker_rejects_duplicate_document_multiplicity(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class DuplicateRetriever:
+        async def retrieve(self, query: str) -> RetrievalResult:
+            return RetrievalResult(
+                documents=[
+                    Document(id="a", content=query),
+                    Document(id="a", content=f"{query}-second"),
+                    Document(id="b", content=query),
+                ]
+            )
+
+    class InvalidRanker:
+        async def rank(self, documents: list[Document]) -> RerankingResult:
+            return RerankingResult(
+                documents=[documents[0], documents[2], documents[2]]
+            )
+
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        run = await RunEventRepository(pool).create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool), tenant_id="tenant-a", run_id=run.run_id,
+            owner_instance_id="i1", execution_epoch=run.execution_epoch,
+            artifact_repository=ArtifactRepository(pool),
+        )
+        result = await build_tracer_graph(
+            phase_context=context, retriever=DuplicateRetriever(), ranker=InvalidRanker()
+        ).ainvoke({"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []})
+
+    assert result["halted"] is True
+    assert "every retrieved document exactly once" in result["reranking_error"]
+
+
 def test_failed_ranker_terminates_public_stream(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
