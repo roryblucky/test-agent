@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, FastAPI, Header, Request
@@ -14,9 +16,35 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, tracer_graph
-from app.langgraph_v2.run_events import EventInput, RunEventRepository
+from app.langgraph_v2.run_events import (
+    CLAIM_HEARTBEAT_INTERVAL_SECONDS,
+    ClaimFenced,
+    EventInput,
+    RunEventRepository,
+)
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
+
+
+async def _refresh_claim(
+    repository: RunEventRepository,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    owner_instance_id: str,
+    execution_epoch: int,
+) -> None:
+    """Refresh a request's claim until it is cancelled or fenced."""
+    while True:
+        await asyncio.sleep(CLAIM_HEARTBEAT_INTERVAL_SECONDS)
+        try:
+            await repository.heartbeat(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+            )
+        except ClaimFenced:
+            return
 
 
 class TracerGraph(Protocol):
@@ -59,39 +87,55 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
                 conversation_id=conversation_id,
                 owner_instance_id=_INSTANCE_ID,
             )
-            result = await graph.ainvoke(
-                {
-                    "query": payload.query,
-                    "conversation_id": conversation_id,
-                    "client_request_id": payload.client_request_id,
-                    "events": [],
-                }
-            )
-            for raw_event in result["events"]:
-                event = TracerStreamEvent.model_validate(raw_event)
-                event_input = EventInput(
-                    event_key=event.event_key,
-                    type=event.type,
-                    step=event.step,
-                    data=event.data,
+            heartbeat_task = asyncio.create_task(
+                _refresh_claim(
+                    repository,
+                    x_application_id,
+                    run_id,
+                    _INSTANCE_ID,
+                    1,
                 )
-                if event.type == "done":
-                    persisted = await repository.complete_run(
-                        tenant_id=x_application_id,
-                        run_id=run_id,
-                        event=event_input,
-                        owner_instance_id=_INSTANCE_ID,
+            )
+            try:
+                result = await graph.ainvoke(
+                    {
+                        "query": payload.query,
+                        "conversation_id": conversation_id,
+                        "client_request_id": payload.client_request_id,
+                        "events": [],
+                    }
+                )
+                for raw_event in result["events"]:
+                    event = TracerStreamEvent.model_validate(raw_event)
+                    event_input = EventInput(
+                        event_key=event.event_key,
+                        type=event.type,
+                        step=event.step,
+                        data=event.data,
                     )
-                else:
-                    persisted = await repository.append_event(
-                        tenant_id=x_application_id,
-                        run_id=run_id,
-                        event=event_input,
-                        owner_instance_id=_INSTANCE_ID,
-                    )
-                yield event.model_copy(
-                    update={"sequence": persisted.sequence}
-                ).to_sse()
+                    if event.type == "done":
+                        persisted = await repository.complete_run(
+                            tenant_id=x_application_id,
+                            run_id=run_id,
+                            event=event_input,
+                            owner_instance_id=_INSTANCE_ID,
+                            execution_epoch=1,
+                        )
+                    else:
+                        persisted = await repository.append_event(
+                            tenant_id=x_application_id,
+                            run_id=run_id,
+                            event=event_input,
+                            owner_instance_id=_INSTANCE_ID,
+                            execution_epoch=1,
+                        )
+                    yield event.model_copy(
+                        update={"sequence": persisted.sequence}
+                    ).to_sse()
+            finally:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
         return StreamingResponse(
             event_generator(),

@@ -33,6 +33,7 @@ async def test_run_and_event_are_persisted_and_read_back(
             tenant_id="tenant-a",
             run_id=run_id,
             conversation_id="conversation-1",
+            owner_instance_id="local",
         )
         appended = await repository.append_event(
             tenant_id="tenant-a",
@@ -42,6 +43,8 @@ async def test_run_and_event_are_persisted_and_read_back(
                 type="step_start",
                 step="query",
             ),
+            owner_instance_id="local",
+            execution_epoch=1,
         )
 
         assert created.status == "running"
@@ -65,6 +68,7 @@ async def test_run_and_event_access_conceals_another_tenants_run(
             tenant_id="tenant-a",
             run_id=run_id,
             conversation_id="conversation-1",
+            owner_instance_id="local",
         )
 
         with pytest.raises(RunNotFound):
@@ -80,6 +84,8 @@ async def test_run_and_event_access_conceals_another_tenants_run(
                     type="step_start",
                     step="query",
                 ),
+                owner_instance_id="local",
+                execution_epoch=1,
             )
 
         persisted = await repository.append_event(
@@ -90,6 +96,8 @@ async def test_run_and_event_access_conceals_another_tenants_run(
                 type="step_start",
                 data={"status": "running"},
             ),
+            owner_instance_id="local",
+            execution_epoch=1,
         )
         assert (
             await repository.get_event(
@@ -114,6 +122,8 @@ async def test_run_and_event_access_conceals_another_tenants_run(
                     type="done",
                     data={"status": "completed"},
                 ),
+                owner_instance_id="local",
+                execution_epoch=1,
             )
 
 
@@ -132,6 +142,7 @@ async def test_lifecycle_event_retry_is_idempotent_and_conflicts_fail_the_run(
             tenant_id="tenant-a",
             run_id=run_id,
             conversation_id="conversation-1",
+            owner_instance_id="local",
         )
         first = await repository.append_event(
             tenant_id="tenant-a",
@@ -141,6 +152,8 @@ async def test_lifecycle_event_retry_is_idempotent_and_conflicts_fail_the_run(
                 type="step_start",
                 data={"b": 2, "a": 1},
             ),
+            owner_instance_id="local",
+            execution_epoch=1,
         )
 
         repeated = await repository.append_event(
@@ -151,6 +164,8 @@ async def test_lifecycle_event_retry_is_idempotent_and_conflicts_fail_the_run(
                 type="step_start",
                 data={"a": 1, "b": 2},
             ),
+            owner_instance_id="local",
+            execution_epoch=1,
         )
 
         assert repeated == first
@@ -163,6 +178,8 @@ async def test_lifecycle_event_retry_is_idempotent_and_conflicts_fail_the_run(
                     type="step_start",
                     data={"a": 999, "b": 2},
                 ),
+                owner_instance_id="local",
+                execution_epoch=1,
             )
 
         assert (await repository.get_run("tenant-a", run_id)).status == "failed"
@@ -185,6 +202,7 @@ async def test_terminal_event_retry_is_atomic_and_idempotent(
             tenant_id="tenant-a",
             run_id=run_id,
             conversation_id="conversation-1",
+            owner_instance_id="local",
         )
         terminal = EventInput(
             event_key="lifecycle:completed:0",
@@ -196,11 +214,15 @@ async def test_terminal_event_retry_is_atomic_and_idempotent(
             tenant_id="tenant-a",
             run_id=run_id,
             event=terminal,
+            owner_instance_id="local",
+            execution_epoch=1,
         )
         repeated = await repository.complete_run(
             tenant_id="tenant-a",
             run_id=run_id,
             event=terminal,
+            owner_instance_id="local",
+            execution_epoch=1,
         )
 
         completed = await repository.get_run("tenant-a", run_id)
@@ -217,6 +239,8 @@ async def test_terminal_event_retry_is_atomic_and_idempotent(
                 event=terminal.model_copy(
                     update={"data": {"answer": "different"}}
                 ),
+                owner_instance_id="local",
+                execution_epoch=1,
             )
         assert (await repository.get_run("tenant-a", run_id)).status == "failed"
 
@@ -236,6 +260,7 @@ async def test_concurrent_event_appends_allocate_one_ordered_sequence(
             tenant_id="tenant-a",
             run_id=run_id,
             conversation_id="conversation-1",
+            owner_instance_id="local",
         )
 
         await asyncio.gather(
@@ -249,6 +274,8 @@ async def test_concurrent_event_appends_allocate_one_ordered_sequence(
                         step="query",
                         data={"ordinal": ordinal},
                     ),
+                    owner_instance_id="local",
+                    execution_epoch=1,
                 )
                 for ordinal in range(1, 9)
             )
@@ -277,14 +304,12 @@ async def test_expired_claim_rejects_heartbeat_and_writes(
             run_id=run_id,
             conversation_id="conversation-1",
             owner_instance_id="instance-a",
-            lease_seconds=30,
         )
         refreshed = await repository.heartbeat(
             tenant_id="tenant-a",
             run_id=run_id,
             owner_instance_id="instance-a",
             execution_epoch=created.execution_epoch,
-            lease_seconds=30,
         )
         assert refreshed.expires_at > refreshed.heartbeat_at
 
@@ -307,7 +332,6 @@ async def test_expired_claim_rejects_heartbeat_and_writes(
                 run_id=run_id,
                 owner_instance_id="instance-a",
                 execution_epoch=created.execution_epoch,
-                lease_seconds=30,
             )
         with pytest.raises(ClaimFenced):
             await repository.append_event(
@@ -332,4 +356,66 @@ async def test_expired_claim_rejects_heartbeat_and_writes(
                 ),
                 owner_instance_id="instance-a",
                 execution_epoch=created.execution_epoch,
+            )
+
+
+@pytest.mark.asyncio
+async def test_replaced_claim_epoch_rejects_stale_owner_writes(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url,
+        min_size=1,
+        max_size=2,
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        created = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+
+        with psycopg.connect(
+            langgraph_v2_migrated_database_url,
+            autocommit=True,
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET owner_instance_id = 'instance-b',
+                    execution_epoch = 2,
+                    heartbeat_at = now(),
+                    expires_at = now() + interval '30 seconds'
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                ("tenant-a", run_id),
+            )
+
+        stale_claim = {
+            "tenant_id": "tenant-a",
+            "run_id": run_id,
+            "owner_instance_id": "instance-a",
+            "execution_epoch": created.execution_epoch,
+        }
+        with pytest.raises(ClaimFenced):
+            await repository.heartbeat(**stale_claim)
+        with pytest.raises(ClaimFenced):
+            await repository.append_event(
+                **stale_claim,
+                event=EventInput(
+                    event_key="phase:query:step_start:1",
+                    type="step_start",
+                    step="query",
+                ),
+            )
+        with pytest.raises(ClaimFenced):
+            await repository.complete_run(
+                **stale_claim,
+                event=EventInput(
+                    event_key="lifecycle:completed:0",
+                    type="done",
+                    data={"status": "completed"},
+                ),
             )

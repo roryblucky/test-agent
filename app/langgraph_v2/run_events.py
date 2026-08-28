@@ -33,6 +33,10 @@ class ClaimFenced(RuntimeError):
     """The supplied owner and execution epoch cannot write this Run."""
 
 
+CLAIM_LEASE_SECONDS = 30
+CLAIM_HEARTBEAT_INTERVAL_SECONDS = CLAIM_LEASE_SECONDS // 3
+
+
 class EventInput(BaseModel):
     """One producer-keyed Event to append to a Run."""
 
@@ -83,9 +87,7 @@ class RunEventRepository:
         tenant_id: str,
         run_id: UUID,
         conversation_id: str,
-        owner_instance_id: str = "local",
-        execution_epoch: int = 1,
-        lease_seconds: int = 30,
+        owner_instance_id: str,
     ) -> RunRecord:
         """Create a directly executing Run in the running state."""
         async with self._pool.connection() as connection:
@@ -108,8 +110,8 @@ class RunEventRepository:
                         run_id,
                         conversation_id,
                         owner_instance_id,
-                        execution_epoch,
-                        lease_seconds,
+                        1,
+                        CLAIM_LEASE_SECONDS,
                     ),
                 )
                 row = await cursor.fetchone()
@@ -160,7 +162,6 @@ class RunEventRepository:
         run_id: UUID,
         owner_instance_id: str,
         execution_epoch: int,
-        lease_seconds: int = 30,
     ) -> RunRecord:
         """Refresh a matching, non-expired claim while its Run is running."""
         async with self._pool.connection() as connection:
@@ -181,7 +182,7 @@ class RunEventRepository:
                               expires_at
                     """,
                     (
-                        lease_seconds,
+                        CLAIM_LEASE_SECONDS,
                         tenant_id,
                         run_id,
                         owner_instance_id,
@@ -222,8 +223,8 @@ class RunEventRepository:
         tenant_id: str,
         run_id: UUID,
         event: EventInput,
-        owner_instance_id: str = "local",
-        execution_epoch: int = 1,
+        owner_instance_id: str,
+        execution_epoch: int,
     ) -> EventRecord:
         """Append idempotently or fail the Run on a stable-key conflict."""
         return await self._persist_event(
@@ -241,8 +242,8 @@ class RunEventRepository:
         tenant_id: str,
         run_id: UUID,
         event: EventInput,
-        owner_instance_id: str = "local",
-        execution_epoch: int = 1,
+        owner_instance_id: str,
+        execution_epoch: int,
     ) -> EventRecord:
         """Atomically append the terminal Event and complete its Run."""
         return await self._persist_event(
@@ -260,8 +261,8 @@ class RunEventRepository:
         tenant_id: str,
         run_id: UUID,
         event: EventInput,
-        owner_instance_id: str = "local",
-        execution_epoch: int = 1,
+        owner_instance_id: str,
+        execution_epoch: int,
         completes_run: bool,
     ) -> EventRecord:
         canonical_envelope = _canonical_envelope(event)
@@ -272,7 +273,7 @@ class RunEventRepository:
                 run_cursor = await connection.execute(
                     """
                     SELECT next_event_sequence, status, owner_instance_id,
-                           execution_epoch, expires_at
+                           execution_epoch, expires_at <= now()
                     FROM langgraph_v2.runs
                     WHERE tenant_id = %s AND run_id = %s
                     FOR UPDATE
@@ -286,7 +287,7 @@ class RunEventRepository:
                     run_row[1] not in {"running", "completed"}
                     or run_row[2] != owner_instance_id
                     or run_row[3] != execution_epoch
-                    or run_row[4] <= datetime.now(run_row[4].tzinfo)
+                    or run_row[4]
                     or (run_row[1] == "completed" and not completes_run)
                 ):
                     raise ClaimFenced(str(run_id))
