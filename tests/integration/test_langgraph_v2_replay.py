@@ -107,10 +107,10 @@ def test_replay_route_is_default_off() -> None:
     }
 
 
-def test_replay_returns_only_snapshot_events_after_sequence_and_closes_while_running(
+def test_replay_returns_only_events_after_sequence_when_terminal(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    run_id = asyncio.run(_seed_run(langgraph_v2_migrated_database_url))
+    run_id = asyncio.run(_seed_run(langgraph_v2_migrated_database_url, terminal=True))
     app = _replay_app(langgraph_v2_migrated_database_url, replay_enabled=True)
 
     with TestClient(app) as client:
@@ -128,7 +128,12 @@ def test_replay_returns_only_snapshot_events_after_sequence_and_closes_while_run
             "sequence": 2,
             "step": "query",
             "data": {"ordinal": 2, "payload": ["unchanged"]},
-        }
+        },
+        {
+            "type": "done",
+            "sequence": 3,
+            "data": {"status": "completed"},
+        },
     ]
 
 

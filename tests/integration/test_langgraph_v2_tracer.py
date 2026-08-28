@@ -823,7 +823,7 @@ def test_resume_replays_existing_event_without_duplicate_publication(
     )
     with TestClient(app) as client:
         response = client.post(
-            f"/v2/runs/{run_id}/resume/stream",
+            f"/v2/runs/{run_id}/resume/stream?afterSequence=1",
             headers={"X-Application-Id": "tenant-a"},
         )
     delivered = parse_sse(response.text)
@@ -995,7 +995,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
     app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
     with TestClient(app) as client:
         response = client.post(
-            f"/v2/runs/{run_id}/resume/stream",
+            f"/v2/runs/{run_id}/resume/stream?afterSequence=10",
             headers={"X-Application-Id": "tenant-a"},
         )
 

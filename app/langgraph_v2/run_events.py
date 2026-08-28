@@ -12,6 +12,8 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field
 
+from app.langgraph_v2.live_events import LiveEventWakeups
+
 
 class RepositoryNotFound(LookupError):
     """A tenant-scoped repository lookup is indistinguishable from missing."""
@@ -85,8 +87,14 @@ class EventRecord(BaseModel):
 class RunEventRepository:
     """Persist minimal Runs and ordered Events through psycopg3 directly."""
 
-    def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
+    def __init__(
+        self,
+        pool: AsyncConnectionPool[Any],
+        *,
+        live_events: LiveEventWakeups | None = None,
+    ) -> None:
         self._pool = pool
+        self._live_events = live_events
 
     async def _lock_and_validate_claim(
         self,
@@ -399,7 +407,34 @@ class RunEventRepository:
                     row = await cursor.fetchone()
         if row is None:
             raise ClaimFenced(str(run_id))
+        await self._publish_wakeup(tenant_id, run_id)
         return RunRecord.model_validate(row)
+
+    async def interrupt_expired_run(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        observed_execution_epoch: int,
+    ) -> EventRecord | None:
+        """Fence one expired owner and append its interruption Event atomically.
+
+        A follower supplies the epoch it observed.  A conditional update makes
+        exactly one stale-claim observer the winner; every loser only replays
+        the winner's durable Event.
+        """
+        event: EventRecord | None = None
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                event = await interrupt_expired_run_in_transaction(
+                    connection,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    observed_execution_epoch=observed_execution_epoch,
+                )
+        if event is not None:
+            await self._publish_wakeup(tenant_id, run_id)
+        return event
 
     async def get_event(
         self,
@@ -656,7 +691,85 @@ class RunEventRepository:
                     )
         if conflict:
             raise EventInvariantConflict(event.event_key)
-        return EventRecord.model_validate(row)
+        persisted = EventRecord.model_validate(row)
+        await self._publish_wakeup(tenant_id, run_id)
+        return persisted
+
+    async def _publish_wakeup(self, tenant_id: str, run_id: UUID) -> None:
+        if self._live_events is not None:
+            await self._live_events.publish(tenant_id, run_id)
+
+
+async def interrupt_expired_run_in_transaction(
+    connection: Any,
+    *,
+    tenant_id: str,
+    run_id: UUID,
+    observed_execution_epoch: int,
+) -> EventRecord | None:
+    """CAS one expired `running` claim inside a caller-owned transaction seam."""
+    async with connection.cursor(row_factory=dict_row) as cursor:
+        await cursor.execute(
+            """
+            SELECT next_event_sequence
+            FROM langgraph_v2.runs
+            WHERE tenant_id = %s AND run_id = %s
+              AND status = 'running'
+              AND execution_epoch = %s
+              AND expires_at <= clock_timestamp()
+            FOR UPDATE
+            """,
+            (tenant_id, run_id, observed_execution_epoch),
+        )
+        run = await cursor.fetchone()
+        if run is None:
+            return None
+        event_key = f"lifecycle:interrupted:{observed_execution_epoch}"
+        event = EventInput(
+            event_key=event_key,
+            type="error",
+            step="lifecycle",
+            data={"status": "interrupted", "reason": "claim_expired"},
+        )
+        canonical_envelope = _canonical_envelope(event)
+        await cursor.execute(
+            """
+            INSERT INTO langgraph_v2.events (
+                tenant_id, run_id, sequence, event_key, type, step, data,
+                canonical_envelope
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING tenant_id, run_id, sequence, event_key, type, step,
+                      data, created_at
+            """,
+            (
+                tenant_id,
+                run_id,
+                run["next_event_sequence"],
+                event.event_key,
+                event.type,
+                event.step,
+                Jsonb(event.data),
+                canonical_envelope,
+            ),
+        )
+        event_row = await cursor.fetchone()
+        await cursor.execute(
+            """
+            UPDATE langgraph_v2.runs
+            SET status = 'interrupted', owner_instance_id = '',
+                execution_epoch = execution_epoch + 1,
+                heartbeat_at = clock_timestamp(), expires_at = clock_timestamp(),
+                next_event_sequence = next_event_sequence + 1
+            WHERE tenant_id = %s AND run_id = %s
+              AND status = 'running'
+              AND execution_epoch = %s
+              AND expires_at <= clock_timestamp()
+            """,
+            (tenant_id, run_id, observed_execution_epoch),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("expired Run CAS lost after row lock")
+    return EventRecord.model_validate(event_row)
 
 
 async def _set_terminal_status_in_transaction(

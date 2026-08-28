@@ -34,6 +34,7 @@ from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
+from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.provider_adapters import (
@@ -47,7 +48,7 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementActor,
     build_question_refinement_actor,
 )
-from app.langgraph_v2.replay import PersistedEventReplay
+from app.langgraph_v2.replay import PersistedEventFollower
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import (
@@ -525,6 +526,39 @@ async def _subscribe_to_run(
         await asyncio.sleep(0.01)
 
 
+def _live_events(app: FastAPI) -> LiveEventWakeups:
+    """Return the app-local wakeup relay used by durable Event followers."""
+    wakeups = getattr(app.state, "langgraph_v2_live_events", None)
+    if wakeups is None:
+        wakeups = LiveEventWakeups()
+        app.state.langgraph_v2_live_events = wakeups
+    return cast(LiveEventWakeups, wakeups)
+
+
+async def _follow_persisted_events(
+    repository: RunEventRepository,
+    wakeups: LiveEventWakeups,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    after_sequence: int,
+) -> AsyncIterator[str]:
+    """Serialize replay/live Event records from their durable sequence space."""
+    follower = PersistedEventFollower(repository, wakeups)
+    async for event in follower.follow(
+        tenant_id=tenant_id,
+        run_id=run_id,
+        after_sequence=after_sequence,
+    ):
+        yield TracerStreamEvent(
+            event_key=event.event_key,
+            type=cast(Any, event.type),
+            step=event.step,
+            data=event.data,
+            sequence=event.sequence,
+        ).to_sse()
+
+
 def _local_runtime(app: FastAPI) -> LocalRunRuntime:
     """Return the instance-local runtime used to retain detached executions."""
     runtime = getattr(app.state, "langgraph_v2_runtime", None)
@@ -607,7 +641,9 @@ def create_tracer_router(
             if configured_pool is None:
                 raise RuntimeError("LangGraph v2 PostgreSQL is not configured")
             pool = cast(AsyncConnectionPool[Any], configured_pool)
-            repository = RunEventRepository(pool)
+            repository = RunEventRepository(
+                pool, live_events=_live_events(http_request.app)
+            )
             message_repository = ConversationMessageRepository(pool)
             claim = await repository.create_run(
                 tenant_id=x_application_id,
@@ -777,6 +813,7 @@ def create_tracer_router(
         run_id: uuid.UUID,
         http_request: Request,
         x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+        after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
     ) -> StreamingResponse:
         """Resume one stale or interrupted Run from its exact checkpoint."""
         _ensure_tenant_available(http_request.app, x_application_id)
@@ -791,7 +828,8 @@ def create_tracer_router(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
         pool = cast(AsyncConnectionPool[Any], configured_pool)
-        repository = RunEventRepository(pool)
+        wakeups = _live_events(http_request.app)
+        repository = RunEventRepository(pool, live_events=wakeups)
         message_repository = ConversationMessageRepository(pool)
         try:
             claim = await repository.resume_run(
@@ -833,11 +871,6 @@ def create_tracer_router(
                 message=str(exc) or "Groundedness actor construction failed.",
             )
 
-            async def completed_setup_failure() -> None:
-                return
-
-            execution_task = asyncio.create_task(completed_setup_failure())
-            initial_sent_keys: set[str] = set()
         else:
             (
                 configured_retriever,
@@ -910,7 +943,7 @@ def create_tracer_router(
                     and event.event_key.startswith("phase:answer:token:")
                 )
             }
-            execution_task = await _start_execution_or_interrupt(
+            await _start_execution_or_interrupt(
                 runtime,
                 _execute_graph_run(
                     selected_graph,
@@ -932,21 +965,13 @@ def create_tracer_router(
                 owner_instance_id=claim.owner_instance_id,
                 execution_epoch=claim.execution_epoch,
             )
-            if execution_task is None:
-                async def completed_interruption() -> None:
-                    return
-
-                execution_task = asyncio.create_task(completed_interruption())
-
         async def event_generator() -> AsyncIterator[str]:
-            async for frame in _subscribe_to_run(
+            async for frame in _follow_persisted_events(
                 repository,
-                execution_task,
+                wakeups,
                 tenant_id=x_application_id,
                 run_id=run_id,
-                answer_chunk_interval_ms=answer_chunk_interval_ms,
-                initial_sent_keys=initial_sent_keys,
-                suppress_replayed_phase_events=True,
+                after_sequence=after_sequence,
             ):
                 yield frame
 
@@ -963,7 +988,7 @@ def create_tracer_router(
         x_application_id: Annotated[str, Header(alias="X-Application-Id")],
         after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
     ) -> StreamingResponse:
-        """Replay the current durable Event snapshot and then close."""
+        """Replay and then follow one Run from the requested sequence cursor."""
         configured_pool = getattr(
             http_request.app.state, "langgraph_v2_postgres_pool", None
         )
@@ -971,25 +996,22 @@ def create_tracer_router(
             raise HTTPException(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
-        replay = PersistedEventReplay(RunEventRepository(configured_pool))
+        wakeups = _live_events(http_request.app)
+        repository = RunEventRepository(configured_pool, live_events=wakeups)
         try:
-            events = await replay.snapshot(
-                tenant_id=x_application_id,
-                run_id=run_id,
-                after_sequence=after_sequence,
-            )
+            await repository.get_run(x_application_id, run_id)
         except RunNotFound as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
 
         async def event_generator() -> AsyncIterator[str]:
-            for event in events:
-                yield TracerStreamEvent(
-                    event_key=event.event_key,
-                    type=cast(Any, event.type),
-                    step=event.step,
-                    data=event.data,
-                    sequence=event.sequence,
-                ).to_sse()
+            async for frame in _follow_persisted_events(
+                repository,
+                wakeups,
+                tenant_id=x_application_id,
+                run_id=run_id,
+                after_sequence=after_sequence,
+            ):
+                yield frame
 
         return StreamingResponse(
             event_generator(),

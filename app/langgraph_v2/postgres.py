@@ -13,6 +13,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
+from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.run_events import RunEventRepository
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
@@ -73,8 +74,15 @@ async def postgres_lifespan(
     resolved_config = config or V2PostgresConfig.from_environment()
     app.state.langgraph_v2_postgres_pool = None
     app.state.langgraph_v2_checkpointer = None
+    app.state.langgraph_v2_live_events = LiveEventWakeups(
+        redis_url=os.environ.get("LANGGRAPH_V2_REDIS_URL")
+    )
+    await app.state.langgraph_v2_live_events.start()
     if resolved_config is None:
-        yield
+        try:
+            yield
+        finally:
+            await app.state.langgraph_v2_live_events.close()
         return
 
     pool = pool_factory(
@@ -99,3 +107,4 @@ async def postgres_lifespan(
         await pool.close()
         app.state.langgraph_v2_postgres_pool = None
         app.state.langgraph_v2_checkpointer = None
+        await app.state.langgraph_v2_live_events.close()
