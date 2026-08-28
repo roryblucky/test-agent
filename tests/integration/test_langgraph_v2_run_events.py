@@ -65,9 +65,8 @@ async def test_run_and_event_access_conceals_another_tenants_run(
             conversation_id="conversation-1",
         )
 
-        with pytest.raises(RunNotFound) as missing_run:
+        with pytest.raises(RunNotFound):
             await repository.get_run("tenant-b", run_id)
-        assert missing_run.value.status_code == 404
         with pytest.raises(RunNotFound):
             await repository.list_events("tenant-b", run_id)
         with pytest.raises(RunNotFound):
@@ -98,13 +97,12 @@ async def test_run_and_event_access_conceals_another_tenants_run(
             )
             == persisted
         )
-        with pytest.raises(EventNotFound) as missing_event:
+        with pytest.raises(EventNotFound):
             await repository.get_event(
                 "tenant-b",
                 run_id,
                 "lifecycle:started:0",
             )
-        assert missing_event.value.status_code == 404
         with pytest.raises(RunNotFound):
             await repository.complete_run(
                 tenant_id="tenant-b",

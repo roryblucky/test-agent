@@ -14,9 +14,7 @@ from pydantic import BaseModel, Field
 
 
 class RepositoryNotFound(LookupError):
-    """A tenant-scoped repository lookup maps to HTTP not-found semantics."""
-
-    status_code = 404
+    """A tenant-scoped repository lookup is indistinguishable from missing."""
 
 
 class RunNotFound(RepositoryNotFound):
