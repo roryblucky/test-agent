@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
     checkpoint_namespace_for,
@@ -30,6 +30,7 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementActor,
     build_question_refinement_actor,
 )
+from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import (
     CLAIM_HEARTBEAT_INTERVAL_SECONDS,
     ClaimFenced,
@@ -143,6 +144,7 @@ class TracerGraph(Protocol):
 def create_tracer_router(
     graph: TracerGraph | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
+    retriever: Retriever | None = None,
 ) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
     router = APIRouter(tags=["LangGraph v2 tracer"])
@@ -184,6 +186,9 @@ def create_tracer_router(
                 http_request.app,
                 x_application_id,
                 refinement_actor,
+            )
+            configured_retriever = retriever or getattr(
+                http_request.app.state, "langgraph_v2_retriever", None
             )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
@@ -233,6 +238,7 @@ def create_tracer_router(
                     saver,
                     phase_context=phase_context,
                     refinement_actor=configured_refinement_actor,
+                    retriever=configured_retriever,
                 )
             heartbeat_task = asyncio.create_task(
                 _refresh_claim(
@@ -319,6 +325,9 @@ def create_tracer_router(
                 x_application_id,
                 refinement_actor,
             )
+            configured_retriever = retriever or getattr(
+                http_request.app.state, "langgraph_v2_retriever", None
+            )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None and configured_checkpointer is not None:
@@ -355,6 +364,7 @@ def create_tracer_router(
                         execution_epoch=claim.execution_epoch,
                     ),
                     refinement_actor=configured_refinement_actor,
+                    retriever=configured_retriever,
                 )
                 graph_config = exact_checkpoint_config(
                     thread_id=thread_id_for(x_application_id, claim.conversation_id),
@@ -400,6 +410,28 @@ def create_tracer_router(
             headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
         )
 
+    @router.get("/v2/artifacts/{artifact_id}")
+    async def get_artifact(
+        artifact_id: uuid.UUID,
+        http_request: Request,
+        x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+    ) -> dict[str, Any]:
+        """Read one Artifact through the caller's Tenant boundary."""
+        configured_pool = getattr(
+            http_request.app.state, "langgraph_v2_postgres_pool", None
+        )
+        if configured_pool is None:
+            raise HTTPException(
+                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
+            )
+        try:
+            artifact = await ArtifactRepository(configured_pool).get(
+                tenant_id=x_application_id, artifact_id=artifact_id
+            )
+        except ArtifactNotFound as error:
+            raise HTTPException(status_code=404, detail="Artifact not found") from error
+        return artifact.model_dump(mode="json")
+
     return router
 
 
@@ -409,11 +441,12 @@ def register_tracer_routes(
     enabled: bool,
     graph: TracerGraph | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
+    retriever: Retriever | None = None,
     resume_enabled: bool = False,
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
-        router = create_tracer_router(graph, refinement_actor)
+        router = create_tracer_router(graph, refinement_actor, retriever)
         if not resume_enabled:
             router.routes = [
                 route

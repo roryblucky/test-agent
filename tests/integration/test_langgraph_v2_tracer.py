@@ -29,6 +29,7 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
+from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
 from app.services.events import EventEmitter
 
@@ -49,6 +50,7 @@ def persistent_tracer_app(
     graph: TracerGraph | None = None,
     resume_enabled: bool = False,
     refinement_actor: QuestionRefinementActor | None = None,
+    retriever: Retriever | None = None,
 ) -> FastAPI:
     """Create the test-only tracer with its real application database pool."""
 
@@ -66,6 +68,7 @@ def persistent_tracer_app(
         enabled=True,
         graph=graph,
         refinement_actor=refinement_actor,
+        retriever=retriever,
         resume_enabled=resume_enabled,
     )
     return app
@@ -183,7 +186,11 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
         {
             "type": "step_completed",
             "step": "retriever",
-            "data": {"document_count": 1, "artifact_ids": actual_events[7]["data"]["artifact_ids"]},
+            "data": {
+                "document_count": 1,
+                "documents": [{"id": "mock-doc-1", "score": 1.0}],
+                "artifact_ids": actual_events[7]["data"]["artifact_ids"],
+            },
         },
         {
             "type": "step_start",
@@ -199,14 +206,7 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
             "data": {
                 **fixture["events"][-1]["data"],
                 "refined_query": "What is LangGraph?",
-                "documents": [
-                    {
-                        "id": "mock-doc-1",
-                        "content": "Evidence for What is LangGraph?",
-                        "score": 1.0,
-                        "metadata": {},
-                    }
-                ],
+                "documents": [],
                 "metadata": {
                         "steps_executed": [
                             "query",

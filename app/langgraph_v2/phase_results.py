@@ -14,7 +14,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
-from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.run_events import (
     ClaimFenced,
     EventInput,
@@ -105,7 +105,7 @@ class PhaseExecutionContext:
     run_id: UUID
     owner_instance_id: str
     execution_epoch: int
-    artifact_repository: ArtifactRepository | None = None
+    artifact_repository: ArtifactStore | None = None
 
 
 PhaseInvoker = Callable[[], Awaitable[PhaseResultInput]]

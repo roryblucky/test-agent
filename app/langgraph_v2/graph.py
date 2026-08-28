@@ -9,7 +9,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.pre_moderation import (
@@ -40,8 +40,8 @@ class TracerState(TypedDict):
     moderation: NotRequired[dict[str, Any]]
     refined_query: NotRequired[str]
     refinement_error: NotRequired[str]
+    retrieval_error: NotRequired[str]
     artifact_refs: NotRequired[list[dict[str, Any]]]
-    documents: NotRequired[list[dict[str, Any]]]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -52,8 +52,8 @@ class TracerStateUpdate(TypedDict, total=False):
     moderation: dict[str, Any]
     refined_query: str
     refinement_error: str
+    retrieval_error: str
     artifact_refs: list[dict[str, Any]]
-    documents: list[dict[str, Any]]
 
 
 async def _query(
@@ -134,7 +134,7 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
             ]
         },
         refined_query=state.get("refined_query"),
-        documents=state.get("documents", []),
+        documents=[],
     )
     events.extend(
         [
@@ -186,7 +186,7 @@ def build_tracer_graph(
     phase_context: PhaseExecutionContext | None = None,
     moderation_provider: ModerationProvider | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
-    artifact_repository: ArtifactRepository | None = None,
+    artifact_repository: ArtifactStore | None = None,
     retriever: Retriever | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
@@ -265,8 +265,8 @@ def build_tracer_graph(
 
     async def retrieval_node(state: TracerState) -> TracerStateUpdate:
         if phase_context is None or selected_artifact_repository is None:
-            return {"artifact_refs": [], "documents": []}
-        events, refs, documents, halted, error = await run_retrieval(
+            return {"artifact_refs": []}
+        events, refs, _, halted, error = await run_retrieval(
             state,
             context=phase_context,
             artifacts=selected_artifact_repository,
@@ -276,10 +276,9 @@ def build_tracer_graph(
             "events": [*state["events"], *[_event_state(event, event.sequence) for event in events]],
             "halted": halted,
             "artifact_refs": refs,
-            "documents": [doc.model_dump(exclude_none=True) for doc in documents],
         }
         if error is not None:
-            update["refinement_error"] = error
+            update["retrieval_error"] = error
         return update
 
     builder.add_node("retrieval", retrieval_node)
@@ -293,10 +292,14 @@ def build_tracer_graph(
     )
     builder.add_conditional_edges(
         "question_refinement",
-        lambda state: "end" if state.get("halted", False) else "finalization",
-        {"finalization": "retrieval", "end": END},
+        lambda state: "end" if state.get("halted", False) else "retrieval",
+        {"retrieval": "retrieval", "end": END},
     )
-    builder.add_edge("retrieval", "finalization")
+    builder.add_conditional_edges(
+        "retrieval",
+        lambda state: "end" if state.get("halted", False) else "finalization",
+        {"finalization": "finalization", "end": END},
+    )
     builder.add_edge("finalization", END)
     return builder.compile(checkpointer=checkpointer)
 

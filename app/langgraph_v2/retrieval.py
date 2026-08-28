@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Protocol
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, Field
 
-from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
@@ -42,7 +43,7 @@ async def run_retrieval(
     state: Mapping[str, Any],
     *,
     context: PhaseExecutionContext,
-    artifacts: ArtifactRepository,
+    artifacts: ArtifactStore,
     retriever: Retriever,
 ) -> tuple[list[EventRecord], list[dict[str, Any]], list[Document], bool, str | None]:
     """Journal retrieval output and persist referenced Artifacts."""
@@ -50,17 +51,19 @@ async def run_retrieval(
         try:
             result = await retriever.retrieve(state.get("refined_query", state["query"]))
             refs: list[dict[str, Any]] = []
-            for document in result.documents:
+            for index, document in enumerate(result.documents):
                 artifact = await artifacts.create(
                     tenant_id=context.tenant_id,
                     artifact_type="document",
                     payload=document.model_dump(exclude_none=True),
+                    artifact_id=_artifact_id(context, "document", index),
                 )
                 refs.append({"artifact_id": str(artifact.artifact_id), "artifact_type": "document"})
             raw = await artifacts.create(
                 tenant_id=context.tenant_id,
                 artifact_type="retrieval_raw",
                 payload=result.raw_payload,
+                artifact_id=_artifact_id(context, "retrieval_raw", 0),
             )
             refs.append({"artifact_id": str(raw.artifact_id), "artifact_type": "retrieval_raw"})
             events = (
@@ -69,12 +72,21 @@ async def run_retrieval(
                     event_key="phase:retrieval:step_completed:1",
                     type="step_completed",
                     step="retriever",
-                    data={"document_count": len(result.documents), "artifact_ids": [ref["artifact_id"] for ref in refs]},
+                    data={
+                        "document_count": len(result.documents),
+                        "documents": [
+                            {"id": document.id, "score": document.score}
+                            for document in result.documents
+                        ],
+                        "artifact_ids": [ref["artifact_id"] for ref in refs],
+                    },
                 ),
             )
             return PhaseResultInput(
                 phase_name="retrieval",
-                normalized_result={"documents": [doc.model_dump(exclude_none=True) for doc in result.documents]},
+                normalized_result={
+                    "document_ids": [document.id for document in result.documents]
+                },
                 artifact_refs=refs,
                 events=events,
             )
@@ -94,5 +106,12 @@ async def run_retrieval(
     )
     if result.normalized_result.get("failed") is True:
         return list(result.events), [], [], True, str(result.normalized_result["error"])
-    documents = [Document.model_validate(item) for item in result.normalized_result["documents"]]
-    return list(result.events), list(result.artifact_refs), documents, False, None
+    return list(result.events), list(result.artifact_refs), [], False, None
+
+
+def _artifact_id(context: PhaseExecutionContext, artifact_type: str, index: int) -> UUID:
+    """Derive a stable id so a retry after a checkpoint gap is idempotent."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"langgraph-v2:{context.tenant_id}:{context.run_id}:retrieval:{artifact_type}:{index}",
+    )

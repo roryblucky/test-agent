@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from psycopg.rows import dict_row
@@ -23,6 +23,25 @@ class ArtifactRecord(BaseModel):
     artifact_type: str
     payload: Any
     created_at: datetime
+
+
+class ArtifactStore(Protocol):
+    """Narrow tenant-scoped Artifact persistence seam used by graph nodes."""
+
+    async def create(
+        self,
+        *,
+        tenant_id: str,
+        artifact_type: str,
+        payload: Any,
+        artifact_id: UUID | None = None,
+    ) -> ArtifactRecord:
+        """Create or idempotently reuse one Artifact."""
+        ...
+
+    async def get(self, *, tenant_id: str, artifact_id: UUID) -> ArtifactRecord:
+        """Read one Artifact within a Tenant boundary."""
+        ...
 
 
 class ArtifactRepository:
@@ -47,6 +66,9 @@ class ArtifactRepository:
                     """INSERT INTO langgraph_v2.artifacts
                     (tenant_id, artifact_id, artifact_type, payload)
                     VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (tenant_id, artifact_id) DO UPDATE
+                    SET artifact_type = EXCLUDED.artifact_type,
+                        payload = EXCLUDED.payload
                     RETURNING tenant_id, artifact_id, artifact_type, payload, created_at""",
                     (tenant_id, artifact_id, artifact_type, Jsonb(payload)),
                 )
