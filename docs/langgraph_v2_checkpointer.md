@@ -27,3 +27,7 @@ namespace-latest lookup is authoritative.
 
 Checkpoint rows are internal journal state. They do not create application
 Events and are not emitted in the query SSE stream.
+
+The fenced saver emits only operation-level OpenTelemetry spans for checkpoint
+read, write, and intermediate-write operations. Span attributes contain no
+tenant, conversation, query, or checkpoint identifiers.

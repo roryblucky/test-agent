@@ -280,6 +280,17 @@ async def test_stale_saver_checkpoint_is_orphaned_and_cannot_move_run_pointer(
         current_run = await repository.get_run("tenant-a", run_id)
         assert current_run.checkpoint_ns == new_namespace
         assert current_run.checkpoint_id != orphan_id
+        fresh_saver = await _setup_saver(pool)
+        assert (
+            await fresh_saver.aget(
+                exact_checkpoint_config(
+                    thread_id=thread_id_for("tenant-a", "conversation-1"),
+                    checkpoint_ns=new_namespace,
+                    checkpoint_id=orphan_id,
+                )
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio

@@ -15,8 +15,10 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
 )
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from opentelemetry import trace
 
 CheckpointPointerWriter = Callable[[str, str], Awaitable[None]]
+_TRACER = trace.get_tracer(__name__)
 
 
 def thread_id_for(tenant_id: str, conversation_id: str) -> str:
@@ -86,7 +88,11 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Read the current Run namespace from the official saver."""
-        return await super().aget_tuple(self._scoped_config(config))
+        with _TRACER.start_as_current_span("langgraph_v2.checkpoint.read") as span:
+            span.set_attribute(
+                "checkpoint.exact", bool(config.get("configurable", {}).get("checkpoint_id"))
+            )
+            return await super().aget_tuple(self._scoped_config(config))
 
     async def aput(
         self,
@@ -96,18 +102,20 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Commit through the official saver before fencing the Run pointer."""
-        next_config = await super().aput(
-            self._scoped_config(config),
-            checkpoint,
-            metadata,
-            new_versions,
-        )
-        configurable = next_config.get("configurable", {})
-        await self._pointer_writer(
-            str(configurable["checkpoint_id"]),
-            str(configurable["checkpoint_ns"]),
-        )
-        return next_config
+        with _TRACER.start_as_current_span("langgraph_v2.checkpoint.write") as span:
+            span.set_attribute("checkpoint.exact_parent", bool(config.get("configurable", {}).get("checkpoint_id")))
+            next_config = await super().aput(
+                self._scoped_config(config),
+                checkpoint,
+                metadata,
+                new_versions,
+            )
+            configurable = next_config.get("configurable", {})
+            await self._pointer_writer(
+                str(configurable["checkpoint_id"]),
+                str(configurable["checkpoint_ns"]),
+            )
+            return next_config
 
     async def aput_writes(
         self,
@@ -117,9 +125,10 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         task_path: str = "",
     ) -> None:
         """Persist intermediate writes in the same fenced namespace."""
-        await super().aput_writes(
-            self._scoped_config(config), writes, task_id, task_path
-        )
+        with _TRACER.start_as_current_span("langgraph_v2.checkpoint.write_intermediate"):
+            await super().aput_writes(
+                self._scoped_config(config), writes, task_id, task_path
+            )
 
 
 def _encode_parts(*parts: str) -> str:
