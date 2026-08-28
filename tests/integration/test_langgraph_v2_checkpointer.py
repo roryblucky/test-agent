@@ -149,19 +149,36 @@ async def test_resume_graph_reads_exact_prior_namespace_before_writing_new_epoch
                 checkpoint_ns=old_namespace,
             ),
         )
-        assert old_ids
+        authoritative_checkpoint_id = old_ids[0]
+        await old_graph.ainvoke(
+            _state("latest", "conversation-1"),
+            config=initial_checkpoint_config(
+                thread_id=thread_id_for("tenant-a", "conversation-1"),
+                checkpoint_ns=old_namespace,
+            ),
+        )
+        assert old_ids[-1] != authoritative_checkpoint_id
+        await repository.update_checkpoint_pointer(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+            checkpoint_id=authoritative_checkpoint_id,
+            checkpoint_ns=old_namespace,
+        )
 
         new_namespace = checkpoint_namespace_for("tenant-a", str(run_id), 2)
+        new_ids: list[tuple[str, str]] = []
 
-        async def noop_pointer(_: str, __: str) -> None:
-            return None
+        async def new_pointer(checkpoint_id: str, checkpoint_ns: str) -> None:
+            new_ids.append((checkpoint_id, checkpoint_ns))
 
         resumed_graph = build_tracer_graph(
             FencedAsyncPostgresSaver(
                 pool,
                 checkpoint_namespace=new_namespace,
                 read_namespace=old_namespace,
-                pointer_writer=noop_pointer,
+                pointer_writer=new_pointer,
             )
         )
         resumed = await resumed_graph.ainvoke(
@@ -169,10 +186,12 @@ async def test_resume_graph_reads_exact_prior_namespace_before_writing_new_epoch
             config=exact_checkpoint_config(
                 thread_id=thread_id_for("tenant-a", "conversation-1"),
                 checkpoint_ns="",
-                checkpoint_id=old_ids[-1],
+                checkpoint_id=authoritative_checkpoint_id,
             ),
         )
         assert resumed["query"] == "authoritative"
+        assert new_ids
+        assert {namespace for _, namespace in new_ids} == {new_namespace}
 
 
 @pytest.mark.asyncio
