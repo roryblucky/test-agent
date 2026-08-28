@@ -1,0 +1,354 @@
+"""Epoch-fenced PhaseResult journal for replay-safe LangGraph nodes."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Awaitable, Callable
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
+from pydantic import BaseModel, Field, model_validator
+
+from app.langgraph_v2.run_events import (
+    ClaimFenced,
+    EventInput,
+    EventInvariantConflict,
+    EventRecord,
+    RunNotFound,
+    _canonical_envelope,
+)
+
+PhaseName = Literal[
+    "query",
+    "pre_moderation",
+    "question_refinement",
+    "retrieval",
+    "reranking",
+    "answer",
+    "groundedness",
+    "post_moderation",
+    "finalization",
+]
+
+ALLOWED_PHASE_NAMES: frozenset[PhaseName] = frozenset(
+    {
+        "query",
+        "pre_moderation",
+        "question_refinement",
+        "retrieval",
+        "reranking",
+        "answer",
+        "groundedness",
+        "post_moderation",
+        "finalization",
+    }
+)
+
+
+class PhaseResultConflict(RuntimeError):
+    """A phase key was reused with different normalized content."""
+
+
+class PhaseResultInput(BaseModel):
+    """Normalized phase output plus stable Events committed as one unit."""
+
+    phase_name: PhaseName
+    normalized_result: Any = None
+    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    events: tuple[EventInput, ...] = ()
+
+    @model_validator(mode="after")
+    def require_normalized_content(self) -> PhaseResultInput:
+        """Require structured output or references to durable Artifacts."""
+        if self.normalized_result is None and not self.artifact_refs:
+            raise ValueError("a PhaseResult needs normalized_result or artifact_refs")
+        return self
+
+
+class PhaseResultRecord(BaseModel):
+    """Durable normalized result keyed by Tenant, Run, and phase."""
+
+    tenant_id: str
+    run_id: UUID
+    phase_name: PhaseName
+    execution_epoch: int
+    normalized_result: Any = None
+    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    canonical_result: str
+    created_at: datetime
+
+
+PhaseInvoker = Callable[[], Awaitable[PhaseResultInput]]
+
+
+class PhaseResultRepository:
+    """Persist and reuse one normalized result per Run phase."""
+
+    def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
+        self._pool = pool
+
+    async def get_completed(
+        self,
+        tenant_id: str,
+        run_id: UUID,
+        phase_name: PhaseName,
+    ) -> PhaseResultRecord | None:
+        """Read a completed PhaseResult without crossing Tenant boundaries."""
+        _validate_phase_name(phase_name)
+        async with self._pool.connection() as connection:
+            async with connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT tenant_id, run_id, phase_name, execution_epoch,
+                           normalized_result, artifact_refs, canonical_result,
+                           created_at
+                    FROM langgraph_v2.phase_results
+                    WHERE tenant_id = %s AND run_id = %s AND phase_name = %s
+                    """,
+                    (tenant_id, run_id, phase_name),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        return PhaseResultRecord.model_validate(row)
+
+    async def get_or_invoke(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+        phase_name: PhaseName,
+        invoke: PhaseInvoker,
+    ) -> PhaseResultRecord:
+        """Reuse a completed result, otherwise invoke and atomically commit it."""
+        _validate_phase_name(phase_name)
+        existing = await self.get_completed(tenant_id, run_id, phase_name)
+        if existing is not None:
+            return existing
+        candidate = await invoke()
+        if candidate.phase_name != phase_name:
+            raise ValueError("invoked PhaseResult name does not match requested phase")
+        return await self.commit(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+            phase=candidate,
+        )
+
+    async def commit(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+        phase: PhaseResultInput,
+    ) -> PhaseResultRecord:
+        """Commit a normalized result and all stable Events under one claim."""
+        _validate_phase_name(phase.phase_name)
+        canonical_result = _canonical_result(phase)
+        result_row: dict[str, Any] | None = None
+        conflict: RuntimeError | None = None
+
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT status, owner_instance_id, execution_epoch,
+                               expires_at
+                        FROM langgraph_v2.runs
+                        WHERE tenant_id = %s AND run_id = %s
+                        FOR UPDATE
+                        """,
+                        (tenant_id, run_id),
+                    )
+                    run_row = await cursor.fetchone()
+                    if run_row is None:
+                        raise RunNotFound(str(run_id))
+                    if (
+                        run_row["status"] != "running"
+                        or run_row["owner_instance_id"] != owner_instance_id
+                        or run_row["execution_epoch"] != execution_epoch
+                        or run_row["expires_at"] <= await _database_now(cursor)
+                    ):
+                        raise ClaimFenced(str(run_id))
+
+                    await cursor.execute(
+                        """
+                        SELECT tenant_id, run_id, phase_name, execution_epoch,
+                               normalized_result, artifact_refs, canonical_result,
+                               created_at
+                        FROM langgraph_v2.phase_results
+                        WHERE tenant_id = %s AND run_id = %s AND phase_name = %s
+                        FOR UPDATE
+                        """,
+                        (tenant_id, run_id, phase.phase_name),
+                    )
+                    result_row = await cursor.fetchone()
+                    if result_row is not None:
+                        if result_row["canonical_result"] != canonical_result:
+                            await _fail_for_conflict(
+                                connection, tenant_id, run_id, phase.phase_name
+                            )
+                            conflict = PhaseResultConflict(phase.phase_name)
+                    else:
+                        await cursor.execute(
+                            """
+                            INSERT INTO langgraph_v2.phase_results (
+                                tenant_id, run_id, phase_name, execution_epoch,
+                                normalized_result, artifact_refs, canonical_result
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            RETURNING tenant_id, run_id, phase_name,
+                                      execution_epoch, normalized_result,
+                                      artifact_refs, canonical_result, created_at
+                            """,
+                            (
+                                tenant_id,
+                                run_id,
+                                phase.phase_name,
+                                execution_epoch,
+                                Jsonb(phase.normalized_result),
+                                Jsonb(phase.artifact_refs),
+                                canonical_result,
+                            ),
+                        )
+                        result_row = await cursor.fetchone()
+
+                    if conflict is None:
+                        for event in phase.events:
+                            try:
+                                await _persist_event_in_transaction(
+                                    cursor,
+                                    tenant_id=tenant_id,
+                                    run_id=run_id,
+                                    event=event,
+                                )
+                            except EventInvariantConflict as error:
+                                await _fail_for_conflict(
+                                    connection, tenant_id, run_id, event.event_key
+                                )
+                                conflict = error
+                                break
+
+        if conflict is not None:
+            raise conflict
+        if result_row is None:
+            raise RuntimeError("PhaseResult commit returned no row")
+        return PhaseResultRecord.model_validate(result_row)
+
+
+async def _database_now(cursor: Any) -> datetime:
+    await cursor.execute("SELECT clock_timestamp() AS now")
+    row = await cursor.fetchone()
+    return row["now"]
+
+
+async def _persist_event_in_transaction(
+    cursor: Any,
+    *,
+    tenant_id: str,
+    run_id: UUID,
+    event: EventInput,
+) -> EventRecord:
+    canonical_envelope = _canonical_envelope(event)
+    await cursor.execute(
+        """
+        SELECT tenant_id, run_id, sequence, event_key, type, step, data,
+               canonical_envelope, created_at
+        FROM langgraph_v2.events
+        WHERE tenant_id = %s AND run_id = %s AND event_key = %s
+        """,
+        (tenant_id, run_id, event.event_key),
+    )
+    existing = await cursor.fetchone()
+    if existing is not None:
+        if existing["canonical_envelope"] != canonical_envelope:
+            raise EventInvariantConflict(event.event_key)
+        return EventRecord.model_validate(existing)
+
+    await cursor.execute(
+        """
+        SELECT next_event_sequence
+        FROM langgraph_v2.runs
+        WHERE tenant_id = %s AND run_id = %s
+        FOR UPDATE
+        """,
+        (tenant_id, run_id),
+    )
+    run_row = await cursor.fetchone()
+    sequence = run_row["next_event_sequence"]
+    await cursor.execute(
+        """
+        INSERT INTO langgraph_v2.events (
+            tenant_id, run_id, sequence, event_key, type, step, data,
+            canonical_envelope
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING tenant_id, run_id, sequence, event_key, type, step, data,
+                  canonical_envelope, created_at
+        """,
+        (
+            tenant_id,
+            run_id,
+            sequence,
+            event.event_key,
+            event.type,
+            event.step,
+            Jsonb(event.data),
+            canonical_envelope,
+        ),
+    )
+    inserted = await cursor.fetchone()
+    await cursor.execute(
+        """
+        UPDATE langgraph_v2.runs
+        SET next_event_sequence = next_event_sequence + 1
+        WHERE tenant_id = %s AND run_id = %s
+        """,
+        (tenant_id, run_id),
+    )
+    return EventRecord.model_validate(inserted)
+
+
+async def _fail_for_conflict(
+    connection: Any,
+    tenant_id: str,
+    run_id: UUID,
+    key: str,
+) -> None:
+    await connection.execute(
+        """
+        UPDATE langgraph_v2.runs
+        SET status = 'failed', terminal_outcome = %s, completed_at = NULL
+        WHERE tenant_id = %s AND run_id = %s
+        """,
+        (
+            Jsonb({"error": "phase_result_invariant_conflict", "key": key}),
+            tenant_id,
+            run_id,
+        ),
+    )
+
+
+def _canonical_result(phase: PhaseResultInput) -> str:
+    return json.dumps(
+        {
+            "artifact_refs": phase.artifact_refs,
+            "normalized_result": phase.normalized_result,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _validate_phase_name(phase_name: str) -> None:
+    if phase_name not in ALLOWED_PHASE_NAMES:
+        raise ValueError(f"unsupported PhaseResult name: {phase_name}")
