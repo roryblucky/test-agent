@@ -53,7 +53,9 @@ class PydanticAIGroundednessActor:
         """Evaluate the answer against the supplied evidence text."""
         evidence = "\n\n".join(document.content for document in documents)
         with observe("pydantic_ai.invoke", attributes={"actor.role": "groundedness"}):
-            result = await self._agent.run(f"Answer:\n{answer}\n\nEvidence:\n{evidence}")
+            result = await self._agent.run(
+                f"Answer:\n{answer}\n\nEvidence:\n{evidence}"
+            )
         usage = result.usage()
         usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
         return GroundednessAssessment(
