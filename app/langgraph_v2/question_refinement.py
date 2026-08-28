@@ -10,7 +10,6 @@ from pydantic import Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
-from app.langgraph_v2.observability import observe
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.workflow import ResolvedQuery
@@ -56,17 +55,13 @@ class PydanticAIQuestionRefinementActor:
         self, query: str, history: Sequence[ConversationTurn] = ()
     ) -> ResolvedQuery:
         """Run the agent and return its validated structured output."""
-        with observe(
-            "pydantic_ai.invoke",
-            attributes={"actor.role": "question_refinement"},
-        ):
-            if history:
-                result = await self._agent.run(
-                    query,
-                    message_history=to_model_message_history(history),
-                )
-            else:
-                result = await self._agent.run(query)
+        if history:
+            result = await self._agent.run(
+                query,
+                message_history=to_model_message_history(history),
+            )
+        else:
+            result = await self._agent.run(query)
         usage_method = getattr(result, "usage", None)
         if callable(usage_method):
             usage = usage_method()

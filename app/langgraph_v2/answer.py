@@ -13,7 +13,6 @@ from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
-from app.langgraph_v2.observability import observe
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import CancellationObserved, EventInput, EventRecord
 from app.models.domain import Document
@@ -159,14 +158,13 @@ class PydanticAIAnswerActor:
             for index, document in enumerate(documents, 1)
         )
         prompt = f"Question: {query}\n\nEvidence:\n{evidence}"
-        with observe("pydantic_ai.invoke", attributes={"actor.role": "answer"}):
-            if history:
-                result = await self._agent.run(
-                    prompt,
-                    message_history=to_model_message_history(history),
-                )
-            else:
-                result = await self._agent.run(prompt)
+        if history:
+            result = await self._agent.run(
+                prompt,
+                message_history=to_model_message_history(history),
+            )
+        else:
+            result = await self._agent.run(prompt)
         usage = result.usage()
         usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
         output = AnswerOutput.model_validate(result.output)

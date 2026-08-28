@@ -15,10 +15,10 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
 )
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-from app.langgraph_v2.observability import observe
+from opentelemetry import trace
 
 CheckpointPointerWriter = Callable[[str, str], Awaitable[None]]
+_TRACER = trace.get_tracer(__name__)
 
 
 def thread_id_for(tenant_id: str, conversation_id: str) -> str:
@@ -95,14 +95,11 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Read the current Run namespace from the official saver."""
-        with observe(
-            "checkpoint.read",
-            attributes={
-                "checkpoint.exact": bool(
-                    config.get("configurable", {}).get("checkpoint_id")
-                )
-            },
-        ):
+        with _TRACER.start_as_current_span("langgraph_v2.checkpoint.read") as span:
+            span.set_attribute(
+                "checkpoint.exact",
+                bool(config.get("configurable", {}).get("checkpoint_id")),
+            )
             return await super().aget_tuple(
                 self._scoped_config(config, namespace=self._read_namespace)
             )
@@ -115,14 +112,11 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
         """Commit through the official saver before fencing the Run pointer."""
-        with observe(
-            "checkpoint.write",
-            attributes={
-                "checkpoint.exact_parent": bool(
-                    config.get("configurable", {}).get("checkpoint_id")
-                )
-            },
-        ):
+        with _TRACER.start_as_current_span("langgraph_v2.checkpoint.write") as span:
+            span.set_attribute(
+                "checkpoint.exact_parent",
+                bool(config.get("configurable", {}).get("checkpoint_id")),
+            )
             next_config = await super().aput(
                 self._scoped_config(config),
                 checkpoint,
@@ -144,7 +138,9 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         task_path: str = "",
     ) -> None:
         """Persist intermediate writes in the same fenced namespace."""
-        with observe("checkpoint.write_intermediate"):
+        with _TRACER.start_as_current_span(
+            "langgraph_v2.checkpoint.write_intermediate"
+        ):
             await super().aput_writes(
                 self._scoped_config(config), writes, task_id, task_path
             )

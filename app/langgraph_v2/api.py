@@ -39,7 +39,6 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.live_events import LiveEventWakeups
-from app.langgraph_v2.observability import observe, safe_span_attribute
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.provider_adapters import (
@@ -399,39 +398,26 @@ async def _persist_graph_result(
             and not event["event_key"].startswith("phase:finalization:")
             and event["event_key"] != "lifecycle:completed:0"
         )
-        with observe(
-            "persistence.event_batch",
+        async for _ in _persist_result_events(
+            repository,
+            message_repository,
+            tenant_id=tenant_id,
             run_id=run_id,
             conversation_id=conversation_id,
+            result=result,
+            owner_instance_id=owner_instance_id,
             execution_epoch=execution_epoch,
-            attributes={"persistence.kind": "run_events"},
+            suppress_sse_for_event_keys=sent_keys,
+            answer_chunk_interval_ms=answer_chunk_interval_ms,
         ):
-            async for _ in _persist_result_events(
-                repository,
-                message_repository,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                conversation_id=conversation_id,
-                result=result,
-                owner_instance_id=owner_instance_id,
-                execution_epoch=execution_epoch,
-                suppress_sse_for_event_keys=sent_keys,
-                answer_chunk_interval_ms=answer_chunk_interval_ms,
-            ):
-                pass
+            pass
     except CancellationObserved:
-        with observe(
-            "cancellation.apply",
+        await cancellation_repository.apply_if_requested(
+            tenant_id=tenant_id,
             run_id=run_id,
+            owner_instance_id=owner_instance_id,
             execution_epoch=execution_epoch,
-            attributes={"cancellation.operation": "apply"},
-        ):
-            await cancellation_repository.apply_if_requested(
-                tenant_id=tenant_id,
-                run_id=run_id,
-                owner_instance_id=owner_instance_id,
-                execution_epoch=execution_epoch,
-            )
+        )
     finally:
         if not graph_task.done():
             graph_task.cancel()
@@ -466,69 +452,42 @@ async def _execute_graph_run(
             execution_epoch,
         )
     )
-    with observe(
-        "execution.run",
-        run_id=run_id,
-        conversation_id=conversation_id,
-        execution_epoch=execution_epoch,
-    ):
-        await cancellation_observer.start()
+    await cancellation_observer.start()
+    try:
+        await _persist_graph_result(
+            selected_graph,
+            state,
+            graph_config,
+            repository,
+            cancellation_repository,
+            message_repository,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+            answer_chunk_interval_ms=answer_chunk_interval_ms,
+            initial_sent_keys=initial_sent_keys,
+        )
+    except (CancellationObserved, ClaimFenced):
+        return
+    except Exception as exc:
         try:
-            await _persist_graph_result(
-                selected_graph,
-                state,
-                graph_config,
+            await _persist_setup_failure(
                 repository,
-                cancellation_repository,
-                message_repository,
                 tenant_id=tenant_id,
                 run_id=run_id,
-                conversation_id=conversation_id,
                 owner_instance_id=owner_instance_id,
                 execution_epoch=execution_epoch,
-                answer_chunk_interval_ms=answer_chunk_interval_ms,
-                initial_sent_keys=initial_sent_keys,
+                message=str(exc) or "LangGraph execution failed.",
             )
-        except (CancellationObserved, ClaimFenced):
+        except ClaimFenced:
             return
-        except Exception as exc:
-            try:
-                await _persist_setup_failure(
-                    repository,
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    owner_instance_id=owner_instance_id,
-                    execution_epoch=execution_epoch,
-                    message=str(exc) or "LangGraph execution failed.",
-                )
-            except ClaimFenced:
-                return
-        finally:
-            await cancellation_observer.close()
-            heartbeat_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await heartbeat_task
-
-
-async def _observed_stream(
-    stream: AsyncIterator[str],
-    *,
-    operation: str,
-    run_id: uuid.UUID,
-    conversation_id: str | None = None,
-    execution_epoch: int | None = None,
-    attributes: dict[str, str | bool | int | float] | None = None,
-) -> AsyncIterator[str]:
-    """Keep a redacted operation span open for one SSE response body."""
-    with observe(
-        operation,
-        run_id=run_id,
-        conversation_id=conversation_id,
-        execution_epoch=execution_epoch,
-        attributes=attributes,
-    ):
-        async for frame in stream:
-            yield frame
+    finally:
+        await cancellation_observer.close()
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 async def _subscribe_to_run(
@@ -868,16 +827,7 @@ def create_tracer_router(
                 yield frame
 
         return StreamingResponse(
-            _observed_stream(
-                event_generator(),
-                operation="http.request",
-                run_id=run_id,
-                conversation_id=conversation_id,
-                attributes={
-                    "http.request.method": "POST",
-                    "http.route": "/v2/query/stream",
-                },
-            ),
+            event_generator(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -918,19 +868,11 @@ def create_tracer_router(
         )
         message_repository = ConversationMessageRepository(pool)
         try:
-            with observe(
-                "recovery.resume",
+            claim = await repository.resume_run(
+                tenant_id=x_application_id,
                 run_id=run_id,
-                attributes={"recovery.operation": "resume"},
-            ) as recovery_span:
-                claim = await repository.resume_run(
-                    tenant_id=x_application_id,
-                    run_id=run_id,
-                    owner_instance_id=_INSTANCE_ID,
-                )
-                safe_span_attribute(
-                    recovery_span, "execution.epoch", claim.execution_epoch
-                )
+                owner_instance_id=_INSTANCE_ID,
+            )
         except RunNotFound as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
         except ResumeConflict as error:
@@ -1077,17 +1019,7 @@ def create_tracer_router(
                 yield frame
 
         return StreamingResponse(
-            _observed_stream(
-                event_generator(),
-                operation="http.request",
-                run_id=run_id,
-                conversation_id=claim.conversation_id,
-                execution_epoch=claim.execution_epoch,
-                attributes={
-                    "http.request.method": "POST",
-                    "http.route": "/v2/runs/{run_id}/resume/stream",
-                },
-            ),
+            event_generator(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
         )
@@ -1125,15 +1057,7 @@ def create_tracer_router(
                 yield frame
 
         return StreamingResponse(
-            _observed_stream(
-                event_generator(),
-                operation="http.request",
-                run_id=run_id,
-                attributes={
-                    "http.request.method": "GET",
-                    "http.route": "/v2/runs/{run_id}/stream",
-                },
-            ),
+            event_generator(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
         )
@@ -1158,26 +1082,10 @@ def create_tracer_router(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
         try:
-            with observe(
-                "http.request",
-                run_id=run_id,
-                attributes={
-                    "http.request.method": "POST",
-                    "http.route": "/v2/runs/{run_id}/cancel",
-                },
-            ):
-                with observe(
-                    "cancellation.request",
-                    run_id=run_id,
-                    attributes={"cancellation.operation": "request"},
-                ) as cancellation_span:
-                    result = await CancellationRepository(
-                        configured_pool,
-                        wakeups=_live_events(http_request.app),
-                    ).request(tenant_id=x_application_id, run_id=run_id)
-                    safe_span_attribute(
-                        cancellation_span, "run.status", result.run_status
-                    )
+            result = await CancellationRepository(
+                configured_pool,
+                wakeups=_live_events(http_request.app),
+            ).request(tenant_id=x_application_id, run_id=run_id)
         except RunNotFound as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
         response = CancellationResponse(

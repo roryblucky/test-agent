@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Awaitable, Callable
-from functools import wraps
 from typing import Any, NotRequired, TypedDict, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -17,7 +15,6 @@ from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
 from app.langgraph_v2.history import ConversationTurn, select_sliding_window_history
-from app.langgraph_v2.observability import observe
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.post_moderation import run_post_moderation
 from app.langgraph_v2.pre_moderation import (
@@ -89,36 +86,6 @@ class TracerStateUpdate(TypedDict, total=False):
     post_moderation: dict[str, Any]
     post_moderation_error: str
     final_response: TracerQueryResponse
-
-
-def _observed_phase(
-    phase_name: str,
-    context: PhaseExecutionContext | None,
-) -> Callable[
-    [Callable[[TracerState], Awaitable[TracerStateUpdate]]],
-    Callable[[TracerState], Awaitable[TracerStateUpdate]],
-]:
-    """Trace one graph node without exposing its state or result."""
-
-    def decorate(
-        node: Callable[[TracerState], Awaitable[TracerStateUpdate]],
-    ) -> Callable[[TracerState], Awaitable[TracerStateUpdate]]:
-        @wraps(node)
-        async def observed(state: TracerState) -> TracerStateUpdate:
-            with observe(
-                "graph.phase",
-                run_id=context.run_id if context is not None else None,
-                conversation_id=state.get("conversation_id"),
-                execution_epoch=(
-                    context.execution_epoch if context is not None else None
-                ),
-                attributes={"graph.phase": phase_name},
-            ):
-                return await node(state)
-
-        return observed
-
-    return decorate
 
 
 async def _query(
@@ -253,7 +220,6 @@ def build_tracer_graph(
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
 
-    @_observed_phase("query", phase_context)
     async def query_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
         return await _query(state, phase_context=phase_context)
@@ -267,7 +233,6 @@ def build_tracer_graph(
         phase_context.artifact_repository if phase_context is not None else None
     )
 
-    @_observed_phase("pre_moderation", phase_context)
     async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
         if phase_context is None:
@@ -296,7 +261,6 @@ def build_tracer_graph(
 
     builder.add_node("pre_moderation", pre_moderation_node)
 
-    @_observed_phase("question_refinement", phase_context)
     async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
         if phase_context is None:
@@ -333,7 +297,6 @@ def build_tracer_graph(
 
     builder.add_node("question_refinement", question_refinement_node)
 
-    @_observed_phase("retrieval", phase_context)
     async def retrieval_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
         if phase_context is None or selected_artifact_repository is None:
@@ -358,7 +321,6 @@ def build_tracer_graph(
 
     builder.add_node("retrieval", retrieval_node)
 
-    @_observed_phase("reranking", phase_context)
     async def reranking_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
         if phase_context is None or selected_artifact_repository is None:
@@ -385,7 +347,6 @@ def build_tracer_graph(
 
     if answer_actor is not None and selected_artifact_repository is not None:
 
-        @_observed_phase("answer", phase_context)
         async def answer_node(state: TracerState) -> TracerStateUpdate:
             await _check_cancellation(phase_context)
             events, result, halted, error = await run_answer(
@@ -419,7 +380,6 @@ def build_tracer_graph(
 
         if groundedness_actor is not None:
 
-            @_observed_phase("groundedness", phase_context)
             async def groundedness_node(state: TracerState) -> TracerStateUpdate:
                 await _check_cancellation(phase_context)
                 events, result, halted, error = await run_groundedness(
@@ -443,7 +403,6 @@ def build_tracer_graph(
 
             builder.add_node("groundedness", groundedness_node)
 
-        @_observed_phase("post_moderation", phase_context)
         async def post_moderation_node(state: TracerState) -> TracerStateUpdate:
             await _check_cancellation(phase_context)
             events, decision, safe_answer, halted, error = await run_post_moderation(
@@ -468,7 +427,6 @@ def build_tracer_graph(
 
         builder.add_node("post_moderation", post_moderation_node)
 
-    @_observed_phase("finalization", phase_context)
     async def finalization_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
         if phase_context is None or selected_artifact_repository is None:

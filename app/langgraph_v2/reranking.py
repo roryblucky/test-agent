@@ -11,7 +11,6 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
-from app.langgraph_v2.observability import observe
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
@@ -67,22 +66,14 @@ async def run_reranking(
                 )
                 for ref in refs
             ]
-            with observe(
-                "provider.invoke",
-                run_id=context.run_id,
-                execution_epoch=context.execution_epoch,
-                attributes={"provider.role": "reranking"},
-            ):
-                ranked = await ranker.rank(
-                    state.get("refined_query", state["query"]), documents
-                )
+            ranked = await ranker.rank(
+                state.get("refined_query", state["query"]), documents
+            )
             output_ids = [document.id for document in ranked.documents]
             input_keys = [_document_key(document) for document in documents]
             output_keys = [_document_key(document) for document in ranked.documents]
             if Counter(output_keys) != Counter(input_keys):
-                raise ValueError(
-                    "ranker must return every retrieved document exactly once"
-                )
+                raise ValueError("ranker must return every retrieved document exactly once")
             refs_by_key: dict[str, list[ArtifactRef]] = {}
             for document, ref in zip(documents, refs, strict=True):
                 refs_by_key.setdefault(_document_key(document), []).append(ref)
