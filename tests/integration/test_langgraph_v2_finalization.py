@@ -8,15 +8,19 @@ import pytest
 from langgraph.checkpoint.memory import MemorySaver
 from psycopg_pool import AsyncConnectionPool
 
+from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import AnswerResult
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
-from app.models.domain import Document
+from app.models.domain import Document, GroundednessResult, ModerationResult
+from app.models.workflow import CitationReference
+from app.services.events import EventEmitter
 
 
 class _Retriever:
@@ -45,7 +49,21 @@ class _Answer:
         self.calls += 1
         assert query == "hello"
         assert [document.id for document in documents] == ["d1"]
-        return AnswerResult(answer="grounded answer", usage={"output_tokens": 3})
+        return AnswerResult(answer="grounded answer [1]", usage={"output_tokens": 3})
+
+
+class _Groundedness:
+    async def evaluate(
+        self, answer: str, documents: list[Document]
+    ) -> GroundednessAssessment:
+        assert answer == "grounded answer [1]"
+        assert [document.id for document in documents] == ["d1"]
+        return GroundednessAssessment(
+            is_grounded=True,
+            score=0.9,
+            details="supported",
+            usage={"input_tokens": 5, "output_tokens": 2},
+        )
 
 
 class _Moderation:
@@ -53,7 +71,7 @@ class _Moderation:
 
     async def check(self, text: str) -> ModerationDecision:
         self.calls += 1
-        assert text in {"hello", "grounded answer"}
+        assert text in {"hello", "grounded answer [1]"}
         return ModerationDecision(is_flagged=False)
 
 
@@ -102,31 +120,67 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=answer,
+            groundedness_actor=_Groundedness(),
         )
         result = await graph.ainvoke(_state())
 
     done = result["events"][-1]["data"]
     assert done["session_id"] == "c1"
-    assert done["answer"] == "grounded answer"
+    assert done["answer"] == "grounded answer [1]"
     assert done["documents"][0]["id"] == "d1"
     assert done["moderation"]["is_flagged"] is False
-    assert done["metadata"]["usage"] == {
-        "requests": 1,
-        "request_tokens": 0,
-        "response_tokens": 3,
-        "total_tokens": 3,
-        "input_tokens": 0,
-        "output_tokens": 3,
+    assert done["groundedness"] == {
+        "is_grounded": True,
+        "score": 0.9,
+        "details": "supported",
     }
+    assert done["citations"][0]["index"] == 1
+    assert done["metadata"]["usage"] == {
+        "requests": 2,
+        "request_tokens": 5,
+        "response_tokens": 5,
+        "total_tokens": 10,
+        "input_tokens": 5,
+        "output_tokens": 5,
+    }
+    legacy_response = QueryResponse(
+        query="hello",
+        refined_query="hello",
+        answer="grounded answer [1]",
+        documents=[Document(**done["documents"][0])],
+        moderation=ModerationResult(is_flagged=False),
+        groundedness=GroundednessResult(
+            is_grounded=True, score=0.9, details="supported"
+        ),
+        session_id="c1",
+        metadata=done["metadata"],
+        citations=[
+            CitationReference(
+                **{
+                    **done["citations"][0],
+                    "evidence_id": "__artifact_id__",
+                    "metadata": {"artifact_id": "__artifact_id__"},
+                }
+            )
+        ],
+    )
+    legacy_emitter = EventEmitter()
+    await legacy_emitter.emit_done(legacy_response.model_dump())
+    legacy_frames = [frame async for frame in legacy_emitter]
+    legacy_event = json.loads(legacy_frames[0].removeprefix("data: "))
     expected = json.loads(
         (
             Path(__file__).parents[1]
             / "fixtures"
             / "langgraph_v2"
-            / "v2_finalization_wire.json"
+            / "v1_finalization_wire.json"
         ).read_text()
     )
-    assert done == expected
+    assert legacy_event == expected["event"]
+    stable_done = json.loads(json.dumps(done))
+    stable_done["citations"][0]["evidence_id"] = "__artifact_id__"
+    stable_done["citations"][0]["metadata"]["artifact_id"] = "__artifact_id__"
+    assert stable_done == expected["event"]["data"]
     assert result["final_response"].model_dump(by_alias=True) == done
     assert answer.calls == 1
     assert moderation.calls == 2

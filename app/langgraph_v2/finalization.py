@@ -47,6 +47,45 @@ def _legacy_usage(usage: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _combine_usage(usages: list[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """Aggregate usage from each model-backed phase."""
+    non_empty = [usage for usage in usages if usage]
+    if not non_empty:
+        return None
+    combined = {
+        "requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    for usage in non_empty:
+        combined["requests"] += int(usage.get("requests", 1))
+        combined["input_tokens"] += int(
+            usage.get("input_tokens", usage.get("request_tokens", 0))
+        )
+        combined["output_tokens"] += int(
+            usage.get("output_tokens", usage.get("response_tokens", 0))
+        )
+        combined["total_tokens"] += int(
+            usage.get(
+                "total_tokens",
+                int(usage.get("input_tokens", usage.get("request_tokens", 0)))
+                + int(usage.get("output_tokens", usage.get("response_tokens", 0))),
+            )
+        )
+    return _legacy_usage(combined)
+
+
+def _legacy_moderation(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Render moderation fields with the legacy nullable keys present."""
+    if value is None:
+        return None
+    result = dict(value)
+    result.setdefault("categories", {})
+    result.setdefault("reason", None)
+    return result
+
+
 async def run_finalization(
     state: Mapping[str, Any],
     *,
@@ -77,7 +116,11 @@ async def run_finalization(
             refined_query=state.get("refined_query"),
             answer=state.get("answer"),
             documents=[document.model_dump(mode="json") for document in documents],
-            moderation=state.get("moderation") if "answer" in state else None,
+            moderation=(
+                _legacy_moderation(state.get("moderation"))
+                if "answer" in state
+                else None
+            ),
             groundedness=state.get("groundedness"),
             citations=state.get("citations", []),
         )
@@ -95,7 +138,14 @@ async def run_finalization(
             ),
         )
         normalized = response.model_dump(mode="json")
-        usage = _legacy_usage(state.get("answer_usage", {}))
+        usages: list[Mapping[str, Any]] = [state.get("answer_usage", {})]
+        for phase_name in ("question_refinement", "groundedness"):
+            phase = await context.repository.get_completed(
+                context.tenant_id, context.run_id, phase_name
+            )
+            if phase is not None and isinstance(phase.normalized_result, Mapping):
+                usages.append(phase.normalized_result.get("usage", {}))
+        usage = _combine_usage(usages)
         if usage is not None:
             normalized["metadata"]["usage"] = usage
         return PhaseResultInput(
@@ -125,7 +175,9 @@ def finalize_in_memory(state: Mapping[str, Any]) -> dict[str, Any]:
         metadata={"steps_executed": _steps(state)},
         refined_query=state.get("refined_query"),
         answer=state.get("answer"),
-        moderation=state.get("moderation") if "answer" in state else None,
+        moderation=(
+            _legacy_moderation(state.get("moderation")) if "answer" in state else None
+        ),
         groundedness=state.get("groundedness"),
         citations=state.get("citations", []),
         documents=[],

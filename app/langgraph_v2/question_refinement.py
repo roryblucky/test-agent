@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
 
 from pydantic import Field
@@ -42,10 +43,17 @@ class PydanticAIQuestionRefinementActor:
 
     def __init__(self, agent: Agent[Any, V2ResolvedQuery]) -> None:
         self._agent = agent
+        self.last_usage: dict[str, Any] = {}
 
     async def refine(self, query: str) -> ResolvedQuery:
         """Run the agent and return its validated structured output."""
         result = await self._agent.run(query)
+        usage_method = getattr(result, "usage", None)
+        if callable(usage_method):
+            usage = usage_method()
+            self.last_usage = (
+                asdict(usage) if is_dataclass(usage) else dict(vars(usage))
+            )
         return result.output
 
 
@@ -108,9 +116,12 @@ async def run_question_refinement(
 
     async def invoke() -> PhaseResultInput:
         try:
-            result = V2ResolvedQuery.model_validate(
-                (await actor.refine(state["query"])).model_dump()
-            )
+            refined = await actor.refine(state["query"])
+            result = V2ResolvedQuery.model_validate(refined.model_dump())
+            normalized_result = result.model_dump(exclude_none=True)
+            usage = getattr(actor, "last_usage", {})
+            if usage:
+                normalized_result["usage"] = usage
         except Exception as exc:
             message = str(exc) or REFINEMENT_ERROR_MESSAGE
             return PhaseResultInput(
@@ -121,7 +132,7 @@ async def run_question_refinement(
             )
         return PhaseResultInput(
             phase_name="question_refinement",
-            normalized_result=result.model_dump(exclude_none=True),
+            normalized_result=normalized_result,
             events=refinement_events(result),
         )
 
