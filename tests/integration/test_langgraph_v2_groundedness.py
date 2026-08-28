@@ -1,16 +1,22 @@
 from __future__ import annotations
 
-from uuid import UUID, uuid4
 from unittest.mock import patch
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
+from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerCitation, AnswerResult
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph
-from app.langgraph_v2.groundedness import GroundednessResult
+from app.langgraph_v2.groundedness import (
+    GroundednessAssessment,
+    GroundednessOutput,
+    GroundednessResult,
+    PydanticAIGroundednessActor,
+)
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
@@ -82,11 +88,14 @@ async def test_low_groundedness_is_advisory_and_replayed(
         state = {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
+        phase = await context.repository.get_completed("tenant-a", run.run_id, "groundedness")
 
     assert evaluator.calls == 1
     assert first["answer"] == second["answer"] == "answer [1]"
     assert first["groundedness"] == second["groundedness"]
     assert first["groundedness"].score == 0.2
+    assert phase is not None
+    assert phase.normalized_result["usage"] == {}
     assert any(event.get("step") == "groundedness" for event in first["events"])
 
 
@@ -252,3 +261,24 @@ async def test_groundedness_actor_setup_failure_terminalizes_run(
             "tenant-a", UUID(response.headers["x-run-id"])
         )
     assert run.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_pydantic_groundedness_actor_preserves_usage() -> None:
+    class Result:
+        output = GroundednessOutput(is_grounded=True, score=0.9)
+
+        def usage(self) -> RunUsage:
+            return RunUsage(input_tokens=4, output_tokens=2)
+
+    class AgentStub:
+        async def run(self, prompt: str) -> Result:
+            assert "Evidence:" in prompt
+            return Result()
+
+    actor = PydanticAIGroundednessActor(AgentStub())  # type: ignore[arg-type]
+    result = await actor.evaluate("answer", [Document(id="d1", content="evidence")])
+
+    assert isinstance(result, GroundednessAssessment)
+    assert result.usage["input_tokens"] == 4
+    assert result.usage["output_tokens"] == 2

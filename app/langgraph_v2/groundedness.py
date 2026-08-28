@@ -24,6 +24,12 @@ class GroundednessOutput(BaseModel):
     details: str | None = None
 
 
+class GroundednessAssessment(GroundednessOutput):
+    """V2-owned evaluator result carrying model usage metadata."""
+
+    usage: dict[str, Any] = Field(default_factory=dict)
+
+
 class GroundednessActor(Protocol):
     """PydanticAI-backed seam for advisory answer evaluation."""
 
@@ -31,7 +37,7 @@ class GroundednessActor(Protocol):
         self,
         answer: str,
         documents: list[Document],
-    ) -> GroundednessResult:
+    ) -> GroundednessAssessment:
         """Return a structured groundedness assessment."""
         ...
 
@@ -42,13 +48,13 @@ class PydanticAIGroundednessActor:
     def __init__(self, agent: Agent[Any, GroundednessOutput]) -> None:
         self._agent = agent
 
-    async def evaluate(self, answer: str, documents: list[Document]) -> GroundednessResult:
+    async def evaluate(self, answer: str, documents: list[Document]) -> GroundednessAssessment:
         """Evaluate the answer against the supplied evidence text."""
         evidence = "\n\n".join(document.content for document in documents)
         result = await self._agent.run(f"Answer:\n{answer}\n\nEvidence:\n{evidence}")
         usage = result.usage()
         usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
-        return GroundednessResult(
+        return GroundednessAssessment(
             **result.output.model_dump(),
             usage=usage_payload,
         )
@@ -107,12 +113,14 @@ async def run_groundedness(
             actor_result = await actor.evaluate(state.get("answer", ""), documents)
             raw_result = actor_result.model_dump()
             output = GroundednessOutput.model_validate(raw_result)
-            result = GroundednessResult.model_validate(
-                {**output.model_dump(), "usage": raw_result.get("usage", {})}
-            )
+            result = GroundednessResult.model_validate(output.model_dump())
+            normalized_result = {
+                **result.model_dump(),
+                "usage": raw_result.get("usage", {}),
+            }
             return PhaseResultInput(
                 phase_name="groundedness",
-                normalized_result=result.model_dump(),
+                normalized_result=normalized_result,
                 events=(
                     EventInput(
                         event_key="phase:groundedness:step_start:1",
@@ -157,4 +165,9 @@ async def run_groundedness(
     )
     if result.normalized_result.get("failed") is True:
         return list(result.events), None, True, str(result.normalized_result["error"])
-    return list(result.events), GroundednessResult.model_validate(result.normalized_result), False, None
+    return (
+        list(result.events),
+        GroundednessResult.model_validate(result.normalized_result),
+        False,
+        None,
+    )
