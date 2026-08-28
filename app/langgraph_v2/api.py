@@ -33,6 +33,7 @@ from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
+from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.provider_adapters import (
@@ -427,10 +428,13 @@ def create_tracer_router(
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
     answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
+    history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
 ) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
     if not 200 <= answer_chunk_interval_ms <= 500:
         raise ValueError("answer_chunk_interval_ms must be between 200 and 500")
+    if history_token_budget < 0:
+        raise ValueError("history_token_budget must not be negative")
     router = APIRouter(tags=["LangGraph v2 tracer"])
 
     @router.post("/v2/query/stream")
@@ -522,6 +526,8 @@ def create_tracer_router(
                 phase_context = PhaseExecutionContext(
                     repository=PhaseResultRepository(pool),
                     artifact_repository=ArtifactRepository(pool),
+                    message_repository=message_repository,
+                    history_token_budget=history_token_budget,
                     tenant_id=x_application_id,
                     run_id=run_id,
                     owner_instance_id=claim.owner_instance_id,
@@ -719,6 +725,8 @@ def create_tracer_router(
                     phase_context=PhaseExecutionContext(
                         repository=PhaseResultRepository(pool),
                         artifact_repository=ArtifactRepository(pool),
+                        message_repository=message_repository,
+                        history_token_budget=history_token_budget,
                         tenant_id=x_application_id,
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
@@ -822,6 +830,7 @@ def register_tracer_routes(
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
     answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
+    history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     resume_enabled: bool = False,
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
@@ -835,6 +844,7 @@ def register_tracer_routes(
             answer_actor,
             groundedness_actor,
             answer_chunk_interval_ms,
+            history_token_budget,
         )
         if not resume_enabled:
             router.routes = [

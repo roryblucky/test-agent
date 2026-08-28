@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
+from inspect import signature
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
+from app.langgraph_v2.history import ConversationTurn, to_model_message_history
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
@@ -101,7 +103,9 @@ async def build_inline_citations(
             continue
         ref = refs[index - 1]
         document = documents[index - 1]
-        source = str(document.metadata.get("source") or document.source_url or document.id)
+        source = str(
+            document.metadata.get("source") or document.source_url or document.id
+        )
         citations.append(
             CitationReference(
                 index=index,
@@ -123,7 +127,12 @@ async def build_inline_citations(
 class AnswerActor(Protocol):
     """PydanticAI-backed seam for generating an answer from evidence."""
 
-    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+    async def answer(
+        self,
+        query: str,
+        documents: list[Document],
+        history: Sequence[ConversationTurn],
+    ) -> AnswerResult:
         """Return a validated answer for the ordered evidence."""
         ...
 
@@ -138,13 +147,25 @@ class PydanticAIAnswerActor:
     def __init__(self, agent: Agent[Any, AnswerOutput]) -> None:
         self._agent = agent
 
-    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+    async def answer(
+        self,
+        query: str,
+        documents: list[Document],
+        history: Sequence[ConversationTurn] = (),
+    ) -> AnswerResult:
         """Run the model with only the query and ordered Documents as context."""
         evidence = "\n\n".join(
-            f"[{index}] {document.content}" for index, document in enumerate(documents, 1)
+            f"[{index}] {document.content}"
+            for index, document in enumerate(documents, 1)
         )
         prompt = f"Question: {query}\n\nEvidence:\n{evidence}"
-        result = await self._agent.run(prompt)
+        if history:
+            result = await self._agent.run(
+                prompt,
+                message_history=to_model_message_history(history),
+            )
+        else:
+            result = await self._agent.run(prompt)
         usage = result.usage()
         usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
         output = AnswerOutput.model_validate(result.output)
@@ -153,6 +174,18 @@ class PydanticAIAnswerActor:
             usage=usage_payload,
             citations=output.citations,
         )
+
+
+async def invoke_answer_actor(
+    actor: AnswerActor,
+    query: str,
+    documents: list[Document],
+    history: Sequence[ConversationTurn],
+) -> AnswerResult:
+    """Call a history-aware actor while retaining injected POC actor compatibility."""
+    if "history" not in signature(actor.answer).parameters:
+        return await actor.answer(query, documents)  # type: ignore[call-arg]
+    return await actor.answer(query, documents, history)
 
 
 def build_answer_actor(
@@ -219,8 +252,15 @@ async def run_answer(
                 )
                 for ref in refs
             ]
-            answer = await actor.answer(
-                state.get("refined_query", state["query"]), documents
+            history = [
+                ConversationTurn.model_validate(turn)
+                for turn in state.get("history", [])
+            ]
+            answer = await invoke_answer_actor(
+                actor,
+                state.get("refined_query", state["query"]),
+                documents,
+                history,
             )
             validated = AnswerResult.model_validate(answer)
             chunks = split_answer_chunks(validated.answer)
@@ -266,7 +306,9 @@ async def run_answer(
                 normalized_result={
                     "answer": normalized_answer,
                     "usage": validated.usage,
-                    "citations": [citation.model_dump(mode="json") for citation in citations],
+                    "citations": [
+                        citation.model_dump(mode="json") for citation in citations
+                    ],
                 },
                 events=tuple(events),
                 terminal_status=None,
@@ -292,7 +334,10 @@ async def run_answer(
             )
 
     async def check_before_commit() -> None:
-        if context.cancellation_check is not None and await context.cancellation_check():
+        if (
+            context.cancellation_check is not None
+            and await context.cancellation_check()
+        ):
             raise AnswerCancelled("answer generation cancelled before publication")
 
     if context.cancellation_check is not None and await context.cancellation_check():

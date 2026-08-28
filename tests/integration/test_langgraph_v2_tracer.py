@@ -679,6 +679,18 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
                 conversation_id="conversation-1",
                 owner_instance_id="instance-a",
             )
+            messages = ConversationMessageRepository(pool)
+            await messages.resolve_conversation(
+                tenant_id="tenant-a",
+                conversation_id="conversation-1",
+            )
+            await messages.persist_user_message(
+                tenant_id="tenant-a",
+                conversation_id="conversation-1",
+                run_id=run_id,
+                content="authoritative",
+                idempotency_key=f"run:{run_id}:user",
+            )
             old_namespace = checkpoint_namespace_for(
                 "tenant-a", str(run_id), run.execution_epoch
             )

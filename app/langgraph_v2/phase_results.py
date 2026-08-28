@@ -15,6 +15,8 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.run_events import (
     ClaimFenced,
     EventInput,
@@ -106,6 +108,8 @@ class PhaseExecutionContext:
     owner_instance_id: str
     execution_epoch: int
     artifact_repository: ArtifactStore | None = None
+    message_repository: ConversationMessageRepository | None = None
+    history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET
     cancellation_check: Callable[[], Awaitable[bool]] | None = None
 
 

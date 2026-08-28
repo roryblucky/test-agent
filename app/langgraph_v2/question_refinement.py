@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
+from inspect import signature
 from typing import Any, Protocol
 
 from pydantic import Field
 from pydantic_ai import Agent
 
+from app.langgraph_v2.history import ConversationTurn, to_model_message_history
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.workflow import ResolvedQuery
@@ -25,7 +27,9 @@ class V2ResolvedQuery(ResolvedQuery):
 class QuestionRefinementActor(Protocol):
     """PydanticAI-backed seam for producing structured standalone questions."""
 
-    async def refine(self, query: str) -> ResolvedQuery:
+    async def refine(
+        self, query: str, history: Sequence[ConversationTurn]
+    ) -> ResolvedQuery:
         """Return a validated standalone question."""
         ...
 
@@ -33,8 +37,11 @@ class QuestionRefinementActor(Protocol):
 class MockQuestionRefinementActor:
     """Deterministic actor used when no tenant model registry is configured."""
 
-    async def refine(self, query: str) -> ResolvedQuery:
+    async def refine(
+        self, query: str, history: Sequence[ConversationTurn] = ()
+    ) -> ResolvedQuery:
         """Keep the query unchanged while satisfying the structured contract."""
+        del history
         return ResolvedQuery(original_query=query, standalone_query=query)
 
 
@@ -45,9 +52,17 @@ class PydanticAIQuestionRefinementActor:
         self._agent = agent
         self.last_usage: dict[str, Any] = {}
 
-    async def refine(self, query: str) -> ResolvedQuery:
+    async def refine(
+        self, query: str, history: Sequence[ConversationTurn] = ()
+    ) -> ResolvedQuery:
         """Run the agent and return its validated structured output."""
-        result = await self._agent.run(query)
+        if history:
+            result = await self._agent.run(
+                query,
+                message_history=to_model_message_history(history),
+            )
+        else:
+            result = await self._agent.run(query)
         usage_method = getattr(result, "usage", None)
         if callable(usage_method):
             usage = usage_method()
@@ -55,6 +70,17 @@ class PydanticAIQuestionRefinementActor:
                 asdict(usage) if is_dataclass(usage) else dict(vars(usage))
             )
         return result.output
+
+
+async def invoke_refinement_actor(
+    actor: QuestionRefinementActor,
+    query: str,
+    history: Sequence[ConversationTurn],
+) -> ResolvedQuery:
+    """Call a history-aware actor while retaining injected POC actor compatibility."""
+    if "history" not in signature(actor.refine).parameters:
+        return await actor.refine(query)  # type: ignore[call-arg]
+    return await actor.refine(query, history)
 
 
 def build_question_refinement_actor(
@@ -116,7 +142,11 @@ async def run_question_refinement(
 
     async def invoke() -> PhaseResultInput:
         try:
-            refined = await actor.refine(state["query"])
+            history = [
+                ConversationTurn.model_validate(turn)
+                for turn in state.get("history", [])
+            ]
+            refined = await invoke_refinement_actor(actor, state["query"], history)
             result = V2ResolvedQuery.model_validate(refined.model_dump())
             normalized_result = result.model_dump(exclude_none=True)
             usage = getattr(actor, "last_usage", {})

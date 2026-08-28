@@ -14,6 +14,7 @@ from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
+from app.langgraph_v2.history import ConversationTurn, select_sliding_window_history
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.post_moderation import run_post_moderation
 from app.langgraph_v2.pre_moderation import (
@@ -26,6 +27,7 @@ from app.langgraph_v2.pre_moderation import (
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
     QuestionRefinementActor,
+    invoke_refinement_actor,
     refinement_events,
     run_question_refinement,
 )
@@ -43,6 +45,7 @@ class TracerState(TypedDict):
     conversation_id: str
     client_request_id: str | None
     events: list[dict[str, Any]]
+    history: NotRequired[list[ConversationTurn]]
     halted: NotRequired[bool]
     moderation: NotRequired[dict[str, Any]]
     refined_query: NotRequired[str]
@@ -66,6 +69,7 @@ class TracerStateUpdate(TypedDict, total=False):
     """Partial state update returned by one tracer node."""
 
     events: list[dict[str, Any]]
+    history: list[ConversationTurn]
     halted: bool
     moderation: dict[str, Any]
     refined_query: str
@@ -94,9 +98,23 @@ async def _query(
     canonical = canonical_query(query)
 
     async def invoke() -> PhaseResultInput:
+        history: list[ConversationTurn] = []
+        if phase_context is not None and phase_context.message_repository is not None:
+            messages = await phase_context.message_repository.list_messages(
+                phase_context.tenant_id,
+                state["conversation_id"],
+            )
+            history = select_sliding_window_history(
+                messages,
+                token_budget=phase_context.history_token_budget,
+                current_run_id=phase_context.run_id,
+            )
         return PhaseResultInput(
             phase_name="query",
-            normalized_result={"query": canonical, "history_snapshot": []},
+            normalized_result={
+                "query": canonical,
+                "history_snapshot": [turn.model_dump() for turn in history],
+            },
             events=(
                 EventInput(
                     event_key="phase:query:step_start:1",
@@ -118,7 +136,11 @@ async def _query(
             "events": [
                 _event_state(event, index)
                 for index, event in enumerate(phase.events, 1)
-            ]
+            ],
+            "history": [
+                ConversationTurn.model_validate(turn)
+                for turn in phase.normalized_result["history_snapshot"]
+            ],
         }
     result = await phase_context.repository.get_or_invoke(
         tenant_id=phase_context.tenant_id,
@@ -128,7 +150,13 @@ async def _query(
         phase_name="query",
         invoke=invoke,
     )
-    return {"events": [_event_state(event, event.sequence) for event in result.events]}
+    return {
+        "events": [_event_state(event, event.sequence) for event in result.events],
+        "history": [
+            ConversationTurn.model_validate(turn)
+            for turn in result.normalized_result["history_snapshot"]
+        ],
+    }
 
 
 def _event_state(event: EventInput | EventRecord, sequence: int) -> dict[str, Any]:
@@ -224,7 +252,9 @@ def build_tracer_graph(
 
     async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
         if phase_context is None:
-            result = await selected_refinement_actor.refine(state["query"])
+            result = await invoke_refinement_actor(
+                selected_refinement_actor, state["query"], state.get("history", [])
+            )
             return {
                 "events": [
                     *state["events"],
