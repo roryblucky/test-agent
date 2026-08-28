@@ -44,9 +44,7 @@ class V2PostgresConfig(BaseModel):
         return cls.model_validate(
             {
                 "database_url": database_url,
-                "min_size": environment.get(
-                    "LANGGRAPH_V2_DATABASE_POOL_MIN_SIZE", "1"
-                ),
+                "min_size": environment.get("LANGGRAPH_V2_DATABASE_POOL_MIN_SIZE", "1"),
                 "max_size": environment.get(
                     "LANGGRAPH_V2_DATABASE_POOL_MAX_SIZE", "10"
                 ),

@@ -34,7 +34,9 @@ def _state(query: str, conversation_id: str) -> dict:
     }
 
 
-def test_identifier_encoding_keeps_tenant_boundaries_and_tuple_shapes_distinct() -> None:
+def test_identifier_encoding_keeps_tenant_boundaries_and_tuple_shapes_distinct() -> (
+    None
+):
     assert thread_id_for("tenant/a", "conversation|1") != thread_id_for(
         "tenant", "a/conversation|1"
     )

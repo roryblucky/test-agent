@@ -90,7 +90,8 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         """Read the current Run namespace from the official saver."""
         with _TRACER.start_as_current_span("langgraph_v2.checkpoint.read") as span:
             span.set_attribute(
-                "checkpoint.exact", bool(config.get("configurable", {}).get("checkpoint_id"))
+                "checkpoint.exact",
+                bool(config.get("configurable", {}).get("checkpoint_id")),
             )
             return await super().aget_tuple(self._scoped_config(config))
 
@@ -103,7 +104,10 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
     ) -> RunnableConfig:
         """Commit through the official saver before fencing the Run pointer."""
         with _TRACER.start_as_current_span("langgraph_v2.checkpoint.write") as span:
-            span.set_attribute("checkpoint.exact_parent", bool(config.get("configurable", {}).get("checkpoint_id")))
+            span.set_attribute(
+                "checkpoint.exact_parent",
+                bool(config.get("configurable", {}).get("checkpoint_id")),
+            )
             next_config = await super().aput(
                 self._scoped_config(config),
                 checkpoint,
@@ -125,7 +129,9 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         task_path: str = "",
     ) -> None:
         """Persist intermediate writes in the same fenced namespace."""
-        with _TRACER.start_as_current_span("langgraph_v2.checkpoint.write_intermediate"):
+        with _TRACER.start_as_current_span(
+            "langgraph_v2.checkpoint.write_intermediate"
+        ):
             await super().aput_writes(
                 self._scoped_config(config), writes, task_id, task_path
             )
