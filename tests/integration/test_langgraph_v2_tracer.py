@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from importlib import reload
 from pathlib import Path
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import psycopg
@@ -483,7 +484,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
             async def old_pointer(checkpoint_id: str, _: str) -> None:
                 old_ids.append(checkpoint_id)
 
-            await AsyncPostgresSaver(pool).setup()
+            await AsyncPostgresSaver(cast(Any, pool)).setup()
             old_graph = build_tracer_graph(
                 FencedAsyncPostgresSaver(
                     pool,
