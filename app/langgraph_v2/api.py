@@ -25,7 +25,10 @@ from app.langgraph_v2.checkpointing import (
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
-from app.langgraph_v2.question_refinement import QuestionRefinementActor
+from app.langgraph_v2.question_refinement import (
+    QuestionRefinementActor,
+    build_question_refinement_actor,
+)
 from app.langgraph_v2.run_events import (
     CLAIM_HEARTBEAT_INTERVAL_SECONDS,
     ClaimFenced,
@@ -36,6 +39,23 @@ from app.langgraph_v2.run_events import (
 )
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
+
+
+def _resolve_refinement_actor(
+    app: FastAPI,
+    tenant_id: str,
+    injected: QuestionRefinementActor | None,
+) -> QuestionRefinementActor | None:
+    """Resolve an injected actor or build one from the tenant model registry."""
+    if injected is not None:
+        return injected
+    configured = getattr(app.state, "langgraph_v2_refinement_actor", None)
+    if configured is not None:
+        return configured
+    manager = getattr(app.state, "tenant_manager", None)
+    if manager is None:
+        return None
+    return build_question_refinement_actor(manager.get_model_registry(tenant_id))
 
 
 async def _refresh_claim(
@@ -159,10 +179,10 @@ def create_tracer_router(
                 "langgraph_v2_checkpointer",
                 None,
             )
-            configured_refinement_actor = refinement_actor or getattr(
-                http_request.app.state,
-                "langgraph_v2_refinement_actor",
-                None,
+            configured_refinement_actor = _resolve_refinement_actor(
+                http_request.app,
+                x_application_id,
+                refinement_actor,
             )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
@@ -299,10 +319,10 @@ def create_tracer_router(
             configured_checkpointer = getattr(
                 http_request.app.state, "langgraph_v2_checkpointer", None
             )
-            configured_refinement_actor = refinement_actor or getattr(
-                http_request.app.state,
-                "langgraph_v2_refinement_actor",
-                None,
+            configured_refinement_actor = _resolve_refinement_actor(
+                http_request.app,
+                x_application_id,
+                refinement_actor,
             )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None

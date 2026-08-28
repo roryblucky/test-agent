@@ -95,6 +95,11 @@ class TenantManager:
         """Get the full configuration for a specific tenant."""
         return self._resolve_tenant(app_id)
 
+    def get_model_registry(self, app_id: str) -> ModelRegistry:
+        """Return the tenant-scoped model registry for v2 actor construction."""
+        self._resolve_tenant(app_id)
+        return self._registries[app_id]
+
     def validate_ad_group(self, app_id: str, user_groups: list[str]) -> bool:
         """Check whether *user_groups* overlap with the tenant's ``adGroups``."""
         cfg = self._resolve_tenant(app_id)

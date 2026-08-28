@@ -28,6 +28,7 @@ from app.langgraph_v2.checkpointing import (
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
+from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
 from app.services.events import EventEmitter
 
@@ -47,6 +48,7 @@ def persistent_tracer_app(
     database_url: str,
     graph: TracerGraph | None = None,
     resume_enabled: bool = False,
+    refinement_actor: QuestionRefinementActor | None = None,
 ) -> FastAPI:
     """Create the test-only tracer with its real application database pool."""
 
@@ -60,7 +62,11 @@ def persistent_tracer_app(
 
     app = FastAPI(lifespan=lifespan)
     register_tracer_routes(
-        app, enabled=True, graph=graph, resume_enabled=resume_enabled
+        app,
+        enabled=True,
+        graph=graph,
+        refinement_actor=refinement_actor,
+        resume_enabled=resume_enabled,
     )
     return app
 

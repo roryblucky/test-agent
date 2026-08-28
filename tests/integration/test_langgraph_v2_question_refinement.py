@@ -14,6 +14,7 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.workflow import ResolvedQuery
+from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
 def _state() -> dict:
@@ -220,3 +221,33 @@ async def test_pydantic_ai_actor_returns_agent_output() -> None:
     result = await actor.refine("raw")
 
     assert result.standalone_query == "refined"
+
+
+def test_http_query_uses_injected_refinement_actor(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class CountingActor:
+        calls = 0
+
+        async def refine(self, query: str) -> ResolvedQuery:
+            self.calls += 1
+            return ResolvedQuery(original_query=query, standalone_query="http-refined")
+
+    actor = CountingActor()
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        refinement_actor=actor,
+    )
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "conversation-1"},
+            headers={"X-Application-Id": "tenant-a"},
+        )
+
+    assert response.status_code == 200
+    assert actor.calls == 1
+    assert parse_sse(response.text)[-1]["data"]["refined_query"] == "http-refined"
