@@ -348,7 +348,7 @@ def build_tracer_graph(
             if result is not None:
                 update["answer"] = result.answer
                 update["answer_usage"] = result.usage
-                update["citations"] = [citation.model_dump(mode="json") for citation in result.citations]
+                update["citations"] = result.citations
             if error is not None:
                 update["answer_error"] = error
             if (
