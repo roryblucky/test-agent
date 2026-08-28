@@ -75,7 +75,8 @@ async def postgres_lifespan(
     app.state.langgraph_v2_postgres_pool = None
     app.state.langgraph_v2_checkpointer = None
     app.state.langgraph_v2_live_events = LiveEventWakeups(
-        redis_url=os.environ.get("LANGGRAPH_V2_REDIS_URL")
+        redis_url=os.environ.get("LANGGRAPH_V2_REDIS_URL"),
+        instance_id=_INSTANCE_ID,
     )
     wakeups = app.state.langgraph_v2_live_events
     pool: Any | None = None

@@ -13,6 +13,7 @@ from uuid import UUID
 import redis.asyncio as aioredis
 
 _CHANNEL = "langgraph_v2:run-events"
+_CANCELLATION_CHANNEL = "langgraph_v2:run-cancellations"
 
 
 @dataclass
@@ -58,10 +59,13 @@ class LiveEventWakeups:
         self,
         *,
         redis_url: str | None = None,
+        instance_id: str | None = None,
     ) -> None:
         self._slots: dict[tuple[str, UUID], _WakeupSlot] = {}
+        self._cancellation_slots: dict[tuple[str, UUID], _WakeupSlot] = {}
         self._slots_lock = asyncio.Lock()
         self._redis_url = redis_url
+        self._instance_id = instance_id
         self._redis: Any | None = None
         self._pubsub: Any | None = None
         self._listener: asyncio.Task[None] | None = None
@@ -92,17 +96,37 @@ class LiveEventWakeups:
         self, tenant_id: str, run_id: UUID
     ) -> AsyncIterator[LiveEventSubscription]:
         """Retain local state only while at least one follower is active."""
+        async with self._subscribe(self._slots, tenant_id, run_id) as subscription:
+            yield subscription
+
+    @asynccontextmanager
+    async def subscribe_cancellation(
+        self, tenant_id: str, run_id: UUID
+    ) -> AsyncIterator[LiveEventSubscription]:
+        """Retain one owner-local cancellation signal subscription."""
+        async with self._subscribe(
+            self._cancellation_slots, tenant_id, run_id
+        ) as subscription:
+            yield subscription
+
+    @asynccontextmanager
+    async def _subscribe(
+        self,
+        slots: dict[tuple[str, UUID], _WakeupSlot],
+        tenant_id: str,
+        run_id: UUID,
+    ) -> AsyncIterator[LiveEventSubscription]:
         key = (tenant_id, run_id)
         async with self._slots_lock:
-            slot = self._slots.setdefault(key, _WakeupSlot())
+            slot = slots.setdefault(key, _WakeupSlot())
             slot.subscribers += 1
         try:
             yield LiveEventSubscription(slot)
         finally:
             async with self._slots_lock:
                 slot.subscribers -= 1
-                if slot.subscribers == 0 and self._slots.get(key) is slot:
-                    self._slots.pop(key)
+                if slot.subscribers == 0 and slots.get(key) is slot:
+                    slots.pop(key)
 
     async def publish(self, tenant_id: str, run_id: UUID) -> None:
         """Wake local followers and best-effort relay the wakeup remotely."""
@@ -119,10 +143,50 @@ class LiveEventWakeups:
             # PostgreSQL polling is the loss-tolerant fallback.
             return
 
+    async def publish_cancellation(
+        self,
+        tenant_id: str,
+        run_id: UUID,
+        *,
+        owner_instance_id: str,
+    ) -> None:
+        """Best-effort wake only the instance owning the current Run claim."""
+        if self._instance_id == owner_instance_id:
+            await self._wake_local_cancellation(tenant_id, run_id)
+        if self._redis_url is None or not owner_instance_id:
+            return
+        try:
+            redis = self._redis_client()
+            await redis.publish(
+                _CANCELLATION_CHANNEL,
+                json.dumps(
+                    {
+                        "kind": "cancellation",
+                        "owner_instance_id": owner_instance_id,
+                        "tenant_id": tenant_id,
+                        "run_id": str(run_id),
+                    }
+                ),
+            )
+        except Exception:
+            # The persisted intent remains authoritative.
+            return
+
     async def _wake_local(self, tenant_id: str, run_id: UUID) -> None:
+        await self._wake_slot(self._slots, tenant_id, run_id)
+
+    async def _wake_local_cancellation(self, tenant_id: str, run_id: UUID) -> None:
+        await self._wake_slot(self._cancellation_slots, tenant_id, run_id)
+
+    async def _wake_slot(
+        self,
+        slots: dict[tuple[str, UUID], _WakeupSlot],
+        tenant_id: str,
+        run_id: UUID,
+    ) -> None:
         key = (tenant_id, run_id)
         async with self._slots_lock:
-            slot = self._slots.get(key)
+            slot = slots.get(key)
         if slot is None:
             return
         async with slot.condition:
@@ -145,14 +209,18 @@ class LiveEventWakeups:
             try:
                 redis = self._redis_client()
                 self._pubsub = redis.pubsub()
-                await self._pubsub.subscribe(_CHANNEL)
+                await self._pubsub.subscribe(_CHANNEL, _CANCELLATION_CHANNEL)
                 async for message in self._pubsub.listen():
                     if message.get("type") != "message":
                         continue
                     payload = json.loads(message["data"])
-                    await self._wake_local(
-                        str(payload["tenant_id"]), UUID(str(payload["run_id"]))
-                    )
+                    tenant_id = str(payload["tenant_id"])
+                    run_id = UUID(str(payload["run_id"]))
+                    if payload.get("kind") == "cancellation":
+                        if payload.get("owner_instance_id") == self._instance_id:
+                            await self._wake_local_cancellation(tenant_id, run_id)
+                    else:
+                        await self._wake_local(tenant_id, run_id)
             except asyncio.CancelledError:
                 raise
             except Exception:

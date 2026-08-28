@@ -95,7 +95,7 @@ async def test_postgres_startup_failure_closes_all_started_resources(
     monkeypatch.setattr(
         postgres_module,
         "LiveEventWakeups",
-        lambda *, redis_url: wakeups,
+        lambda *, redis_url, instance_id: wakeups,
     )
 
     with pytest.raises(RuntimeError, match="startup failed"):

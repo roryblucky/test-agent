@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,6 +26,16 @@ class V2QueryRequest(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9._:-]+$",
     )
+
+
+class CancellationResponse(BaseModel):
+    """Immediate acknowledgement of a cooperative cancellation request."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    status: Literal["accepted", "already_terminal"]
+    run_id: UUID = Field(serialization_alias="runId")
+    run_status: str = Field(serialization_alias="runStatus")
 
 
 class TracerQueryResponse(BaseModel):

@@ -87,14 +87,63 @@ async def test_redis_publish_on_one_instance_wakes_another_instance(
     assert all(client.closed for client in broker.clients)
 
 
+@pytest.mark.asyncio
+async def test_cancellation_wakeup_is_addressed_only_to_owning_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = FakeRedisBroker()
+    monkeypatch.setattr(
+        live_events_module.aioredis,
+        "from_url",
+        lambda *args, **kwargs: broker.client(),
+    )
+    requester = LiveEventWakeups(redis_url="redis://test", instance_id="requester")
+    owner = LiveEventWakeups(redis_url="redis://test", instance_id="owner")
+    bystander = LiveEventWakeups(redis_url="redis://test", instance_id="bystander")
+    run_id = uuid4()
+
+    async with (
+        owner.subscribe_cancellation("tenant-a", run_id) as owner_subscription,
+        bystander.subscribe_cancellation("tenant-a", run_id) as bystander_subscription,
+    ):
+        await owner.start()
+        await bystander.start()
+        await asyncio.wait_for(broker.subscribed.wait(), timeout=1)
+        await asyncio.sleep(0)
+        owner_generation = owner_subscription.generation
+        bystander_generation = bystander_subscription.generation
+
+        await requester.publish_cancellation(
+            "tenant-a",
+            run_id,
+            owner_instance_id="owner",
+        )
+
+        assert (
+            await owner_subscription.wait(owner_generation, timeout_seconds=1)
+            == owner_generation + 1
+        )
+        assert (
+            await bystander_subscription.wait(
+                bystander_generation, timeout_seconds=0.001
+            )
+            == bystander_generation
+        )
+
+    await requester.close()
+    await owner.close()
+    await bystander.close()
+    assert broker.published_channels[-1] == "langgraph_v2:run-cancellations"
+
+
 class FakePubSub:
     def __init__(self, broker: FakeRedisBroker) -> None:
         self._broker = broker
         self._messages: asyncio.Queue[dict[str, str]] = asyncio.Queue()
-        self.subscribed_channel: str | None = None
+        self.subscribed_channels: set[str] = set()
 
-    async def subscribe(self, channel: str) -> None:
-        self.subscribed_channel = channel
+    async def subscribe(self, *channels: str) -> None:
+        self.subscribed_channels.update(channels)
         self._broker.pubsubs.append(self)
         self._broker.subscribed.set()
 
@@ -117,7 +166,7 @@ class FakeRedis:
     async def publish(self, channel: str, data: str) -> None:
         self._broker.published_channels.append(channel)
         for pubsub in self._broker.pubsubs:
-            if pubsub.subscribed_channel == channel:
+            if channel in pubsub.subscribed_channels:
                 await pubsub._messages.put({"type": "message", "data": data})
 
     async def aclose(self) -> None:

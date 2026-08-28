@@ -11,7 +11,7 @@ from contextlib import suppress
 from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 
@@ -22,6 +22,7 @@ from app.langgraph_v2.answer import (
     build_answer_actor,
 )
 from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
+from app.langgraph_v2.cancellation import CancellationRepository
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
     checkpoint_namespace_for,
@@ -29,7 +30,11 @@ from app.langgraph_v2.checkpointing import (
     initial_checkpoint_config,
     thread_id_for,
 )
-from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
+from app.langgraph_v2.contracts import (
+    CancellationResponse,
+    TracerStreamEvent,
+    V2QueryRequest,
+)
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
@@ -530,7 +535,7 @@ def _live_events(app: FastAPI) -> LiveEventWakeups:
     """Return the app-local wakeup relay used by durable Event followers."""
     wakeups = getattr(app.state, "langgraph_v2_live_events", None)
     if wakeups is None:
-        wakeups = LiveEventWakeups()
+        wakeups = LiveEventWakeups(instance_id=_INSTANCE_ID)
         app.state.langgraph_v2_live_events = wakeups
     return cast(LiveEventWakeups, wakeups)
 
@@ -1022,6 +1027,42 @@ def create_tracer_router(
             headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
         )
 
+    @router.post(
+        "/v2/runs/{run_id}/cancel",
+        response_model=CancellationResponse,
+        status_code=202,
+        responses={200: {"model": CancellationResponse}},
+    )
+    async def cancel_run(
+        run_id: uuid.UUID,
+        http_request: Request,
+        x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+    ) -> JSONResponse:
+        """Accept a durable cancellation intent without claiming completion."""
+        configured_pool = getattr(
+            http_request.app.state, "langgraph_v2_postgres_pool", None
+        )
+        if configured_pool is None:
+            raise HTTPException(
+                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
+            )
+        try:
+            result = await CancellationRepository(
+                configured_pool,
+                wakeups=_live_events(http_request.app),
+            ).request(tenant_id=x_application_id, run_id=run_id)
+        except RunNotFound as error:
+            raise HTTPException(status_code=404, detail="Run not found") from error
+        response = CancellationResponse(
+            status="accepted" if result.accepted else "already_terminal",
+            run_id=run_id,
+            run_status=result.run_status,
+        )
+        return JSONResponse(
+            status_code=202 if result.accepted else 200,
+            content=response.model_dump(mode="json", by_alias=True),
+        )
+
     @router.get("/v2/artifacts/{artifact_id}")
     async def get_artifact(
         artifact_id: uuid.UUID,
@@ -1062,6 +1103,7 @@ def register_tracer_routes(
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     resume_enabled: bool = False,
     replay_enabled: bool = False,
+    cancellation_enabled: bool = False,
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
@@ -1082,6 +1124,8 @@ def register_tracer_routes(
             disabled_control_paths.add("/v2/runs/{run_id}/resume/stream")
         if not replay_enabled:
             disabled_control_paths.add("/v2/runs/{run_id}/stream")
+        if not cancellation_enabled:
+            disabled_control_paths.add("/v2/runs/{run_id}/cancel")
         if disabled_control_paths:
             router.routes = [
                 route
