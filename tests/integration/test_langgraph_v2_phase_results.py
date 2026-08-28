@@ -179,6 +179,8 @@ async def test_pre_moderation_replay_reuses_provider_result_and_events(
             "phase:query:step_completed:1",
             "phase:pre_moderation:step_start:1",
             "phase:pre_moderation:step_completed:1",
+            "phase:question_refinement:step_start:1",
+            "phase:question_refinement:step_completed:1",
         ]
 
 

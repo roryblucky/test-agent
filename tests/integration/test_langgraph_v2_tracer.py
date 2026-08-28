@@ -119,7 +119,7 @@ async def test_in_memory_graph_sequences_events_additively() -> None:
         }
     )
 
-    assert [event["sequence"] for event in result["events"]] == list(range(1, 8))
+    assert [event["sequence"] for event in result["events"]] == list(range(1, 10))
 
 
 def test_enabled_tracer_preserves_the_minimal_stream_contract(
@@ -144,7 +144,7 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
     assert response.headers["x-conversation-id"] == "conversation-123"
     assert response.text.endswith("\n\n")
     actual_events = parse_sse(response.text)
-    assert [event.pop("sequence") for event in actual_events] == list(range(1, 8))
+    assert [event.pop("sequence") for event in actual_events] == list(range(1, 10))
     assert actual_events == [
         {
             "type": "step_start",
@@ -166,6 +166,15 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
         },
         {
             "type": "step_start",
+            "step": "llm:refine_question",
+        },
+        {
+            "type": "step_completed",
+            "step": "llm:refine_question",
+            "data": {"refined_query": "What is LangGraph?"},
+        },
+        {
+            "type": "step_start",
             "step": "finalization",
         },
         {
@@ -177,10 +186,12 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
             "type": "done",
             "data": {
                 **fixture["events"][-1]["data"],
+                "refined_query": "What is LangGraph?",
                 "metadata": {
                     "steps_executed": [
                         "query",
                         "pre_moderation",
+                        "question_refinement",
                         "finalization",
                     ]
                 },
@@ -683,7 +694,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     delivered = parse_sse(response.text)
     assert response.status_code == 200
-    assert [event["sequence"] for event in delivered] == [5, 6, 7]
+    assert [event["sequence"] for event in delivered] == [7, 8, 9]
 
     async def read_run_and_events() -> tuple[str, int, list, Any]:
         async with AsyncConnectionPool(
@@ -699,7 +710,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     status, epoch, events, phase = asyncio.run(read_run_and_events())
     assert (status, epoch) == ("completed", 2)
-    assert [event.sequence for event in events] == list(range(1, 8))
+    assert [event.sequence for event in events] == list(range(1, 10))
     assert phase is not None
     assert phase.normalized_result == {
         "query": "authoritative",
@@ -820,12 +831,14 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
 
     assert run.status == "completed"
     assert run.terminal_outcome == delivered[-1]["data"]
-    assert [event.sequence for event in persisted] == list(range(1, 8))
+    assert [event.sequence for event in persisted] == list(range(1, 10))
     assert [event.event_key for event in persisted] == [
         "phase:query:step_start:1",
         "phase:query:step_completed:1",
         "phase:pre_moderation:step_start:1",
         "phase:pre_moderation:step_completed:1",
+        "phase:question_refinement:step_start:1",
+        "phase:question_refinement:step_completed:1",
         "phase:finalization:step_start:1",
         "phase:finalization:step_completed:1",
         "lifecycle:completed:0",

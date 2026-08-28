@@ -18,6 +18,12 @@ from app.langgraph_v2.pre_moderation import (
     pre_moderation_events,
     run_pre_moderation,
 )
+from app.langgraph_v2.question_refinement import (
+    MockQuestionRefinementActor,
+    QuestionRefinementActor,
+    refinement_events,
+    run_question_refinement,
+)
 from app.langgraph_v2.run_events import EventInput, EventRecord
 
 
@@ -30,6 +36,7 @@ class TracerState(TypedDict):
     events: list[dict[str, Any]]
     halted: NotRequired[bool]
     moderation: NotRequired[dict[str, Any]]
+    refined_query: NotRequired[str]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -38,6 +45,7 @@ class TracerStateUpdate(TypedDict, total=False):
     events: list[dict[str, Any]]
     halted: bool
     moderation: dict[str, Any]
+    refined_query: str
 
 
 async def _query(
@@ -108,7 +116,15 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     response = TracerQueryResponse(
         query=state["query"],
         conversation_id=state["conversation_id"],
-        metadata={"steps_executed": ["query", "pre_moderation", "finalization"]},
+        metadata={
+            "steps_executed": [
+                "query",
+                "pre_moderation",
+                "question_refinement",
+                "finalization",
+            ]
+        },
+        refined_query=state.get("refined_query"),
     )
     events.extend(
         [
@@ -159,6 +175,7 @@ def build_tracer_graph(
     checkpointer: BaseCheckpointSaver | None = None,
     phase_context: PhaseExecutionContext | None = None,
     moderation_provider: ModerationProvider | None = None,
+    refinement_actor: QuestionRefinementActor | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
@@ -168,6 +185,7 @@ def build_tracer_graph(
 
     builder.add_node("query", query_node)
     selected_moderation_provider = moderation_provider or MockModerationProvider()
+    selected_refinement_actor = refinement_actor or MockQuestionRefinementActor()
 
     async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
         if phase_context is None:
@@ -195,12 +213,50 @@ def build_tracer_graph(
         }
 
     builder.add_node("pre_moderation", pre_moderation_node)
+
+    async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
+        if phase_context is None:
+            result = await selected_refinement_actor.refine(state["query"])
+            return {
+                "events": [
+                    *state["events"],
+                    *[
+                        _event_state(event, len(state["events"]) + index)
+                        for index, event in enumerate(refinement_events(result), 1)
+                    ],
+                ],
+                "refined_query": result.standalone_query,
+            }
+        events, halted, result, error = await run_question_refinement(
+            state,
+            context=phase_context,
+            actor=selected_refinement_actor,
+        )
+        update: TracerStateUpdate = {
+            "events": [
+                *state["events"],
+                *[_event_state(event, event.sequence) for event in events],
+            ],
+            "halted": halted,
+        }
+        if result is not None:
+            update["refined_query"] = result.standalone_query
+        if error is not None:
+            update["moderation"] = {"error": error}
+        return update
+
+    builder.add_node("question_refinement", question_refinement_node)
     builder.add_node("finalization", _finalize)
     builder.add_edge(START, "query")
     builder.add_edge("query", "pre_moderation")
     builder.add_conditional_edges(
         "pre_moderation",
         _next_after_pre_moderation,
+        {"finalization": "question_refinement", "end": END},
+    )
+    builder.add_conditional_edges(
+        "question_refinement",
+        lambda state: "end" if state.get("halted", False) else "finalization",
         {"finalization": "finalization", "end": END},
     )
     builder.add_edge("finalization", END)

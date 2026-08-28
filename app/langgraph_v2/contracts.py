@@ -28,7 +28,7 @@ class TracerQueryResponse(BaseModel):
     """Minimal v1-shaped final response emitted by the tracer."""
 
     query: str
-    refined_query: None = None
+    refined_query: str | None = None
     intent: None = None
     answer: None = None
     documents: list[Any] = Field(default_factory=list)
