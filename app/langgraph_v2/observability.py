@@ -6,6 +6,8 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
+from hmac import new as hmac_new
+from secrets import token_bytes
 from threading import Lock
 from time import perf_counter
 from typing import Any
@@ -64,6 +66,7 @@ _TELEMETRY = V2Telemetry(
 )
 _METER_PROVIDER_LOCK = Lock()
 _FALLBACK_METRIC_READER: InMemoryMetricReader | None = None
+_IDENTIFIER_KEY = token_bytes(32)
 _BOUNDED_OUTCOMES = frozenset(
     {"ok", "error", "completed", "failed", "cancelled", "fenced"}
 )
@@ -168,9 +171,13 @@ def set_operation_outcome(
 
 
 def redacted_identifier(value: UUID | str) -> str:
-    """Return a stable opaque identifier without exporting caller input."""
-    digest = sha256(str(value).encode("utf-8")).hexdigest()
-    return f"sha256:{digest}"
+    """Return a process-stable opaque identifier without exporting caller input."""
+    digest = hmac_new(
+        _IDENTIFIER_KEY,
+        str(value).encode("utf-8"),
+        sha256,
+    ).hexdigest()
+    return f"id:{digest}"
 
 
 def context_for_span(observation: OperationObservation) -> Context:

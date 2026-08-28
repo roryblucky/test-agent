@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from hashlib import sha256
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -41,6 +40,7 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.replay import PersistedEventFollower
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
+from app.services.exceptions import TenantNotFoundError
 from tests.integration.test_langgraph_v2_tracer import (
     parse_sse,
     persistent_tracer_app,
@@ -99,22 +99,35 @@ def test_failed_operation_exports_only_safe_metadata(
         ):
             raise RuntimeError(secret)
 
+    with observability.observe(
+        "provider.invoke",
+        run_id=run_id,
+        conversation_id=conversation_id,
+        attributes={"provider.role": "retrieval"},
+    ):
+        pass
+
     spans = capture.spans.get_finished_spans()
-    assert len(spans) == 1
+    assert len(spans) == 2
     assert spans[0].name == "langgraph_v2.provider.invoke"
     assert spans[0].attributes == {
-        "run.id": f"sha256:{sha256(str(run_id).encode()).hexdigest()}",
-        "conversation.id": f"sha256:{sha256(conversation_id.encode()).hexdigest()}",
+        "run.id": spans[1].attributes["run.id"],
+        "conversation.id": spans[1].attributes["conversation.id"],
         "provider.role": "retrieval",
         "error.type": "RuntimeError",
     }
+    assert str(run_id) not in spans[0].attributes["run.id"]
+    assert conversation_id not in spans[0].attributes["conversation.id"]
+    assert spans[0].attributes["run.id"].startswith("id:")
+    assert spans[0].attributes["conversation.id"].startswith("id:")
     assert spans[0].events == ()
     assert secret not in repr(spans[0])
 
     metrics = capture.metrics.get_metrics_data()
     points = metrics.resource_metrics[0].scope_metrics[0].metrics[0].data.data_points
     assert [point.attributes for point in points] == [
-        {"operation": "provider.invoke", "outcome": "error"}
+        {"operation": "provider.invoke", "outcome": "error"},
+        {"operation": "provider.invoke", "outcome": "ok"},
     ]
     assert all("run.id" not in point.attributes for point in points)
     assert all("conversation.id" not in point.attributes for point in points)
@@ -375,6 +388,67 @@ def test_complete_v2_path_emits_correlated_redacted_telemetry(
     assert all(set(point.attributes) == {"operation", "outcome"} for point in points)
     assert all("run.id" not in point.attributes for point in points)
     assert all("conversation.id" not in point.attributes for point in points)
+
+
+class _UnknownTenantManager:
+    def get_providers(self, tenant_id: str) -> None:
+        raise TenantNotFoundError(tenant_id)
+
+
+def test_preflight_rejections_emit_redacted_http_spans(
+    langgraph_v2_migrated_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejected requests remain observable before an SSE iterator exists."""
+    capture = _install_capture(monkeypatch)
+    app = _observed_app(
+        langgraph_v2_migrated_database_url,
+        secret_query="unused",
+    )
+    app.state.tenant_manager = _UnknownTenantManager()
+
+    with TestClient(app) as client:
+        unknown_tenant = client.post(
+            "/v2/query/stream",
+            headers={"X-Application-Id": "private-missing-tenant"},
+            json={"query": "private rejected query"},
+        )
+        del app.state.tenant_manager
+        missing_replay = client.get(
+            f"/v2/runs/{uuid4()}/stream",
+            headers={"X-Application-Id": "tenant-a"},
+        )
+        missing_artifact = client.get(
+            f"/v2/artifacts/{uuid4()}",
+            headers={"X-Application-Id": "tenant-a"},
+        )
+        asyncio.run(
+            app.state.langgraph_v2_runtime.stop_and_wait_for_checkpoint_boundary()
+        )
+        shutdown = client.post(
+            "/v2/query/stream",
+            headers={"X-Application-Id": "tenant-a"},
+            json={"query": "private shutdown query"},
+        )
+
+    assert unknown_tenant.status_code == 404
+    assert missing_replay.status_code == 404
+    assert missing_artifact.status_code == 404
+    assert shutdown.status_code == 503
+    spans = [
+        span
+        for span in capture.spans.get_finished_spans()
+        if span.name == "langgraph_v2.http.request"
+    ]
+    routes = [span.attributes["http.route"] for span in spans]
+    assert routes.count("/v2/query/stream") == 2
+    assert "/v2/runs/{run_id}/stream" in routes
+    assert "/v2/artifacts/{artifact_id}" in routes
+    assert all(span.status.status_code.name == "ERROR" for span in spans)
+    exported = repr(spans)
+    assert "private-missing-tenant" not in exported
+    assert "private rejected query" not in exported
+    assert "private shutdown query" not in exported
 
 
 class _ResumeGraph:
@@ -658,12 +732,10 @@ async def test_expired_claim_interruption_is_correlated_and_redacted(
     replay = next(span for span in spans if span.name == "langgraph_v2.replay.follow")
     assert recovery.context.trace_id == replay.context.trace_id
     assert recovery.parent.span_id == replay.context.span_id
-    assert recovery.attributes == {
-        "run.id": f"sha256:{sha256(str(run.run_id).encode()).hexdigest()}",
-        "execution.epoch": 1,
-        "recovery.operation": "interrupt_expired",
-        "run.status": "interrupted",
-    }
+    assert recovery.attributes["run.id"].startswith("id:")
+    assert recovery.attributes["execution.epoch"] == 1
+    assert recovery.attributes["recovery.operation"] == "interrupt_expired"
+    assert recovery.attributes["run.status"] == "interrupted"
     exported = repr(spans)
     assert "tenant-expired-secret" not in exported
     assert "conversation-expired-secret" not in exported
