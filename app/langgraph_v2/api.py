@@ -26,6 +26,8 @@ from app.langgraph_v2.checkpointing import (
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
+from app.langgraph_v2.pre_moderation import ModerationProvider
+from app.langgraph_v2.provider_adapters import V2ProviderBundle, adapt_tenant_providers
 from app.langgraph_v2.question_refinement import (
     QuestionRefinementActor,
     build_question_refinement_actor,
@@ -59,6 +61,14 @@ def _resolve_refinement_actor(
     if manager is None:
         return None
     return build_question_refinement_actor(manager.get_model_registry(tenant_id))
+
+
+def _resolve_provider_bundle(app: FastAPI, tenant_id: str) -> V2ProviderBundle | None:
+    """Adapt the tenant's existing provider instances for v2 graph construction."""
+    manager = getattr(app.state, "tenant_manager", None)
+    if manager is None or not hasattr(manager, "get_providers"):
+        return None
+    return adapt_tenant_providers(manager.get_providers(tenant_id))
 
 
 async def _refresh_claim(
@@ -147,6 +157,7 @@ def create_tracer_router(
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
+    moderation_provider: ModerationProvider | None = None,
 ) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
     router = APIRouter(tags=["LangGraph v2 tracer"])
@@ -195,6 +206,16 @@ def create_tracer_router(
             configured_ranker = ranker or getattr(
                 http_request.app.state, "langgraph_v2_ranker", None
             )
+            configured_moderation = moderation_provider or getattr(
+                http_request.app.state, "langgraph_v2_moderation_provider", None
+            )
+            provider_bundle = _resolve_provider_bundle(
+                http_request.app, x_application_id
+            )
+            if provider_bundle is not None:
+                configured_retriever = configured_retriever or provider_bundle.retriever
+                configured_ranker = configured_ranker or provider_bundle.ranker
+                configured_moderation = configured_moderation or provider_bundle.moderation
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None:
@@ -245,6 +266,7 @@ def create_tracer_router(
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
                     ranker=configured_ranker,
+                    moderation_provider=configured_moderation,
                 )
             heartbeat_task = asyncio.create_task(
                 _refresh_claim(
@@ -337,6 +359,16 @@ def create_tracer_router(
             configured_ranker = ranker or getattr(
                 http_request.app.state, "langgraph_v2_ranker", None
             )
+            configured_moderation = moderation_provider or getattr(
+                http_request.app.state, "langgraph_v2_moderation_provider", None
+            )
+            provider_bundle = _resolve_provider_bundle(
+                http_request.app, x_application_id
+            )
+            if provider_bundle is not None:
+                configured_retriever = configured_retriever or provider_bundle.retriever
+                configured_ranker = configured_ranker or provider_bundle.ranker
+                configured_moderation = configured_moderation or provider_bundle.moderation
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None and configured_checkpointer is not None:
@@ -375,6 +407,7 @@ def create_tracer_router(
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
                     ranker=configured_ranker,
+                    moderation_provider=configured_moderation,
                 )
                 graph_config = exact_checkpoint_config(
                     thread_id=thread_id_for(x_application_id, claim.conversation_id),
@@ -453,11 +486,14 @@ def register_tracer_routes(
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
+    moderation_provider: ModerationProvider | None = None,
     resume_enabled: bool = False,
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
-        router = create_tracer_router(graph, refinement_actor, retriever, ranker)
+        router = create_tracer_router(
+            graph, refinement_actor, retriever, ranker, moderation_provider
+        )
         if not resume_enabled:
             router.routes = [
                 route

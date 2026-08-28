@@ -100,6 +100,11 @@ class TenantManager:
         self._resolve_tenant(app_id)
         return self._registries[app_id]
 
+    def get_providers(self, app_id: str) -> TenantProviders:
+        """Return the tenant-scoped non-LLM providers for adapter construction."""
+        self._resolve_tenant(app_id)
+        return self._providers[app_id]
+
     def validate_ad_group(self, app_id: str, user_groups: list[str]) -> bool:
         """Check whether *user_groups* overlap with the tenant's ``adGroups``."""
         cfg = self._resolve_tenant(app_id)

@@ -33,7 +33,8 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
     class Ranker:
         received: list[str] = []
 
-        async def rank(self, documents: list[Document]) -> RerankingResult:
+        async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
+            assert query == "hello"
             self.received = [document.id for document in documents]
             return RerankingResult(documents=[documents[1], documents[0]])
 
@@ -81,7 +82,8 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
             )
 
     class InvalidRanker:
-        async def rank(self, documents: list[Document]) -> RerankingResult:
+        async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
+            del query
             return RerankingResult(
                 documents=[documents[0], documents[2], documents[2]]
             )
@@ -118,7 +120,8 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
             )
 
     class ReverseRanker:
-        async def rank(self, documents: list[Document]) -> RerankingResult:
+        async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
+            del query
             return RerankingResult(documents=list(reversed(documents)))
 
     async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
@@ -146,7 +149,8 @@ def test_failed_ranker_terminates_public_stream(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class FailingRanker:
-        async def rank(self, documents: list[Document]) -> RerankingResult:
+        async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
+            del query, documents
             raise RuntimeError("ranker unavailable")
 
     app = persistent_tracer_app(
@@ -170,8 +174,9 @@ async def test_reranking_replays_after_commit_window_crash(
     class CountingRanker:
         calls = 0
 
-        async def rank(self, documents: list[Document]) -> RerankingResult:
+        async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
             self.calls += 1
+            del query
             return RerankingResult(documents=list(reversed(documents)))
 
     class CrashAfterRerankingCommit(PhaseResultRepository):

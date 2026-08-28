@@ -25,7 +25,7 @@ class RerankingResult(BaseModel):
 class Ranker(Protocol):
     """Provider seam for deterministic or model-backed ranking."""
 
-    async def rank(self, documents: list[Document]) -> RerankingResult:
+    async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
         """Return the same documents in the selected order."""
         ...
 
@@ -33,8 +33,9 @@ class Ranker(Protocol):
 class MockRanker:
     """Deterministic POC ranker that reverses the retrieved order."""
 
-    async def rank(self, documents: list[Document]) -> RerankingResult:
+    async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
         """Return a stable reordered copy without changing document contents."""
+        del query
         return RerankingResult(documents=list(reversed(documents)))
 
 
@@ -65,7 +66,9 @@ async def run_reranking(
                 )
                 for ref in refs
             ]
-            ranked = await ranker.rank(documents)
+            ranked = await ranker.rank(
+                state.get("refined_query", state["query"]), documents
+            )
             output_ids = [document.id for document in ranked.documents]
             input_keys = [_document_key(document) for document in documents]
             output_keys = [_document_key(document) for document in ranked.documents]
