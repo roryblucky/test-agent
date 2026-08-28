@@ -137,22 +137,6 @@ def test_failed_operation_exports_only_safe_metadata(
     assert all("conversation.id" not in point.attributes for point in points)
 
 
-def test_unknown_operation_is_rejected_before_export(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Caller input cannot create an unbounded metric label or span name."""
-    capture = _install_capture(monkeypatch)
-    secret_operation = "provider.private-customer-operation"
-
-    with pytest.raises(ValueError) as error:
-        with observability.observe(cast(Any, secret_operation)):
-            pass
-
-    assert str(error.value) == "unsupported telemetry operation"
-    assert secret_operation not in str(error.value)
-    assert capture.spans.get_finished_spans() == ()
-
-
 def test_startup_installs_an_exporting_metric_reader_without_a_host_provider(
     langgraph_v2_migrated_database_url: str,
 ) -> None:

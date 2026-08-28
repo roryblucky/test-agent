@@ -42,7 +42,6 @@ from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.observability import (
-    TelemetryOperation,
     activate_context,
     context_for_span,
     current_trace_context,
@@ -564,7 +563,7 @@ async def _execute_graph_run(
 async def _observed_stream(
     stream: AsyncIterator[str],
     *,
-    operation: TelemetryOperation,
+    operation: str,
     run_id: uuid.UUID,
     conversation_id: str | None = None,
     execution_epoch: int | None = None,

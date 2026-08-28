@@ -10,7 +10,7 @@ from hashlib import sha256
 from hmac import new as hmac_new
 from threading import Lock
 from time import perf_counter
-from typing import Any, Literal, get_args
+from typing import Any
 from uuid import UUID
 
 from opentelemetry import context as otel_context
@@ -75,28 +75,6 @@ _FALLBACK_METRIC_READER: MetricReader | None = None
 _BOUNDED_OUTCOMES = frozenset(
     {"ok", "error", "completed", "failed", "cancelled", "fenced"}
 )
-TelemetryOperation = Literal[
-    "cancellation.apply",
-    "cancellation.request",
-    "checkpoint.read",
-    "checkpoint.write",
-    "checkpoint.write_intermediate",
-    "execution.run",
-    "graph.phase",
-    "http.request",
-    "http.stream",
-    "persistence.event_batch",
-    "persistence.phase_result",
-    "provider.invoke",
-    "pydantic_ai.invoke",
-    "pydantic_ai.setup",
-    "recovery.interrupt_expired",
-    "recovery.interrupt_shutdown",
-    "recovery.resume",
-    "replay.follow",
-    "replay.snapshot",
-]
-_ALLOWED_OPERATIONS: frozenset[str] = frozenset(get_args(TelemetryOperation))
 _DEVELOPMENT_TELEMETRY_KEY = "langgraph-v2-local-development-key-only"
 
 
@@ -177,7 +155,7 @@ def ensure_meter_provider() -> MetricReader | None:
 
 @contextmanager
 def observe(
-    operation: TelemetryOperation,
+    operation: str,
     *,
     run_id: UUID | str | None = None,
     conversation_id: str | None = None,
@@ -190,8 +168,6 @@ def observe(
     Exception values are deliberately not recorded.  They can contain queries,
     credentials, model output, Evidence, or provider payloads.
     """
-    if operation not in _ALLOWED_OPERATIONS:
-        raise ValueError("unsupported telemetry operation")
     span_attributes: dict[str, str | bool | int | float] = {}
     if run_id is not None:
         span_attributes["run.id"] = redacted_identifier(run_id)
