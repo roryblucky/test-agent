@@ -42,11 +42,17 @@ def test_v2_postgres_config_rejects_an_inverted_pool_bound() -> None:
 async def test_postgres_lifespan_opens_and_closes_the_configured_pool() -> None:
     app = FastAPI()
     pools: list[FakeAsyncPool] = []
+    checkpointers: list[FakeCheckpointer] = []
 
     def pool_factory(**kwargs: Any) -> FakeAsyncPool:
         pool = FakeAsyncPool(**kwargs)
         pools.append(pool)
         return pool
+
+    def checkpointer_factory(pool: Any) -> FakeCheckpointer:
+        checkpointer = FakeCheckpointer(pool)
+        checkpointers.append(checkpointer)
+        return checkpointer
 
     config = V2PostgresConfig(
         database_url="postgresql://app:secret@db/v2",
@@ -54,18 +60,27 @@ async def test_postgres_lifespan_opens_and_closes_the_configured_pool() -> None:
         max_size=12,
     )
 
-    async with postgres_lifespan(app, config=config, pool_factory=pool_factory):
+    async with postgres_lifespan(
+        app,
+        config=config,
+        pool_factory=pool_factory,
+        checkpointer_factory=checkpointer_factory,
+    ):
         assert app.state.langgraph_v2_postgres_pool is pools[0]
+        assert app.state.langgraph_v2_checkpointer is checkpointers[0]
         assert pools[0].opened is True
+        assert checkpointers[0].setup_called is True
         assert pools[0].options == {
             "conninfo": "postgresql://app:secret@db/v2",
             "min_size": 2,
             "max_size": 12,
+            "kwargs": {"autocommit": True, "prepare_threshold": 0},
             "open": False,
         }
 
     assert pools[0].closed is True
     assert app.state.langgraph_v2_postgres_pool is None
+    assert app.state.langgraph_v2_checkpointer is None
 
 
 class FakeAsyncPool:
@@ -82,3 +97,14 @@ class FakeAsyncPool:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class FakeCheckpointer:
+    """Controllable substitute for the official saver setup boundary."""
+
+    def __init__(self, pool: Any) -> None:
+        self.pool = pool
+        self.setup_called = False
+
+    async def setup(self) -> None:
+        self.setup_called = True

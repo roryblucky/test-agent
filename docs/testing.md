@@ -25,3 +25,8 @@ database is unreachable, or user-created schemas, relations, functions, or
 types already exist. It never cleans an unrecognised database. After the test,
 it removes the `langgraph_v2` schema and Alembic version table so the dedicated
 database can be reused.
+
+The v2 application lifespan also runs the official LangGraph PostgreSQL
+checkpointer setup. Checkpointer integration tests use the same disposable
+database contract and remove LangGraph-owned checkpoint tables during session
+cleanup.

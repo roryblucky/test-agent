@@ -75,6 +75,10 @@ def langgraph_v2_test_database_url() -> Iterator[str]:
         with psycopg.connect(database_url, autocommit=True) as connection:
             connection.execute("DROP SCHEMA IF EXISTS langgraph_v2 CASCADE")
             connection.execute("DROP TABLE IF EXISTS public.alembic_version")
+            connection.execute("DROP TABLE IF EXISTS public.checkpoint_writes")
+            connection.execute("DROP TABLE IF EXISTS public.checkpoint_blobs")
+            connection.execute("DROP TABLE IF EXISTS public.checkpoints")
+            connection.execute("DROP TABLE IF EXISTS public.checkpoint_migrations")
 
 
 @pytest.fixture

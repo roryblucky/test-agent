@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Self
 
 from fastapi import FastAPI
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
@@ -54,6 +55,7 @@ class V2PostgresConfig(BaseModel):
 
 
 PoolFactory = Callable[..., Any]
+CheckpointerFactory = Callable[[Any], AsyncPostgresSaver]
 
 
 @asynccontextmanager
@@ -62,10 +64,12 @@ async def postgres_lifespan(
     *,
     config: V2PostgresConfig | None = None,
     pool_factory: PoolFactory = AsyncConnectionPool,
+    checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
 ) -> AsyncIterator[None]:
     """Open the configured pool for the application lifespan and always close it."""
     resolved_config = config or V2PostgresConfig.from_environment()
     app.state.langgraph_v2_postgres_pool = None
+    app.state.langgraph_v2_checkpointer = None
     if resolved_config is None:
         yield
         return
@@ -74,12 +78,17 @@ async def postgres_lifespan(
         conninfo=resolved_config.conninfo,
         min_size=resolved_config.min_size,
         max_size=resolved_config.max_size,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
         open=False,
     )
     await pool.open(wait=True)
     app.state.langgraph_v2_postgres_pool = pool
     try:
+        checkpointer = checkpointer_factory(pool)
+        await checkpointer.setup()
+        app.state.langgraph_v2_checkpointer = checkpointer
         yield
     finally:
         await pool.close()
         app.state.langgraph_v2_postgres_pool = None
+        app.state.langgraph_v2_checkpointer = None

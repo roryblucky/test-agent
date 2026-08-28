@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -79,7 +80,9 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     return {"events": events}
 
 
-def build_tracer_graph() -> CompiledStateGraph:
+def build_tracer_graph(
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
     builder.add_node("query", _query)
@@ -87,7 +90,7 @@ def build_tracer_graph() -> CompiledStateGraph:
     builder.add_edge(START, "query")
     builder.add_edge("query", "finalization")
     builder.add_edge("finalization", END)
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 tracer_graph = build_tracer_graph()

@@ -60,6 +60,8 @@ class RunRecord(BaseModel):
     execution_epoch: int
     heartbeat_at: datetime
     expires_at: datetime
+    checkpoint_id: str | None = None
+    checkpoint_ns: str | None = None
 
 
 class EventRecord(BaseModel):
@@ -98,12 +100,12 @@ class RunEventRepository:
                         tenant_id, run_id, conversation_id, status,
                         owner_instance_id, execution_epoch, heartbeat_at,
                         expires_at
-                    ) VALUES (%s, %s, %s, 'running', %s, %s, now(),
+                    ) VALUES (%s, %s, %s, 'running', %s, %s, clock_timestamp(),
                     clock_timestamp() + (%s * interval '1 second'))
                     RETURNING tenant_id, run_id, conversation_id, status,
                               terminal_outcome, created_at, completed_at,
                               owner_instance_id, execution_epoch, heartbeat_at,
-                              expires_at
+                              expires_at, checkpoint_id, checkpoint_ns
                     """,
                     (
                         tenant_id,
@@ -126,7 +128,7 @@ class RunEventRepository:
                     SELECT tenant_id, run_id, conversation_id, status,
                            terminal_outcome, created_at, completed_at,
                            owner_instance_id, execution_epoch, heartbeat_at,
-                           expires_at
+                           expires_at, checkpoint_id, checkpoint_ns
                     FROM langgraph_v2.runs
                     WHERE tenant_id = %s AND run_id = %s
                     """,
@@ -208,7 +210,7 @@ class RunEventRepository:
                         RETURNING tenant_id, run_id, conversation_id, status,
                                   terminal_outcome, created_at, completed_at,
                                   owner_instance_id, execution_epoch, heartbeat_at,
-                                  expires_at
+                                  expires_at, checkpoint_id, checkpoint_ns
                         """,
                         (CLAIM_LEASE_SECONDS, tenant_id, run_id),
                     )
@@ -239,6 +241,74 @@ class RunEventRepository:
         if row is None:
             raise EventNotFound(event_key)
         return EventRecord.model_validate(row)
+
+    async def update_checkpoint_pointer(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+        checkpoint_id: str,
+        checkpoint_ns: str,
+    ) -> RunRecord:
+        """Record a committed checkpoint only while its claim is authoritative."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT status, owner_instance_id, execution_epoch
+                        FROM langgraph_v2.runs
+                        WHERE tenant_id = %s AND run_id = %s
+                        FOR UPDATE
+                        """,
+                        (tenant_id, run_id),
+                    )
+                    claim = await cursor.fetchone()
+                    if claim is not None:
+                        await cursor.execute(
+                            """
+                            SELECT expires_at > clock_timestamp() AS claim_active
+                            FROM langgraph_v2.runs
+                            WHERE tenant_id = %s AND run_id = %s
+                            """,
+                            (tenant_id, run_id),
+                        )
+                        claim_active = await cursor.fetchone()
+                    else:
+                        claim_active = None
+                if (
+                    claim is None
+                    or claim["status"] != "running"
+                    or claim["owner_instance_id"] != owner_instance_id
+                    or claim["execution_epoch"] != execution_epoch
+                    or claim_active is None
+                    or not claim_active["claim_active"]
+                ):
+                    raise ClaimFenced(str(run_id))
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE langgraph_v2.runs
+                        SET checkpoint_id = %s, checkpoint_ns = %s
+                        WHERE tenant_id = %s AND run_id = %s
+                        RETURNING tenant_id, run_id, conversation_id, status,
+                                  terminal_outcome, created_at, completed_at,
+                                  owner_instance_id, execution_epoch, heartbeat_at,
+                                  expires_at, checkpoint_id, checkpoint_ns
+                        """,
+                        (
+                            checkpoint_id,
+                            checkpoint_ns,
+                            tenant_id,
+                            run_id,
+                        ),
+                    )
+                    row = await cursor.fetchone()
+        if row is None:
+            raise ClaimFenced(str(run_id))
+        return RunRecord.model_validate(row)
 
     async def append_event(
         self,

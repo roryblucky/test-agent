@@ -12,10 +12,17 @@ from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, FastAPI, Header, Request
 from fastapi.responses import StreamingResponse
+from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 
+from app.langgraph_v2.checkpointing import (
+    FencedAsyncPostgresSaver,
+    checkpoint_namespace_for,
+    initial_checkpoint_config,
+    thread_id_for,
+)
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
-from app.langgraph_v2.graph import TracerState, tracer_graph
+from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.run_events import (
     CLAIM_HEARTBEAT_INTERVAL_SECONDS,
     ClaimFenced,
@@ -50,12 +57,16 @@ async def _refresh_claim(
 class TracerGraph(Protocol):
     """Minimal graph invocation seam used by the test-only HTTP adapter."""
 
-    async def ainvoke(self, state: TracerState) -> dict[str, Any]:
+    async def ainvoke(
+        self,
+        state: TracerState,
+        config: RunnableConfig | None = None,
+    ) -> dict[str, Any]:
         """Run one graph invocation and return its final state."""
         ...
 
 
-def create_tracer_router(graph: TracerGraph) -> APIRouter:
+def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
     router = APIRouter(tags=["LangGraph v2 tracer"])
 
@@ -87,6 +98,47 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
                 conversation_id=conversation_id,
                 owner_instance_id=_INSTANCE_ID,
             )
+            configured_checkpointer = getattr(
+                http_request.app.state,
+                "langgraph_v2_checkpointer",
+                None,
+            )
+            selected_graph = graph or tracer_graph
+            graph_config: RunnableConfig | None = None
+            if graph is None and configured_checkpointer is not None:
+
+                async def write_checkpoint_pointer(
+                    checkpoint_id: str,
+                    checkpoint_ns: str,
+                ) -> None:
+                    await repository.update_checkpoint_pointer(
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                        checkpoint_id=checkpoint_id,
+                        checkpoint_ns=checkpoint_ns,
+                    )
+
+                checkpoint_ns = checkpoint_namespace_for(
+                    x_application_id,
+                    str(run_id),
+                    claim.execution_epoch,
+                )
+                selected_graph = build_tracer_graph(
+                    FencedAsyncPostgresSaver(
+                        pool,
+                        checkpoint_namespace=checkpoint_ns,
+                        pointer_writer=write_checkpoint_pointer,
+                    )
+                )
+                graph_config = initial_checkpoint_config(
+                    thread_id=thread_id_for(
+                        x_application_id,
+                        conversation_id,
+                    ),
+                    checkpoint_ns=checkpoint_ns,
+                )
             heartbeat_task = asyncio.create_task(
                 _refresh_claim(
                     repository,
@@ -97,14 +149,16 @@ def create_tracer_router(graph: TracerGraph) -> APIRouter:
                 )
             )
             try:
-                result = await graph.ainvoke(
-                    {
-                        "query": payload.query,
-                        "conversation_id": conversation_id,
-                        "client_request_id": payload.client_request_id,
-                        "events": [],
-                    }
-                )
+                state: TracerState = {
+                    "query": payload.query,
+                    "conversation_id": conversation_id,
+                    "client_request_id": payload.client_request_id,
+                    "events": [],
+                }
+                if graph_config is None:
+                    result = await selected_graph.ainvoke(state)
+                else:
+                    result = await selected_graph.ainvoke(state, config=graph_config)
                 for raw_event in result["events"]:
                     event = TracerStreamEvent.model_validate(raw_event)
                     event_input = EventInput(
@@ -159,5 +213,4 @@ def register_tracer_routes(
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
-        selected_graph = graph or cast(TracerGraph, tracer_graph)
-        app.include_router(create_tracer_router(selected_graph))
+        app.include_router(create_tracer_router(graph))
