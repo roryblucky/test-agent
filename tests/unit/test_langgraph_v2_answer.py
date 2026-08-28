@@ -1,4 +1,54 @@
-from app.langgraph_v2.answer import split_answer_chunks
+from types import SimpleNamespace
+
+import pytest
+from pydantic_ai.usage import RunUsage
+
+from app.langgraph_v2.answer import (
+    AnswerOutput,
+    PydanticAIAnswerActor,
+    build_answer_actor,
+    split_answer_chunks,
+)
+from app.models.domain import Document
+
+
+class _FakeAgent:
+    def __init__(self) -> None:
+        self.prompt: str | None = None
+
+    async def run(self, prompt: str) -> SimpleNamespace:
+        self.prompt = prompt
+        return SimpleNamespace(
+            output=AnswerOutput(answer="structured answer"),
+            usage=lambda: RunUsage(input_tokens=2, output_tokens=3),
+        )
+
+
+@pytest.mark.asyncio
+async def test_pydantic_ai_answer_actor_passes_only_ordered_evidence() -> None:
+    agent = _FakeAgent()
+    actor = PydanticAIAnswerActor(agent)  # type: ignore[arg-type]
+
+    result = await actor.answer("question", [Document(id="d1", content="evidence")])
+
+    assert result.answer == "structured answer"
+    assert result.usage["input_tokens"] == 2
+    assert agent.prompt == "Question: question\n\nEvidence:\n[1] evidence"
+
+
+def test_build_answer_actor_uses_registry_model_and_output_type() -> None:
+    agent = _FakeAgent()
+
+    class Registry:
+        def create_agent(self, model_name: str, **kwargs: object) -> _FakeAgent:
+            assert model_name == "pro"
+            assert kwargs["output_type"] is AnswerOutput
+            assert kwargs["instructions"] == "custom"
+            return agent
+
+    built = build_answer_actor(Registry(), instructions="custom")
+
+    assert isinstance(built, PydanticAIAnswerActor)
 
 
 def test_split_answer_chunks_preserves_text_and_prefers_boundaries() -> None:

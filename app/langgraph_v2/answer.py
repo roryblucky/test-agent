@@ -43,15 +43,6 @@ class AnswerActor(Protocol):
         ...
 
 
-class MockAnswerActor:
-    """Deterministic answer actor used by focused v2 tests."""
-
-    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
-        """Return a non-empty answer that identifies the evidence count."""
-        del documents
-        return AnswerResult(answer=f"Answer for {query}.")
-
-
 class PydanticAIAnswerActor:
     """Adapt a PydanticAI Agent with structured answer output."""
 
