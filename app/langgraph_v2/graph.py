@@ -14,6 +14,7 @@ from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
+from app.langgraph_v2.post_moderation import run_post_moderation
 from app.langgraph_v2.pre_moderation import (
     MockModerationProvider,
     ModerationDecision,
@@ -55,6 +56,8 @@ class TracerState(TypedDict):
     answer_error: NotRequired[str]
     groundedness: NotRequired[GroundednessResult]
     groundedness_error: NotRequired[str]
+    post_moderation: NotRequired[dict[str, Any]]
+    post_moderation_error: NotRequired[str]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -75,6 +78,8 @@ class TracerStateUpdate(TypedDict, total=False):
     answer_error: str
     groundedness: GroundednessResult
     groundedness_error: str
+    post_moderation: dict[str, Any]
+    post_moderation_error: str
 
 
 async def _query(
@@ -153,6 +158,8 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
         steps.append("answer")
     if "groundedness" in state:
         steps.append("groundedness")
+    if "post_moderation" in state:
+        steps.append("moderation:post")
     steps.append("finalization")
     response = TracerQueryResponse(
         query=state["query"],
@@ -394,6 +401,29 @@ def build_tracer_graph(
                 return update
 
             builder.add_node("groundedness", groundedness_node)
+
+        async def post_moderation_node(state: TracerState) -> TracerStateUpdate:
+            events, decision, safe_answer, halted, error = await run_post_moderation(
+                state,
+                context=phase_context,
+                provider=selected_moderation_provider,
+            )
+            update: TracerStateUpdate = {
+                "events": [
+                    *state["events"],
+                    *[_event_state(event, event.sequence) for event in events],
+                ],
+                "halted": halted,
+            }
+            if decision is not None:
+                update["post_moderation"] = decision.model_dump(exclude_none=True)
+            if safe_answer is not None:
+                update["answer"] = safe_answer
+            if error is not None:
+                update["post_moderation_error"] = error
+            return update
+
+        builder.add_node("post_moderation", post_moderation_node)
     builder.add_node("finalization", _finalize)
     builder.add_edge(START, "query")
     builder.add_edge("query", "pre_moderation")
@@ -430,6 +460,8 @@ def build_tracer_graph(
         answer_routes = {"finalization": "finalization", "end": END}
         if groundedness_actor is not None:
             answer_routes["groundedness"] = "groundedness"
+        else:
+            answer_routes["post_moderation"] = "post_moderation"
         builder.add_conditional_edges(
             "answer",
             lambda state: (
@@ -437,16 +469,21 @@ def build_tracer_graph(
                 if state.get("halted", False)
                 else "groundedness"
                 if groundedness_actor is not None
-                else "finalization"
+                else "post_moderation"
             ),
             answer_routes,
         )
         if groundedness_actor is not None:
             builder.add_conditional_edges(
                 "groundedness",
-                lambda state: "end" if state.get("halted", False) else "finalization",
-                {"finalization": "finalization", "end": END},
+                lambda state: "end" if state.get("halted", False) else "post_moderation",
+                {"post_moderation": "post_moderation", "end": END},
             )
+        builder.add_conditional_edges(
+            "post_moderation",
+            lambda state: "end" if state.get("halted", False) else "finalization",
+            {"finalization": "finalization", "end": END},
+        )
     builder.add_edge("finalization", END)
     return builder.compile(checkpointer=checkpointer)
 
