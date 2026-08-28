@@ -8,6 +8,7 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 from pydantic import ValidationError
 
+from app.langgraph_v2.graph import canonical_query
 from app.langgraph_v2.phase_results import (
     ALLOWED_PHASE_NAMES,
     PhaseName,
@@ -229,6 +230,52 @@ async def test_event_conflict_rolls_back_the_phase_and_prior_events(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_candidate_event_conflict_rolls_back_everything(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        runs = RunEventRepository(pool)
+        phases = PhaseResultRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        phase = PhaseResultInput(
+            phase_name="retrieval",
+            normalized_result={"documents": []},
+            events=(
+                EventInput(
+                    event_key="phase:retrieval:step_completed:1",
+                    type="step_completed",
+                    step="retrieval",
+                    data={"value": "first"},
+                ),
+                EventInput(
+                    event_key="phase:retrieval:step_completed:1",
+                    type="step_completed",
+                    step="retrieval",
+                    data={"value": "second"},
+                ),
+            ),
+        )
+        with pytest.raises(EventInvariantConflict):
+            await phases.commit(
+                tenant_id="tenant-a",
+                run_id=run.run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+                phase=phase,
+            )
+        assert await phases.get_completed("tenant-a", run.run_id, "retrieval") is None
+        assert await runs.list_events("tenant-a", run.run_id) == []
+        assert (await runs.get_run("tenant-a", run.run_id)).status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_stale_epoch_cannot_commit_a_replacement(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -275,6 +322,22 @@ def test_phase_result_rejects_volatile_or_unstructured_content() -> None:
             normalized_result="raw provider response",
             events=(),
         )
+    with pytest.raises(ValidationError):
+        PhaseResultInput(
+            phase_name="query",
+            normalized_result={"query": "hello"},
+            events=(
+                EventInput(
+                    event_key="phase:query:step_completed:1",
+                    type="step_completed",
+                    data={"duration_ms": 10},
+                ),
+            ),
+        )
+
+
+def test_query_canonicalization_is_unicode_and_line_ending_stable() -> None:
+    assert canonical_query("  e\u0301\r\n  x  ") == "é\n  x"
 
 
 def test_phase_names_are_exactly_the_nine_linear_phases() -> None:

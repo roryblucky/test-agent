@@ -73,6 +73,8 @@ class PhaseResultInput(BaseModel):
             raise ValueError("normalized_result must be a structured object or list")
         _assert_stable_content(self.normalized_result)
         _assert_stable_content(self.artifact_refs)
+        for event in self.events:
+            _assert_stable_content(event.data)
         return self
 
 
@@ -256,6 +258,24 @@ class PhaseResultRepository:
                             conflict = PhaseResultConflict(phase.phase_name)
                     for event in phase.events:
                         if conflict is not None:
+                            break
+                        prior_event = next(
+                            (
+                                candidate
+                                for candidate in phase.events
+                                if candidate.event_key == event.event_key
+                                and candidate is not event
+                            ),
+                            None,
+                        )
+                        if prior_event is not None and (
+                            _canonical_envelope(prior_event)
+                            != _canonical_envelope(event)
+                        ):
+                            await _fail_for_conflict(
+                                connection, tenant_id, run_id, event.event_key
+                            )
+                            conflict = EventInvariantConflict(event.event_key)
                             break
                         await cursor.execute(
                             """

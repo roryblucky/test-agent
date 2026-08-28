@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Any, TypedDict, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -34,11 +35,12 @@ async def _query(
     phase_context: PhaseExecutionContext | None = None,
 ) -> TracerStateUpdate:
     query = state["query"]
+    canonical = canonical_query(query)
 
     async def invoke() -> PhaseResultInput:
         return PhaseResultInput(
             phase_name="query",
-            normalized_result={"query": query, "history_snapshot": []},
+            normalized_result={"query": canonical, "history_snapshot": []},
             events=(
                 EventInput(
                     event_key="phase:query:step_start:1",
@@ -49,7 +51,7 @@ async def _query(
                     event_key="phase:query:step_completed:1",
                     type="step_completed",
                     step="query",
-                    data={"query": query},
+                    data={"query": canonical},
                 ),
             ),
         )
@@ -82,6 +84,11 @@ def _event_state(event: EventInput | EventRecord, sequence: int) -> dict[str, An
         data=event.data,
         sequence=sequence,
     ).model_dump(exclude_none=True)
+
+
+def canonical_query(query: str) -> str:
+    """Normalize query text without changing internal whitespace."""
+    return unicodedata.normalize("NFC", query.replace("\r\n", "\n")).strip()
 
 
 async def _finalize(state: TracerState) -> TracerStateUpdate:
