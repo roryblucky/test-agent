@@ -1,5 +1,69 @@
 {
-    "event": {
+  "legacy_events": [
+    {"type": "step_start", "step": "query"},
+    {"type": "step_completed", "step": "query", "data": {"query": "hello"}},
+    {
+      "type": "done",
+      "data": {
+        "query": "hello",
+        "refined_query": "hello",
+        "intent": null,
+        "answer": "grounded answer [1]",
+        "documents": [
+          {
+            "id": "d1",
+            "content": "hello",
+            "metadata": {},
+            "score": null,
+            "source_url": "https://example.test/d1",
+            "source_type": "mock",
+            "page_number": null,
+            "section_title": null
+          }
+        ],
+        "moderation": {"is_flagged": false, "categories": {}, "reason": null},
+        "groundedness": {"is_grounded": true, "score": 0.9, "details": "supported"},
+        "clarification": null,
+        "session_id": "c1",
+        "metadata": {
+          "steps_executed": [
+            "query", "pre_moderation", "question_refinement", "retrieval",
+            "reranking", "answer", "groundedness", "moderation:post", "finalization"
+          ],
+          "usage": {
+            "requests": 3,
+            "request_tokens": 7,
+            "response_tokens": 8,
+            "total_tokens": 15,
+            "input_tokens": 7,
+            "output_tokens": 8
+          }
+        },
+        "citations": [
+          {
+            "index": 1,
+            "evidence_id": "__artifact_id__",
+            "source": "https://example.test/d1",
+            "source_type": "mock",
+            "title": null,
+            "url": "https://example.test/d1",
+            "snippet": "hello",
+            "quoted_text": null,
+            "quoted_passages": [],
+            "page_number": null,
+            "section": null,
+            "published_at": null,
+            "highlight_content": "hello",
+            "highlight_spans": [],
+            "offset_encoding": "utf-16",
+            "attribution_status": "unlocated",
+            "metadata": {"artifact_id": "__artifact_id__"}
+          }
+        ]
+      }
+    }
+  ],
+  "event": {
         "type": "done",
         "data": {
             "query": "hello",

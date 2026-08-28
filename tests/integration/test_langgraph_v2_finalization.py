@@ -251,6 +251,8 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
         for frame in legacy_http.text.strip().split("\n\n")
     ]
     assert legacy_http.status_code == 200
+    assert legacy_http.headers["content-type"].startswith("text/event-stream")
+    assert legacy_frames == expected["legacy_events"]
     assert legacy_frames[-1] == expected["event"]
     stable_done = json.loads(json.dumps(done))
     stable_done["citations"][0]["evidence_id"] = "__artifact_id__"
