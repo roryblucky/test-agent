@@ -8,7 +8,7 @@ import socket
 import uuid
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import suppress
-from typing import Annotated, Any, Literal, Protocol, cast
+from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -45,7 +45,6 @@ from app.langgraph_v2.observability import (
     context_for_span,
     observe,
     safe_span_attribute,
-    set_operation_outcome,
 )
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
@@ -71,7 +70,6 @@ from app.langgraph_v2.run_events import (
     ResumeConflict,
     RunEventRepository,
     RunNotFound,
-    RunRecord,
 )
 from app.langgraph_v2.runtime import LocalRunRuntime, RuntimeStopping
 from app.services.exceptions import TenantNotFoundError
@@ -386,9 +384,8 @@ async def _persist_graph_result(
     execution_epoch: int,
     answer_chunk_interval_ms: int,
     initial_sent_keys: set[str] | None = None,
-) -> Literal["completed", "failed", "cancelled"]:
+) -> None:
     """Run a graph and persist its durable result independently of subscribers."""
-    outcome: Literal["completed", "failed", "cancelled"] = "completed"
     if graph_config is None:
         graph_task = asyncio.create_task(selected_graph.ainvoke(state))
     else:
@@ -399,8 +396,6 @@ async def _persist_graph_result(
         while not graph_task.done():
             await asyncio.sleep(0.01)
         result = await graph_task
-        if any(event["type"] == "error" for event in result["events"]):
-            outcome = "failed"
         sent_keys = set(initial_sent_keys or ())
         sent_keys.update(
             event["event_key"]
@@ -431,7 +426,6 @@ async def _persist_graph_result(
             ):
                 pass
     except CancellationObserved:
-        outcome = "cancelled"
         with observe(
             "cancellation.apply",
             run_id=run_id,
@@ -451,7 +445,6 @@ async def _persist_graph_result(
             graph_task.cancel()
         with suppress(asyncio.CancelledError, CancellationObserved):
             await graph_task
-    return outcome
 
 
 async def _execute_graph_run(
@@ -486,10 +479,10 @@ async def _execute_graph_run(
         run_id=run_id,
         conversation_id=conversation_id,
         execution_epoch=execution_epoch,
-    ) as execution_span:
+    ):
         await cancellation_observer.start()
         try:
-            outcome = await _persist_graph_result(
+            await _persist_graph_result(
                 selected_graph,
                 state,
                 graph_config,
@@ -504,14 +497,7 @@ async def _execute_graph_run(
                 answer_chunk_interval_ms=answer_chunk_interval_ms,
                 initial_sent_keys=initial_sent_keys,
             )
-            set_operation_outcome(execution_span, outcome)
-            safe_span_attribute(execution_span, "run.status", outcome)
-        except (CancellationObserved, ClaimFenced) as error:
-            outcome = (
-                "cancelled" if isinstance(error, CancellationObserved) else "fenced"
-            )
-            set_operation_outcome(execution_span, outcome)
-            safe_span_attribute(execution_span, "error.type", type(error).__name__)
+        except (CancellationObserved, ClaimFenced):
             return
         except Exception as exc:
             try:
@@ -523,13 +509,8 @@ async def _execute_graph_run(
                     execution_epoch=execution_epoch,
                     message=str(exc) or "LangGraph execution failed.",
                 )
-            except ClaimFenced as error:
-                set_operation_outcome(execution_span, "fenced")
-                safe_span_attribute(execution_span, "error.type", type(error).__name__)
+            except ClaimFenced:
                 return
-            set_operation_outcome(execution_span, "failed")
-            safe_span_attribute(execution_span, "run.status", "failed")
-            safe_span_attribute(execution_span, "error.type", type(exc).__name__)
         finally:
             await cancellation_observer.close()
             heartbeat_task.cancel()
@@ -680,36 +661,6 @@ async def _start_execution_or_interrupt(
         except ClaimFenced:
             pass
         return None
-
-
-async def _resume_claim(
-    repository: RunEventRepository,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-) -> tuple[RunRecord, Context]:
-    """Claim a Run under an HTTP root and return its recovery context."""
-    with observe(
-        "http.request",
-        run_id=run_id,
-        attributes={
-            "http.request.method": "POST",
-            "http.route": "/v2/runs/{run_id}/resume/stream",
-        },
-    ):
-        with observe(
-            "recovery.resume",
-            run_id=run_id,
-            attributes={"recovery.operation": "resume"},
-        ) as recovery_span:
-            claim = await repository.resume_run(
-                tenant_id=tenant_id,
-                run_id=run_id,
-                owner_instance_id=_INSTANCE_ID,
-            )
-            safe_span_attribute(recovery_span, "execution.epoch", claim.execution_epoch)
-            safe_span_attribute(recovery_span, "run.status", "running")
-            return claim, context_for_span(recovery_span)
 
 
 def create_tracer_router(
@@ -976,12 +927,23 @@ def create_tracer_router(
             run_id=run_id,
         )
         message_repository = ConversationMessageRepository(pool)
+        recovery_context: Context | None = None
         try:
-            claim, recovery_context = await _resume_claim(
-                repository,
-                tenant_id=x_application_id,
+            with observe(
+                "recovery.resume",
                 run_id=run_id,
-            )
+                attributes={"recovery.operation": "resume"},
+            ) as recovery_span:
+                claim = await repository.resume_run(
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                    owner_instance_id=_INSTANCE_ID,
+                )
+                safe_span_attribute(
+                    recovery_span, "execution.epoch", claim.execution_epoch
+                )
+                safe_span_attribute(recovery_span, "run.status", "running")
+                recovery_context = context_for_span(recovery_span)
         except RunNotFound as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
         except ResumeConflict as error:
@@ -1091,6 +1053,7 @@ def create_tracer_router(
                     and event.event_key.startswith("phase:answer:token:")
                 )
             }
+            assert recovery_context is not None
             with activate_context(recovery_context):
                 await _start_execution_or_interrupt(
                     runtime,
@@ -1131,7 +1094,7 @@ def create_tracer_router(
         return StreamingResponse(
             _observed_stream(
                 event_generator(),
-                operation="http.stream",
+                operation="http.request",
                 run_id=run_id,
                 conversation_id=claim.conversation_id,
                 execution_epoch=claim.execution_epoch,
@@ -1250,30 +1213,20 @@ def create_tracer_router(
         x_application_id: Annotated[str, Header(alias="X-Application-Id")],
     ) -> dict[str, Any]:
         """Read one Artifact through the caller's Tenant boundary."""
-        with observe(
-            "http.request",
-            attributes={
-                "http.request.method": "GET",
-                "http.route": "/v2/artifacts/{artifact_id}",
-            },
-        ):
-            configured_pool = getattr(
-                http_request.app.state, "langgraph_v2_postgres_pool", None
+        configured_pool = getattr(
+            http_request.app.state, "langgraph_v2_postgres_pool", None
+        )
+        if configured_pool is None:
+            raise HTTPException(
+                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
-            if configured_pool is None:
-                raise HTTPException(
-                    status_code=500,
-                    detail="LangGraph v2 PostgreSQL is not configured",
-                )
-            try:
-                artifact = await ArtifactRepository(configured_pool).get(
-                    tenant_id=x_application_id, artifact_id=artifact_id
-                )
-            except ArtifactNotFound as error:
-                raise HTTPException(
-                    status_code=404, detail="Artifact not found"
-                ) from error
-            return artifact.model_dump(mode="json")
+        try:
+            artifact = await ArtifactRepository(configured_pool).get(
+                tenant_id=x_application_id, artifact_id=artifact_id
+            )
+        except ArtifactNotFound as error:
+            raise HTTPException(status_code=404, detail="Artifact not found") from error
+        return artifact.model_dump(mode="json")
 
     return router
 

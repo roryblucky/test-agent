@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
-from hashlib import sha256
 from threading import Lock
 from time import perf_counter
 from typing import Any
@@ -31,7 +29,6 @@ _SAFE_ATTRIBUTE_KEYS = frozenset(
         "graph.phase",
         "http.request.method",
         "http.route",
-        "operation.outcome",
         "persistence.kind",
         "provider.role",
         "recovery.operation",
@@ -64,17 +61,6 @@ _TELEMETRY = V2Telemetry(
 )
 _METER_PROVIDER_LOCK = Lock()
 _FALLBACK_METRIC_READER: InMemoryMetricReader | None = None
-_BOUNDED_OUTCOMES = frozenset(
-    {"ok", "error", "completed", "failed", "cancelled", "fenced"}
-)
-
-
-@dataclass
-class OperationObservation:
-    """Per-invocation state independent of provider span object reuse."""
-
-    span: Span
-    outcome: str = "ok"
 
 
 def ensure_meter_provider() -> InMemoryMetricReader | None:
@@ -105,7 +91,7 @@ def observe(
     execution_epoch: int | None = None,
     attributes: Mapping[str, str | bool | int | float] | None = None,
     parent_context: Context | None = None,
-) -> Iterator[OperationObservation]:
+) -> Iterator[Span]:
     """Emit a redacted span and bounded metrics for one fixed operation.
 
     Exception values are deliberately not recorded.  They can contain queries,
@@ -113,20 +99,19 @@ def observe(
     """
     span_attributes: dict[str, str | bool | int | float] = {}
     if run_id is not None:
-        span_attributes["run.id"] = redacted_identifier(run_id)
+        span_attributes["run.id"] = str(run_id)
     if conversation_id is not None:
-        span_attributes["conversation.id"] = redacted_identifier(conversation_id)
+        span_attributes["conversation.id"] = conversation_id
     if execution_epoch is not None:
         span_attributes["execution.epoch"] = execution_epoch
     if attributes:
         unknown = set(attributes) - _SAFE_ATTRIBUTE_KEYS
         if unknown:
             raise ValueError(f"unsafe telemetry attribute keys: {sorted(unknown)}")
-        if {"run.id", "conversation.id"} & set(attributes):
-            raise ValueError("identifier attributes must use the redacting arguments")
         span_attributes.update(attributes)
 
     started_at = perf_counter()
+    outcome = "ok"
     with _TELEMETRY.tracer.start_as_current_span(
         f"langgraph_v2.{operation}",
         context=parent_context,
@@ -134,19 +119,15 @@ def observe(
         record_exception=False,
         set_status_on_exception=False,
     ) as span:
-        observation = OperationObservation(span=span)
         try:
-            yield observation
+            yield span
         except BaseException as error:
-            observation.outcome = "error"
+            outcome = "error"
             span.set_attribute("error.type", type(error).__name__)
             span.set_status(Status(StatusCode.ERROR))
             raise
         finally:
-            metric_attributes = {
-                "operation": operation,
-                "outcome": observation.outcome,
-            }
+            metric_attributes = {"operation": operation, "outcome": outcome}
             _TELEMETRY.operations.add(1, metric_attributes)
             _TELEMETRY.duration.record(
                 perf_counter() - started_at,
@@ -154,28 +135,9 @@ def observe(
             )
 
 
-def set_operation_outcome(
-    observation: OperationObservation,
-    outcome: str,
-) -> None:
-    """Record a bounded outcome when a control boundary consumes an error."""
-    if outcome not in _BOUNDED_OUTCOMES:
-        raise ValueError(f"unsupported telemetry outcome: {outcome}")
-    observation.outcome = outcome
-    observation.span.set_attribute("operation.outcome", outcome)
-    if outcome in {"failed", "fenced"}:
-        observation.span.set_status(Status(StatusCode.ERROR))
-
-
-def redacted_identifier(value: UUID | str) -> str:
-    """Return a stable opaque identifier without exporting caller input."""
-    digest = sha256(str(value).encode("utf-8")).hexdigest()
-    return f"sha256:{digest}"
-
-
-def context_for_span(observation: OperationObservation) -> Context:
+def context_for_span(span: Span) -> Context:
     """Capture one safe propagation handle without serializing span content."""
-    return trace.set_span_in_context(observation.span)
+    return trace.set_span_in_context(span)
 
 
 @contextmanager
@@ -188,18 +150,12 @@ def activate_context(context: Context) -> Iterator[None]:
         otel_context.detach(token)
 
 
-def safe_span_attribute(
-    observation: OperationObservation,
-    key: str,
-    value: Any,
-) -> None:
+def safe_span_attribute(span: Span, key: str, value: Any) -> None:
     """Set one late-bound attribute only when it belongs to the safe schema."""
     if key not in _SAFE_ATTRIBUTE_KEYS:
         raise ValueError(f"unsafe telemetry attribute key: {key}")
     if isinstance(value, UUID):
         value = str(value)
-    if key in {"run.id", "conversation.id"}:
-        value = redacted_identifier(str(value))
     if not isinstance(value, (str, bool, int, float)):
         raise TypeError(f"unsupported telemetry attribute type: {type(value).__name__}")
-    observation.span.set_attribute(key, value)
+    span.set_attribute(key, value)
