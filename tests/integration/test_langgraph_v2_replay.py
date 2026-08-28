@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.api import register_tracer_routes
+from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
 
@@ -28,7 +28,7 @@ def _replay_app(database_url: str, *, replay_enabled: bool) -> FastAPI:
             yield
 
     app = FastAPI(lifespan=lifespan)
-    register_tracer_routes(app, enabled=True, replay_enabled=replay_enabled)
+    register_v2_routes(app, enabled=True, replay_enabled=replay_enabled)
     return app
 
 
@@ -100,7 +100,7 @@ def _events(response_text: str) -> list[dict[str, object]]:
 
 def test_replay_route_is_default_off() -> None:
     app = FastAPI()
-    register_tracer_routes(app, enabled=True)
+    register_v2_routes(app, enabled=True)
 
     assert "/v2/runs/{run_id}/stream" not in {
         getattr(route, "path", None) for route in app.routes

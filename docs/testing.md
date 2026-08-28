@@ -13,7 +13,7 @@ against the disposable PostgreSQL database:
 
 ```shell
 LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms_test_42' \
-  uv run pytest \
+  PYTHONPATH=. uv run pytest \
   tests/integration/test_langgraph_v2_tracer.py \
   tests/integration/test_langgraph_v2_history_stream.py \
   tests/integration/test_langgraph_v2_replay.py \

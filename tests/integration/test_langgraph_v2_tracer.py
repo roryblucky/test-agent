@@ -19,7 +19,7 @@ from psycopg_pool import AsyncConnectionPool
 import app.langgraph_v2.api as api_module
 from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import ANSWER_CHUNK_INTERVAL_MS, AnswerActor
-from app.langgraph_v2.api import TracerGraph, register_tracer_routes
+from app.langgraph_v2.api import TracerGraph, register_v2_routes
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
     checkpoint_namespace_for,
@@ -72,7 +72,7 @@ def persistent_tracer_app(
             yield
 
     app = FastAPI(lifespan=lifespan)
-    register_tracer_routes(
+    register_v2_routes(
         app,
         enabled=True,
         graph=graph,
@@ -769,12 +769,17 @@ async def test_resume_stream_is_fenced_to_claim_captured_before_body_consumption
         assert replacement.execution_epoch == 3
 
 
-def test_main_registers_the_uat_route_set_only_when_the_feature_flag_is_enabled(
+@pytest.mark.parametrize(
+    "feature_flag",
+    ["LANGGRAPH_V2_UAT_ENABLED", "LANGGRAPH_V2_TRACER_ENABLED"],
+)
+def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
     monkeypatch,
+    feature_flag: str,
 ) -> None:
     import app.main as main_module
 
-    monkeypatch.setenv("LANGGRAPH_V2_TRACER_ENABLED", "1")
+    monkeypatch.setenv(feature_flag, "1")
     enabled_app = reload(main_module).app
     assert {
         getattr(route, "path", None)
@@ -787,7 +792,7 @@ def test_main_registers_the_uat_route_set_only_when_the_feature_flag_is_enabled(
         "/v2/runs/{run_id}/cancel",
     }
 
-    monkeypatch.delenv("LANGGRAPH_V2_TRACER_ENABLED")
+    monkeypatch.delenv(feature_flag)
     disabled_app = reload(main_module).app
     assert not {
         getattr(route, "path", None)
@@ -798,7 +803,7 @@ def test_main_registers_the_uat_route_set_only_when_the_feature_flag_is_enabled(
 
 def test_resume_route_is_default_off() -> None:
     app = FastAPI()
-    register_tracer_routes(app, enabled=True)
+    register_v2_routes(app, enabled=True)
     assert "/v2/runs/{run_id}/resume/stream" not in {
         getattr(route, "path", None) for route in app.routes
     }

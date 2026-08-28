@@ -13,7 +13,7 @@ import pytest
 from fastapi import FastAPI, Request
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.api import register_tracer_routes
+from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.replay import PersistedEventFollower
@@ -85,7 +85,7 @@ async def test_public_replay_then_live_is_gapless_and_closes_at_terminal(
             yield
 
     app = FastAPI(lifespan=lifespan)
-    register_tracer_routes(app, enabled=True, replay_enabled=True)
+    register_v2_routes(app, enabled=True, replay_enabled=True)
     async with app.router.lifespan_context(app):
         pool = app.state.langgraph_v2_postgres_pool
         repository = RunEventRepository(

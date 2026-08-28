@@ -17,7 +17,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult
-from app.langgraph_v2.api import register_tracer_routes
+from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.cancellation import CancellationRepository
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
@@ -45,7 +45,7 @@ def _cancellation_app(database_url: str, *, cancellation_enabled: bool) -> FastA
             yield
 
     app = FastAPI(lifespan=lifespan)
-    register_tracer_routes(
+    register_v2_routes(
         app,
         enabled=True,
         cancellation_enabled=cancellation_enabled,
@@ -138,7 +138,7 @@ async def _persisted_message_roles(database_url: str, run_id: UUID) -> list[str]
 
 def test_cancellation_route_is_default_off() -> None:
     app = FastAPI()
-    register_tracer_routes(app, enabled=True)
+    register_v2_routes(app, enabled=True)
 
     assert "/v2/runs/{run_id}/cancel" not in {
         getattr(route, "path", None) for route in app.routes

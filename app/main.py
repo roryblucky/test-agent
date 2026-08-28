@@ -17,7 +17,7 @@ from app.config.loader import load_config
 from app.core.audit_middleware import AuditMiddleware
 from app.core.http_client_pool import HttpClientPool
 from app.core.rate_limit_middleware import TenantRateLimitMiddleware
-from app.langgraph_v2.api import register_tracer_routes
+from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.postgres import postgres_lifespan
 from app.services.tenant_manager import TenantManager
 
@@ -155,9 +155,12 @@ app.add_middleware(TenantRateLimitMiddleware)
 # Routers
 app.include_router(router)
 app.include_router(admin_router)
-register_tracer_routes(
+register_v2_routes(
     app,
-    enabled=os.environ.get("LANGGRAPH_V2_TRACER_ENABLED") == "1",
+    enabled=(
+        os.environ.get("LANGGRAPH_V2_UAT_ENABLED") == "1"
+        or os.environ.get("LANGGRAPH_V2_TRACER_ENABLED") == "1"
+    ),
     resume_enabled=True,
     replay_enabled=True,
     cancellation_enabled=True,

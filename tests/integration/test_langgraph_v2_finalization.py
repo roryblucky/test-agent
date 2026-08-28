@@ -16,7 +16,7 @@ from pydantic_ai.usage import RunUsage
 from app.api.dependencies import TenantContext, get_tenant
 from app.api.router import router as legacy_router
 from app.langgraph_v2.answer import AnswerResult
-from app.langgraph_v2.api import register_tracer_routes
+from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
@@ -285,7 +285,7 @@ def test_public_v2_sse_matches_final_output_golden(
             yield
 
     app = FastAPI(lifespan=lifespan)
-    register_tracer_routes(
+    register_v2_routes(
         app,
         enabled=True,
         refinement_actor=_UsageRefinement(),

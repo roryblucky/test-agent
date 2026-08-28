@@ -1123,7 +1123,7 @@ def create_tracer_router(
     return router
 
 
-def register_tracer_routes(
+def register_v2_routes(
     app: FastAPI,
     *,
     enabled: bool,
