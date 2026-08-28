@@ -7,7 +7,11 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from app.langgraph_v2.live_events import LiveEventWakeups
-from app.langgraph_v2.run_events import EventRecord, RunEventRepository
+from app.langgraph_v2.run_events import (
+    EventNotFound,
+    EventRecord,
+    RunEventRepository,
+)
 
 FOLLOW_POLL_INTERVAL_SECONDS = 0.25
 
@@ -88,7 +92,13 @@ class PersistedEventFollower:
                         run_id,
                         after_sequence=cursor,
                     )
-                    for event in _events_through_interruption(events, followed_epoch):
+                    for event in await _events_through_interruption(
+                        self._repository,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        events=events,
+                        followed_epoch=followed_epoch,
+                    ):
                         yield event
                     return
 
@@ -111,8 +121,12 @@ class PersistedEventFollower:
                             run_id,
                             after_sequence=cursor,
                         )
-                        final_events = _events_through_interruption(
-                            final_events, followed_epoch
+                        final_events = await _events_through_interruption(
+                            self._repository,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            events=final_events,
+                            followed_epoch=followed_epoch,
                         )
                     for event in final_events:
                         yield event
@@ -141,12 +155,23 @@ class PersistedEventFollower:
                 )
 
 
-def _events_through_interruption(
-    events: list[EventRecord], followed_epoch: int
+async def _events_through_interruption(
+    repository: RunEventRepository,
+    *,
+    tenant_id: str,
+    run_id: UUID,
+    events: list[EventRecord],
+    followed_epoch: int,
 ) -> list[EventRecord]:
-    """Keep the old epoch's boundary Event and fence all later Events."""
+    """Return the old epoch through its boundary, independent of the cursor."""
     interruption_key = f"lifecycle:interrupted:{followed_epoch}"
-    for index, event in enumerate(events):
-        if event.event_key == interruption_key:
-            return events[: index + 1]
-    return []
+    try:
+        interruption = await repository.get_event(tenant_id, run_id, interruption_key)
+    except EventNotFound:
+        return []
+    before_boundary = [
+        event for event in events if event.sequence <= interruption.sequence
+    ]
+    if all(event.event_key != interruption_key for event in before_boundary):
+        before_boundary.append(interruption)
+    return before_boundary

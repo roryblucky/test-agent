@@ -94,6 +94,14 @@ async def test_resume_claims_expired_run_once_and_fences_old_owner(
         )
         assert resumed.execution_epoch == created.execution_epoch + 1
         assert resumed.owner_instance_id == "instance-b"
+        interruption = await repository.get_event(
+            "tenant-a", run_id, "lifecycle:interrupted:1"
+        )
+        assert interruption.sequence == 1
+        assert interruption.data == {
+            "status": "interrupted",
+            "reason": "claim_expired",
+        }
         with pytest.raises(ResumeConflict):
             await repository.resume_run(
                 tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-c"

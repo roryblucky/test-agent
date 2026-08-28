@@ -274,6 +274,54 @@ async def test_only_one_expiry_cas_wins_and_losers_replay_its_event(
         ]
 
 
+@pytest.mark.asyncio
+async def test_direct_stale_resume_wakes_old_follower_with_boundary_below_cursor(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        wakeups = LiveEventWakeups()
+        repository = RunEventRepository(pool, live_events=wakeups)
+        run_id, owner, _ = await _seed(repository)
+        await repository.update_checkpoint_pointer(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            owner_instance_id=owner,
+            execution_epoch=1,
+            checkpoint_id="checkpoint-1",
+            checkpoint_ns="tenant-a:run:1",
+        )
+        follower = PersistedEventFollower(
+            repository,
+            wakeups,
+            poll_interval_seconds=1,
+        ).follow(tenant_id="tenant-a", run_id=run_id, after_sequence=99)
+        waiting = asyncio.create_task(anext(follower))
+        await asyncio.sleep(0)
+        async with pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET expires_at = clock_timestamp() - interval '1 second'
+                WHERE tenant_id = 'tenant-a' AND run_id = %s
+                """,
+                (run_id,),
+            )
+        resumed = await repository.resume_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            owner_instance_id="replacement",
+        )
+
+        boundary = await asyncio.wait_for(waiting, timeout=1)
+        assert boundary.event_key == "lifecycle:interrupted:1"
+        assert boundary.sequence == 2 < 99
+        assert resumed.execution_epoch == 2
+        with pytest.raises(StopAsyncIteration):
+            await anext(follower)
+
+
 class _CompleteAfterEventRead(RunEventRepository):
     def __init__(
         self, repository: RunEventRepository, *, run_id: UUID, owner: str
@@ -384,6 +432,11 @@ class _ResumeAfterFirstRunRead(RunEventRepository):
         return await self._repository.list_events_after(
             tenant_id, run_id, after_sequence=after_sequence
         )
+
+    async def get_event(
+        self, tenant_id: str, run_id: UUID, event_key: str
+    ) -> EventRecord:
+        return await self._repository.get_event(tenant_id, run_id, event_key)
 
     async def interrupt_expired_run(
         self,

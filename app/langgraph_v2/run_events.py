@@ -206,6 +206,7 @@ class RunEventRepository:
         owner_instance_id: str,
     ) -> RunRecord:
         """Atomically claim a stale or interrupted Run for a new epoch."""
+        interruption: EventRecord | None = None
         async with self._pool.connection() as connection:
             async with connection.transaction():
                 async with connection.cursor(row_factory=dict_row) as cursor:
@@ -215,6 +216,7 @@ class RunEventRepository:
                                terminal_outcome, created_at, completed_at,
                                owner_instance_id, execution_epoch, heartbeat_at,
                                expires_at, checkpoint_id, checkpoint_ns,
+                               next_event_sequence,
                                expires_at > clock_timestamp() AS claim_active
                         FROM langgraph_v2.runs
                         WHERE tenant_id = %s AND run_id = %s
@@ -237,6 +239,17 @@ class RunEventRepository:
                         or row["checkpoint_ns"] is None
                     ):
                         raise ResumeConflict(str(run_id))
+                    stale_running = (
+                        row["status"] == "running" and not row["claim_active"]
+                    )
+                    if stale_running:
+                        interruption = await _insert_interruption_event(
+                            cursor,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            sequence=row["next_event_sequence"],
+                            interrupted_epoch=row["execution_epoch"],
+                        )
                     await cursor.execute(
                         """
                         UPDATE langgraph_v2.runs
@@ -244,7 +257,8 @@ class RunEventRepository:
                             execution_epoch = execution_epoch + 1,
                             heartbeat_at = clock_timestamp(),
                             expires_at = clock_timestamp() +
-                                (%s * interval '1 second')
+                                (%s * interval '1 second'),
+                            next_event_sequence = next_event_sequence + %s
                         WHERE tenant_id = %s AND run_id = %s
                         RETURNING tenant_id, run_id, conversation_id, status,
                                   terminal_outcome, created_at, completed_at,
@@ -255,6 +269,7 @@ class RunEventRepository:
                         (
                             owner_instance_id,
                             CLAIM_LEASE_SECONDS,
+                            int(stale_running),
                             tenant_id,
                             run_id,
                         ),
@@ -262,6 +277,8 @@ class RunEventRepository:
                     row = await cursor.fetchone()
         if row is None:
             raise ResumeConflict(str(run_id))
+        if interruption is not None:
+            await self._publish_wakeup(tenant_id, run_id)
         return RunRecord.model_validate(row)
 
     async def list_events(self, tenant_id: str, run_id: UUID) -> list[EventRecord]:
@@ -724,35 +741,13 @@ async def interrupt_expired_run_in_transaction(
         run = await cursor.fetchone()
         if run is None:
             return None
-        event_key = f"lifecycle:interrupted:{observed_execution_epoch}"
-        event = EventInput(
-            event_key=event_key,
-            type="error",
-            step="lifecycle",
-            data={"status": "interrupted", "reason": "claim_expired"},
+        event = await _insert_interruption_event(
+            cursor,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            sequence=run["next_event_sequence"],
+            interrupted_epoch=observed_execution_epoch,
         )
-        canonical_envelope = _canonical_envelope(event)
-        await cursor.execute(
-            """
-            INSERT INTO langgraph_v2.events (
-                tenant_id, run_id, sequence, event_key, type, step, data,
-                canonical_envelope
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING tenant_id, run_id, sequence, event_key, type, step,
-                      data, created_at
-            """,
-            (
-                tenant_id,
-                run_id,
-                run["next_event_sequence"],
-                event.event_key,
-                event.type,
-                event.step,
-                Jsonb(event.data),
-                canonical_envelope,
-            ),
-        )
-        event_row = await cursor.fetchone()
         await cursor.execute(
             """
             UPDATE langgraph_v2.runs
@@ -769,7 +764,45 @@ async def interrupt_expired_run_in_transaction(
         )
         if cursor.rowcount != 1:
             raise RuntimeError("expired Run CAS lost after row lock")
-    return EventRecord.model_validate(event_row)
+    return event
+
+
+async def _insert_interruption_event(
+    cursor: Any,
+    *,
+    tenant_id: str,
+    run_id: UUID,
+    sequence: int,
+    interrupted_epoch: int,
+) -> EventRecord:
+    """Append the stable boundary that fences followers of an expired epoch."""
+    event = EventInput(
+        event_key=f"lifecycle:interrupted:{interrupted_epoch}",
+        type="error",
+        step="lifecycle",
+        data={"status": "interrupted", "reason": "claim_expired"},
+    )
+    await cursor.execute(
+        """
+        INSERT INTO langgraph_v2.events (
+            tenant_id, run_id, sequence, event_key, type, step, data,
+            canonical_envelope
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING tenant_id, run_id, sequence, event_key, type, step,
+                  data, created_at
+        """,
+        (
+            tenant_id,
+            run_id,
+            sequence,
+            event.event_key,
+            event.type,
+            event.step,
+            Jsonb(event.data),
+            _canonical_envelope(event),
+        ),
+    )
+    return EventRecord.model_validate(await cursor.fetchone())
 
 
 async def _set_terminal_status_in_transaction(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from uuid import uuid4
 
 import pytest
@@ -59,57 +60,78 @@ async def test_inactive_runs_do_not_retain_local_wakeup_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_redis_pubsub_message_wakes_matching_local_subscriber(
+async def test_redis_publish_on_one_instance_wakes_another_instance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    redis = FakeRedis()
+    broker = FakeRedisBroker()
     monkeypatch.setattr(
         live_events_module.aioredis,
         "from_url",
-        lambda *args, **kwargs: redis,
+        lambda *args, **kwargs: broker.client(),
     )
-    wakeups = LiveEventWakeups(redis_url="redis://test")
+    producer = LiveEventWakeups(redis_url="redis://test")
+    consumer = LiveEventWakeups(redis_url="redis://test")
     run_id = uuid4()
 
-    async with wakeups.subscribe("tenant-a", run_id) as subscription:
-        redis.pubsub_instance.message = {
-            "type": "message",
-            "data": ('{"tenant_id":"tenant-a","run_id":"' + str(run_id) + '"}'),
-        }
+    async with consumer.subscribe("tenant-a", run_id) as subscription:
+        await consumer.start()
+        await asyncio.wait_for(broker.subscribed.wait(), timeout=1)
         generation = subscription.generation
-        await wakeups.start()
+        await producer.publish("tenant-a", run_id)
 
         assert await subscription.wait(generation, timeout_seconds=1) == generation + 1
 
-    await wakeups.close()
-    assert redis.pubsub_instance.subscribed_channel == "langgraph_v2:run-events"
-    assert redis.closed is True
+    await producer.close()
+    await consumer.close()
+    assert broker.published_channels == ["langgraph_v2:run-events"]
+    assert all(client.closed for client in broker.clients)
 
 
 class FakePubSub:
-    def __init__(self) -> None:
-        self.message: dict[str, str] | None = None
+    def __init__(self, broker: FakeRedisBroker) -> None:
+        self._broker = broker
+        self._messages: asyncio.Queue[dict[str, str]] = asyncio.Queue()
         self.subscribed_channel: str | None = None
 
     async def subscribe(self, channel: str) -> None:
         self.subscribed_channel = channel
+        self._broker.pubsubs.append(self)
+        self._broker.subscribed.set()
 
-    async def listen(self):
-        if self.message is not None:
-            yield self.message
-        await asyncio.Event().wait()
+    async def listen(self) -> AsyncIterator[dict[str, str]]:
+        while True:
+            yield await self._messages.get()
 
     async def aclose(self) -> None:
         pass
 
 
 class FakeRedis:
-    def __init__(self) -> None:
-        self.pubsub_instance = FakePubSub()
+    def __init__(self, broker: FakeRedisBroker) -> None:
+        self._broker = broker
         self.closed = False
 
     def pubsub(self) -> FakePubSub:
-        return self.pubsub_instance
+        return FakePubSub(self._broker)
+
+    async def publish(self, channel: str, data: str) -> None:
+        self._broker.published_channels.append(channel)
+        for pubsub in self._broker.pubsubs:
+            if pubsub.subscribed_channel == channel:
+                await pubsub._messages.put({"type": "message", "data": data})
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class FakeRedisBroker:
+    def __init__(self) -> None:
+        self.clients: list[FakeRedis] = []
+        self.pubsubs: list[FakePubSub] = []
+        self.published_channels: list[str] = []
+        self.subscribed = asyncio.Event()
+
+    def client(self) -> FakeRedis:
+        client = FakeRedis(self)
+        self.clients.append(client)
+        return client

@@ -749,6 +749,14 @@ async def test_resume_stream_is_fenced_to_claim_captured_before_body_consumption
             ),
         )
 
+        boundary = json.loads(
+            (await anext(response.body_iterator)).removeprefix("data: ")
+        )
+        assert boundary["type"] == "error"
+        assert boundary["data"] == {
+            "status": "interrupted",
+            "reason": "claim_expired",
+        }
         with pytest.raises(StopAsyncIteration):
             await anext(response.body_iterator)
         await response.body_iterator.aclose()
@@ -939,8 +947,8 @@ def test_resume_replays_existing_event_without_duplicate_publication(
             headers={"X-Application-Id": "tenant-a"},
         )
     delivered = parse_sse(response.text)
-    assert [event["type"] for event in delivered] == ["done"]
-    assert [event["sequence"] for event in delivered] == [2]
+    assert [event["type"] for event in delivered] == ["error", "done"]
+    assert [event["sequence"] for event in delivered] == [2, 3]
 
     async def read_events() -> list:
         async with AsyncConnectionPool(
@@ -951,6 +959,7 @@ def test_resume_replays_existing_event_without_duplicate_publication(
     persisted = asyncio.run(read_events())
     assert [event.event_key for event in persisted] == [
         "phase:query:step_start:1",
+        "lifecycle:interrupted:1",
         "recovery:completed:2",
     ]
 
@@ -1023,7 +1032,9 @@ def test_resume_route_runs_injected_graph_for_resumable_run(
             headers={"X-Application-Id": "tenant-a"},
         )
     assert response.status_code == 200
-    assert parse_sse(response.text)[0]["type"] == "done"
+    assert [event["type"] for event in parse_sse(response.text)] == (
+        ["error", "done"] if initial_status == "stale_running" else ["done"]
+    )
 
 
 def test_resume_route_uses_real_checkpoint_recovery_path(
@@ -1113,7 +1124,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     delivered = parse_sse(response.text)
     assert response.status_code == 200
-    assert [event["sequence"] for event in delivered] == [11, 12, 13]
+    assert [event["sequence"] for event in delivered] == [11, 12, 13, 14]
 
     async def read_run_and_events() -> tuple[str, int, list, Any]:
         async with AsyncConnectionPool(
@@ -1129,7 +1140,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     status, epoch, events, phase = asyncio.run(read_run_and_events())
     assert (status, epoch) == ("completed", 2)
-    assert [event.sequence for event in events] == list(range(1, 14))
+    assert [event.sequence for event in events] == list(range(1, 15))
     assert phase is not None
     assert phase.normalized_result == {
         "query": "authoritative",
@@ -1216,7 +1227,10 @@ def test_concurrent_resume_requests_have_one_http_winner(
 
     status, epoch, events = asyncio.run(read_run_and_events())
     assert (status, epoch) == ("completed", 2)
-    assert [event.event_key for event in events] == ["recovery:completed:1"]
+    assert [event.event_key for event in events] == [
+        "lifecycle:interrupted:1",
+        "recovery:completed:1",
+    ]
 
 
 def test_completed_tracer_persists_its_run_and_every_delivered_event(
