@@ -109,6 +109,38 @@ async def test_resume_claims_expired_run_once_and_fences_old_owner(
 
 
 @pytest.mark.asyncio
+async def test_resume_rejects_run_without_authoritative_checkpoint(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run_id = uuid4()
+        await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        with psycopg.connect(
+            langgraph_v2_migrated_database_url, autocommit=True
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET expires_at = clock_timestamp() - interval '1 second'
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                ("tenant-a", run_id),
+            )
+        with pytest.raises(ResumeConflict):
+            await repository.resume_run(
+                tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-b"
+            )
+
+
+@pytest.mark.asyncio
 async def test_resume_concurrent_requests_have_one_winner(
     langgraph_v2_migrated_database_url: str,
 ) -> None:

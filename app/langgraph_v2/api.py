@@ -65,10 +65,10 @@ async def _persist_result_events(
     result: dict[str, Any],
     owner_instance_id: str,
     execution_epoch: int,
-    skip_event_keys: set[str] | None = None,
+    suppress_sse_for_event_keys: set[str] | None = None,
 ) -> AsyncIterator[str]:
     """Persist graph Events and serialize newly published SSE frames."""
-    prior_keys = skip_event_keys or set()
+    prior_keys = suppress_sse_for_event_keys or set()
     for raw_event in result["events"]:
         event = TracerStreamEvent.model_validate(raw_event)
         event_input = EventInput(
@@ -255,10 +255,8 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
             raise HTTPException(
                 status_code=409, detail="Run is not resumable"
             ) from error
-        previous_checkpoint_id = claim.checkpoint_id
-        previous_checkpoint_ns = claim.checkpoint_ns
-        if previous_checkpoint_id is None or previous_checkpoint_ns is None:
-            raise HTTPException(status_code=409, detail="Run has no checkpoint")
+        previous_checkpoint_id = cast(str, claim.checkpoint_id)
+        previous_checkpoint_ns = cast(str, claim.checkpoint_ns)
 
         async def event_generator() -> AsyncIterator[str]:
             configured_checkpointer = getattr(
@@ -322,7 +320,7 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
                     result=result,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
-                    skip_event_keys=prior_events,
+                    suppress_sse_for_event_keys=prior_events,
                 ):
                     yield frame
             finally:
