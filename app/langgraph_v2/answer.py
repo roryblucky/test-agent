@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
@@ -14,8 +15,7 @@ from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
-from app.models.workflow import AggregatedEvidence, CitationReference
-from app.services.citation_extractor import build_citations
+from app.models.workflow import CitationReference
 
 ANSWER_CHUNK_INTERVAL_MS = 250
 ANSWER_CHUNK_MAX_CODEPOINTS = 240
@@ -94,23 +94,29 @@ async def build_inline_citations(
     documents: list[Document],
 ) -> list[CitationReference]:
     """Extract ``[n]`` references and map them through ranked ArtifactRefs."""
-    evidence = [
-        AggregatedEvidence(
-            evidence_id=ref["artifact_id"],
-            source=document.source_url or document.id,
-            tool_call_id=str(document.metadata.get("tool_call_id", "retrieval")),
-            content=document.content,
-            title=document.section_title,
-            url=document.source_url,
-            source_type=document.source_type,
-            page_number=document.page_number,
-            section=document.section_title,
-            citation_index=index,
-            metadata={"artifact_id": ref["artifact_id"]},
+    citations: list[CitationReference] = []
+    for match in re.finditer(r"\[([1-9]\d*)\]", answer):
+        index = int(match.group(1))
+        if index > len(refs) or any(citation.index == index for citation in citations):
+            continue
+        ref = refs[index - 1]
+        document = documents[index - 1]
+        source = str(document.metadata.get("source") or document.source_url or document.id)
+        citations.append(
+            CitationReference(
+                index=index,
+                evidence_id=ref["artifact_id"],
+                source=source,
+                source_type=document.source_type,
+                title=document.section_title,
+                url=document.source_url,
+                snippet=document.content[:300],
+                page_number=document.page_number,
+                section=document.section_title,
+                highlight_content=document.content,
+                metadata={"artifact_id": ref["artifact_id"]},
+            )
         )
-        for index, (ref, document) in enumerate(zip(refs, documents, strict=True), 1)
-    ]
-    citations, _ = await build_citations(answer, evidence)
     return citations
 
 
