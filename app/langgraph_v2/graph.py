@@ -12,6 +12,7 @@ from langgraph.graph.state import CompiledStateGraph
 from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
+from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.pre_moderation import (
     MockModerationProvider,
@@ -29,6 +30,7 @@ from app.langgraph_v2.question_refinement import (
 from app.langgraph_v2.reranking import MockRanker, Ranker, run_reranking
 from app.langgraph_v2.retrieval import MockRetriever, Retriever, run_retrieval
 from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
 
@@ -51,6 +53,8 @@ class TracerState(TypedDict):
     answer_usage: NotRequired[dict[str, Any]]
     citations: NotRequired[list[CitationReference]]
     answer_error: NotRequired[str]
+    groundedness: NotRequired[GroundednessResult]
+    groundedness_error: NotRequired[str]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -69,6 +73,8 @@ class TracerStateUpdate(TypedDict, total=False):
     answer_usage: dict[str, Any]
     citations: list[CitationReference]
     answer_error: str
+    groundedness: GroundednessResult
+    groundedness_error: str
 
 
 async def _query(
@@ -145,6 +151,8 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     ]
     if "answer" in state:
         steps.append("answer")
+    if "groundedness" in state:
+        steps.append("groundedness")
     steps.append("finalization")
     response = TracerQueryResponse(
         query=state["query"],
@@ -155,6 +163,7 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
         refined_query=state.get("refined_query"),
         answer=state.get("answer"),
         citations=state.get("citations", []),
+        groundedness=state.get("groundedness"),
         documents=[],
     )
     events.extend(
@@ -210,6 +219,7 @@ def build_tracer_graph(
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
     answer_actor: AnswerActor | None = None,
+    groundedness_actor: GroundednessActor | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
@@ -360,6 +370,30 @@ def build_tracer_graph(
             return update
 
         builder.add_node("answer", answer_node)
+
+        if groundedness_actor is not None:
+
+            async def groundedness_node(state: TracerState) -> TracerStateUpdate:
+                events, result, halted, error = await run_groundedness(
+                    state,
+                    context=phase_context,
+                    artifacts=selected_artifact_repository,
+                    actor=groundedness_actor,
+                )
+                update: TracerStateUpdate = {
+                    "events": [
+                        *state["events"],
+                        *[_event_state(event, event.sequence) for event in events],
+                    ],
+                    "halted": halted,
+                }
+                if result is not None:
+                    update["groundedness"] = result
+                if error is not None:
+                    update["groundedness_error"] = error
+                return update
+
+            builder.add_node("groundedness", groundedness_node)
     builder.add_node("finalization", _finalize)
     builder.add_edge(START, "query")
     builder.add_edge("query", "pre_moderation")
@@ -393,11 +427,26 @@ def build_tracer_graph(
         reranking_routes,
     )
     if answer_actor is not None and selected_artifact_repository is not None:
+        answer_routes = {"finalization": "finalization", "end": END}
+        if groundedness_actor is not None:
+            answer_routes["groundedness"] = "groundedness"
         builder.add_conditional_edges(
             "answer",
-            lambda state: "end" if state.get("halted", False) else "finalization",
-            {"finalization": "finalization", "end": END},
+            lambda state: (
+                "end"
+                if state.get("halted", False)
+                else "groundedness"
+                if groundedness_actor is not None
+                else "finalization"
+            ),
+            answer_routes,
         )
+        if groundedness_actor is not None:
+            builder.add_conditional_edges(
+                "groundedness",
+                lambda state: "end" if state.get("halted", False) else "finalization",
+                {"finalization": "finalization", "end": END},
+            )
     builder.add_edge("finalization", END)
     return builder.compile(checkpointer=checkpointer)
 

@@ -31,6 +31,7 @@ from app.langgraph_v2.checkpointing import (
 )
 from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
+from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.provider_adapters import (
@@ -127,6 +128,23 @@ def _resolve_cancellation_check(
         return bool(await checker(tenant_id, run_id))
 
     return check
+
+
+def _resolve_groundedness_actor(
+    app: FastAPI,
+    tenant_id: str,
+    injected: GroundednessActor | None,
+) -> GroundednessActor | None:
+    """Resolve an injected or tenant-registry groundedness evaluator."""
+    if injected is not None:
+        return injected
+    configured = getattr(app.state, "langgraph_v2_groundedness_actor", None)
+    if configured is not None:
+        return configured
+    manager = getattr(app.state, "tenant_manager", None)
+    if manager is None or not hasattr(manager, "get_model_registry"):
+        return None
+    return build_groundedness_actor(manager.get_model_registry(tenant_id))
 
 
 def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
@@ -357,6 +375,7 @@ def create_tracer_router(
     ranker: Ranker | None = None,
     moderation_provider: ModerationProvider | None = None,
     answer_actor: AnswerActor | None = None,
+    groundedness_actor: GroundednessActor | None = None,
     answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
 ) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
@@ -405,6 +424,9 @@ def create_tracer_router(
             )
             configured_answer_actor = _resolve_answer_actor(
                 http_request.app, x_application_id, answer_actor
+            )
+            configured_groundedness_actor = _resolve_groundedness_actor(
+                http_request.app, x_application_id, groundedness_actor
             )
             (
                 configured_retriever,
@@ -472,6 +494,7 @@ def create_tracer_router(
                     ranker=configured_ranker,
                     moderation_provider=configured_moderation,
                     answer_actor=configured_answer_actor,
+                    groundedness_actor=configured_groundedness_actor,
                 )
             heartbeat_task = asyncio.create_task(
                 _refresh_claim(
@@ -561,6 +584,9 @@ def create_tracer_router(
             configured_answer_actor = _resolve_answer_actor(
                 http_request.app, x_application_id, answer_actor
             )
+            configured_groundedness_actor = _resolve_groundedness_actor(
+                http_request.app, x_application_id, groundedness_actor
+            )
             (
                 configured_retriever,
                 configured_ranker,
@@ -615,6 +641,7 @@ def create_tracer_router(
                     ranker=configured_ranker,
                     moderation_provider=configured_moderation,
                     answer_actor=configured_answer_actor,
+                    groundedness_actor=configured_groundedness_actor,
                 )
                 graph_config = exact_checkpoint_config(
                     thread_id=thread_id_for(x_application_id, claim.conversation_id),
@@ -700,6 +727,7 @@ def register_tracer_routes(
     ranker: Ranker | None = None,
     moderation_provider: ModerationProvider | None = None,
     answer_actor: AnswerActor | None = None,
+    groundedness_actor: GroundednessActor | None = None,
     answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
     resume_enabled: bool = False,
 ) -> None:
@@ -712,6 +740,7 @@ def register_tracer_routes(
             ranker,
             moderation_provider,
             answer_actor,
+            groundedness_actor,
             answer_chunk_interval_ms,
         )
         if not resume_enabled:

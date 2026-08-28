@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
 
@@ -35,7 +36,7 @@ class TracerQueryResponse(BaseModel):
     answer: str | None = None
     documents: list[Any] = Field(default_factory=list)
     moderation: None = None
-    groundedness: None = None
+    groundedness: GroundednessResult | None = None
     clarification: None = None
     conversation_id: str = Field(serialization_alias="session_id")
     metadata: dict[str, Any] = Field(default_factory=dict)
