@@ -377,12 +377,12 @@ async def _stream_graph_result(
         return
     if not forward_live_events:
         sent_keys.update(
-            event.event_key
-            for event in await repository.list_events(tenant_id, run_id)
-            if not (
-                event.type == "token"
-                and event.event_key.startswith("phase:answer:token:")
-            )
+            event["event_key"]
+            for event in result["events"]
+            if event["event_key"].startswith("phase:")
+            if event["type"] != "token"
+            and not event["event_key"].startswith("phase:finalization:")
+            and event["event_key"] != "lifecycle:completed:0"
         )
     async for frame in _persist_result_events(
         repository,

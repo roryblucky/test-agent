@@ -35,8 +35,9 @@ class TracerQueryResponse(BaseModel):
     intent: None = None
     answer: str | None = None
     documents: list[Any] = Field(default_factory=list)
-    moderation: None = None
+    moderation: dict[str, Any] | None = None
     groundedness: GroundednessResult | None = None
+    usage: dict[str, Any] = Field(default_factory=dict)
     clarification: None = None
     conversation_id: str = Field(serialization_alias="session_id")
     metadata: dict[str, Any] = Field(default_factory=dict)

@@ -12,6 +12,7 @@ from langgraph.graph.state import CompiledStateGraph
 from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
+from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.post_moderation import run_post_moderation
@@ -58,6 +59,7 @@ class TracerState(TypedDict):
     groundedness_error: NotRequired[str]
     post_moderation: NotRequired[dict[str, Any]]
     post_moderation_error: NotRequired[str]
+    final_response: NotRequired[TracerQueryResponse]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -80,6 +82,7 @@ class TracerStateUpdate(TypedDict, total=False):
     groundedness_error: str
     post_moderation: dict[str, Any]
     post_moderation_error: str
+    final_response: TracerQueryResponse
 
 
 async def _query(
@@ -145,56 +148,7 @@ def canonical_query(query: str) -> str:
 
 
 async def _finalize(state: TracerState) -> TracerStateUpdate:
-    events = list(state["events"])
-    sequence_start = len(events) + 1
-    steps = [
-        "query",
-        "pre_moderation",
-        "question_refinement",
-        "retrieval",
-        "reranking",
-    ]
-    if "answer" in state:
-        steps.append("answer")
-    if "groundedness" in state:
-        steps.append("groundedness")
-    if "post_moderation" in state:
-        steps.append("moderation:post")
-    steps.append("finalization")
-    response = TracerQueryResponse(
-        query=state["query"],
-        conversation_id=state["conversation_id"],
-        metadata={"steps_executed": steps},
-        refined_query=state.get("refined_query"),
-        answer=state.get("answer"),
-        citations=state.get("citations", []),
-        groundedness=state.get("groundedness"),
-        documents=[],
-    )
-    events.extend(
-        [
-            TracerStreamEvent(
-                event_key="phase:finalization:step_start:1",
-                type="step_start",
-                step="finalization",
-                sequence=sequence_start,
-            ).model_dump(exclude_none=True),
-            TracerStreamEvent(
-                event_key="phase:finalization:step_completed:1",
-                type="step_completed",
-                step="finalization",
-                data={"status": "completed"},
-                sequence=sequence_start + 1,
-            ).model_dump(exclude_none=True),
-            TracerStreamEvent(
-                event_key="lifecycle:completed:0",
-                type="done",
-                data=response.model_dump(by_alias=True),
-                sequence=sequence_start + 2,
-            ).model_dump(exclude_none=True),
-        ]
-    )
-    return {"events": events}
+    return finalize_in_memory(state)
 
 
 async def _pre_moderation_without_journal(
@@ -425,7 +379,24 @@ def build_tracer_graph(
             return update
 
         builder.add_node("post_moderation", post_moderation_node)
-    builder.add_node("finalization", _finalize)
+
+    async def finalization_node(state: TracerState) -> TracerStateUpdate:
+        if phase_context is None or selected_artifact_repository is None:
+            return await _finalize(state)
+        events, response = await run_finalization(
+            state,
+            context=phase_context,
+            artifacts=selected_artifact_repository,
+        )
+        return {
+            "events": [
+                *state["events"],
+                *[_event_state(event, event.sequence) for event in events],
+            ],
+            "final_response": response,
+        }
+
+    builder.add_node("finalization", finalization_node)
     builder.add_edge(START, "query")
     builder.add_edge("query", "pre_moderation")
     builder.add_conditional_edges(
