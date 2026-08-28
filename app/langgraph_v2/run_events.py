@@ -270,25 +270,27 @@ class RunEventRepository:
         row = None
         async with self._pool.connection() as connection:
             async with connection.transaction():
-                run_cursor = await connection.execute(
-                    """
-                    SELECT next_event_sequence, status, owner_instance_id,
-                           execution_epoch, expires_at <= clock_timestamp()
-                    FROM langgraph_v2.runs
-                    WHERE tenant_id = %s AND run_id = %s
-                    FOR UPDATE
-                    """,
-                    (tenant_id, run_id),
-                )
-                run_row = await run_cursor.fetchone()
+                async with connection.cursor(row_factory=dict_row) as run_cursor:
+                    await run_cursor.execute(
+                        """
+                        SELECT next_event_sequence, status, owner_instance_id,
+                               execution_epoch,
+                               expires_at <= clock_timestamp() AS claim_expired
+                        FROM langgraph_v2.runs
+                        WHERE tenant_id = %s AND run_id = %s
+                        FOR UPDATE
+                        """,
+                        (tenant_id, run_id),
+                    )
+                    run_row = await run_cursor.fetchone()
                 if run_row is None:
                     raise RunNotFound(str(run_id))
                 if (
-                    run_row[1] not in {"running", "completed"}
-                    or run_row[2] != owner_instance_id
-                    or run_row[3] != execution_epoch
-                    or run_row[4]
-                    or (run_row[1] == "completed" and not completes_run)
+                    run_row["status"] not in {"running", "completed"}
+                    or run_row["owner_instance_id"] != owner_instance_id
+                    or run_row["execution_epoch"] != execution_epoch
+                    or run_row["claim_expired"]
+                    or (run_row["status"] == "completed" and not completes_run)
                 ):
                     raise ClaimFenced(str(run_id))
                 async with connection.cursor(row_factory=dict_row) as existing_cursor:
@@ -325,7 +327,7 @@ class RunEventRepository:
                         )
                         conflict = True
                 else:
-                    sequence = run_row[0]
+                    sequence = run_row["next_event_sequence"]
                     async with connection.cursor(row_factory=dict_row) as event_cursor:
                         await event_cursor.execute(
                             """

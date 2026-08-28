@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
+import app.langgraph_v2.api as api_module
 from app.api.schemas import QueryResponse
 from app.langgraph_v2.api import TracerGraph, register_tracer_routes
 from app.langgraph_v2.graph import TracerState
@@ -232,6 +233,48 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
     assert [event.type for event in persisted] == [
         event["type"] for event in delivered
     ]
+
+
+def test_long_running_request_refreshes_its_claim(
+    langgraph_v2_migrated_database_url: str,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(api_module, "CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+
+    class SlowGraph:
+        async def ainvoke(self, state: TracerState) -> dict:
+            await asyncio.sleep(0.05)
+            return {
+                "events": [
+                    {
+                        "event_key": "lifecycle:completed:0",
+                        "type": "done",
+                        "data": {"source": "slow"},
+                        "sequence": 1,
+                    }
+                ]
+            }
+
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, SlowGraph())
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "conversation-1"},
+            headers={"X-Application-Id": "tenant-a"},
+        )
+
+    run_id = UUID(response.headers["x-run-id"])
+
+    async def load_run():
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url,
+            min_size=1,
+            max_size=2,
+        ) as pool:
+            return await RunEventRepository(pool).get_run("tenant-a", run_id)
+
+    run = asyncio.run(load_run())
+    assert run.heartbeat_at > run.created_at
 
 
 def test_persistence_failure_emits_no_unpersisted_event(
