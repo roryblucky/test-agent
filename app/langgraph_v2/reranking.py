@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.langgraph_v2.artifacts import ArtifactRef, ArtifactWriter
+from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
@@ -40,7 +40,7 @@ async def run_reranking(
     state: Mapping[str, Any],
     *,
     context: PhaseExecutionContext,
-    artifacts: ArtifactWriter,
+    artifacts: ArtifactStore,
     ranker: Ranker,
 ) -> tuple[list[EventRecord], list[ArtifactRef], bool, str | None]:
     """Hydrate retrieved Documents, journal ranking, and return ordered refs."""
