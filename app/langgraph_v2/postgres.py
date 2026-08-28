@@ -14,7 +14,12 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
 from app.langgraph_v2.live_events import LiveEventWakeups
-from app.langgraph_v2.observability import ensure_meter_provider
+from app.langgraph_v2.observability import (
+    ensure_meter_provider,
+    observe,
+    safe_span_attribute,
+    set_operation_outcome,
+)
 from app.langgraph_v2.run_events import RunEventRepository
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
@@ -110,10 +115,25 @@ async def postgres_lifespan(
                         runtime is not None
                         and app.state.langgraph_v2_postgres_pool is pool
                     ):
-                        await runtime.stop_and_wait_for_checkpoint_boundary()
-                        await RunEventRepository(pool).interrupt_runs_owned_by(
-                            _INSTANCE_ID
-                        )
+                        with observe(
+                            "recovery.interrupt_shutdown",
+                            attributes={"recovery.operation": "interrupt_shutdown"},
+                        ) as shutdown_span:
+                            await runtime.stop_and_wait_for_checkpoint_boundary()
+                            interrupted = await RunEventRepository(
+                                pool
+                            ).interrupt_runs_owned_by(_INSTANCE_ID)
+                            set_operation_outcome(shutdown_span, "completed")
+                            safe_span_attribute(
+                                shutdown_span,
+                                "run.status",
+                                "interrupted" if interrupted else "completed",
+                            )
+                            safe_span_attribute(
+                                shutdown_span,
+                                "recovery.run_count",
+                                len(interrupted),
+                            )
                 finally:
                     await pool.close()
         finally:

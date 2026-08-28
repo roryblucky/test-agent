@@ -14,7 +14,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableConfig
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.metrics.export import (
+    InMemoryMetricReader,
+    PeriodicExportingMetricReader,
+)
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -25,6 +28,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent
 
 import app.langgraph_v2.observability as observability
+import app.langgraph_v2.postgres as postgres_module
 from app.langgraph_v2.answer import AnswerOutput, PydanticAIAnswerActor
 from app.langgraph_v2.api import register_tracer_routes
 from app.langgraph_v2.cancellation import CancellationRepository
@@ -133,7 +137,7 @@ def test_failed_operation_exports_only_safe_metadata(
     assert all("conversation.id" not in point.attributes for point in points)
 
 
-def test_startup_installs_a_real_metric_reader_without_an_external_collector(
+def test_startup_installs_an_exporting_metric_reader_without_a_host_provider(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     """The production lifespan records metrics without app configuration."""
@@ -149,18 +153,50 @@ def test_startup_installs_a_real_metric_reader_without_an_external_collector(
     app = FastAPI(lifespan=lifespan)
     with TestClient(app):
         reader = app.state.langgraph_v2_metric_reader
-        assert isinstance(reader, InMemoryMetricReader)
+        assert isinstance(reader, PeriodicExportingMetricReader)
         with observability.observe("execution.run"):
             pass
-        metrics_data = reader.get_metrics_data()
+        assert reader.force_flush()
 
-    assert any(
-        point.attributes == {"operation": "execution.run", "outcome": "ok"}
-        for resource in metrics_data.resource_metrics
-        for scope in resource.scope_metrics
-        for metric in scope.metrics
-        for point in metric.data.data_points
+
+def test_identifier_redaction_is_stable_for_deployment_key() -> None:
+    """Separate process configuration produces the same opaque correlation ID."""
+    environment = {"LANGGRAPH_V2_TELEMETRY_KEY": "k" * 32}
+    first = observability.IdentifierRedactor.from_environment(environment)
+    second = observability.IdentifierRedactor.from_environment(dict(environment))
+
+    assert first.redact("conversation-secret") == second.redact("conversation-secret")
+    assert "conversation-secret" not in first.redact("conversation-secret")
+    assert "kkkk" not in repr(first)
+
+
+def test_otlp_metric_exporter_uses_the_configured_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback pipeline can export to an operator-managed OTLP collector."""
+    exporter_calls: list[str | None] = []
+    exporter = object()
+    reader = object()
+    monkeypatch.setattr(
+        observability,
+        "OTLPMetricExporter",
+        lambda *, endpoint=None: exporter_calls.append(endpoint) or exporter,
     )
+    monkeypatch.setattr(
+        observability,
+        "PeriodicExportingMetricReader",
+        lambda selected: reader if selected is exporter else None,
+    )
+
+    configured = observability.build_metric_reader(
+        {
+            "LANGGRAPH_V2_METRICS_EXPORTER": "otlp",
+            "LANGGRAPH_V2_OTLP_METRICS_ENDPOINT": "https://collector.example/v1/metrics",
+        }
+    )
+
+    assert configured is reader
+    assert exporter_calls == ["https://collector.example/v1/metrics"]
 
 
 def test_existing_application_meter_provider_is_preserved(
@@ -291,7 +327,7 @@ def test_complete_v2_path_emits_correlated_redacted_telemetry(
 
     assert isinstance(
         app.state.langgraph_v2_metric_reader,
-        InMemoryMetricReader,
+        PeriodicExportingMetricReader,
     )
 
     assert query.status_code == 200
@@ -408,6 +444,10 @@ def test_preflight_rejections_emit_redacted_http_spans(
     app.state.tenant_manager = _UnknownTenantManager()
 
     with TestClient(app) as client:
+        invalid_query = client.post(
+            "/v2/query/stream",
+            json={"query": "private invalid query"},
+        )
         unknown_tenant = client.post(
             "/v2/query/stream",
             headers={"X-Application-Id": "private-missing-tenant"},
@@ -422,6 +462,14 @@ def test_preflight_rejections_emit_redacted_http_spans(
             f"/v2/artifacts/{uuid4()}",
             headers={"X-Application-Id": "tenant-a"},
         )
+        missing_resume = client.post(
+            f"/v2/runs/{uuid4()}/resume/stream",
+            headers={"X-Application-Id": "tenant-a"},
+        )
+        missing_cancel = client.post(
+            f"/v2/runs/{uuid4()}/cancel",
+            headers={"X-Application-Id": "tenant-a"},
+        )
         asyncio.run(
             app.state.langgraph_v2_runtime.stop_and_wait_for_checkpoint_boundary()
         )
@@ -431,9 +479,12 @@ def test_preflight_rejections_emit_redacted_http_spans(
             json={"query": "private shutdown query"},
         )
 
+    assert invalid_query.status_code == 422
     assert unknown_tenant.status_code == 404
     assert missing_replay.status_code == 404
     assert missing_artifact.status_code == 404
+    assert missing_resume.status_code == 404
+    assert missing_cancel.status_code == 404
     assert shutdown.status_code == 503
     spans = [
         span
@@ -441,14 +492,89 @@ def test_preflight_rejections_emit_redacted_http_spans(
         if span.name == "langgraph_v2.http.request"
     ]
     routes = [span.attributes["http.route"] for span in spans]
-    assert routes.count("/v2/query/stream") == 2
+    assert routes.count("/v2/query/stream") == 3
     assert "/v2/runs/{run_id}/stream" in routes
     assert "/v2/artifacts/{artifact_id}" in routes
+    assert "/v2/runs/{run_id}/resume/stream" in routes
+    assert "/v2/runs/{run_id}/cancel" in routes
     assert all(span.status.status_code.name == "ERROR" for span in spans)
     exported = repr(spans)
     assert "private-missing-tenant" not in exported
     assert "private rejected query" not in exported
     assert "private shutdown query" not in exported
+
+
+def test_groundedness_setup_failure_is_redacted_and_diagnosable(
+    langgraph_v2_migrated_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actor construction failure emits a bounded setup operation."""
+    capture = _install_capture(monkeypatch)
+    app = _observed_app(
+        langgraph_v2_migrated_database_url,
+        secret_query="unused",
+    )
+    monkeypatch.setattr(
+        "app.langgraph_v2.api._resolve_groundedness_actor",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("private groundedness credential=never-export")
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            headers={"X-Application-Id": "tenant-a"},
+            json={"query": "private setup query"},
+        )
+
+    assert response.status_code == 200
+    span = next(
+        span
+        for span in capture.spans.get_finished_spans()
+        if span.name == "langgraph_v2.pydantic_ai.setup"
+    )
+    assert span.attributes["actor.role"] == "groundedness"
+    assert span.attributes["error.type"] == "RuntimeError"
+    assert span.status.status_code.name == "ERROR"
+    exported = repr(span)
+    assert "private groundedness" not in exported
+    assert "private setup query" not in exported
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_interruption_emits_outcome(
+    langgraph_v2_migrated_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown recovery reports the durable interruption it applies."""
+    capture = _install_capture(monkeypatch)
+    monkeypatch.setattr(postgres_module, "_INSTANCE_ID", "test-shutdown-instance")
+    app = _observed_app(
+        langgraph_v2_migrated_database_url,
+        secret_query="unused",
+    )
+
+    async with app.router.lifespan_context(app):
+        await RunEventRepository(app.state.langgraph_v2_postgres_pool).create_run(
+            tenant_id="private-shutdown-tenant",
+            run_id=uuid4(),
+            conversation_id="private-shutdown-conversation",
+            owner_instance_id="test-shutdown-instance",
+        )
+
+    span = next(
+        span
+        for span in capture.spans.get_finished_spans()
+        if span.name == "langgraph_v2.recovery.interrupt_shutdown"
+    )
+    assert span.attributes["recovery.operation"] == "interrupt_shutdown"
+    assert span.attributes["operation.outcome"] == "completed"
+    assert span.attributes["run.status"] == "interrupted"
+    assert span.attributes["recovery.run_count"] == 1
+    exported = repr(span)
+    assert "private-shutdown-tenant" not in exported
+    assert "private-shutdown-conversation" not in exported
 
 
 class _ResumeGraph:

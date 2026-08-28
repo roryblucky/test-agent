@@ -6,12 +6,13 @@ import asyncio
 import os
 import socket
 import uuid
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import suppress
 from typing import Annotated, Any, Literal, Protocol, cast
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 from langchain_core.runnables import RunnableConfig
 from opentelemetry.context import Context
 from psycopg_pool import AsyncConnectionPool
@@ -43,6 +44,7 @@ from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.observability import (
     activate_context,
     context_for_span,
+    current_trace_context,
     observe,
     safe_span_attribute,
     set_operation_outcome,
@@ -77,6 +79,27 @@ from app.langgraph_v2.runtime import LocalRunRuntime, RuntimeStopping
 from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
+
+
+class ObservedV2Route(APIRoute):
+    """Observe matched v2 HTTP requests, including validation failures."""
+
+    def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
+        """Wrap FastAPI validation and endpoint execution in one HTTP span."""
+        route_handler = super().get_route_handler()
+        route = self.path
+
+        async def observed(request: Request) -> Response:
+            with observe(
+                "http.request",
+                attributes={
+                    "http.request.method": request.method,
+                    "http.route": route,
+                },
+            ):
+                return await route_handler(request)
+
+        return observed
 
 
 async def _pace_answer_chunk(
@@ -688,28 +711,20 @@ async def _resume_claim(
     tenant_id: str,
     run_id: uuid.UUID,
 ) -> tuple[RunRecord, Context]:
-    """Claim a Run under an HTTP root and return its recovery context."""
+    """Claim a Run and return its recovery context."""
     with observe(
-        "http.request",
+        "recovery.resume",
         run_id=run_id,
-        attributes={
-            "http.request.method": "POST",
-            "http.route": "/v2/runs/{run_id}/resume/stream",
-        },
-    ):
-        with observe(
-            "recovery.resume",
+        attributes={"recovery.operation": "resume"},
+    ) as recovery_span:
+        claim = await repository.resume_run(
+            tenant_id=tenant_id,
             run_id=run_id,
-            attributes={"recovery.operation": "resume"},
-        ) as recovery_span:
-            claim = await repository.resume_run(
-                tenant_id=tenant_id,
-                run_id=run_id,
-                owner_instance_id=_INSTANCE_ID,
-            )
-            safe_span_attribute(recovery_span, "execution.epoch", claim.execution_epoch)
-            safe_span_attribute(recovery_span, "run.status", "running")
-            return claim, context_for_span(recovery_span)
+            owner_instance_id=_INSTANCE_ID,
+        )
+        safe_span_attribute(recovery_span, "execution.epoch", claim.execution_epoch)
+        safe_span_attribute(recovery_span, "run.status", "running")
+        return claim, context_for_span(recovery_span)
 
 
 def _admit_query(
@@ -717,28 +732,20 @@ def _admit_query(
     *,
     tenant_id: str,
     requested_conversation_id: str | None,
-) -> tuple[LocalRunRuntime, uuid.UUID, str, Context]:
-    """Validate a query and establish its HTTP trace before streaming."""
-    with observe(
-        "http.request",
-        attributes={
-            "http.request.method": "POST",
-            "http.route": "/v2/query/stream",
-        },
-    ) as http_span:
-        _ensure_tenant_available(app, tenant_id)
-        runtime = _local_runtime(app)
-        if not runtime.accepting:
-            raise HTTPException(
-                status_code=503,
-                detail="LangGraph v2 is shutting down",
-            )
-        return (
-            runtime,
-            uuid.uuid4(),
-            requested_conversation_id or str(uuid.uuid4()),
-            context_for_span(http_span),
+) -> tuple[LocalRunRuntime, uuid.UUID, str]:
+    """Validate a query before streaming."""
+    _ensure_tenant_available(app, tenant_id)
+    runtime = _local_runtime(app)
+    if not runtime.accepting:
+        raise HTTPException(
+            status_code=503,
+            detail="LangGraph v2 is shutting down",
         )
+    return (
+        runtime,
+        uuid.uuid4(),
+        requested_conversation_id or str(uuid.uuid4()),
+    )
 
 
 async def _prepare_replay(
@@ -746,29 +753,21 @@ async def _prepare_replay(
     *,
     tenant_id: str,
     run_id: uuid.UUID,
-) -> tuple[RunEventRepository, LiveEventWakeups, Context]:
-    """Validate replay ownership under an HTTP span before streaming."""
-    with observe(
-        "http.request",
-        run_id=run_id,
-        attributes={
-            "http.request.method": "GET",
-            "http.route": "/v2/runs/{run_id}/stream",
-        },
-    ) as http_span:
-        configured_pool = getattr(app.state, "langgraph_v2_postgres_pool", None)
-        if configured_pool is None:
-            raise HTTPException(
-                status_code=500,
-                detail="LangGraph v2 PostgreSQL is not configured",
-            )
-        wakeups = _live_events(app)
-        repository = RunEventRepository(configured_pool, live_events=wakeups)
-        try:
-            await repository.get_run(tenant_id, run_id)
-        except RunNotFound as error:
-            raise HTTPException(status_code=404, detail="Run not found") from error
-        return repository, wakeups, context_for_span(http_span)
+) -> tuple[RunEventRepository, LiveEventWakeups]:
+    """Validate replay ownership before streaming."""
+    configured_pool = getattr(app.state, "langgraph_v2_postgres_pool", None)
+    if configured_pool is None:
+        raise HTTPException(
+            status_code=500,
+            detail="LangGraph v2 PostgreSQL is not configured",
+        )
+    wakeups = _live_events(app)
+    repository = RunEventRepository(configured_pool, live_events=wakeups)
+    try:
+        await repository.get_run(tenant_id, run_id)
+    except RunNotFound as error:
+        raise HTTPException(status_code=404, detail="Run not found") from error
+    return repository, wakeups
 
 
 def create_tracer_router(
@@ -787,7 +786,10 @@ def create_tracer_router(
         raise ValueError("answer_chunk_interval_ms must be between 200 and 500")
     if history_token_budget < 0:
         raise ValueError("history_token_budget must not be negative")
-    router = APIRouter(tags=["LangGraph v2 tracer"])
+    router = APIRouter(
+        tags=["LangGraph v2 tracer"],
+        route_class=ObservedV2Route,
+    )
 
     @router.post("/v2/query/stream")
     async def query_stream(
@@ -798,11 +800,12 @@ def create_tracer_router(
     ) -> StreamingResponse:
         """Run the deterministic tracer and return its events as SSE."""
         del x_user_groups
-        runtime, run_id, conversation_id, http_context = _admit_query(
+        runtime, run_id, conversation_id = _admit_query(
             http_request.app,
             tenant_id=x_application_id,
             requested_conversation_id=payload.conversation_id,
         )
+        http_context = current_trace_context()
 
         async def event_generator() -> AsyncIterator[str]:
             configured_pool = getattr(
@@ -854,9 +857,18 @@ def create_tracer_router(
                 http_request.app, x_application_id, answer_actor
             )
             try:
-                configured_groundedness_actor = _resolve_groundedness_actor(
-                    http_request.app, x_application_id, groundedness_actor
-                )
+                with observe(
+                    "pydantic_ai.setup",
+                    run_id=run_id,
+                    conversation_id=conversation_id,
+                    execution_epoch=claim.execution_epoch,
+                    attributes={"actor.role": "groundedness"},
+                ):
+                    configured_groundedness_actor = _resolve_groundedness_actor(
+                        http_request.app,
+                        x_application_id,
+                        groundedness_actor,
+                    )
             except Exception as exc:
                 yield await _persist_setup_failure(
                     repository,
@@ -1058,9 +1070,18 @@ def create_tracer_router(
             http_request.app, x_application_id, answer_actor
         )
         try:
-            configured_groundedness_actor = _resolve_groundedness_actor(
-                http_request.app, x_application_id, groundedness_actor
-            )
+            with observe(
+                "pydantic_ai.setup",
+                run_id=run_id,
+                conversation_id=claim.conversation_id,
+                execution_epoch=claim.execution_epoch,
+                attributes={"actor.role": "groundedness"},
+            ):
+                configured_groundedness_actor = _resolve_groundedness_actor(
+                    http_request.app,
+                    x_application_id,
+                    groundedness_actor,
+                )
         except Exception as exc:
             await _persist_setup_failure(
                 repository,
@@ -1208,11 +1229,12 @@ def create_tracer_router(
         after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
     ) -> StreamingResponse:
         """Replay and then follow one Run from the requested sequence cursor."""
-        repository, wakeups, http_context = await _prepare_replay(
+        repository, wakeups = await _prepare_replay(
             http_request.app,
             tenant_id=x_application_id,
             run_id=run_id,
         )
+        http_context = current_trace_context()
 
         async def event_generator() -> AsyncIterator[str]:
             async for frame in _follow_persisted_events(
@@ -1260,25 +1282,15 @@ def create_tracer_router(
             )
         try:
             with observe(
-                "http.request",
+                "cancellation.request",
                 run_id=run_id,
-                attributes={
-                    "http.request.method": "POST",
-                    "http.route": "/v2/runs/{run_id}/cancel",
-                },
-            ):
-                with observe(
-                    "cancellation.request",
-                    run_id=run_id,
-                    attributes={"cancellation.operation": "request"},
-                ) as cancellation_span:
-                    result = await CancellationRepository(
-                        configured_pool,
-                        wakeups=_live_events(http_request.app),
-                    ).request(tenant_id=x_application_id, run_id=run_id)
-                    safe_span_attribute(
-                        cancellation_span, "run.status", result.run_status
-                    )
+                attributes={"cancellation.operation": "request"},
+            ) as cancellation_span:
+                result = await CancellationRepository(
+                    configured_pool,
+                    wakeups=_live_events(http_request.app),
+                ).request(tenant_id=x_application_id, run_id=run_id)
+                safe_span_attribute(cancellation_span, "run.status", result.run_status)
         except RunNotFound as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
         response = CancellationResponse(
@@ -1298,30 +1310,21 @@ def create_tracer_router(
         x_application_id: Annotated[str, Header(alias="X-Application-Id")],
     ) -> dict[str, Any]:
         """Read one Artifact through the caller's Tenant boundary."""
-        with observe(
-            "http.request",
-            attributes={
-                "http.request.method": "GET",
-                "http.route": "/v2/artifacts/{artifact_id}",
-            },
-        ):
-            configured_pool = getattr(
-                http_request.app.state, "langgraph_v2_postgres_pool", None
+        configured_pool = getattr(
+            http_request.app.state, "langgraph_v2_postgres_pool", None
+        )
+        if configured_pool is None:
+            raise HTTPException(
+                status_code=500,
+                detail="LangGraph v2 PostgreSQL is not configured",
             )
-            if configured_pool is None:
-                raise HTTPException(
-                    status_code=500,
-                    detail="LangGraph v2 PostgreSQL is not configured",
-                )
-            try:
-                artifact = await ArtifactRepository(configured_pool).get(
-                    tenant_id=x_application_id, artifact_id=artifact_id
-                )
-            except ArtifactNotFound as error:
-                raise HTTPException(
-                    status_code=404, detail="Artifact not found"
-                ) from error
-            return artifact.model_dump(mode="json")
+        try:
+            artifact = await ArtifactRepository(configured_pool).get(
+                tenant_id=x_application_id, artifact_id=artifact_id
+            )
+        except ArtifactNotFound as error:
+            raise HTTPException(status_code=404, detail="Artifact not found") from error
+        return artifact.model_dump(mode="json")
 
     return router
 
