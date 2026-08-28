@@ -444,7 +444,11 @@ def create_tracer_router(
         del x_user_groups
         _ensure_tenant_available(http_request.app, x_application_id)
         run_id = uuid.uuid4()
-        conversation_id = payload.conversation_id or str(uuid.uuid4())
+        conversation_id = (
+            payload.conversation_id
+            if payload.conversation_id is not None
+            else str(uuid.uuid4())
+        )
 
         async def event_generator() -> AsyncIterator[str]:
             configured_pool = getattr(

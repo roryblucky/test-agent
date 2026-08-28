@@ -180,3 +180,59 @@ async def test_assistant_message_requires_successful_run_completion(
             message.content
             for message in await messages.list_messages("tenant-a", "session-1")
         ] == ["safe answer"]
+
+
+@pytest.mark.asyncio
+async def test_resume_retry_reuses_the_user_message(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        messages = ConversationMessageRepository(pool)
+        runs = RunEventRepository(pool)
+        await messages.resolve_conversation(
+            tenant_id="tenant-a", conversation_id="session-1"
+        )
+        run = await runs.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="session-1",
+            owner_instance_id="instance-1",
+        )
+        await messages.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="session-1",
+            run_id=run.run_id,
+            content="hello",
+            idempotency_key="retry:user",
+        )
+        await runs.update_checkpoint_pointer(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+            checkpoint_id="checkpoint-1",
+            checkpoint_ns="namespace-1",
+        )
+        async with pool.connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "UPDATE langgraph_v2.runs SET status = 'interrupted', owner_instance_id = '' WHERE tenant_id = %s AND run_id = %s",
+                    ("tenant-a", run.run_id),
+                )
+        resumed = await runs.resume_run(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id="instance-2",
+        )
+        repeated = await messages.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id=resumed.conversation_id,
+            run_id=run.run_id,
+            content="hello",
+            idempotency_key="retry:user",
+        )
+
+        assert repeated.run_id == run.run_id
+        assert len(await messages.list_messages("tenant-a", "session-1")) == 1
