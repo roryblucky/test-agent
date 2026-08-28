@@ -114,5 +114,12 @@ def test_tenant_provider_bundle_is_adapted_without_legacy_orchestration_imports(
     assert adapted.moderation is not None
     package_root = Path(__file__).parents[2] / "app" / "langgraph_v2"
     source = "\n".join(path.read_text() for path in package_root.glob("*.py"))
-    for forbidden in ("app.services.handlers", "FlowConfig", "FlowContext", "ExecutorContext"):
+    for forbidden in (
+        "app.services.handlers",
+        "app.services.flow_engine",
+        "FlowEngine",
+        "FlowConfig",
+        "FlowContext",
+        "ExecutorContext",
+    ):
         assert forbidden not in source
