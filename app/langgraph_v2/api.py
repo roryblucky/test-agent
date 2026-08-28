@@ -186,57 +186,50 @@ def create_tracer_router(
             )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
-            if graph is None and configured_checkpointer is not None:
-
-                async def write_checkpoint_pointer(
-                    checkpoint_id: str,
-                    checkpoint_ns: str,
-                ) -> None:
-                    await repository.update_checkpoint_pointer(
-                        tenant_id=x_application_id,
-                        run_id=run_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                        checkpoint_id=checkpoint_id,
-                        checkpoint_ns=checkpoint_ns,
-                    )
-
-                checkpoint_ns = checkpoint_namespace_for(
-                    x_application_id,
-                    str(run_id),
-                    claim.execution_epoch,
+            if graph is None:
+                phase_context = PhaseExecutionContext(
+                    repository=PhaseResultRepository(pool),
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                    owner_instance_id=claim.owner_instance_id,
+                    execution_epoch=claim.execution_epoch,
                 )
-                selected_graph = build_tracer_graph(
-                    FencedAsyncPostgresSaver(
+                saver: FencedAsyncPostgresSaver | None = None
+                if configured_checkpointer is not None:
+
+                    async def write_checkpoint_pointer(
+                        checkpoint_id: str,
+                        checkpoint_ns: str,
+                    ) -> None:
+                        await repository.update_checkpoint_pointer(
+                            tenant_id=x_application_id,
+                            run_id=run_id,
+                            owner_instance_id=claim.owner_instance_id,
+                            execution_epoch=claim.execution_epoch,
+                            checkpoint_id=checkpoint_id,
+                            checkpoint_ns=checkpoint_ns,
+                        )
+
+                    checkpoint_ns = checkpoint_namespace_for(
+                        x_application_id,
+                        str(run_id),
+                        claim.execution_epoch,
+                    )
+                    saver = FencedAsyncPostgresSaver(
                         pool,
                         checkpoint_namespace=checkpoint_ns,
                         pointer_writer=write_checkpoint_pointer,
-                    ),
-                    phase_context=PhaseExecutionContext(
-                        repository=PhaseResultRepository(pool),
-                        tenant_id=x_application_id,
-                        run_id=run_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                    ),
-                    refinement_actor=configured_refinement_actor,
-                )
-                graph_config = initial_checkpoint_config(
-                    thread_id=thread_id_for(
-                        x_application_id,
-                        conversation_id,
-                    ),
-                    checkpoint_ns=checkpoint_ns,
-                )
-            elif graph is None and configured_refinement_actor is not None:
+                    )
+                    graph_config = initial_checkpoint_config(
+                        thread_id=thread_id_for(
+                            x_application_id,
+                            conversation_id,
+                        ),
+                        checkpoint_ns=checkpoint_ns,
+                    )
                 selected_graph = build_tracer_graph(
-                    phase_context=PhaseExecutionContext(
-                        repository=PhaseResultRepository(pool),
-                        tenant_id=x_application_id,
-                        run_id=run_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                    ),
+                    saver,
+                    phase_context=phase_context,
                     refinement_actor=configured_refinement_actor,
                 )
             heartbeat_task = asyncio.create_task(
