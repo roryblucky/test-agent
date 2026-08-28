@@ -63,6 +63,15 @@ class _CitingAnswer:
         )
 
 
+class _InlineCitationAnswer:
+    calls = 0
+
+    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+        self.calls += 1
+        del query, documents
+        return AnswerResult(answer="Supported claim [1]. Unknown claim [99].")
+
+
 @pytest.mark.asyncio
 async def test_answer_receives_ranked_documents_and_replays_without_model_call(
     langgraph_v2_migrated_database_url: str,
@@ -247,3 +256,49 @@ async def test_answer_citation_subresult_is_bound_and_replayed(
     assert [event["type"] for event in answer_events] == [
         "step_start", "token", "citations", "step_completed"
     ]
+
+
+@pytest.mark.asyncio
+async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_indices(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        actor = _InlineCitationAnswer()
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            phase_context=context, retriever=_Retriever(), ranker=_Ranker(), answer_actor=actor
+        )
+        state = {
+            "query": "hello", "conversation_id": "c1", "client_request_id": None,
+            "events": [],
+        }
+        result = await graph.ainvoke(state)
+
+    assert actor.calls == 1
+    assert [citation.index for citation in result["citations"]] == [1]
+    assert result["citations"][0].evidence_id
+    answer_events = [
+        event for event in result["events"] if event["event_key"].startswith("phase:answer:")
+    ]
+    assert [event["type"] for event in answer_events] == [
+        "step_start", "token", "token", "citations", "step_completed"
+    ]
+    citation_fixture = json.loads(
+        (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "langgraph_v2"
+            / "v1_citations_wire.json"
+        ).read_text()
+    )
+    citation_event = answer_events[3]
+    assert citation_event["type"] == citation_fixture["event"]["type"]
+    assert set(citation_fixture["event"]["data"][0]) <= set(citation_event["data"][0])

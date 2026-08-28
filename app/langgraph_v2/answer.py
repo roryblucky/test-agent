@@ -14,7 +14,8 @@ from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document
-from app.models.workflow import CitationReference
+from app.models.workflow import AggregatedEvidence, CitationReference
+from app.services.citation_extractor import build_citations
 
 ANSWER_CHUNK_INTERVAL_MS = 250
 ANSWER_CHUNK_MAX_CODEPOINTS = 240
@@ -85,6 +86,32 @@ def bind_answer_citations(
             )
         )
     return bound
+
+
+async def build_inline_citations(
+    answer: str,
+    refs: list[Mapping[str, Any]],
+    documents: list[Document],
+) -> list[CitationReference]:
+    """Extract ``[n]`` references and map them through ranked ArtifactRefs."""
+    evidence = [
+        AggregatedEvidence(
+            evidence_id=ref["artifact_id"],
+            source=document.source_url or document.id,
+            tool_call_id="langgraph_v2:answer",
+            content=document.content,
+            title=document.section_title,
+            url=document.source_url,
+            source_type=document.source_type,
+            page_number=document.page_number,
+            section=document.section_title,
+            citation_index=index,
+            metadata={"artifact_id": ref["artifact_id"]},
+        )
+        for index, (ref, document) in enumerate(zip(refs, documents, strict=True), 1)
+    ]
+    citations, _ = await build_citations(answer, evidence)
+    return citations
 
 
 class AnswerActor(Protocol):
@@ -192,7 +219,9 @@ async def run_answer(
             validated = AnswerResult.model_validate(answer)
             chunks = split_answer_chunks(validated.answer)
             normalized_answer = "".join(chunks)
-            citations = bind_answer_citations(validated.citations, refs, documents)
+            citations = await build_inline_citations(normalized_answer, refs, documents)
+            if not citations:
+                citations = bind_answer_citations(validated.citations, refs, documents)
             events: list[EventInput] = [
                 EventInput(
                     event_key="phase:answer:step_start:1",

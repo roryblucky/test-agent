@@ -1,0 +1,15 @@
+{
+  "event": {
+    "type": "citations",
+    "data": [
+      {
+        "index": 1,
+        "evidence_id": "evidence:1",
+        "source": "document"
+      }
+    ]
+  },
+  "documented_v2_differences": [
+    "v2 adds durable Artifact evidence_id values and deterministic highlight metadata"
+  ]
+}
