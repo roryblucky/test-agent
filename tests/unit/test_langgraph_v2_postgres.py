@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
+import app.langgraph_v2.postgres as postgres_module
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 
 
@@ -83,6 +84,38 @@ async def test_postgres_lifespan_opens_and_closes_the_configured_pool() -> None:
     assert app.state.langgraph_v2_checkpointer is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["pool_open", "checkpointer_setup"])
+async def test_postgres_startup_failure_closes_all_started_resources(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = FastAPI()
+    pool = FailingAsyncPool(fail_open=failure == "pool_open")
+    wakeups = FakeWakeups()
+    monkeypatch.setattr(
+        postgres_module,
+        "LiveEventWakeups",
+        lambda *, redis_url: wakeups,
+    )
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        async with postgres_lifespan(
+            app,
+            config=V2PostgresConfig(database_url="postgresql://app:secret@db/v2"),
+            pool_factory=lambda **_: pool,
+            checkpointer_factory=lambda _: FailingCheckpointer(
+                fail_setup=failure == "checkpointer_setup"
+            ),
+        ):
+            pass
+
+    assert wakeups.started is True
+    assert wakeups.closed is True
+    assert pool.closed is True
+    assert app.state.langgraph_v2_postgres_pool is None
+    assert app.state.langgraph_v2_checkpointer is None
+
+
 class FakeAsyncPool:
     """Controllable substitute for the external psycopg pool boundary."""
 
@@ -108,3 +141,37 @@ class FakeCheckpointer:
 
     async def setup(self) -> None:
         self.setup_called = True
+
+
+class FailingAsyncPool(FakeAsyncPool):
+    def __init__(self, *, fail_open: bool) -> None:
+        super().__init__()
+        self._fail_open = fail_open
+
+    async def open(self, *, wait: bool) -> None:
+        await super().open(wait=wait)
+        if self._fail_open:
+            raise RuntimeError("startup failed")
+
+
+class FailingCheckpointer(FakeCheckpointer):
+    def __init__(self, *, fail_setup: bool) -> None:
+        super().__init__(None)
+        self._fail_setup = fail_setup
+
+    async def setup(self) -> None:
+        await super().setup()
+        if self._fail_setup:
+            raise RuntimeError("startup failed")
+
+
+class FakeWakeups:
+    def __init__(self) -> None:
+        self.started = False
+        self.closed = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def close(self) -> None:
+        self.closed = True

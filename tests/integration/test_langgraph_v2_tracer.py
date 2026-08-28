@@ -475,7 +475,10 @@ async def test_closing_the_public_sse_subscription_keeps_its_run_executing(
 
         graph.release.set()
         for _ in range(100):
-            if graph.completed.is_set() and app.state.langgraph_v2_runtime.active_task_count == 0:
+            if (
+                graph.completed.is_set()
+                and app.state.langgraph_v2_runtime.active_task_count == 0
+            ):
                 break
             await asyncio.sleep(0.01)
 
@@ -485,9 +488,12 @@ async def test_closing_the_public_sse_subscription_keeps_its_run_executing(
             "tenant-a", UUID(response.headers["x-run-id"])
         )
         assert run.status == "completed"
-        assert [event.type for event in await RunEventRepository(
-            app.state.langgraph_v2_postgres_pool
-        ).list_events("tenant-a", run.run_id)] == ["done"]
+        assert [
+            event.type
+            for event in await RunEventRepository(
+                app.state.langgraph_v2_postgres_pool
+            ).list_events("tenant-a", run.run_id)
+        ] == ["done"]
 
 
 @pytest.mark.asyncio
@@ -647,6 +653,112 @@ async def test_resume_registration_starts_before_its_sse_body_is_consumed(
         ).get_run("tenant-a", run.run_id)
 
     assert resumed.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_resume_stream_is_fenced_to_claim_captured_before_body_consumption(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class BlockingGraph:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def ainvoke(
+            self, state: TracerState | None, config: RunnableConfig | None = None
+        ) -> dict[str, Any]:
+            del state, config
+            self.started.set()
+            await self.release.wait()
+            return {
+                "events": [
+                    {
+                        "event_key": "recovery:old-claim:done",
+                        "type": "done",
+                        "data": {"source": "old-claim"},
+                        "sequence": 1,
+                    }
+                ]
+            }
+
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        repository = RunEventRepository(pool)
+        run = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        await repository.update_checkpoint_pointer(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+            checkpoint_id="checkpoint-1",
+            checkpoint_ns="namespace-1",
+        )
+        async with pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET status = 'interrupted', owner_instance_id = ''
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                ("tenant-a", run.run_id),
+            )
+
+    graph = BlockingGraph()
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        graph,
+        resume_enabled=True,
+    )
+    async with app.router.lifespan_context(app):
+        response = await v2_resume_endpoint(app)(
+            run.run_id,
+            stream_request(app),
+            x_application_id="tenant-a",
+        )
+        await graph.started.wait()
+        repository = RunEventRepository(app.state.langgraph_v2_postgres_pool)
+        async with app.state.langgraph_v2_postgres_pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE langgraph_v2.runs
+                SET expires_at = clock_timestamp() - interval '1 second'
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                ("tenant-a", run.run_id),
+            )
+        replacement = await repository.resume_run(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id="replacement",
+        )
+        await repository.complete_run(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=replacement.owner_instance_id,
+            execution_epoch=replacement.execution_epoch,
+            event=EventInput(
+                event_key="recovery:replacement:done",
+                type="done",
+                data={"source": "replacement"},
+            ),
+        )
+
+        with pytest.raises(StopAsyncIteration):
+            await anext(response.body_iterator)
+        await response.body_iterator.aclose()
+        graph.release.set()
+        for _ in range(100):
+            if app.state.langgraph_v2_runtime.active_task_count == 0:
+                break
+            await asyncio.sleep(0.01)
+
+        assert replacement.execution_epoch == 3
 
 
 def test_main_registers_the_tracer_only_when_the_feature_flag_is_enabled(

@@ -53,11 +53,16 @@ class PersistedEventFollower:
         tenant_id: str,
         run_id: UUID,
         after_sequence: int,
+        expected_execution_epoch: int | None = None,
     ) -> AsyncIterator[EventRecord]:
         """Yield each Event once, then close as soon as the Run is not running."""
         cursor = after_sequence
         attached_run = await self._repository.get_run(tenant_id, run_id)
-        followed_epoch = attached_run.execution_epoch
+        followed_epoch = (
+            attached_run.execution_epoch
+            if expected_execution_epoch is None
+            else expected_execution_epoch
+        )
         async with self._wakeups.subscribe(tenant_id, run_id) as subscription:
             while True:
                 # Read the local generation before PostgreSQL so a producer cannot
@@ -114,11 +119,19 @@ class PersistedEventFollower:
                     return
 
                 if run_after.expires_at <= datetime.now(UTC):
-                    await self._repository.interrupt_expired_run(
+                    interrupted = await self._repository.interrupt_expired_run(
                         tenant_id=tenant_id,
                         run_id=run_id,
                         observed_execution_epoch=followed_epoch,
                     )
+                    if interrupted is None:
+                        # PostgreSQL is authoritative for lease expiry.  If the
+                        # application clock reached expiry first (or another CAS
+                        # won), retain bounded polling instead of spinning.
+                        await subscription.wait(
+                            generation,
+                            timeout_seconds=self._poll_interval_seconds,
+                        )
                     continue
                 if events:
                     continue

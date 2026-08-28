@@ -77,34 +77,43 @@ async def postgres_lifespan(
     app.state.langgraph_v2_live_events = LiveEventWakeups(
         redis_url=os.environ.get("LANGGRAPH_V2_REDIS_URL")
     )
-    await app.state.langgraph_v2_live_events.start()
-    if resolved_config is None:
-        try:
-            yield
-        finally:
-            await app.state.langgraph_v2_live_events.close()
-        return
-
-    pool = pool_factory(
-        conninfo=resolved_config.conninfo,
-        min_size=resolved_config.min_size,
-        max_size=resolved_config.max_size,
-        kwargs={"autocommit": True, "prepare_threshold": 0},
-        open=False,
-    )
-    await pool.open(wait=True)
-    app.state.langgraph_v2_postgres_pool = pool
+    wakeups = app.state.langgraph_v2_live_events
+    pool: Any | None = None
     try:
+        await wakeups.start()
+        if resolved_config is None:
+            yield
+            return
+
+        pool = pool_factory(
+            conninfo=resolved_config.conninfo,
+            min_size=resolved_config.min_size,
+            max_size=resolved_config.max_size,
+            kwargs={"autocommit": True, "prepare_threshold": 0},
+            open=False,
+        )
+        await pool.open(wait=True)
+        app.state.langgraph_v2_postgres_pool = pool
         checkpointer = checkpointer_factory(pool)
         await checkpointer.setup()
         app.state.langgraph_v2_checkpointer = checkpointer
         yield
     finally:
-        runtime = getattr(app.state, "langgraph_v2_runtime", None)
-        if runtime is not None:
-            await runtime.stop_and_wait_for_checkpoint_boundary()
-            await RunEventRepository(pool).interrupt_runs_owned_by(_INSTANCE_ID)
-        await pool.close()
-        app.state.langgraph_v2_postgres_pool = None
-        app.state.langgraph_v2_checkpointer = None
-        await app.state.langgraph_v2_live_events.close()
+        try:
+            if pool is not None:
+                try:
+                    runtime = getattr(app.state, "langgraph_v2_runtime", None)
+                    if (
+                        runtime is not None
+                        and app.state.langgraph_v2_postgres_pool is pool
+                    ):
+                        await runtime.stop_and_wait_for_checkpoint_boundary()
+                        await RunEventRepository(pool).interrupt_runs_owned_by(
+                            _INSTANCE_ID
+                        )
+                finally:
+                    await pool.close()
+        finally:
+            app.state.langgraph_v2_postgres_pool = None
+            app.state.langgraph_v2_checkpointer = None
+            await wakeups.close()

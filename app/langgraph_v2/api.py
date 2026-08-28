@@ -542,6 +542,7 @@ async def _follow_persisted_events(
     tenant_id: str,
     run_id: uuid.UUID,
     after_sequence: int,
+    expected_execution_epoch: int | None = None,
 ) -> AsyncIterator[str]:
     """Serialize replay/live Event records from their durable sequence space."""
     follower = PersistedEventFollower(repository, wakeups)
@@ -549,6 +550,7 @@ async def _follow_persisted_events(
         tenant_id=tenant_id,
         run_id=run_id,
         after_sequence=after_sequence,
+        expected_execution_epoch=expected_execution_epoch,
     ):
         yield TracerStreamEvent(
             event_key=event.event_key,
@@ -972,6 +974,7 @@ def create_tracer_router(
                 tenant_id=x_application_id,
                 run_id=run_id,
                 after_sequence=after_sequence,
+                expected_execution_epoch=claim.execution_epoch,
             ):
                 yield frame
 
