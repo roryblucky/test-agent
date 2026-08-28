@@ -56,7 +56,7 @@ class _CitingAnswer:
             citations=[
                 AnswerCitation(
                     index=1,
-                    quoted_text="evidence",
+                    quoted_text="hello",
                 ),
                 AnswerCitation(index=2, quoted_text="nope"),
             ],
@@ -242,7 +242,7 @@ async def test_answer_citation_subresult_is_bound_and_replayed(
     assert actor.calls == 1
     assert first["citations"] == second["citations"]
     assert first["citations"][0].evidence_id
-    assert first["citations"][0].quoted_text == "evidence"
+    assert first["citations"][0].quoted_text == "hello"
     answer_events = [event for event in first["events"] if event["event_key"].startswith("phase:answer:")]
     assert [event["type"] for event in answer_events] == [
         "step_start", "token", "citations", "step_completed"

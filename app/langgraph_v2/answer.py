@@ -51,6 +51,42 @@ class BoundAnswerResult(BaseModel):
     citations: list[CitationReference] = Field(default_factory=list)
 
 
+def bind_answer_citations(
+    citations: list[AnswerCitation],
+    refs: list[Mapping[str, Any]],
+    documents: list[Document],
+) -> list[CitationReference]:
+    """Bind indexed model citations to ranked Artifacts with quote validation."""
+    bound: list[CitationReference] = []
+    seen_indices: set[int] = set()
+    for citation in citations:
+        if citation.index > len(refs) or citation.index in seen_indices:
+            continue
+        seen_indices.add(citation.index)
+        ref = refs[citation.index - 1]
+        document = documents[citation.index - 1]
+        quote = citation.quoted_text
+        located = bool(quote and quote in document.content)
+        bound.append(
+            CitationReference(
+                index=citation.index,
+                evidence_id=ref["artifact_id"],
+                source=document.source_url or document.id,
+                source_type=document.source_type,
+                title=document.section_title,
+                url=document.source_url,
+                snippet=quote if located else None,
+                quoted_text=quote if located else None,
+                quoted_passages=[quote] if located and quote else [],
+                page_number=document.page_number,
+                section=document.section_title,
+                attribution_status="located" if located else "unlocated",
+                metadata={"artifact_id": ref["artifact_id"]},
+            )
+        )
+    return bound
+
+
 class AnswerActor(Protocol):
     """PydanticAI-backed seam for generating an answer from evidence."""
 
@@ -156,33 +192,7 @@ async def run_answer(
             validated = AnswerResult.model_validate(answer)
             chunks = split_answer_chunks(validated.answer)
             normalized_answer = "".join(chunks)
-            citations: list[CitationReference] = []
-            seen_citations: set[int] = set()
-            for citation in validated.citations:
-                if citation.index > len(refs) or citation.index in seen_citations:
-                    continue
-                seen_citations.add(citation.index)
-                ref = refs[citation.index - 1]
-                document = documents[citation.index - 1]
-                source = document.source_url or document.id
-                citations.append(
-                    CitationReference(
-                        index=citation.index,
-                        evidence_id=ref["artifact_id"],
-                        source=source,
-                        source_type=document.source_type,
-                        title=document.section_title,
-                        url=document.source_url,
-                        snippet=citation.quoted_text,
-                        quoted_text=citation.quoted_text,
-                        page_number=document.page_number,
-                        section=document.section_title,
-                        attribution_status=(
-                            "located" if citation.quoted_text else "unlocated"
-                        ),
-                        metadata={"artifact_id": ref["artifact_id"]},
-                    )
-                )
+            citations = bind_answer_citations(validated.citations, refs, documents)
             events: list[EventInput] = [
                 EventInput(
                     event_key="phase:answer:step_start:1",

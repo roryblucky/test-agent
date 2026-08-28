@@ -10,8 +10,10 @@ from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import (
     AnswerCancelled,
+    AnswerCitation,
     AnswerOutput,
     PydanticAIAnswerActor,
+    bind_answer_citations,
     build_answer_actor,
     run_answer,
     split_answer_chunks,
@@ -147,6 +149,18 @@ def test_split_answer_chunks_normalizes_only_crlf() -> None:
 
     assert chunks == ["A\n", "B\rC"]
     assert "".join(chunks) == "A\nB\rC"
+
+
+def test_answer_citation_quote_must_match_bound_document() -> None:
+    citations = bind_answer_citations(
+        [AnswerCitation(index=1, quoted_text="not in evidence")],
+        [{"artifact_id": "artifact-1", "artifact_type": "document"}],
+        [Document(id="doc-1", content="actual evidence")],
+    )
+
+    assert citations[0].evidence_id == "artifact-1"
+    assert citations[0].attribution_status == "unlocated"
+    assert citations[0].quoted_text is None
 
 
 def test_answer_chunk_golden_case() -> None:
