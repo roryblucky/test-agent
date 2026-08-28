@@ -57,12 +57,52 @@ async def _refresh_claim(
             return
 
 
+async def _persist_result_events(
+    repository: RunEventRepository,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    result: dict[str, Any],
+    owner_instance_id: str,
+    execution_epoch: int,
+    skip_event_keys: set[str] | None = None,
+) -> AsyncIterator[str]:
+    """Persist graph Events and serialize newly published SSE frames."""
+    prior_keys = skip_event_keys or set()
+    for raw_event in result["events"]:
+        event = TracerStreamEvent.model_validate(raw_event)
+        event_input = EventInput(
+            event_key=event.event_key,
+            type=event.type,
+            step=event.step,
+            data=event.data,
+        )
+        if event.type == "done":
+            persisted = await repository.complete_run(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event=event_input,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+            )
+        else:
+            persisted = await repository.append_event(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event=event_input,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+            )
+        if event.event_key not in prior_keys:
+            yield event.model_copy(update={"sequence": persisted.sequence}).to_sse()
+
+
 class TracerGraph(Protocol):
     """Minimal graph invocation seam used by the test-only HTTP adapter."""
 
     async def ainvoke(
         self,
-        state: TracerState,
+        state: TracerState | None,
         config: RunnableConfig | None = None,
     ) -> dict[str, Any]:
         """Run one graph invocation and return its final state."""
@@ -162,33 +202,15 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
                     result = await selected_graph.ainvoke(state)
                 else:
                     result = await selected_graph.ainvoke(state, config=graph_config)
-                for raw_event in result["events"]:
-                    event = TracerStreamEvent.model_validate(raw_event)
-                    event_input = EventInput(
-                        event_key=event.event_key,
-                        type=event.type,
-                        step=event.step,
-                        data=event.data,
-                    )
-                    if event.type == "done":
-                        persisted = await repository.complete_run(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            event=event_input,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                        )
-                    else:
-                        persisted = await repository.append_event(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            event=event_input,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                        )
-                    yield event.model_copy(
-                        update={"sequence": persisted.sequence}
-                    ).to_sse()
+                async for frame in _persist_result_events(
+                    repository,
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                    result=result,
+                    owner_instance_id=claim.owner_instance_id,
+                    execution_epoch=claim.execution_epoch,
+                ):
+                    yield frame
             finally:
                 heartbeat_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -222,23 +244,21 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
         pool = cast(AsyncConnectionPool[Any], configured_pool)
         repository = RunEventRepository(pool)
         try:
-            previous = await repository.get_run(x_application_id, run_id)
-        except RunNotFound as error:
-            raise HTTPException(status_code=404, detail="Run not found") from error
-        if previous.checkpoint_id is None or previous.checkpoint_ns is None:
-            raise HTTPException(status_code=409, detail="Run has no checkpoint")
-        previous_checkpoint_id = previous.checkpoint_id
-        previous_checkpoint_ns = previous.checkpoint_ns
-        try:
             claim = await repository.resume_run(
                 tenant_id=x_application_id,
                 run_id=run_id,
                 owner_instance_id=_INSTANCE_ID,
             )
+        except RunNotFound as error:
+            raise HTTPException(status_code=404, detail="Run not found") from error
         except ResumeConflict as error:
             raise HTTPException(
                 status_code=409, detail="Run is not resumable"
             ) from error
+        previous_checkpoint_id = claim.checkpoint_id
+        previous_checkpoint_ns = claim.checkpoint_ns
+        if previous_checkpoint_id is None or previous_checkpoint_ns is None:
+            raise HTTPException(status_code=409, detail="Run has no checkpoint")
 
         async def event_generator() -> AsyncIterator[str]:
             configured_checkpointer = getattr(
@@ -287,49 +307,24 @@ def create_tracer_router(graph: TracerGraph | None = None) -> APIRouter:
                 )
             )
             try:
-                state: TracerState = {
-                    "query": "resume",
-                    "conversation_id": claim.conversation_id,
-                    "client_request_id": None,
-                    "events": [],
-                }
                 if graph_config is None:
-                    result = await selected_graph.ainvoke(state)
+                    result = await selected_graph.ainvoke(None)
                 else:
-                    result = await selected_graph.ainvoke(state, config=graph_config)
+                    result = await selected_graph.ainvoke(None, config=graph_config)
                 prior_events = {
                     event.event_key
                     for event in await repository.list_events(x_application_id, run_id)
                 }
-                for raw_event in result["events"]:
-                    event = TracerStreamEvent.model_validate(raw_event)
-                    if event.event_key in prior_events:
-                        continue
-                    event_input = EventInput(
-                        event_key=event.event_key,
-                        type=event.type,
-                        step=event.step,
-                        data=event.data,
-                    )
-                    if event.type == "done":
-                        persisted = await repository.complete_run(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            event=event_input,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                        )
-                    else:
-                        persisted = await repository.append_event(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            event=event_input,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                        )
-                    yield event.model_copy(
-                        update={"sequence": persisted.sequence}
-                    ).to_sse()
+                async for frame in _persist_result_events(
+                    repository,
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                    result=result,
+                    owner_instance_id=claim.owner_instance_id,
+                    execution_epoch=claim.execution_epoch,
+                    skip_event_keys=prior_events,
+                ):
+                    yield frame
             finally:
                 heartbeat_task.cancel()
                 with suppress(asyncio.CancelledError):

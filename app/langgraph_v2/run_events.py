@@ -218,7 +218,11 @@ class RunEventRepository:
                         row["status"] == "interrupted"
                         and row["owner_instance_id"] == ""
                     )
-                    if not resumable:
+                    if (
+                        not resumable
+                        or row["checkpoint_id"] is None
+                        or row["checkpoint_ns"] is None
+                    ):
                         raise ResumeConflict(str(run_id))
                     await cursor.execute(
                         """

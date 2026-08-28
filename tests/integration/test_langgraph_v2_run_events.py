@@ -15,6 +15,7 @@ from app.langgraph_v2.run_events import (
     ResumeConflict,
     RunEventRepository,
     RunNotFound,
+    RunRecord,
 )
 
 
@@ -69,6 +70,14 @@ async def test_resume_claims_expired_run_once_and_fences_old_owner(
             conversation_id="conversation-1",
             owner_instance_id="instance-a",
         )
+        await repository.update_checkpoint_pointer(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            owner_instance_id=created.owner_instance_id,
+            execution_epoch=created.execution_epoch,
+            checkpoint_id="checkpoint-1",
+            checkpoint_ns="namespace-1",
+        )
         with psycopg.connect(
             langgraph_v2_migrated_database_url, autocommit=True
         ) as connection:
@@ -108,11 +117,19 @@ async def test_resume_concurrent_requests_have_one_winner(
     ) as pool:
         repository = RunEventRepository(pool)
         run_id = uuid4()
-        await repository.create_run(
+        created = await repository.create_run(
             tenant_id="tenant-a",
             run_id=run_id,
             conversation_id="conversation-1",
             owner_instance_id="instance-a",
+        )
+        await repository.update_checkpoint_pointer(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            owner_instance_id=created.owner_instance_id,
+            execution_epoch=created.execution_epoch,
+            checkpoint_id="checkpoint-1",
+            checkpoint_ns="namespace-1",
         )
         with psycopg.connect(
             langgraph_v2_migrated_database_url, autocommit=True
@@ -134,12 +151,23 @@ async def test_resume_concurrent_requests_have_one_winner(
             ),
             return_exceptions=True,
         )
-        assert sum(not isinstance(item, ResumeConflict) for item in results) == 1
-        assert (await repository.get_run("tenant-a", run_id)).execution_epoch == 2
+        winners = [item for item in results if isinstance(item, RunRecord)]
+        assert len(winners) == 1
+        winner = winners[0]
+        await repository.complete_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            event=EventInput(event_key="recovery:done", type="done", data={}),
+            owner_instance_id=winner.owner_instance_id,
+            execution_epoch=winner.execution_epoch,
+        )
+        completed = await repository.get_run("tenant-a", run_id)
+        assert completed.execution_epoch == 2
+        assert completed.status == "completed"
 
 
 @pytest.mark.asyncio
-async def test_resume_claims_interrupted_run_without_active_owner(
+async def test_resume_concurrent_interrupted_run_has_one_winner(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -147,11 +175,19 @@ async def test_resume_claims_interrupted_run_without_active_owner(
     ) as pool:
         repository = RunEventRepository(pool)
         run_id = uuid4()
-        await repository.create_run(
+        created = await repository.create_run(
             tenant_id="tenant-a",
             run_id=run_id,
             conversation_id="conversation-1",
             owner_instance_id="instance-a",
+        )
+        await repository.update_checkpoint_pointer(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            owner_instance_id=created.owner_instance_id,
+            execution_epoch=created.execution_epoch,
+            checkpoint_id="checkpoint-1",
+            checkpoint_ns="namespace-1",
         )
         with psycopg.connect(
             langgraph_v2_migrated_database_url, autocommit=True
@@ -165,11 +201,28 @@ async def test_resume_claims_interrupted_run_without_active_owner(
                 """,
                 ("tenant-a", run_id),
             )
-        resumed = await repository.resume_run(
-            tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-b"
+        results = await asyncio.gather(
+            repository.resume_run(
+                tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-b"
+            ),
+            repository.resume_run(
+                tenant_id="tenant-a", run_id=run_id, owner_instance_id="instance-c"
+            ),
+            return_exceptions=True,
         )
-        assert resumed.status == "running"
-        assert resumed.execution_epoch == 2
+        winners = [item for item in results if isinstance(item, RunRecord)]
+        assert len(winners) == 1
+        winner = winners[0]
+        await repository.complete_run(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            event=EventInput(event_key="recovery:done", type="done", data={}),
+            owner_instance_id=winner.owner_instance_id,
+            execution_epoch=winner.execution_epoch,
+        )
+        completed = await repository.get_run("tenant-a", run_id)
+        assert completed.status == "completed"
+        assert completed.execution_epoch == 2
 
 
 @pytest.mark.asyncio

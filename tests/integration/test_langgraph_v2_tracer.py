@@ -141,7 +141,7 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
             self.received_state: TracerState | None = None
 
         async def ainvoke(
-            self, state: TracerState, config: RunnableConfig | None = None
+            self, state: TracerState | None, config: RunnableConfig | None = None
         ) -> dict:
             del config
             self.received_state = state
@@ -228,7 +228,7 @@ def test_resume_route_runs_injected_graph_for_stale_run(
 ) -> None:
     class ResumeGraph:
         async def ainvoke(
-            self, state: TracerState, config: RunnableConfig | None = None
+            self, state: TracerState | None, config: RunnableConfig | None = None
         ) -> dict:
             del config
             return {
@@ -236,7 +236,7 @@ def test_resume_route_runs_injected_graph_for_stale_run(
                     {
                         "event_key": "recovery:completed:2",
                         "type": "done",
-                        "data": {"source": state["query"]},
+                        "data": {"source": "recovered"},
                         "sequence": 1,
                     }
                 ]
@@ -336,7 +336,7 @@ def test_long_running_request_refreshes_its_claim(
 
     class SlowGraph:
         async def ainvoke(
-            self, state: TracerState, config: RunnableConfig | None = None
+            self, state: TracerState | None, config: RunnableConfig | None = None
         ) -> dict:
             del config
             await asyncio.sleep(0.05)
