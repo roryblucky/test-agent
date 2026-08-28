@@ -27,7 +27,6 @@ from app.langgraph_v2.pre_moderation import (
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
     QuestionRefinementActor,
-    invoke_refinement_actor,
     refinement_events,
     run_question_refinement,
 )
@@ -252,8 +251,8 @@ def build_tracer_graph(
 
     async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
         if phase_context is None:
-            result = await invoke_refinement_actor(
-                selected_refinement_actor, state["query"], state.get("history", [])
+            result = await selected_refinement_actor.refine(
+                state["query"], state.get("history", [])
             )
             return {
                 "events": [

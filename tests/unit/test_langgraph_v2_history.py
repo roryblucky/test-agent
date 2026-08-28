@@ -4,7 +4,10 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from app.langgraph_v2.conversation_messages import MessageRecord
-from app.langgraph_v2.history import select_sliding_window_history
+from app.langgraph_v2.history import (
+    estimate_history_tokens,
+    select_sliding_window_history,
+)
 
 
 def _message(
@@ -41,7 +44,7 @@ def test_empty_history_selects_no_turns() -> None:
 def test_one_oversized_turn_is_excluded_whole() -> None:
     messages = _turn(1, "abc", "def", 1)
 
-    assert select_sliding_window_history(messages, token_budget=5) == []
+    assert select_sliding_window_history(messages, token_budget=9) == []
 
 
 def test_turn_on_exact_budget_boundary_is_included() -> None:
@@ -49,7 +52,7 @@ def test_turn_on_exact_budget_boundary_is_included() -> None:
 
     assert [
         turn.model_dump()
-        for turn in select_sliding_window_history(messages, token_budget=6)
+        for turn in select_sliding_window_history(messages, token_budget=10)
     ] == [{"user": "abc", "assistant": "def"}]
 
 
@@ -60,12 +63,13 @@ def test_old_turns_are_evicted_without_splitting_recent_turns() -> None:
         *_turn(3, "u3", "a3", 5),
     ]
 
-    selected = select_sliding_window_history(messages, token_budget=8)
+    selected = select_sliding_window_history(messages, token_budget=20)
 
     assert [turn.model_dump() for turn in selected] == [
         {"user": "u2", "assistant": "a2"},
         {"user": "u3", "assistant": "a3"},
     ]
+    assert estimate_history_tokens(selected) == 20
 
 
 def test_current_and_incomplete_runs_never_enter_history() -> None:

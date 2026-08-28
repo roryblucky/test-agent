@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 # Public-stream coverage complements the pure selector unit tests.
+import json
+from collections.abc import Sequence
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.langgraph_v2.answer import AnswerResult
@@ -14,6 +18,13 @@ from tests.integration.test_langgraph_v2_tracer import (
     persistent_tracer_app,
 )
 
+_FIXTURE_PATH = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "langgraph_v2"
+    / "v1_session_continuity_wire.json"
+)
+
 
 class _RefinementActor:
     def __init__(self) -> None:
@@ -22,9 +33,9 @@ class _RefinementActor:
     async def refine(
         self,
         query: str,
-        history: list[ConversationTurn],
+        history: Sequence[ConversationTurn],
     ) -> ResolvedQuery:
-        self.histories.append(history)
+        self.histories.append(list(history))
         return ResolvedQuery(original_query=query, standalone_query=query)
 
 
@@ -36,10 +47,10 @@ class _AnswerActor:
         self,
         query: str,
         documents: list[Document],
-        history: list[ConversationTurn],
+        history: Sequence[ConversationTurn],
     ) -> AnswerResult:
         del documents
-        self.histories.append(history)
+        self.histories.append(list(history))
         return AnswerResult(answer=f"answer for {query}")
 
 
@@ -82,7 +93,15 @@ def test_second_public_stream_receives_one_complete_prior_turn(
     expected_history = [
         ConversationTurn(user="first question", assistant="answer for first question")
     ]
+    fixture = json.loads(_FIXTURE_PATH.read_text())
+    assert fixture["requests"] == [
+        {"query": "first question", "sessionId": "conversation-1"},
+        {"query": "follow up", "sessionId": "conversation-1"},
+    ]
     assert first.status_code == second.status_code == 200
     assert refinement.histories == [[], expected_history]
     assert answer.histories == [[], expected_history]
-    assert parse_sse(second.text)[-1]["data"]["answer"] == "answer for follow up"
+    second_done = parse_sse(second.text)[-1]
+    assert {"type": second_done["type"], "data": second_done["data"]} == fixture[
+        "second_done"
+    ]

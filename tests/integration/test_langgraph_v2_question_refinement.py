@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from uuid import uuid4
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
@@ -72,7 +74,10 @@ async def test_refinement_failure_halts_before_later_phases(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class FailingActor:
-        async def refine(self, query: str) -> ResolvedQuery:
+        async def refine(
+            self, query: str, history: Sequence[ConversationTurn]
+        ) -> ResolvedQuery:
+            del history
             raise ValueError(f"invalid output for {query}")
 
     async with AsyncConnectionPool(
@@ -111,7 +116,10 @@ async def test_refinement_replay_does_not_reinvoke_actor_or_duplicate_events(
     class CountingActor:
         calls = 0
 
-        async def refine(self, query: str) -> ResolvedQuery:
+        async def refine(
+            self, query: str, history: Sequence[ConversationTurn]
+        ) -> ResolvedQuery:
+            del history
             self.calls += 1
             return ResolvedQuery(original_query=query, standalone_query="standalone")
 
@@ -159,7 +167,10 @@ async def test_refinement_replays_after_commit_before_checkpoint(
     class CountingActor:
         calls = 0
 
-        async def refine(self, query: str) -> ResolvedQuery:
+        async def refine(
+            self, query: str, history: Sequence[ConversationTurn]
+        ) -> ResolvedQuery:
+            del history
             self.calls += 1
             return ResolvedQuery(original_query=query, standalone_query="standalone")
 
@@ -229,7 +240,10 @@ def test_http_query_uses_injected_refinement_actor(
     class CountingActor:
         calls = 0
 
-        async def refine(self, query: str) -> ResolvedQuery:
+        async def refine(
+            self, query: str, history: Sequence[ConversationTurn]
+        ) -> ResolvedQuery:
+            del history
             self.calls += 1
             return ResolvedQuery(original_query=query, standalone_query="http-refined")
 

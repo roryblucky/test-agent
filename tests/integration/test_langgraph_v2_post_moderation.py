@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from uuid import uuid4
 
 import pytest
@@ -9,6 +10,7 @@ from app.langgraph_v2.answer import AnswerResult
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
@@ -28,7 +30,13 @@ class _Ranker:
 
 
 class _Answer:
-    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+    async def answer(
+        self,
+        query: str,
+        documents: list[Document],
+        history: Sequence[ConversationTurn],
+    ) -> AnswerResult:
+        del history
         del query, documents
         return AnswerResult(answer="generated answer")
 

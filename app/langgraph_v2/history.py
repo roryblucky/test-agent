@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from collections.abc import Sequence
 from uuid import UUID
@@ -18,6 +19,8 @@ from pydantic_ai.messages import (
 from app.langgraph_v2.conversation_messages import MessageRecord
 
 DEFAULT_HISTORY_TOKEN_BUDGET = 8_000
+MESSAGE_FRAMING_TOKENS = 4
+_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+|[^\sA-Za-z0-9]")
 
 
 class ConversationTurn(BaseModel):
@@ -40,13 +43,43 @@ def to_model_message_history(
     return messages
 
 
+def estimate_text_tokens(text: str) -> int:
+    """Estimate tokens deterministically without depending on one model tokenizer.
+
+    ASCII words use one token per four characters, while every non-ASCII or
+    punctuation code point counts as one token. Whitespace is represented by
+    the surrounding message framing rather than counted independently.
+    """
+    total = 0
+    for token in _TOKEN_PATTERN.findall(text):
+        if token.isascii() and token.isalnum():
+            total += max(1, (len(token) + 3) // 4)
+        else:
+            total += len(token)
+    return total
+
+
+def estimate_turn_tokens(turn: ConversationTurn) -> int:
+    """Estimate one complete turn, including both message envelopes."""
+    return (
+        estimate_text_tokens(turn.user)
+        + estimate_text_tokens(turn.assistant)
+        + (2 * MESSAGE_FRAMING_TOKENS)
+    )
+
+
+def estimate_history_tokens(turns: Sequence[ConversationTurn]) -> int:
+    """Return the deterministic budget consumed by complete turns."""
+    return sum(estimate_turn_tokens(turn) for turn in turns)
+
+
 def select_sliding_window_history(
     messages: Sequence[MessageRecord],
     *,
     token_budget: int,
     current_run_id: UUID | None = None,
 ) -> list[ConversationTurn]:
-    """Select the newest complete turns under a conservative UTF-8 budget."""
+    """Select the newest complete turns under the deterministic token budget."""
     if token_budget < 0:
         raise ValueError("token_budget must not be negative")
 
@@ -73,7 +106,7 @@ def select_sliding_window_history(
     selected: list[ConversationTurn] = []
     consumed = 0
     for turn in reversed(complete_turns):
-        turn_tokens = len(turn.user.encode()) + len(turn.assistant.encode())
+        turn_tokens = estimate_turn_tokens(turn)
         if consumed + turn_tokens > token_budget:
             break
         selected.append(turn)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from inspect import signature
 from typing import Any, Protocol
 
 from pydantic import Field
@@ -72,17 +71,6 @@ class PydanticAIQuestionRefinementActor:
         return result.output
 
 
-async def invoke_refinement_actor(
-    actor: QuestionRefinementActor,
-    query: str,
-    history: Sequence[ConversationTurn],
-) -> ResolvedQuery:
-    """Call a history-aware actor while retaining injected POC actor compatibility."""
-    if "history" not in signature(actor.refine).parameters:
-        return await actor.refine(query)  # type: ignore[call-arg]
-    return await actor.refine(query, history)
-
-
 def build_question_refinement_actor(
     registry: Any,
     *,
@@ -146,7 +134,7 @@ async def run_question_refinement(
                 ConversationTurn.model_validate(turn)
                 for turn in state.get("history", [])
             ]
-            refined = await invoke_refinement_actor(actor, state["query"], history)
+            refined = await actor.refine(state["query"], history)
             result = V2ResolvedQuery.model_validate(refined.model_dump())
             normalized_result = result.model_dump(exclude_none=True)
             usage = getattr(actor, "last_usage", {})

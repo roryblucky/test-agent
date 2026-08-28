@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from inspect import signature
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -176,18 +175,6 @@ class PydanticAIAnswerActor:
         )
 
 
-async def invoke_answer_actor(
-    actor: AnswerActor,
-    query: str,
-    documents: list[Document],
-    history: Sequence[ConversationTurn],
-) -> AnswerResult:
-    """Call a history-aware actor while retaining injected POC actor compatibility."""
-    if "history" not in signature(actor.answer).parameters:
-        return await actor.answer(query, documents)  # type: ignore[call-arg]
-    return await actor.answer(query, documents, history)
-
-
 def build_answer_actor(
     registry: Any,
     *,
@@ -256,8 +243,7 @@ async def run_answer(
                 ConversationTurn.model_validate(turn)
                 for turn in state.get("history", [])
             ]
-            answer = await invoke_answer_actor(
-                actor,
+            answer = await actor.answer(
                 state.get("refined_query", state["query"]),
                 documents,
                 history,

@@ -1,0 +1,47 @@
+{
+  "requests": [
+    {"query": "first question", "sessionId": "conversation-1"},
+    {"query": "follow up", "sessionId": "conversation-1"}
+  ],
+  "second_done": {
+    "type": "done",
+    "data": {
+      "query": "follow up",
+      "refined_query": "follow up",
+      "intent": null,
+      "answer": "answer for follow up",
+      "documents": [
+        {
+          "id": "follow up",
+          "content": "follow up",
+          "metadata": {},
+          "score": null,
+          "source_url": null,
+          "source_type": null,
+          "page_number": null,
+          "section_title": null
+        }
+      ],
+      "moderation": {"is_flagged": false, "categories": {}, "reason": null},
+      "groundedness": null,
+      "clarification": null,
+      "session_id": "conversation-1",
+      "metadata": {
+        "steps_executed": [
+          "query",
+          "pre_moderation",
+          "question_refinement",
+          "retrieval",
+          "reranking",
+          "answer",
+          "moderation:post",
+          "finalization"
+        ]
+      },
+      "citations": []
+    }
+  },
+  "documented_v2_differences": [
+    "sequence and event_key metadata are additive and excluded from this legacy wire comparison"
+  ]
+}

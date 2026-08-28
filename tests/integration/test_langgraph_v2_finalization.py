@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
@@ -20,6 +20,7 @@ from app.langgraph_v2.api import register_tracer_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
+from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationDecision
@@ -54,7 +55,13 @@ class _Ranker:
 class _Answer:
     calls = 0
 
-    async def answer(self, query: str, documents: list[Document]) -> AnswerResult:
+    async def answer(
+        self,
+        query: str,
+        documents: list[Document],
+        history: Sequence[ConversationTurn],
+    ) -> AnswerResult:
+        del history
         self.calls += 1
         assert query == "hello"
         assert [document.id for document in documents] == ["d1"]
@@ -64,7 +71,10 @@ class _Answer:
 class _UsageRefinement:
     last_usage = {"input_tokens": 2, "output_tokens": 3}
 
-    async def refine(self, query: str) -> ResolvedQuery:
+    async def refine(
+        self, query: str, history: Sequence[ConversationTurn]
+    ) -> ResolvedQuery:
+        del history
         return ResolvedQuery(original_query=query, standalone_query=query)
 
 
