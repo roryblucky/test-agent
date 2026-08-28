@@ -65,29 +65,42 @@ def _state() -> dict[str, object]:
 async def test_safe_answer_passes_post_moderation_unchanged(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="c1",
+            owner_instance_id="i1",
         )
         moderation = _SafeModeration()
         context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            repository=PhaseResultRepository(pool),
+            artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
         graph = build_tracer_graph(
-            phase_context=context, moderation_provider=moderation,
-            retriever=_Retriever(), ranker=_Ranker(), answer_actor=_Answer(),
+            phase_context=context,
+            moderation_provider=moderation,
+            retriever=_Retriever(),
+            ranker=_Ranker(),
+            answer_actor=_Answer(),
         )
         result = await graph.ainvoke(_state())
 
     assert moderation.calls == 2
     assert result["answer"] == "generated answer"
     assert result["post_moderation"]["is_flagged"] is False
-    assert [event["step"] for event in result["events"] if event.get("step") == "moderation:post"] == [
-        "moderation:post", "moderation:post"
-    ]
+    assert [
+        event["step"]
+        for event in result["events"]
+        if event.get("step") == "moderation:post"
+    ] == ["moderation:post", "moderation:post"]
     assert result["events"][-1]["type"] == "done"
     assert result["events"][-1]["data"]["answer"] == "generated answer"
 
@@ -96,26 +109,40 @@ async def test_safe_answer_passes_post_moderation_unchanged(
 async def test_flagged_answer_is_replaced_only_in_final_state(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="c1",
+            owner_instance_id="i1",
         )
         context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            repository=PhaseResultRepository(pool),
+            artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
         graph = build_tracer_graph(
-            phase_context=context, moderation_provider=_FlaggingModeration(),
-            retriever=_Retriever(), ranker=_Ranker(), answer_actor=_Answer(),
+            phase_context=context,
+            moderation_provider=_FlaggingModeration(),
+            retriever=_Retriever(),
+            ranker=_Ranker(),
+            answer_actor=_Answer(),
         )
         result = await graph.ainvoke(_state())
 
     assert result["answer"] == (
         "The generated response was flagged by content moderation and has been removed."
     )
-    assert any(event["type"] == "token" and event["data"] == "generated answer" for event in result["events"])
+    assert any(
+        event["type"] == "token" and event["data"] == "generated answer"
+        for event in result["events"]
+    )
     assert result["events"][-1]["type"] == "done"
     assert result["events"][-1]["data"]["answer"] == result["answer"]
 
@@ -134,20 +161,31 @@ async def test_post_moderation_replays_after_commit_window_crash(
                 raise RuntimeError("crash after post moderation commit")
             return result
 
-    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
         runs = RunEventRepository(pool)
         run = await runs.create_run(
-            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="c1",
+            owner_instance_id="i1",
         )
         moderation = _FlaggingModeration()
         context = PhaseExecutionContext(
-            repository=CrashAfterPostModerationCommit(pool), artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
+            repository=CrashAfterPostModerationCommit(pool),
+            artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
         graph = build_tracer_graph(
-            phase_context=context, moderation_provider=moderation,
-            retriever=_Retriever(), ranker=_Ranker(), answer_actor=_Answer(),
+            phase_context=context,
+            moderation_provider=moderation,
+            retriever=_Retriever(),
+            ranker=_Ranker(),
+            answer_actor=_Answer(),
         )
         with pytest.raises(RuntimeError, match="crash after post moderation commit"):
             await graph.ainvoke(_state())
@@ -157,4 +195,10 @@ async def test_post_moderation_replays_after_commit_window_crash(
     assert moderation.calls == 2
     assert recovered["answer"].startswith("The generated response was flagged")
     assert len({event.event_key for event in events}) == len(events)
-    assert sum(event.event_key == "phase:post_moderation:step_completed:1" for event in events) == 1
+    assert (
+        sum(
+            event.event_key == "phase:post_moderation:step_completed:1"
+            for event in events
+        )
+        == 1
+    )

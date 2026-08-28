@@ -164,9 +164,7 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     response = TracerQueryResponse(
         query=state["query"],
         conversation_id=state["conversation_id"],
-        metadata={
-            "steps_executed": steps
-        },
+        metadata={"steps_executed": steps},
         refined_query=state.get("refined_query"),
         answer=state.get("answer"),
         citations=state.get("citations", []),
@@ -313,7 +311,10 @@ def build_tracer_graph(
             retriever=selected_retriever,
         )
         update: TracerStateUpdate = {
-            "events": [*state["events"], *[_event_state(event, event.sequence) for event in events]],
+            "events": [
+                *state["events"],
+                *[_event_state(event, event.sequence) for event in events],
+            ],
             "halted": halted,
             "artifact_refs": refs,
         }
@@ -476,7 +477,9 @@ def build_tracer_graph(
         if groundedness_actor is not None:
             builder.add_conditional_edges(
                 "groundedness",
-                lambda state: "end" if state.get("halted", False) else "post_moderation",
+                lambda state: (
+                    "end" if state.get("halted", False) else "post_moderation"
+                ),
                 {"post_moderation": "post_moderation", "end": END},
             )
         builder.add_conditional_edges(
