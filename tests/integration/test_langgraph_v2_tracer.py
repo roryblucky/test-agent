@@ -29,6 +29,7 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
+from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
 from app.services.events import EventEmitter
@@ -51,6 +52,7 @@ def persistent_tracer_app(
     resume_enabled: bool = False,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
+    ranker: Ranker | None = None,
 ) -> FastAPI:
     """Create the test-only tracer with its real application database pool."""
 
@@ -69,6 +71,7 @@ def persistent_tracer_app(
         graph=graph,
         refinement_actor=refinement_actor,
         retriever=retriever,
+        ranker=ranker,
         resume_enabled=resume_enabled,
     )
     return app
@@ -153,7 +156,7 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
     assert response.headers["x-conversation-id"] == "conversation-123"
     assert response.text.endswith("\n\n")
     actual_events = parse_sse(response.text)
-    assert [event.pop("sequence") for event in actual_events] == list(range(1, 12))
+    assert [event.pop("sequence") for event in actual_events] == list(range(1, 14))
     assert actual_events == [
         {
             "type": "step_start",
@@ -192,6 +195,15 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
                 "artifact_ids": actual_events[7]["data"]["artifact_ids"],
             },
         },
+        {"type": "step_start", "step": "reranker"},
+        {
+            "type": "step_completed",
+            "step": "reranker",
+            "data": {
+                "document_count": 1,
+                "selected_ids": ["mock-doc-1"],
+            },
+        },
         {
             "type": "step_start",
             "step": "finalization",
@@ -213,6 +225,7 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
                             "pre_moderation",
                             "question_refinement",
                             "retrieval",
+                            "reranking",
                             "finalization",
                     ]
                 },
@@ -715,7 +728,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     delivered = parse_sse(response.text)
     assert response.status_code == 200
-    assert [event["sequence"] for event in delivered] == [9, 10, 11]
+    assert [event["sequence"] for event in delivered] == [11, 12, 13]
 
     async def read_run_and_events() -> tuple[str, int, list, Any]:
         async with AsyncConnectionPool(
@@ -731,7 +744,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
 
     status, epoch, events, phase = asyncio.run(read_run_and_events())
     assert (status, epoch) == ("completed", 2)
-    assert [event.sequence for event in events] == list(range(1, 12))
+    assert [event.sequence for event in events] == list(range(1, 14))
     assert phase is not None
     assert phase.normalized_result == {
         "query": "authoritative",
@@ -852,7 +865,7 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
 
     assert run.status == "completed"
     assert run.terminal_outcome == delivered[-1]["data"]
-    assert [event.sequence for event in persisted] == list(range(1, 12))
+    assert [event.sequence for event in persisted] == list(range(1, 14))
     assert [event.event_key for event in persisted] == [
         "phase:query:step_start:1",
         "phase:query:step_completed:1",
@@ -862,6 +875,8 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
         "phase:question_refinement:step_completed:1",
         "phase:retrieval:step_start:1",
         "phase:retrieval:step_completed:1",
+        "phase:reranking:step_start:1",
+        "phase:reranking:step_completed:1",
         "phase:finalization:step_start:1",
         "phase:finalization:step_completed:1",
         "lifecycle:completed:0",

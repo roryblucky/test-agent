@@ -30,6 +30,7 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementActor,
     build_question_refinement_actor,
 )
+from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import (
     CLAIM_HEARTBEAT_INTERVAL_SECONDS,
@@ -145,6 +146,7 @@ def create_tracer_router(
     graph: TracerGraph | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
+    ranker: Ranker | None = None,
 ) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
     router = APIRouter(tags=["LangGraph v2 tracer"])
@@ -189,6 +191,9 @@ def create_tracer_router(
             )
             configured_retriever = retriever or getattr(
                 http_request.app.state, "langgraph_v2_retriever", None
+            )
+            configured_ranker = ranker or getattr(
+                http_request.app.state, "langgraph_v2_ranker", None
             )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
@@ -239,6 +244,7 @@ def create_tracer_router(
                     phase_context=phase_context,
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
+                    ranker=configured_ranker,
                 )
             heartbeat_task = asyncio.create_task(
                 _refresh_claim(
@@ -328,6 +334,9 @@ def create_tracer_router(
             configured_retriever = retriever or getattr(
                 http_request.app.state, "langgraph_v2_retriever", None
             )
+            configured_ranker = ranker or getattr(
+                http_request.app.state, "langgraph_v2_ranker", None
+            )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None and configured_checkpointer is not None:
@@ -365,6 +374,7 @@ def create_tracer_router(
                     ),
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
+                    ranker=configured_ranker,
                 )
                 graph_config = exact_checkpoint_config(
                     thread_id=thread_id_for(x_application_id, claim.conversation_id),
@@ -442,11 +452,12 @@ def register_tracer_routes(
     graph: TracerGraph | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
+    ranker: Ranker | None = None,
     resume_enabled: bool = False,
 ) -> None:
     """Register the test-only tracer routes when explicitly enabled."""
     if enabled:
-        router = create_tracer_router(graph, refinement_actor, retriever)
+        router = create_tracer_router(graph, refinement_actor, retriever, ranker)
         if not resume_enabled:
             router.routes = [
                 route

@@ -25,6 +25,7 @@ from app.langgraph_v2.question_refinement import (
     refinement_events,
     run_question_refinement,
 )
+from app.langgraph_v2.reranking import MockRanker, Ranker, run_reranking
 from app.langgraph_v2.retrieval import MockRetriever, Retriever, run_retrieval
 from app.langgraph_v2.run_events import EventInput, EventRecord
 
@@ -41,7 +42,9 @@ class TracerState(TypedDict):
     refined_query: NotRequired[str]
     refinement_error: NotRequired[str]
     retrieval_error: NotRequired[str]
+    reranking_error: NotRequired[str]
     artifact_refs: NotRequired[list[ArtifactRef]]
+    ranked_refs: NotRequired[list[ArtifactRef]]
 
 
 class TracerStateUpdate(TypedDict, total=False):
@@ -53,7 +56,9 @@ class TracerStateUpdate(TypedDict, total=False):
     refined_query: str
     refinement_error: str
     retrieval_error: str
+    reranking_error: str
     artifact_refs: list[ArtifactRef]
+    ranked_refs: list[ArtifactRef]
 
 
 async def _query(
@@ -130,6 +135,7 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
                 "pre_moderation",
                 "question_refinement",
                 "retrieval",
+                "reranking",
                 "finalization",
             ]
         },
@@ -187,6 +193,7 @@ def build_tracer_graph(
     moderation_provider: ModerationProvider | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
+    ranker: Ranker | None = None,
 ) -> CompiledStateGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
     builder = StateGraph(TracerState)
@@ -198,6 +205,7 @@ def build_tracer_graph(
     selected_moderation_provider = moderation_provider or MockModerationProvider()
     selected_refinement_actor = refinement_actor or MockQuestionRefinementActor()
     selected_retriever = retriever or MockRetriever()
+    selected_ranker = ranker or MockRanker()
     selected_artifact_repository = (
         phase_context.artifact_repository if phase_context is not None else None
     )
@@ -281,6 +289,29 @@ def build_tracer_graph(
         return update
 
     builder.add_node("retrieval", retrieval_node)
+
+    async def reranking_node(state: TracerState) -> TracerStateUpdate:
+        if phase_context is None or selected_artifact_repository is None:
+            return {"ranked_refs": state.get("artifact_refs", [])}
+        events, refs, halted, error = await run_reranking(
+            state,
+            context=phase_context,
+            artifacts=selected_artifact_repository,
+            ranker=selected_ranker,
+        )
+        update: TracerStateUpdate = {
+            "events": [
+                *state["events"],
+                *[_event_state(event, event.sequence) for event in events],
+            ],
+            "halted": halted,
+            "ranked_refs": refs,
+        }
+        if error is not None:
+            update["reranking_error"] = error
+        return update
+
+    builder.add_node("reranking", reranking_node)
     builder.add_node("finalization", _finalize)
     builder.add_edge(START, "query")
     builder.add_edge("query", "pre_moderation")
@@ -296,6 +327,11 @@ def build_tracer_graph(
     )
     builder.add_conditional_edges(
         "retrieval",
+        lambda state: "end" if state.get("halted", False) else "reranking",
+        {"reranking": "reranking", "end": END},
+    )
+    builder.add_conditional_edges(
+        "reranking",
         lambda state: "end" if state.get("halted", False) else "finalization",
         {"finalization": "finalization", "end": END},
     )
