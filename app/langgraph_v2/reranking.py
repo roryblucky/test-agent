@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Protocol
@@ -65,14 +66,15 @@ async def run_reranking(
                 for ref in refs
             ]
             ranked = await ranker.rank(documents)
-            input_ids = [document.id for document in documents]
             output_ids = [document.id for document in ranked.documents]
-            if Counter(output_ids) != Counter(input_ids):
+            input_keys = [_document_key(document) for document in documents]
+            output_keys = [_document_key(document) for document in ranked.documents]
+            if Counter(output_keys) != Counter(input_keys):
                 raise ValueError("ranker must return every retrieved document exactly once")
-            refs_by_id: dict[str, list[ArtifactRef]] = {}
-            for document_id, ref in zip(input_ids, refs, strict=True):
-                refs_by_id.setdefault(document_id, []).append(ref)
-            ordered_refs = [refs_by_id[document_id].pop(0) for document_id in output_ids]
+            refs_by_key: dict[str, list[ArtifactRef]] = {}
+            for document, ref in zip(documents, refs, strict=True):
+                refs_by_key.setdefault(_document_key(document), []).append(ref)
+            ordered_refs = [refs_by_key[key].pop(0) for key in output_keys]
             return PhaseResultInput(
                 phase_name="reranking",
                 normalized_result={"document_ids": output_ids},
@@ -125,3 +127,10 @@ async def run_reranking(
     if result.normalized_result.get("failed") is True:
         return list(result.events), [], True, str(result.normalized_result["error"])
     return list(result.events), list(result.artifact_refs), False, None
+
+
+def _document_key(document: Document) -> str:
+    """Canonical payload key that preserves distinct Documents sharing an id."""
+    return json.dumps(
+        document.model_dump(exclude_none=True), ensure_ascii=False, sort_keys=True
+    )
