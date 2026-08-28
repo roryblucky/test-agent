@@ -24,6 +24,7 @@ class AnswerOutput(BaseModel):
     """Validated structured answer returned by the PydanticAI actor."""
 
     answer: str = Field(min_length=1)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AnswerResult(BaseModel):
@@ -64,6 +65,7 @@ class PydanticAIAnswerActor:
         output = AnswerOutput.model_validate(result.output)
         return AnswerResult(
             answer=output.answer,
+            citations=output.citations,
             usage=usage_payload,
         )
 
@@ -137,6 +139,7 @@ async def run_answer(
             )
             validated = AnswerResult.model_validate(answer)
             chunks = split_answer_chunks(validated.answer)
+            normalized_answer = "".join(chunks)
             events: list[EventInput] = [
                 EventInput(
                     event_key="phase:answer:step_start:1",
@@ -164,7 +167,8 @@ async def run_answer(
             return PhaseResultInput(
                 phase_name="answer",
                 normalized_result={
-                    "answer": validated.answer,
+                    "answer": normalized_answer,
+                    "citations": validated.citations,
                     "usage": validated.usage,
                 },
                 events=tuple(events),
