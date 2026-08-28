@@ -45,7 +45,7 @@ async def test_ranker_adapter_passes_refined_query_without_changing_provider_con
         async def rank(self, query: str, documents: list[Document], top_n: int = 5) -> list[Document]:
             assert query == "refined"
             assert [document.id for document in documents] == ["d1", "d2"]
-            assert top_n == 5
+            assert top_n == 2
             return [documents[1], documents[0]]
 
     result = await V2RankerAdapter(Provider()).rank(
@@ -54,6 +54,20 @@ async def test_ranker_adapter_passes_refined_query_without_changing_provider_con
 
     assert isinstance(result, RerankingResult)
     assert [document.id for document in result.documents] == ["d2", "d1"]
+
+
+@pytest.mark.asyncio
+async def test_ranker_adapter_requests_all_documents_by_default() -> None:
+    class Provider(BaseRankerProvider):
+        async def rank(self, query: str, documents: list[Document], top_n: int = 5) -> list[Document]:
+            del query
+            assert top_n == 6
+            return documents
+
+    documents = [Document(id=f"d{index}", content=str(index)) for index in range(6)]
+    result = await V2RankerAdapter(Provider()).rank("refined", documents)
+
+    assert result.documents == documents
 
 
 @pytest.mark.asyncio
@@ -92,7 +106,6 @@ def test_tenant_provider_bundle_is_adapted_without_legacy_orchestration_imports(
         retriever = RetrieverProvider()
         ranker = RankerProvider()
         moderation = ModerationProvider()
-        groundedness = object()
 
     adapted = adapt_tenant_providers(Bundle())
 

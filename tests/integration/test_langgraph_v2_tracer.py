@@ -28,6 +28,7 @@ from app.langgraph_v2.checkpointing import (
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
+from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
@@ -53,6 +54,7 @@ def persistent_tracer_app(
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
+    moderation_provider: ModerationProvider | None = None,
 ) -> FastAPI:
     """Create the test-only tracer with its real application database pool."""
 
@@ -72,6 +74,7 @@ def persistent_tracer_app(
         refinement_actor=refinement_actor,
         retriever=retriever,
         ranker=ranker,
+        moderation_provider=moderation_provider,
         resume_enabled=resume_enabled,
     )
     return app

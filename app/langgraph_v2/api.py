@@ -27,7 +27,13 @@ from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
-from app.langgraph_v2.provider_adapters import V2ProviderBundle, adapt_tenant_providers
+from app.langgraph_v2.provider_adapters import (
+    MissingModeration,
+    MissingRanker,
+    MissingRetriever,
+    V2ProviderBundle,
+    adapt_tenant_providers,
+)
 from app.langgraph_v2.question_refinement import (
     QuestionRefinementActor,
     build_question_refinement_actor,
@@ -42,6 +48,7 @@ from app.langgraph_v2.run_events import (
     RunEventRepository,
     RunNotFound,
 )
+from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
 
@@ -69,6 +76,20 @@ def _resolve_provider_bundle(app: FastAPI, tenant_id: str) -> V2ProviderBundle |
     if manager is None or not hasattr(manager, "get_providers"):
         return None
     return adapt_tenant_providers(manager.get_providers(tenant_id))
+
+
+def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
+    """Validate a configured tenant before creating a running v2 Run."""
+    manager = getattr(app.state, "tenant_manager", None)
+    if manager is None:
+        return
+    try:
+        if hasattr(manager, "get_providers"):
+            manager.get_providers(tenant_id)
+        elif hasattr(manager, "get_model_registry"):
+            manager.get_model_registry(tenant_id)
+    except TenantNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Tenant not found") from error
 
 
 async def _refresh_claim(
@@ -171,6 +192,7 @@ def create_tracer_router(
     ) -> StreamingResponse:
         """Run the deterministic tracer and return its events as SSE."""
         del x_user_groups
+        _ensure_tenant_available(http_request.app, x_application_id)
         run_id = uuid.uuid4()
         conversation_id = payload.conversation_id or str(uuid.uuid4())
 
@@ -213,9 +235,15 @@ def create_tracer_router(
                 http_request.app, x_application_id
             )
             if provider_bundle is not None:
-                configured_retriever = configured_retriever or provider_bundle.retriever
-                configured_ranker = configured_ranker or provider_bundle.ranker
-                configured_moderation = configured_moderation or provider_bundle.moderation
+                configured_retriever = (
+                    configured_retriever or provider_bundle.retriever or MissingRetriever()
+                )
+                configured_ranker = configured_ranker or provider_bundle.ranker or MissingRanker()
+                configured_moderation = (
+                    configured_moderation
+                    or provider_bundle.moderation
+                    or MissingModeration()
+                )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None:
@@ -320,6 +348,7 @@ def create_tracer_router(
         x_application_id: Annotated[str, Header(alias="X-Application-Id")],
     ) -> StreamingResponse:
         """Resume one stale or interrupted Run from its exact checkpoint."""
+        _ensure_tenant_available(http_request.app, x_application_id)
         configured_pool = getattr(
             http_request.app.state, "langgraph_v2_postgres_pool", None
         )
@@ -366,9 +395,15 @@ def create_tracer_router(
                 http_request.app, x_application_id
             )
             if provider_bundle is not None:
-                configured_retriever = configured_retriever or provider_bundle.retriever
-                configured_ranker = configured_ranker or provider_bundle.ranker
-                configured_moderation = configured_moderation or provider_bundle.moderation
+                configured_retriever = (
+                    configured_retriever or provider_bundle.retriever or MissingRetriever()
+                )
+                configured_ranker = configured_ranker or provider_bundle.ranker or MissingRanker()
+                configured_moderation = (
+                    configured_moderation
+                    or provider_bundle.moderation
+                    or MissingModeration()
+                )
             selected_graph = graph or tracer_graph
             graph_config: RunnableConfig | None = None
             if graph is None and configured_checkpointer is not None:

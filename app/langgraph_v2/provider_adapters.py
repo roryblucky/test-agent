@@ -10,7 +10,6 @@ from app.langgraph_v2.reranking import Ranker, RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult, Retriever
 from app.models.domain import Document
 from app.providers.base import (
-    BaseGroundednessProvider,
     BaseModerationProvider,
     BaseRankerProvider,
     BaseRetrieverProvider,
@@ -40,13 +39,14 @@ class V2RetrieverAdapter:
 class V2RankerAdapter:
     """Adapt a tenant's existing query-aware ranker to the v2 contract."""
 
-    def __init__(self, provider: BaseRankerProvider, *, top_n: int = 5) -> None:
+    def __init__(self, provider: BaseRankerProvider, *, top_n: int | None = None) -> None:
         self._provider = provider
         self._top_n = top_n
 
     async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
         """Rank Documents through the existing query-aware provider."""
-        ranked = await self._provider.rank(query, documents, top_n=self._top_n)
+        top_n = len(documents) if self._top_n is None else self._top_n
+        ranked = await self._provider.rank(query, documents, top_n=top_n)
         return RerankingResult(documents=ranked)
 
 
@@ -72,7 +72,33 @@ class TenantProvidersLike(Protocol):
     retriever: BaseRetrieverProvider | None
     ranker: BaseRankerProvider | None
     moderation: BaseModerationProvider | None
-    groundedness: BaseGroundednessProvider | None
+
+
+class MissingRetriever:
+    """Explicit failure provider for a tenant without retrieval configuration."""
+
+    async def retrieve(self, query: str) -> RetrievalResult:
+        """Raise a clear configuration error instead of fabricating data."""
+        del query
+        raise RuntimeError("retriever provider is not configured for this tenant")
+
+
+class MissingRanker:
+    """Explicit failure provider for a tenant without ranking configuration."""
+
+    async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
+        """Raise a clear configuration error instead of fabricating ranking."""
+        del query, documents
+        raise RuntimeError("ranker provider is not configured for this tenant")
+
+
+class MissingModeration:
+    """Explicit failure provider for a tenant without moderation configuration."""
+
+    async def check(self, text: str) -> ModerationDecision:
+        """Raise a clear configuration error instead of allowing unsafe input."""
+        del text
+        raise RuntimeError("moderation provider is not configured for this tenant")
 
 
 @dataclass(frozen=True)

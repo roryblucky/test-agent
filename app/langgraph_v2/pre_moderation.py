@@ -93,7 +93,27 @@ async def run_pre_moderation(
     """Journal and return the pre-moderation Events and halt decision."""
 
     async def invoke() -> PhaseResultInput:
-        decision = await provider.check(state["query"])
+        try:
+            decision = await provider.check(state["query"])
+        except Exception as exc:
+            message = str(exc) or "Moderation failed."
+            return PhaseResultInput(
+                phase_name="pre_moderation",
+                normalized_result={"failed": True, "error": message},
+                events=(
+                    EventInput(
+                        event_key="phase:pre_moderation:step_start:1",
+                        type="step_start",
+                        step="moderation:pre",
+                    ),
+                    EventInput(
+                        event_key="phase:pre_moderation:error:1",
+                        type="error",
+                        data=message,
+                    ),
+                ),
+                terminal_status="failed",
+            )
         return PhaseResultInput(
             phase_name="pre_moderation",
             normalized_result=decision.model_dump(exclude_none=True),
@@ -109,7 +129,13 @@ async def run_pre_moderation(
         phase_name="pre_moderation",
         invoke=invoke,
     )
-    decision = ModerationDecision.model_validate(result.normalized_result)
+    if result.normalized_result.get("failed") is True:
+        decision = ModerationDecision(
+            is_flagged=True,
+            reason=str(result.normalized_result.get("error", "Moderation failed.")),
+        )
+    else:
+        decision = ModerationDecision.model_validate(result.normalized_result)
     return (
         list(result.events),
         decision.is_flagged,
