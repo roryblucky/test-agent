@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 from pydantic_ai.usage import RunUsage
 
-from app.langgraph_v2.answer import AnswerCitation, AnswerResult
+from app.langgraph_v2.answer import AnswerCitation, AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.groundedness import (
@@ -49,6 +49,13 @@ class _Answer:
             citations=[AnswerCitation(index=1, quoted_text=query)],
         )
 
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
+
 
 class _Groundedness:
     calls = 0
@@ -69,6 +76,13 @@ class _UncitedAnswer:
     ) -> AnswerResult:
         del query, documents, history
         return AnswerResult(answer="answer without a source")
+
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
 
 
 class _EmptyDocumentGroundedness:

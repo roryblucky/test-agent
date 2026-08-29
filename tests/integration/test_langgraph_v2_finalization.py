@@ -16,7 +16,7 @@ from pydantic_ai.usage import RunUsage
 
 from app.api.dependencies import TenantContext, get_tenant
 from app.api.router import router as legacy_router
-from app.langgraph_v2.answer import AnswerResult
+from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
@@ -69,6 +69,13 @@ class _Answer:
         assert query == "hello"
         assert [document.id for document in documents] == ["d1"]
         return AnswerResult(answer="grounded answer [1]", usage={"output_tokens": 3})
+
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
 
 
 class _UsageRefinement:

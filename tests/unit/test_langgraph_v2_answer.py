@@ -1,7 +1,5 @@
 import asyncio
-import json
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Self
 from uuid import UUID, uuid4
@@ -17,7 +15,6 @@ from app.langgraph_v2.answer import (
     bind_answer_citations,
     build_answer_actor,
     run_answer,
-    split_answer_chunks,
 )
 from app.langgraph_v2.api import _stream_unseen_events
 from app.langgraph_v2.history import ConversationTurn
@@ -39,6 +36,7 @@ class _FakeStructuredStream:
         self.block_after_snapshots = block_after_snapshots
         self.entered = False
         self.exited = False
+        self.cleanup_completed = False
         self.debounce_by: float | None = 0.1
         self.released = asyncio.Event()
 
@@ -48,6 +46,8 @@ class _FakeStructuredStream:
 
     async def __aexit__(self, *args: object) -> None:
         self.exited = True
+        await asyncio.sleep(0)
+        self.cleanup_completed = True
         self.released.set()
 
     async def stream_output(self, *, debounce_by: float | None):
@@ -89,30 +89,6 @@ class _FakePhaseRepository:
             normalized_result=phase.normalized_result,  # type: ignore[attr-defined]
             events=[],
         )
-
-
-class _FakeAgent:
-    def __init__(self) -> None:
-        self.prompt: str | None = None
-
-    async def run(self, prompt: str) -> SimpleNamespace:
-        self.prompt = prompt
-        return SimpleNamespace(
-            output=AnswerOutput(answer="structured answer"),
-            usage=lambda: RunUsage(input_tokens=2, output_tokens=3),
-        )
-
-
-@pytest.mark.asyncio
-async def test_pydantic_ai_answer_actor_passes_only_ordered_evidence() -> None:
-    agent = _FakeAgent()
-    actor = PydanticAIAnswerActor(agent)  # type: ignore[arg-type]
-
-    result = await actor.answer("question", [Document(id="d1", content="evidence")])
-
-    assert result.answer == "structured answer"
-    assert result.usage["input_tokens"] == 2
-    assert agent.prompt == "Question: question\n\nEvidence:\n[1] evidence"
 
 
 @pytest.mark.asyncio
@@ -169,6 +145,7 @@ async def test_pydantic_ai_answer_actor_stream_cancellation_closes_agent_context
 
     assert stream.entered is True
     assert stream.exited is True
+    assert stream.cleanup_completed is True
 
 
 @pytest.mark.asyncio
@@ -228,7 +205,7 @@ async def test_run_answer_cancellation_after_delta_does_not_commit_partial_resul
     async def cancellation_check() -> bool:
         nonlocal checks
         checks += 1
-        return checks > 1
+        return checks > 2
 
     context = PhaseExecutionContext(
         repository=repository,  # type: ignore[arg-type]
@@ -239,24 +216,33 @@ async def test_run_answer_cancellation_after_delta_does_not_commit_partial_resul
         cancellation_check=cancellation_check,
     )
 
+    public_events: list[dict[str, object]] = []
     with pytest.raises(AnswerCancelled):
         await run_answer(
             {"query": "question"},
             context=context,
             artifacts=object(),  # type: ignore[arg-type]
             actor=actor,
-            stream_writer=lambda _: None,
+            stream_writer=public_events.append,
         )
 
     assert repository.committed is False
     assert stream.exited is True
+    assert stream.cleanup_completed is True
+    assert [event["data"] for event in public_events if event["type"] == "token"] == [
+        "Hello"
+    ]
 
 
 def test_build_answer_actor_uses_registry_model_and_output_type() -> None:
-    agent = _FakeAgent()
+    agent = _FakeStructuredAgent(
+        _FakeStructuredStream([], AnswerOutput(answer="answer"))
+    )
 
     class Registry:
-        def create_agent(self, model_name: str, **kwargs: object) -> _FakeAgent:
+        def create_agent(
+            self, model_name: str, **kwargs: object
+        ) -> _FakeStructuredAgent:
             assert model_name == "pro"
             assert kwargs["output_type"] is AnswerOutput
             assert kwargs["instructions"] == "custom"
@@ -291,84 +277,6 @@ async def test_answer_checks_cancellation_before_publication() -> None:
         )
 
 
-@pytest.mark.asyncio
-async def test_live_answer_chunks_use_the_configured_fake_clock_interval(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_id = UUID("00000000-0000-0000-0000-000000000001")
-    created_at = datetime.now(UTC)
-    events = [
-        EventRecord(
-            tenant_id="tenant-a",
-            run_id=run_id,
-            sequence=index + 1,
-            event_key=f"phase:answer:token:{index}",
-            type="token",
-            step="llm:answer",
-            data=chunk,
-            created_at=created_at,
-        )
-        for index, chunk in enumerate(("one", "two"))
-    ]
-
-    class Repository:
-        async def list_events(
-            self, tenant_id: str, requested_run_id: UUID
-        ) -> list[EventRecord]:
-            assert tenant_id == "tenant-a"
-            assert requested_run_id == run_id
-            return events
-
-    sleeps: list[float] = []
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr("app.langgraph_v2.api.asyncio.sleep", fake_sleep)
-    sent: set[str] = set()
-    chunks = [
-        frame
-        async for frame in _stream_unseen_events(
-            Repository(),
-            tenant_id="tenant-a",
-            run_id=run_id,
-            sent_keys=sent,
-            answer_chunk_count=[0],
-            answer_chunk_interval_ms=250,
-        )
-    ]
-
-    assert len(chunks) == 2
-    assert sleeps == [0.25]
-
-
-def test_split_answer_chunks_preserves_text_and_prefers_boundaries() -> None:
-    answer = "First sentence. Second sentence\nThird; final"
-
-    chunks = split_answer_chunks(answer)
-
-    assert chunks == ["First sentence.", " Second sentence\n", "Third;", " final"]
-    assert "".join(chunks) == answer
-
-
-def test_split_answer_chunks_hard_splits_at_unicode_codepoint_limit() -> None:
-    answer = "界" * 241
-
-    chunks = split_answer_chunks(answer)
-
-    assert [len(chunk) for chunk in chunks] == [240, 1]
-    assert "".join(chunks) == answer
-
-
-def test_split_answer_chunks_normalizes_only_crlf() -> None:
-    answer = "A\r\nB\rC"
-
-    chunks = split_answer_chunks(answer)
-
-    assert chunks == ["A\n", "B\rC"]
-    assert "".join(chunks) == "A\nB\rC"
-
-
 def test_answer_citation_quote_must_match_bound_document() -> None:
     citations = bind_answer_citations(
         [AnswerCitation(index=1, quoted_text="not in evidence")],
@@ -379,19 +287,6 @@ def test_answer_citation_quote_must_match_bound_document() -> None:
     assert citations[0].evidence_id == "artifact-1"
     assert citations[0].attribution_status == "unlocated"
     assert citations[0].quoted_text is None
-
-
-def test_answer_chunk_golden_case() -> None:
-    fixture = json.loads(
-        (
-            Path(__file__).parents[1]
-            / "fixtures"
-            / "langgraph_v2"
-            / "v2_answer_wire.json"
-        ).read_text()
-    )
-
-    assert split_answer_chunks(fixture["answer"]) == fixture["chunks"]
 
 
 @pytest.mark.asyncio

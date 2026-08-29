@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.answer import AnswerResult
+from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.cancellation import CancellationRepository
@@ -505,6 +505,13 @@ class _CancelBeforeAnswer:
         await _request_current_run_cancellation(self.app)
         return AnswerResult(answer="must never be published")
 
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
+
 
 async def _request_current_run_cancellation(app: FastAPI) -> None:
     pool = app.state.langgraph_v2_postgres_pool
@@ -542,6 +549,13 @@ class _Answer:
     ) -> AnswerResult:
         del query, documents, history
         return AnswerResult(answer="One. Two.")
+
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
 
 
 class _CancelDuringPostModeration:

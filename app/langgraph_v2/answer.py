@@ -19,10 +19,6 @@ from app.langgraph_v2.run_events import CancellationObserved, EventInput, EventR
 from app.models.domain import Document
 from app.models.workflow import CitationReference
 
-ANSWER_CHUNK_INTERVAL_MS = 250
-ANSWER_CHUNK_MAX_CODEPOINTS = 240
-_ANSWER_BOUNDARIES = frozenset(".?!。！？;；\n")
-
 
 class AnswerOutput(BaseModel):
     """Validated structured answer returned by the PydanticAI actor."""
@@ -133,15 +129,15 @@ async def build_inline_citations(
 
 
 class AnswerActor(Protocol):
-    """PydanticAI-backed seam for generating an answer from evidence."""
+    """PydanticAI-backed seam for streaming an answer from evidence."""
 
-    async def answer(
+    def answer_stream(
         self,
         query: str,
         documents: list[Document],
         history: Sequence[ConversationTurn],
-    ) -> AnswerResult:
-        """Return a validated answer for the ordered evidence."""
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        """Yield final-answer deltas and the complete validated result."""
         ...
 
 
@@ -170,29 +166,6 @@ class PydanticAIAnswerActor:
     def _usage_payload(result: Any) -> dict[str, Any]:
         usage = result.usage()
         return asdict(usage) if is_dataclass(usage) else dict(vars(usage))
-
-    async def answer(
-        self,
-        query: str,
-        documents: list[Document],
-        history: Sequence[ConversationTurn] = (),
-    ) -> AnswerResult:
-        """Run the model with only the query and ordered Documents as context."""
-        prompt = self._prompt(query, documents)
-        if history:
-            result = await self._agent.run(
-                prompt,
-                message_history=to_model_message_history(history),
-            )
-        else:
-            result = await self._agent.run(prompt)
-        usage_payload = self._usage_payload(result)
-        output = AnswerOutput.model_validate(result.output)
-        return AnswerResult(
-            answer=output.answer,
-            usage=usage_payload,
-            citations=output.citations,
-        )
 
     async def answer_stream(
         self,
@@ -250,27 +223,6 @@ def build_answer_actor(
     return PydanticAIAnswerActor(agent)
 
 
-def split_answer_chunks(
-    answer: str,
-    *,
-    max_codepoints: int = ANSWER_CHUNK_MAX_CODEPOINTS,
-) -> list[str]:
-    """Split text at sentence boundaries while preserving its normalized content."""
-    if max_codepoints < 1:
-        raise ValueError("max_codepoints must be positive")
-    normalized = answer.replace("\r\n", "\n")
-    chunks: list[str] = []
-    current: list[str] = []
-    for character in normalized:
-        current.append(character)
-        if character in _ANSWER_BOUNDARIES or len(current) >= max_codepoints:
-            chunks.append("".join(current))
-            current = []
-    if current:
-        chunks.append("".join(current))
-    return chunks
-
-
 async def run_answer(
     state: Mapping[str, Any],
     *,
@@ -314,73 +266,48 @@ async def run_answer(
             if stream_writer is not None:
                 stream_writer(events[0].model_dump(exclude_none=True))
 
-            stream_answer = getattr(actor, "answer_stream", None)
             chunks: list[str] = []
-            if callable(stream_answer):
-                streamed_result: AnswerResult | None = None
-                answer_iterator = stream_answer(answer_query, documents, history)
-                try:
-                    async for chunk in answer_iterator:
-                        if isinstance(chunk, AnswerStreamChunk):
-                            delta = chunk.delta
-                            if chunk.result is not None:
-                                streamed_result = chunk.result
-                        elif isinstance(chunk, str):
-                            # Keep the adapter tolerant of simple streaming actors.
-                            delta = chunk
-                        else:
-                            raise TypeError(
-                                "answer_stream yielded an unsupported chunk"
-                            )
-                        if not delta:
-                            continue
-                        if (
-                            context.cancellation_check is not None
-                            and await context.cancellation_check()
-                        ):
-                            raise AnswerCancelled(
-                                "answer generation cancelled before publication"
-                            )
-                        chunks.append(delta)
-                        event = EventInput(
-                            event_key=f"phase:answer:token:{len(chunks) - 1}",
-                            type="token",
-                            data=delta,
+            streamed_result: AnswerResult | None = None
+            answer_iterator = actor.answer_stream(answer_query, documents, history)
+            try:
+                async for chunk in answer_iterator:
+                    if not isinstance(chunk, AnswerStreamChunk):
+                        raise TypeError("answer_stream yielded an unsupported chunk")
+                    if chunk.result is not None:
+                        streamed_result = chunk.result
+                    if not chunk.delta:
+                        continue
+                    if (
+                        context.cancellation_check is not None
+                        and await context.cancellation_check()
+                    ):
+                        raise AnswerCancelled(
+                            "answer generation cancelled before publication"
                         )
-                        events.append(event)
-                        if stream_writer is not None:
-                            stream_writer(event.model_dump(exclude_none=True))
-                finally:
-                    close = getattr(answer_iterator, "aclose", None)
-                    if close is not None:
-                        close_task = asyncio.ensure_future(close())
-                        try:
-                            await asyncio.shield(close_task)
-                        except asyncio.CancelledError:
-                            await asyncio.shield(close_task)
-                            raise
-                if streamed_result is None:
-                    raise ValueError("answer stream did not return a final result")
-                validated = AnswerResult.model_validate(streamed_result)
-                normalized_answer = validated.answer
-                if "".join(chunks) != normalized_answer:
-                    raise ValueError("streamed Answer deltas do not match final Answer")
-            else:
-                answer = await actor.answer(answer_query, documents, history)
-                validated = AnswerResult.model_validate(answer)
-                # Legacy actors do not expose a model stream. Keep their durable
-                # replay behavior while the PydanticAI actor uses real deltas.
-                chunks = split_answer_chunks(validated.answer)
-                normalized_answer = "".join(chunks)
-                for index, chunk in enumerate(chunks):
+                    chunks.append(chunk.delta)
                     event = EventInput(
-                        event_key=f"phase:answer:token:{index}",
+                        event_key=f"phase:answer:token:{len(chunks) - 1}",
                         type="token",
-                        data=chunk,
+                        data=chunk.delta,
                     )
                     events.append(event)
                     if stream_writer is not None:
                         stream_writer(event.model_dump(exclude_none=True))
+            finally:
+                close = getattr(answer_iterator, "aclose", None)
+                if close is not None:
+                    close_task = asyncio.ensure_future(close())
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        await asyncio.shield(close_task)
+                        raise
+            if streamed_result is None:
+                raise ValueError("answer stream did not return a final result")
+            validated = AnswerResult.model_validate(streamed_result)
+            normalized_answer = validated.answer
+            if "".join(chunks) != normalized_answer:
+                raise ValueError("streamed Answer deltas do not match final Answer")
             citations = await build_inline_citations(normalized_answer, refs, documents)
             if "[" not in normalized_answer and "]" not in normalized_answer:
                 citations = bind_answer_citations(validated.citations, refs, documents)

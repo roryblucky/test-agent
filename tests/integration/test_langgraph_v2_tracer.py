@@ -19,8 +19,12 @@ from psycopg_pool import AsyncConnectionPool
 
 import app.langgraph_v2.api as api_module
 from app.api.schemas import QueryResponse
-from app.langgraph_v2.answer import ANSWER_CHUNK_INTERVAL_MS, AnswerActor
-from app.langgraph_v2.api import TracerGraph, register_v2_routes
+from app.langgraph_v2.answer import AnswerActor
+from app.langgraph_v2.api import (
+    ANSWER_CHUNK_INTERVAL_MS,
+    TracerGraph,
+    register_v2_routes,
+)
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,

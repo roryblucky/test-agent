@@ -16,11 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.answer import (
-    ANSWER_CHUNK_INTERVAL_MS,
-    AnswerActor,
-    build_answer_actor,
-)
+from app.langgraph_v2.answer import AnswerActor, build_answer_actor
 from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
 from app.langgraph_v2.authorization import (
     TrustedRequestContext,
@@ -78,6 +74,7 @@ from app.langgraph_v2.runtime import LocalRunRuntime, RuntimeStopping
 from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
+ANSWER_CHUNK_INTERVAL_MS = 250
 
 
 async def _pace_answer_chunk(

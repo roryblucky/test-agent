@@ -4,13 +4,13 @@ import asyncio
 
 # Public-stream coverage complements the pure selector unit tests.
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.answer import AnswerResult
+from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.history import ConversationTurn
@@ -57,6 +57,13 @@ class _AnswerActor:
         del documents
         self.histories.append(list(history))
         return AnswerResult(answer=f"answer for {query}")
+
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
 
 
 class _Retriever:

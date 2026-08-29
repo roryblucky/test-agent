@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from langgraph.checkpoint.memory import MemorySaver
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.answer import AnswerCitation, AnswerResult
+from app.langgraph_v2.answer import (
+    AnswerCitation,
+    AnswerResult,
+    AnswerStreamChunk,
+)
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
@@ -17,6 +22,7 @@ from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRep
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.stream import stream_graph
 from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence
 from app.services.citation_extractor import build_citations
@@ -38,6 +44,13 @@ class _AnswerActor:
         assert [document.id for document in documents] == ["d1"]
         return AnswerResult(answer="One. Two\nThree; four", usage={"output_tokens": 4})
 
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
+
 
 class _Retriever:
     async def retrieve(self, query: str) -> RetrievalResult:
@@ -49,6 +62,20 @@ class _Ranker:
         return RerankingResult(documents=documents)
 
 
+class _StreamingAnswerActor:
+    async def answer_stream(
+        self,
+        query: str,
+        documents: list[Document],
+        history: Sequence[ConversationTurn],
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        del query, documents, history
+        result = AnswerResult(answer="One. Two.", usage={"output_tokens": 2})
+        yield AnswerStreamChunk(delta="One. ")
+        yield AnswerStreamChunk(delta="Two.")
+        yield AnswerStreamChunk(result=result)
+
+
 class _FailingAnswer:
     async def answer(
         self,
@@ -58,6 +85,13 @@ class _FailingAnswer:
     ) -> AnswerResult:
         del query, documents, history
         raise RuntimeError("answer model unavailable")
+
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
 
 
 class _CitingAnswer:
@@ -82,6 +116,13 @@ class _CitingAnswer:
             ],
         )
 
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
+
 
 class _InlineCitationAnswer:
     calls = 0
@@ -98,6 +139,13 @@ class _InlineCitationAnswer:
             answer="Supported claim [1]. Malformed [x] [0] []. Unknown claim [99]."
         )
 
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
+
 
 class _RankedInlineAnswer:
     calls = 0
@@ -111,6 +159,13 @@ class _RankedInlineAnswer:
         self.calls += 1
         del query, documents, history
         return AnswerResult(answer="World claim [1].")
+
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
 
 
 class _MalformedCitationAnswer:
@@ -128,6 +183,13 @@ class _MalformedCitationAnswer:
             answer="Malformed [x] [0] [] and unmatched [1",
             citations=[AnswerCitation(index=1, quoted_text="hello")],
         )
+
+    async def answer_stream(
+        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta=result.answer)
+        yield AnswerStreamChunk(result=result)
 
 
 @pytest.mark.asyncio
@@ -168,25 +230,53 @@ async def test_answer_receives_ranked_documents_and_replays_without_model_call(
         if event["event_key"].startswith("phase:answer:")
     ]
     assert [event["type"] for event in answer_events] == [
-        "step_start", "token", "token", "token", "token", "step_completed"
+        "step_start", "token", "step_completed"
     ]
-    assert [event["data"] for event in answer_events[1:-1]] == [
-        "One.", " Two\n", "Three;", " four"
+    assert [event["data"] for event in answer_events if event["type"] == "token"] == [
+        "One. Two\nThree; four"
     ]
 
-    fixture = json.loads(
-        (
-            Path(__file__).parents[1]
-            / "fixtures"
-            / "langgraph_v2"
-            / "v1_answer_wire.json"
-        ).read_text()
-    )
-    assert [
-        {key: event[key] for key in ("type", "data")}
-        for event in answer_events
-        if event["type"] == "token"
-    ] == fixture["token_events"]
+
+@pytest.mark.asyncio
+async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool),
+            artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            checkpointer=MemorySaver(),
+            phase_context=context,
+            retriever=_Retriever(),
+            ranker=_Ranker(),
+            answer_actor=_StreamingAnswerActor(),
+        )
+        state = {
+            "query": "hello",
+            "conversation_id": "c1",
+            "client_request_id": None,
+            "events": [],
+        }
+
+        config = {"configurable": {"thread_id": "ticket34-stream"}}
+        frames = [frame async for frame in stream_graph(graph, state, config=config)]
+        result = await graph.aget_state(config)
+
+    events = [parse_sse(frame)[0] for frame in frames]
+    token_events = [event for event in events if event["type"] == "token"]
+    assert [event["data"] for event in token_events] == ["One. ", "Two."]
+    assert "".join(event["data"] for event in token_events) == result.values["answer"]
+    assert not any(event.get("data") == "private reasoning" for event in events)
 
 
 @pytest.mark.asyncio
@@ -210,8 +300,7 @@ async def test_answer_reuses_atomic_commit_after_crash_window(
         )
         actor = _InlineCitationAnswer()
         context = PhaseExecutionContext(
-            repository=CrashAfterAnswerCommit(pool),
-            artifact_repository=ArtifactRepository(pool),
+            repository=CrashAfterAnswerCommit(pool), artifact_repository=ArtifactRepository(pool),
             tenant_id="tenant-a", run_id=run.run_id,
             owner_instance_id=run.owner_instance_id, execution_epoch=run.execution_epoch,
         )
