@@ -213,7 +213,6 @@ async def test_closing_query_sse_closes_graph_and_interrupts_run(
             self.started = asyncio.Event()
             self.closed = False
             self.close_completed = False
-            self.close_completed = False
 
         def __aiter__(self) -> AsyncIterator[Any]:
             return self
@@ -225,7 +224,6 @@ async def test_closing_query_sse_closes_graph_and_interrupts_run(
         async def aclose(self) -> None:
             self.closed = True
             await asyncio.sleep(0)
-            self.close_completed = True
             self.close_completed = True
 
     class BlockingGraph:
