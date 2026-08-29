@@ -87,6 +87,7 @@ def persistent_tracer_app(
         moderation_provider=moderation_provider,
         answer_actor=answer_actor,
         resume_enabled=resume_enabled,
+        run_resume_enabled=True,
     )
     return app
 
@@ -948,17 +949,20 @@ def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
 
     monkeypatch.setenv(feature_flag, "1")
     enabled_app = reload(main_module).app
-    assert {
+    enabled_routes = {
         getattr(route, "path", None)
         for route in enabled_app.routes
         if getattr(route, "path", "").startswith("/v2/")
-    } == {
+    }
+    assert enabled_routes == {
         "/v2/query/stream",
         "/v2/threads/{thread_id}/resume/stream",
-        "/v2/runs/{run_id}/stream",
-        "/v2/runs/{run_id}/resume/stream",
-        "/v2/runs/{run_id}/cancel",
     }
+    assert {
+        path
+        for path in enabled_app.openapi()["paths"]
+        if path.startswith("/v2/")
+    } == enabled_routes
 
     monkeypatch.delenv(feature_flag)
     disabled_app = reload(main_module).app
@@ -978,6 +982,57 @@ def test_resume_route_is_default_off() -> None:
     assert "/v2/runs/{run_id}/resume/stream" not in {
         getattr(route, "path", None) for route in app.routes
     }
+
+
+def test_removed_run_control_routes_are_404_when_not_registered() -> None:
+    app = FastAPI()
+    register_v2_routes(
+        app,
+        enabled=True,
+        resume_enabled=True,
+        run_resume_enabled=False,
+        replay_enabled=False,
+        cancellation_enabled=False,
+        artifact_lookup_enabled=False,
+    )
+
+    assert {
+        path
+        for path in app.openapi()["paths"]
+        if path.startswith("/v2/")
+    } == {"/v2/query/stream", "/v2/threads/{thread_id}/resume/stream"}
+
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/v2/runs/00000000-0000-0000-0000-000000000001/resume/stream",
+                headers={
+                    "X-Application-Id": "tenant-a",
+                    "X-Subject-Id": "subject-a",
+                },
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                "/v2/runs/00000000-0000-0000-0000-000000000001/stream",
+                headers={
+                    "X-Application-Id": "tenant-a",
+                    "X-Subject-Id": "subject-a",
+                },
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/v2/runs/00000000-0000-0000-0000-000000000001/cancel",
+                headers={
+                    "X-Application-Id": "tenant-a",
+                    "X-Subject-Id": "subject-a",
+                },
+            ).status_code
+            == 404
+        )
 
 
 def test_resume_route_returns_404_for_missing_or_cross_tenant_run(

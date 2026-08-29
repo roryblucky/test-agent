@@ -1799,6 +1799,7 @@ def register_v2_routes(
     groundedness_actor: GroundednessActor | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     resume_enabled: bool = False,
+    run_resume_enabled: bool = False,
     replay_enabled: bool = False,
     cancellation_enabled: bool = False,
     artifact_lookup_enabled: bool = True,
@@ -1821,6 +1822,7 @@ def register_v2_routes(
         disabled_control_paths: set[str] = set()
         if not resume_enabled:
             disabled_control_paths.add("/v2/threads/{thread_id}/resume/stream")
+        if not run_resume_enabled:
             disabled_control_paths.add("/v2/runs/{run_id}/resume/stream")
         if not replay_enabled:
             disabled_control_paths.add("/v2/runs/{run_id}/stream")

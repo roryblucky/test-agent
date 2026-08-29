@@ -161,8 +161,7 @@ register_v2_routes(
         os.environ.get("LANGGRAPH_V2_UAT_ENABLED") == "1"
         or os.environ.get("LANGGRAPH_V2_TRACER_ENABLED") == "1"
     ),
+    run_resume_enabled=False,
     resume_enabled=True,
-    replay_enabled=True,
-    cancellation_enabled=True,
     artifact_lookup_enabled=False,
 )
