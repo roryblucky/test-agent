@@ -1,11 +1,10 @@
-"""Tenant-scoped cancellation-request coverage for the test-only v2 route."""
+"""Tenant-scoped cancellation-request coverage for the test-only v2 runtime."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -17,14 +16,12 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.cancellation import CancellationRepository
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
 )
 from app.langgraph_v2.history import ConversationTurn
-from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.question_refinement import V2ResolvedQuery
 from app.langgraph_v2.reranking import RerankingResult
@@ -37,24 +34,6 @@ from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tra
 STOPPED_FIXTURE_PATH = (
     Path(__file__).parents[1] / "fixtures" / "langgraph_v2" / "v1_stopped_wire.json"
 )
-
-
-def _cancellation_app(database_url: str, *, cancellation_enabled: bool) -> FastAPI:
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        async with postgres_lifespan(
-            app,
-            config=V2PostgresConfig(database_url=database_url),
-        ):
-            yield
-
-    app = FastAPI(lifespan=lifespan)
-    register_v2_routes(
-        app,
-        enabled=True,
-        cancellation_enabled=cancellation_enabled,
-    )
-    return app
 
 
 async def _seed_run(
@@ -142,124 +121,6 @@ async def _persisted_message_roles(database_url: str, run_id: UUID) -> list[str]
                 (run_id,),
             )
             return [row[0] for row in await result.fetchall()]
-
-
-def test_cancellation_route_is_default_off() -> None:
-    app = FastAPI()
-    register_v2_routes(app, enabled=True)
-
-    assert "/v2/runs/{run_id}/cancel" not in {
-        getattr(route, "path", None) for route in app.routes
-    }
-
-
-def test_running_run_cancellation_is_durable_and_idempotent(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    run_id = asyncio.run(_seed_run(langgraph_v2_migrated_database_url))
-    app = _cancellation_app(
-        langgraph_v2_migrated_database_url,
-        cancellation_enabled=True,
-    )
-
-    with TestClient(app) as client:
-        first = client.post(
-            f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-        repeated = client.post(
-            f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-
-    assert first.status_code == repeated.status_code == 202
-    assert (
-        first.json()
-        == repeated.json()
-        == {
-            "status": "accepted",
-            "runId": str(run_id),
-            "runStatus": "running",
-        }
-    )
-    run, intents, events = asyncio.run(
-        _persisted_state(
-            langgraph_v2_migrated_database_url,
-            tenant_id="tenant-a",
-            run_id=run_id,
-        )
-    )
-    assert run == {
-        "status": "running",
-        "owner_instance_id": "seed-instance",
-        "execution_epoch": 1,
-    }
-    assert len(intents) == 1
-    assert events == []
-
-
-def test_cancellation_hides_missing_and_cross_tenant_runs(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    run_id = asyncio.run(_seed_run(langgraph_v2_migrated_database_url))
-    app = _cancellation_app(
-        langgraph_v2_migrated_database_url,
-        cancellation_enabled=True,
-    )
-
-    with TestClient(app) as client:
-        missing = client.post(
-            f"/v2/runs/{uuid4()}/cancel",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-        cross_tenant = client.post(
-            f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-b", "X-Subject-Id": "subject-a"},
-        )
-
-    assert missing.status_code == 404
-    assert cross_tenant.status_code == 404
-
-
-def test_terminal_cancellation_is_a_non_mutating_idempotent_response(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    run_id = asyncio.run(_seed_run(langgraph_v2_migrated_database_url, terminal=True))
-    app = _cancellation_app(
-        langgraph_v2_migrated_database_url,
-        cancellation_enabled=True,
-    )
-
-    with TestClient(app) as client:
-        first = client.post(
-            f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-        repeated = client.post(
-            f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-
-    assert first.status_code == repeated.status_code == 200
-    assert (
-        first.json()
-        == repeated.json()
-        == {
-            "status": "already_terminal",
-            "runId": str(run_id),
-            "runStatus": "completed",
-        }
-    )
-    run, intents, events = asyncio.run(
-        _persisted_state(
-            langgraph_v2_migrated_database_url,
-            tenant_id="tenant-a",
-            run_id=run_id,
-        )
-    )
-    assert run["status"] == "completed"
-    assert intents == []
-    assert events == [{"sequence": 1, "event_key": "lifecycle:completed:0"}]
 
 
 @pytest.mark.asyncio

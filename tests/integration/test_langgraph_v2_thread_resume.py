@@ -462,7 +462,7 @@ def test_thread_resume_recovers_pre_answer_checkpoint_from_fresh_app(
     answer_actor = _AnswerActor()
     app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=answer_actor,
     )
 
@@ -507,7 +507,7 @@ def test_thread_resume_returns_404_for_missing_or_unauthorized_thread(
     )
     app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=_AnswerActor(),
     )
 
@@ -541,7 +541,7 @@ def test_thread_resume_returns_404_for_missing_expected_turn(
     )
     app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=_AnswerActor(),
     )
 
@@ -569,7 +569,7 @@ def test_thread_resume_returns_404_for_expected_turn_from_other_conversation(
     )
     app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=_AnswerActor(),
     )
 
@@ -593,7 +593,7 @@ def test_thread_resume_returns_410_for_expired_turn_without_graph_execution(
     answer_actor = _AnswerActor()
     app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=answer_actor,
     )
 
@@ -636,7 +636,7 @@ def test_thread_resume_rejects_non_recoverable_checkpoint_without_graph_executio
     answer_actor = _AnswerActor()
     app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=answer_actor,
     )
 
@@ -681,7 +681,7 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
     app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
         graph=graph,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=_AnswerActor(),
     )
 
@@ -735,7 +735,7 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
     audit = MockOutputAssessmentAudit()
     app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         moderation_provider=moderation_provider,
         answer_actor=answer_actor,
     )
@@ -810,7 +810,7 @@ def test_second_interruption_can_resume_before_original_deadline(
     )
     blocking_app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=blocking_answer_actor,
     )
 
@@ -851,7 +851,7 @@ def test_second_interruption_can_resume_before_original_deadline(
     )
     complete_app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=complete_answer_actor,
     )
 
@@ -887,7 +887,7 @@ def test_second_interruption_returns_410_after_original_deadline_expires(
     )
     blocking_app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=blocking_answer_actor,
     )
 
@@ -916,7 +916,7 @@ def test_second_interruption_returns_410_after_original_deadline_expires(
     )
     expired_app = persistent_tracer_app(
         langgraph_v2_migrated_database_url,
-        resume_enabled=True,
+        thread_resume_enabled=True,
         answer_actor=expired_answer_actor,
     )
 

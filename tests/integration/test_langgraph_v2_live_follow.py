@@ -1,25 +1,19 @@
-"""Replay/live following coverage for the default-off v2 control tracer."""
+"""Persisted follower coverage for the v2 runtime."""
 
 from __future__ import annotations
 
 import asyncio
-import json
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
-from typing import Any, cast
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi import FastAPI, Request
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
 )
 from app.langgraph_v2.live_events import LiveEventWakeups
-from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.replay import PersistedEventFollower
 from app.langgraph_v2.run_events import (
     EventInput,
@@ -27,8 +21,6 @@ from app.langgraph_v2.run_events import (
     RunEventRepository,
     RunRecord,
 )
-
-LiveEndpoint = Callable[[UUID, Request, TrustedRequestContext, int], Awaitable[Any]]
 
 
 async def _seed(
@@ -58,92 +50,6 @@ async def _seed(
         ),
     )
     return run.run_id, run.owner_instance_id, event.sequence
-
-
-def _live_endpoint(app: FastAPI) -> LiveEndpoint:
-    return cast(
-        LiveEndpoint,
-        next(
-            route.endpoint
-            for route in app.routes
-            if getattr(route, "path", None) == "/v2/runs/{run_id}/stream"
-        ),
-    )
-
-
-def _request(app: FastAPI) -> Request:
-    return Request(
-        {
-            "type": "http",
-            "method": "GET",
-            "path": "/v2/runs/run/stream",
-            "headers": [],
-            "app": app,
-        }
-    )
-
-
-@pytest.mark.asyncio
-async def test_public_replay_then_live_is_gapless_and_closes_at_terminal(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        async with postgres_lifespan(
-            app,
-            config=V2PostgresConfig(database_url=langgraph_v2_migrated_database_url),
-        ):
-            yield
-
-    app = FastAPI(lifespan=lifespan)
-    register_v2_routes(app, enabled=True, replay_enabled=True)
-    async with app.router.lifespan_context(app):
-        pool = app.state.langgraph_v2_postgres_pool
-        repository = RunEventRepository(
-            pool, live_events=app.state.langgraph_v2_live_events
-        )
-        run_id, owner, _ = await _seed(repository, pool)
-        response = await _live_endpoint(app)(
-            run_id,
-            _request(app),
-            TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            after_sequence=0,
-        )
-        frames = response.body_iterator
-
-        first = json.loads((await anext(frames)).removeprefix("data: "))
-        assert first["sequence"] == 1
-
-        second_event = await repository.append_event(
-            tenant_id="tenant-a",
-            run_id=run_id,
-            owner_instance_id=owner,
-            execution_epoch=1,
-            event=EventInput(
-                event_key="phase:retrieval:step_completed:1",
-                type="step_completed",
-                step="retrieval",
-                data={"ordinal": 2},
-            ),
-        )
-        second = json.loads((await anext(frames)).removeprefix("data: "))
-        assert second["sequence"] == second_event.sequence == 2
-
-        terminal = await repository.complete_run(
-            tenant_id="tenant-a",
-            run_id=run_id,
-            owner_instance_id=owner,
-            execution_epoch=1,
-            event=EventInput(
-                event_key="lifecycle:completed:0",
-                type="done",
-                data={"status": "completed"},
-            ),
-        )
-        done = json.loads((await anext(frames)).removeprefix("data: "))
-        assert done["sequence"] == terminal.sequence == 3
-        with pytest.raises(StopAsyncIteration):
-            await anext(frames)
 
 
 @pytest.mark.asyncio

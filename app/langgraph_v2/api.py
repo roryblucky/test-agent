@@ -14,7 +14,7 @@ from datetime import timedelta
 from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
 
@@ -27,15 +27,10 @@ from app.langgraph_v2.authorization import (
 from app.langgraph_v2.cancellation import CancellationObserver, CancellationRepository
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
-    checkpoint_namespace_for,
     exact_checkpoint_config,
     initial_checkpoint_config,
 )
-from app.langgraph_v2.contracts import (
-    CancellationResponse,
-    TracerStreamEvent,
-    V2QueryRequest,
-)
+from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
@@ -80,7 +75,6 @@ from app.langgraph_v2.run_events import (
     EventInput,
     EventInvariantConflict,
     EventRecord,
-    ResumeConflict,
     RunEventRepository,
     RunNotFound,
     RunRecord,
@@ -1476,291 +1470,6 @@ def create_tracer_router(
             },
         )
 
-    @router.post("/v2/runs/{run_id}/resume/stream")
-    async def resume_stream(
-        run_id: uuid.UUID,
-        http_request: Request,
-        request_context: Annotated[
-            TrustedRequestContext, Depends(get_trusted_request_context)
-        ],
-        after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
-    ) -> StreamingResponse:
-        """Resume one stale or interrupted Run from its exact checkpoint."""
-        x_application_id = request_context.tenant_id
-        _ensure_tenant_available(http_request.app, x_application_id)
-        runtime = _local_runtime(http_request.app)
-        if not runtime.accepting:
-            raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
-        configured_pool = getattr(
-            http_request.app.state, "langgraph_v2_postgres_pool", None
-        )
-        if configured_pool is None:
-            raise HTTPException(
-                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
-            )
-        pool = cast(AsyncConnectionPool[Any], configured_pool)
-        wakeups = _live_events(http_request.app)
-        repository = RunEventRepository(pool, live_events=wakeups)
-        cancellation_repository = CancellationRepository(pool, wakeups=wakeups)
-        cancellation_observer = CancellationObserver(
-            cancellation_repository,
-            wakeups,
-            tenant_id=x_application_id,
-            run_id=run_id,
-        )
-        message_repository = _message_repository(http_request.app, pool)
-        try:
-            conversation = await _authorized_run_conversation(
-                repository,
-                message_repository,
-                context=request_context,
-                run_id=run_id,
-            )
-            claim = await repository.resume_run(
-                tenant_id=x_application_id,
-                run_id=run_id,
-                owner_instance_id=_INSTANCE_ID,
-            )
-            resume_turn_id = await repository.get_run_turn_id(x_application_id, run_id)
-        except (RunNotFound, ConversationNotFound) as error:
-            raise HTTPException(status_code=404, detail="Run not found") from error
-        except ResumeConflict as error:
-            raise HTTPException(
-                status_code=409, detail="Run is not resumable"
-            ) from error
-        previous_checkpoint_id = cast(str, claim.checkpoint_id)
-        previous_checkpoint_ns = cast(str, claim.checkpoint_ns)
-
-        configured_checkpointer = getattr(
-            http_request.app.state, "langgraph_v2_checkpointer", None
-        )
-        configured_refinement_actor = _resolve_refinement_actor(
-            http_request.app,
-            x_application_id,
-            refinement_actor,
-        )
-        configured_answer_actor = _resolve_answer_actor(
-            http_request.app, x_application_id, answer_actor
-        )
-        configured_groundedness_actor = _resolve_groundedness_actor_safely(
-            http_request.app, x_application_id, groundedness_actor
-        )
-        configured_output_assessment_audit = _resolve_output_assessment_audit(
-            http_request.app, output_assessment_audit
-        )
-        (
-            configured_retriever,
-            configured_ranker,
-            configured_moderation,
-        ) = _resolve_phase_providers(
-            http_request.app,
-            x_application_id,
-            retriever=retriever,
-            ranker=ranker,
-            moderation_provider=moderation_provider,
-        )
-        selected_graph = graph or tracer_graph
-        graph_config: RunnableConfig | None = None
-        if graph is None and configured_checkpointer is not None:
-
-            async def write_checkpoint_pointer(
-                checkpoint_id: str,
-                checkpoint_ns: str,
-            ) -> None:
-                await repository.update_checkpoint_pointer(
-                    tenant_id=x_application_id,
-                    run_id=run_id,
-                    owner_instance_id=claim.owner_instance_id,
-                    execution_epoch=claim.execution_epoch,
-                    checkpoint_id=checkpoint_id,
-                    checkpoint_ns=checkpoint_ns,
-                )
-
-            checkpoint_ns = checkpoint_namespace_for(
-                x_application_id, str(run_id), claim.execution_epoch
-            )
-            selected_graph = build_tracer_graph(
-                FencedAsyncPostgresSaver(
-                    pool,
-                    checkpoint_namespace=checkpoint_ns,
-                    read_namespace=previous_checkpoint_ns,
-                    pointer_writer=write_checkpoint_pointer,
-                ),
-                phase_context=PhaseExecutionContext(
-                    repository=PhaseResultRepository(pool, live_events=wakeups),
-                    artifact_repository=ArtifactRepository(pool),
-                    message_repository=message_repository,
-                    request_context=request_context,
-                    history_token_budget=history_token_budget,
-                    current_turn_id=resume_turn_id,
-                    tenant_id=x_application_id,
-                    run_id=run_id,
-                    owner_instance_id=claim.owner_instance_id,
-                    execution_epoch=claim.execution_epoch,
-                    cancellation_check=_resolve_cancellation_check(
-                        http_request.app,
-                        x_application_id,
-                        run_id,
-                        cancellation_observer,
-                    ),
-                    output_assessment_audit=configured_output_assessment_audit,
-                ),
-                refinement_actor=configured_refinement_actor,
-                retriever=configured_retriever,
-                ranker=configured_ranker,
-                moderation_provider=configured_moderation,
-                answer_actor=configured_answer_actor,
-                groundedness_actor=configured_groundedness_actor,
-            )
-            graph_config = exact_checkpoint_config(
-                thread_id=conversation.thread_id,
-                checkpoint_ns="",
-                checkpoint_id=previous_checkpoint_id,
-            )
-        initial_sent_keys = {
-            event.event_key
-            for event in await repository.list_events(x_application_id, run_id)
-            if not (
-                event.type == "token"
-                and event.event_key.startswith("phase:answer:token:")
-            )
-        }
-        await _start_execution_or_interrupt(
-            runtime,
-            _execute_graph_run(
-                cast(TracerInvoker, selected_graph),
-                None,
-                graph_config,
-                repository,
-                cancellation_repository,
-                cancellation_observer,
-                message_repository,
-                tenant_id=x_application_id,
-                run_id=run_id,
-                conversation_id=claim.conversation_id,
-                expected_turn_id=resume_turn_id,
-                owner_instance_id=claim.owner_instance_id,
-                execution_epoch=claim.execution_epoch,
-                initial_sent_keys=initial_sent_keys,
-            ),
-            repository,
-            tenant_id=x_application_id,
-            run_id=run_id,
-            owner_instance_id=claim.owner_instance_id,
-            execution_epoch=claim.execution_epoch,
-        )
-
-        async def event_generator() -> AsyncIterator[str]:
-            async for frame in _follow_persisted_events(
-                repository,
-                wakeups,
-                tenant_id=x_application_id,
-                run_id=run_id,
-                after_sequence=after_sequence,
-                expected_execution_epoch=claim.execution_epoch,
-            ):
-                yield frame
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
-        )
-
-    @router.get("/v2/runs/{run_id}/stream")
-    async def replay_stream(
-        run_id: uuid.UUID,
-        http_request: Request,
-        request_context: Annotated[
-            TrustedRequestContext, Depends(get_trusted_request_context)
-        ],
-        after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
-    ) -> StreamingResponse:
-        """Replay and then follow one Run from the requested sequence cursor."""
-        configured_pool = getattr(
-            http_request.app.state, "langgraph_v2_postgres_pool", None
-        )
-        if configured_pool is None:
-            raise HTTPException(
-                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
-            )
-        x_application_id = request_context.tenant_id
-        wakeups = _live_events(http_request.app)
-        repository = RunEventRepository(configured_pool, live_events=wakeups)
-        messages = _message_repository(http_request.app, configured_pool)
-        try:
-            await _authorized_run_conversation(
-                repository,
-                messages,
-                context=request_context,
-                run_id=run_id,
-            )
-        except (RunNotFound, ConversationNotFound) as error:
-            raise HTTPException(status_code=404, detail="Run not found") from error
-
-        async def event_generator() -> AsyncIterator[str]:
-            async for frame in _follow_persisted_events(
-                repository,
-                wakeups,
-                tenant_id=x_application_id,
-                run_id=run_id,
-                after_sequence=after_sequence,
-            ):
-                yield frame
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Run-Id": str(run_id)},
-        )
-
-    @router.post(
-        "/v2/runs/{run_id}/cancel",
-        response_model=CancellationResponse,
-        status_code=202,
-        responses={200: {"model": CancellationResponse}},
-    )
-    async def cancel_run(
-        run_id: uuid.UUID,
-        http_request: Request,
-        request_context: Annotated[
-            TrustedRequestContext, Depends(get_trusted_request_context)
-        ],
-    ) -> JSONResponse:
-        """Accept a durable cancellation intent without claiming completion."""
-        configured_pool = getattr(
-            http_request.app.state, "langgraph_v2_postgres_pool", None
-        )
-        if configured_pool is None:
-            raise HTTPException(
-                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
-            )
-        x_application_id = request_context.tenant_id
-        try:
-            repository = RunEventRepository(configured_pool)
-            messages = _message_repository(http_request.app, configured_pool)
-            await _authorized_run_conversation(
-                repository,
-                messages,
-                context=request_context,
-                run_id=run_id,
-            )
-            result = await CancellationRepository(
-                configured_pool,
-                wakeups=_live_events(http_request.app),
-            ).request(tenant_id=x_application_id, run_id=run_id)
-        except (RunNotFound, ConversationNotFound) as error:
-            raise HTTPException(status_code=404, detail="Run not found") from error
-        response = CancellationResponse(
-            status="accepted" if result.accepted else "already_terminal",
-            run_id=run_id,
-            run_status=result.run_status,
-        )
-        return JSONResponse(
-            status_code=202 if result.accepted else 200,
-            content=response.model_dump(mode="json", by_alias=True),
-        )
-
     @router.get("/v2/artifacts/{artifact_id}")
     async def get_artifact(
         artifact_id: uuid.UUID,
@@ -1798,10 +1507,7 @@ def register_v2_routes(
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
-    resume_enabled: bool = False,
-    run_resume_enabled: bool = False,
-    replay_enabled: bool = False,
-    cancellation_enabled: bool = False,
+    thread_resume_enabled: bool = False,
     artifact_lookup_enabled: bool = True,
     output_assessment_audit: OutputAssessmentAudit | None = None,
 ) -> None:
@@ -1820,14 +1526,8 @@ def register_v2_routes(
             output_assessment_audit,
         )
         disabled_control_paths: set[str] = set()
-        if not resume_enabled:
+        if not thread_resume_enabled:
             disabled_control_paths.add("/v2/threads/{thread_id}/resume/stream")
-        if not run_resume_enabled:
-            disabled_control_paths.add("/v2/runs/{run_id}/resume/stream")
-        if not replay_enabled:
-            disabled_control_paths.add("/v2/runs/{run_id}/stream")
-        if not cancellation_enabled:
-            disabled_control_paths.add("/v2/runs/{run_id}/cancel")
         if not artifact_lookup_enabled:
             disabled_control_paths.add("/v2/artifacts/{artifact_id}")
         if disabled_control_paths:

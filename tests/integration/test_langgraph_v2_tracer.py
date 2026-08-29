@@ -1,20 +1,17 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from importlib import reload
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 
 import app.langgraph_v2.api as api_module
@@ -22,15 +19,8 @@ from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import AnswerActor
 from app.langgraph_v2.api import TracerGraph, register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.checkpointing import (
-    FencedAsyncPostgresSaver,
-    checkpoint_namespace_for,
-    initial_checkpoint_config,
-    thread_id_for,
-)
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
-from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
@@ -59,7 +49,7 @@ def parse_sse(response_text: str) -> list[dict]:
 def persistent_tracer_app(
     database_url: str,
     graph: TracerGraph | None = None,
-    resume_enabled: bool = False,
+    thread_resume_enabled: bool = False,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
@@ -86,8 +76,7 @@ def persistent_tracer_app(
         ranker=ranker,
         moderation_provider=moderation_provider,
         answer_actor=answer_actor,
-        resume_enabled=resume_enabled,
-        run_resume_enabled=True,
+        thread_resume_enabled=thread_resume_enabled,
     )
     return app
 
@@ -98,15 +87,6 @@ def v2_stream_endpoint(app: FastAPI) -> Any:
         route.endpoint
         for route in app.router.routes
         if getattr(route, "path", None) == "/v2/query/stream"
-    )
-
-
-def v2_resume_endpoint(app: FastAPI) -> Any:
-    """Return the public resume endpoint for subscriber lifecycle tests."""
-    return next(
-        route.endpoint
-        for route in app.router.routes
-        if getattr(route, "path", None) == "/v2/runs/{run_id}/resume/stream"
     )
 
 
@@ -736,207 +716,6 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
     }
 
 
-@pytest.mark.asyncio
-async def test_resume_registration_starts_before_its_sse_body_is_consumed(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    class BlockingGraph:
-        def __init__(self) -> None:
-            self.started = asyncio.Event()
-            self.release = asyncio.Event()
-
-        async def ainvoke(
-            self, state: TracerState | None, config: RunnableConfig | None = None
-        ) -> dict[str, Any]:
-            del state, config
-            self.started.set()
-            await self.release.wait()
-            return {
-                "events": [
-                    {
-                        "event_key": "lifecycle:completed:0",
-                        "type": "done",
-                        "data": {"source": "resume-detached"},
-                        "sequence": 1,
-                    }
-                ]
-            }
-
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        repository = RunEventRepository(pool)
-        await seed_subject_conversation(pool)
-        run = await repository.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        await repository.update_checkpoint_pointer(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-            checkpoint_id="checkpoint-1",
-            checkpoint_ns="namespace-1",
-        )
-        async with pool.connection() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    """
-                    UPDATE langgraph_v2.runs
-                    SET status = 'interrupted', owner_instance_id = ''
-                    WHERE tenant_id = %s AND run_id = %s
-                    """,
-                    ("tenant-a", run.run_id),
-                )
-
-    graph = BlockingGraph()
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        graph,
-        resume_enabled=True,
-    )
-    async with app.router.lifespan_context(app):
-        response = await v2_resume_endpoint(app)(
-            run.run_id,
-            stream_request(app),
-            request_context=TrustedRequestContext(
-                tenant_id="tenant-a", subject_id="subject-a"
-            ),
-        )
-        await graph.started.wait()
-        await response.body_iterator.aclose()
-        graph.release.set()
-        for _ in range(100):
-            if app.state.langgraph_v2_runtime.active_task_count == 0:
-                break
-            await asyncio.sleep(0.01)
-        resumed = await RunEventRepository(
-            app.state.langgraph_v2_postgres_pool
-        ).get_run("tenant-a", run.run_id)
-
-    assert resumed.status == "completed"
-
-
-@pytest.mark.asyncio
-async def test_resume_stream_is_fenced_to_claim_captured_before_body_consumption(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    class BlockingGraph:
-        def __init__(self) -> None:
-            self.started = asyncio.Event()
-            self.release = asyncio.Event()
-
-        async def ainvoke(
-            self, state: TracerState | None, config: RunnableConfig | None = None
-        ) -> dict[str, Any]:
-            del state, config
-            self.started.set()
-            await self.release.wait()
-            return {
-                "events": [
-                    {
-                        "event_key": "recovery:old-claim:done",
-                        "type": "done",
-                        "data": {"source": "old-claim"},
-                        "sequence": 1,
-                    }
-                ]
-            }
-
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        repository = RunEventRepository(pool)
-        await seed_subject_conversation(pool)
-        run = await repository.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        await repository.update_checkpoint_pointer(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-            checkpoint_id="checkpoint-1",
-            checkpoint_ns="namespace-1",
-        )
-        async with pool.connection() as connection:
-            await connection.execute(
-                """
-                UPDATE langgraph_v2.runs
-                SET status = 'interrupted', owner_instance_id = ''
-                WHERE tenant_id = %s AND run_id = %s
-                """,
-                ("tenant-a", run.run_id),
-            )
-
-    graph = BlockingGraph()
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        graph,
-        resume_enabled=True,
-    )
-    async with app.router.lifespan_context(app):
-        response = await v2_resume_endpoint(app)(
-            run.run_id,
-            stream_request(app),
-            request_context=TrustedRequestContext(
-                tenant_id="tenant-a", subject_id="subject-a"
-            ),
-        )
-        await graph.started.wait()
-        repository = RunEventRepository(app.state.langgraph_v2_postgres_pool)
-        async with app.state.langgraph_v2_postgres_pool.connection() as connection:
-            await connection.execute(
-                """
-                UPDATE langgraph_v2.runs
-                SET expires_at = clock_timestamp() - interval '1 second'
-                WHERE tenant_id = %s AND run_id = %s
-                """,
-                ("tenant-a", run.run_id),
-            )
-        replacement = await repository.resume_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id="replacement",
-        )
-        await repository.complete_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=replacement.owner_instance_id,
-            execution_epoch=replacement.execution_epoch,
-            event=EventInput(
-                event_key="recovery:replacement:done",
-                type="done",
-                data={"source": "replacement"},
-            ),
-        )
-
-        boundary = json.loads(
-            (await anext(response.body_iterator)).removeprefix("data: ")
-        )
-        assert boundary["type"] == "error"
-        assert boundary["data"] == {
-            "status": "interrupted",
-            "reason": "claim_expired",
-        }
-        with pytest.raises(StopAsyncIteration):
-            await anext(response.body_iterator)
-        await response.body_iterator.aclose()
-        graph.release.set()
-        for _ in range(100):
-            if app.state.langgraph_v2_runtime.active_task_count == 0:
-                break
-            await asyncio.sleep(0.01)
-
-        assert replacement.execution_epoch == 3
-
-
 @pytest.mark.parametrize(
     "feature_flag",
     ["LANGGRAPH_V2_UAT_ENABLED", "LANGGRAPH_V2_TRACER_ENABLED"],
@@ -973,702 +752,44 @@ def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
     }
 
 
-def test_resume_route_is_default_off() -> None:
+def test_thread_resume_route_is_default_off() -> None:
     app = FastAPI()
     register_v2_routes(app, enabled=True)
     assert "/v2/threads/{thread_id}/resume/stream" not in {
         getattr(route, "path", None) for route in app.routes
     }
-    assert "/v2/runs/{run_id}/resume/stream" not in {
-        getattr(route, "path", None) for route in app.routes
-    }
 
 
-def test_removed_run_control_routes_are_404_when_not_registered() -> None:
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/v2/runs/00000000-0000-0000-0000-000000000001/resume/stream"),
+        ("get", "/v2/runs/00000000-0000-0000-0000-000000000001/stream"),
+        ("post", "/v2/runs/00000000-0000-0000-0000-000000000001/cancel"),
+    ],
+)
+def test_removed_run_control_routes_are_404(method: str, path: str) -> None:
     app = FastAPI()
-    register_v2_routes(
-        app,
-        enabled=True,
-        resume_enabled=True,
-        run_resume_enabled=False,
-        replay_enabled=False,
-        cancellation_enabled=False,
-        artifact_lookup_enabled=False,
-    )
+    register_v2_routes(app, enabled=True)
 
-    assert {
-        path
-        for path in app.openapi()["paths"]
-        if path.startswith("/v2/")
-    } == {"/v2/query/stream", "/v2/threads/{thread_id}/resume/stream"}
+    v2_paths = {
+        path for path in app.openapi()["paths"] if path.startswith("/v2/")
+    }
+    assert "/v2/query/stream" in v2_paths
+    assert "/v2/runs/{run_id}/resume/stream" not in v2_paths
+    assert "/v2/runs/{run_id}/stream" not in v2_paths
+    assert "/v2/runs/{run_id}/cancel" not in v2_paths
 
     with TestClient(app) as client:
-        assert (
-            client.post(
-                "/v2/runs/00000000-0000-0000-0000-000000000001/resume/stream",
-                headers={
-                    "X-Application-Id": "tenant-a",
-                    "X-Subject-Id": "subject-a",
-                },
-            ).status_code
-            == 404
-        )
-        assert (
-            client.get(
-                "/v2/runs/00000000-0000-0000-0000-000000000001/stream",
-                headers={
-                    "X-Application-Id": "tenant-a",
-                    "X-Subject-Id": "subject-a",
-                },
-            ).status_code
-            == 404
-        )
-        assert (
-            client.post(
-                "/v2/runs/00000000-0000-0000-0000-000000000001/cancel",
-                headers={
-                    "X-Application-Id": "tenant-a",
-                    "X-Subject-Id": "subject-a",
-                },
-            ).status_code
-            == 404
-        )
-
-
-def test_resume_route_returns_404_for_missing_or_cross_tenant_run(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async def seed_other_tenant() -> UUID:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            await seed_subject_conversation(pool)
-            run_id = uuid4()
-            run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            await repository.update_checkpoint_pointer(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-                checkpoint_id="checkpoint-1",
-                checkpoint_ns="namespace-1",
-            )
-            return run_id
-
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
-    run_id = asyncio.run(seed_other_tenant())
-    with TestClient(app) as client:
-        cross_tenant = client.post(
-            f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-b", "X-Subject-Id": "subject-a"},
-        )
-        missing = client.post(
-            f"/v2/runs/{uuid4()}/resume/stream",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-    assert cross_tenant.status_code == 404
-    assert missing.status_code == 404
-
-
-def test_resume_route_returns_409_for_an_active_owner(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async def seed_active_run() -> UUID:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            await seed_subject_conversation(pool)
-            run_id = uuid4()
-            run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            await repository.update_checkpoint_pointer(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-                checkpoint_id="checkpoint-1",
-                checkpoint_ns="namespace-1",
-            )
-            return run_id
-
-    run_id = asyncio.run(seed_active_run())
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
-    with TestClient(app) as client:
-        response = client.post(
-            f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-    assert response.status_code == 409
-
-
-def test_resume_replays_existing_event_without_duplicate_publication(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    class ReplayGraph:
-        async def ainvoke(
-            self, state: TracerState | None, config: RunnableConfig | None = None
-        ) -> dict:
-            del state, config
-            return {
-                "events": [
-                    {
-                        "event_key": "phase:query:step_start:1",
-                        "type": "step_start",
-                        "step": "query",
-                        "sequence": 1,
-                    },
-                    {
-                        "event_key": "recovery:completed:2",
-                        "type": "done",
-                        "data": {"source": "recovered"},
-                        "sequence": 2,
-                    },
-                ]
-            }
-
-    async def seed_run() -> UUID:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            await seed_subject_conversation(pool)
-            run_id = uuid4()
-            run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            await repository.update_checkpoint_pointer(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-                checkpoint_id="checkpoint-1",
-                checkpoint_ns="namespace-1",
-            )
-            await repository.append_event(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                event=EventInput(
-                    event_key="phase:query:step_start:1",
-                    type="step_start",
-                    step="query",
-                ),
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            )
-            with psycopg.connect(
-                langgraph_v2_migrated_database_url, autocommit=True
-            ) as connection:
-                connection.execute(
-                    "UPDATE langgraph_v2.runs SET expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id = %s AND run_id = %s",
-                    ("tenant-a", run_id),
-                )
-            return run_id
-
-    run_id = asyncio.run(seed_run())
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        ReplayGraph(),
-        resume_enabled=True,
-    )
-    with TestClient(app) as client:
-        response = client.post(
-            f"/v2/runs/{run_id}/resume/stream?afterSequence=1",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-    delivered = parse_sse(response.text)
-    assert [event["type"] for event in delivered] == ["error", "done"]
-    assert [event["sequence"] for event in delivered] == [2, 3]
-
-    async def read_events() -> list:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            return await RunEventRepository(pool).list_events("tenant-a", run_id)
-
-    persisted = asyncio.run(read_events())
-    assert [event.event_key for event in persisted] == [
-        "phase:query:step_start:1",
-        "lifecycle:interrupted:1",
-        "recovery:completed:2",
-    ]
-
-
-@pytest.mark.parametrize("initial_status", ["stale_running", "interrupted"])
-def test_resume_route_runs_injected_graph_for_resumable_run(
-    langgraph_v2_migrated_database_url: str,
-    initial_status: str,
-) -> None:
-    class ResumeGraph:
-        async def ainvoke(
-            self, state: TracerState | None, config: RunnableConfig | None = None
-        ) -> dict:
-            del config
-            return {
-                "events": [
-                    {
-                        "event_key": "recovery:completed:2",
-                        "type": "done",
-                        "data": {"source": "recovered"},
-                        "sequence": 1,
-                    }
-                ]
-            }
-
-    async def seed_run() -> UUID:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            await seed_subject_conversation(pool)
-            run_id = uuid4()
-            run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            await repository.update_checkpoint_pointer(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-                checkpoint_id="checkpoint-1",
-                checkpoint_ns="namespace-1",
-            )
-            with psycopg.connect(
-                langgraph_v2_migrated_database_url, autocommit=True
-            ) as connection:
-                if initial_status == "stale_running":
-                    connection.execute(
-                        "UPDATE langgraph_v2.runs SET expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id = %s AND run_id = %s",
-                        ("tenant-a", run_id),
-                    )
-                else:
-                    connection.execute(
-                        "UPDATE langgraph_v2.runs SET status = 'interrupted', owner_instance_id = '', expires_at = clock_timestamp() + interval '30 seconds' WHERE tenant_id = %s AND run_id = %s",
-                        ("tenant-a", run_id),
-                    )
-            return run_id
-
-    run_id = asyncio.run(seed_run())
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        ResumeGraph(),
-        resume_enabled=True,
-    )
-    with TestClient(app) as client:
-        response = client.post(
-            f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-    assert response.status_code == 200
-    assert [event["type"] for event in parse_sse(response.text)] == (
-        ["error", "done"] if initial_status == "stale_running" else ["done"]
-    )
-
-
-def test_resume_route_reads_query_created_root_checkpoint(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    conversation_id = "conversation-query-root-checkpoint"
-    asyncio.run(
-        seed_subject_conversation(
-            langgraph_v2_migrated_database_url, conversation_id
-        )
-    )
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
-
-    with TestClient(app) as client:
-        query_response = client.post(
-            "/v2/query/stream",
-            json={"query": "authoritative", "sessionId": conversation_id},
+        response = getattr(client, method)(
+            path,
             headers={
                 "X-Application-Id": "tenant-a",
                 "X-Subject-Id": "subject-a",
             },
         )
 
-        assert query_response.status_code == 200
-        run_id = UUID(query_response.headers["x-run-id"])
-
-        async def make_run_resumable() -> tuple[str, str]:
-            async with AsyncConnectionPool(
-                langgraph_v2_migrated_database_url, min_size=1, max_size=2
-            ) as pool:
-                repository = RunEventRepository(pool)
-                run = await repository.get_run("tenant-a", run_id)
-                assert run.checkpoint_id is not None
-                assert run.checkpoint_ns == ""
-                async with pool.connection() as connection:
-                    await connection.execute(
-                        """
-                        UPDATE langgraph_v2.runs
-                        SET status = 'running',
-                            expires_at = clock_timestamp() - interval '1 second'
-                        WHERE tenant_id = %s AND run_id = %s
-                        """,
-                        ("tenant-a", run_id),
-                    )
-                return run.checkpoint_id, run.checkpoint_ns
-
-        checkpoint_id, checkpoint_ns = asyncio.run(make_run_resumable())
-        assert checkpoint_ns == ""
-
-        response = client.post(
-            f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-
-    delivered = parse_sse(response.text)
-    assert response.status_code == 200
-    assert response.headers["x-run-id"] == str(run_id)
-    assert delivered
-
-    async def read_resumed_run() -> tuple[str, int, str | None, str | None]:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            run = await RunEventRepository(pool).get_run("tenant-a", run_id)
-            return (
-                run.status,
-                run.execution_epoch,
-                run.checkpoint_id,
-                run.checkpoint_ns,
-            )
-
-    status, epoch, persisted_checkpoint_id, persisted_checkpoint_ns = asyncio.run(
-        read_resumed_run()
-    )
-    assert (status, epoch) == ("completed", 2)
-    assert persisted_checkpoint_id != checkpoint_id
-    assert persisted_checkpoint_ns is not None
-
-
-def test_resume_after_retry_uses_run_turn_for_legacy_checkpoint_result(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    turn_id = uuid4()
-
-    class LegacyResumeGraph:
-        async def ainvoke(
-            self, state: TracerState | None, config: RunnableConfig | None = None
-        ) -> dict:
-            del state, config
-            return {
-                "events": [
-                    {
-                        "event_key": "recovery:completed:legacy",
-                        "type": "done",
-                        "data": {"answer": "recovered answer"},
-                        "sequence": 1,
-                    }
-                ]
-            }
-
-    async def seed_retry_run() -> UUID:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            await seed_subject_conversation(pool)
-            repository = RunEventRepository(pool)
-            messages = ConversationMessageRepository(pool)
-            original_run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=uuid4(),
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            await messages.create_turn(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="conversation-1",
-                run_id=original_run.run_id,
-                turn_id=turn_id,
-                content="question",
-                idempotency_key=f"turn:{turn_id}:user",
-            )
-            retry_run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=uuid4(),
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            await messages.create_turn(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="conversation-1",
-                run_id=retry_run.run_id,
-                turn_id=turn_id,
-                content="question",
-                idempotency_key=f"turn:{turn_id}:user",
-            )
-            await repository.update_checkpoint_pointer(
-                tenant_id="tenant-a",
-                run_id=retry_run.run_id,
-                owner_instance_id=retry_run.owner_instance_id,
-                execution_epoch=retry_run.execution_epoch,
-                checkpoint_id="legacy-checkpoint",
-                checkpoint_ns="legacy-namespace",
-            )
-            async with pool.connection() as connection:
-                await connection.execute(
-                    """
-                    UPDATE langgraph_v2.runs
-                    SET status = 'interrupted', owner_instance_id = ''
-                    WHERE tenant_id = %s AND run_id = %s
-                    """,
-                    ("tenant-a", retry_run.run_id),
-                )
-            return retry_run.run_id
-
-    run_id = asyncio.run(seed_retry_run())
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        LegacyResumeGraph(),
-        resume_enabled=True,
-    )
-    with TestClient(app) as client:
-        response = client.post(
-            f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-
-    assert response.status_code == 200
-
-    async def read_state() -> tuple[str, list]:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            messages = ConversationMessageRepository(pool)
-            run = await repository.get_run("tenant-a", run_id)
-            records = await messages.list_messages(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="conversation-1",
-            )
-            return run.status, [
-                message.role for message in records if message.turn_id == turn_id
-            ]
-
-    assert asyncio.run(read_state()) == ("completed", ["user", "assistant"])
-
-
-def test_resume_route_uses_real_checkpoint_recovery_path(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async def seed_run() -> UUID:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url,
-            min_size=1,
-            max_size=3,
-            kwargs={"autocommit": True, "prepare_threshold": 0},
-        ) as pool:
-            repository = RunEventRepository(pool)
-            await seed_subject_conversation(pool)
-            run_id = uuid4()
-            run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            messages = ConversationMessageRepository(pool)
-            await messages.resolve_conversation(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="conversation-1",
-            )
-            await messages.persist_user_message(
-                tenant_id="tenant-a",
-                conversation_id="conversation-1",
-                run_id=run_id,
-                content="authoritative",
-                idempotency_key=f"run:{run_id}:user",
-            )
-            old_namespace = checkpoint_namespace_for(
-                "tenant-a", str(run_id), run.execution_epoch
-            )
-            old_ids: list[str] = []
-
-            async def old_pointer(checkpoint_id: str, _: str) -> None:
-                old_ids.append(checkpoint_id)
-
-            await AsyncPostgresSaver(cast(Any, pool)).setup()
-            old_graph = build_tracer_graph(
-                FencedAsyncPostgresSaver(
-                    pool,
-                    checkpoint_namespace=old_namespace,
-                    pointer_writer=old_pointer,
-                )
-            )
-            await old_graph.ainvoke(
-                {
-                    "query": "authoritative",
-                    "conversation_id": "conversation-1",
-                    "client_request_id": None,
-                    "events": [],
-                },
-                config=initial_checkpoint_config(
-                    thread_id=thread_id_for("tenant-a", "conversation-1"),
-                    checkpoint_ns=old_namespace,
-                ),
-            )
-            assert old_ids
-            assert old_ids[-1] != old_ids[0]
-            await repository.update_checkpoint_pointer(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-                checkpoint_id=old_ids[0],
-                checkpoint_ns=old_namespace,
-            )
-            with psycopg.connect(
-                langgraph_v2_migrated_database_url, autocommit=True
-            ) as connection:
-                connection.execute(
-                    "UPDATE langgraph_v2.runs SET expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id = %s AND run_id = %s",
-                    ("tenant-a", run_id),
-                )
-            return run_id
-
-    run_id = asyncio.run(seed_run())
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
-    with TestClient(app) as client:
-        response = client.post(
-            f"/v2/runs/{run_id}/resume/stream?afterSequence=10",
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-
-    delivered = parse_sse(response.text)
-    assert response.status_code == 200
-    assert [event["sequence"] for event in delivered] == [11, 12, 13, 14]
-
-    async def read_run_and_events() -> tuple[str, int, list, Any]:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            recovered = await repository.get_run("tenant-a", run_id)
-            events = await repository.list_events("tenant-a", run_id)
-            phase = await PhaseResultRepository(pool).get_completed(
-                "tenant-a", run_id, "query"
-            )
-            return recovered.status, recovered.execution_epoch, events, phase
-
-    status, epoch, events, phase = asyncio.run(read_run_and_events())
-    assert (status, epoch) == ("completed", 2)
-    assert [event.sequence for event in events] == list(range(1, 15))
-    assert phase is not None
-    assert phase.normalized_result == {
-        "query": "authoritative",
-        "history_snapshot": [],
-    }
-
-
-def test_concurrent_resume_requests_have_one_http_winner(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    class SlowResumeGraph:
-        async def ainvoke(
-            self, state: TracerState | None, config: RunnableConfig | None = None
-        ) -> dict:
-            del state, config
-            await asyncio.sleep(0.05)
-            return {
-                "events": [
-                    {
-                        "event_key": "recovery:completed:1",
-                        "type": "done",
-                        "data": {"source": "concurrent-recovery"},
-                        "sequence": 1,
-                    }
-                ]
-            }
-
-    async def seed_run() -> UUID:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            await seed_subject_conversation(pool)
-            run_id = uuid4()
-            run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            await repository.update_checkpoint_pointer(
-                tenant_id="tenant-a",
-                run_id=run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-                checkpoint_id="checkpoint-1",
-                checkpoint_ns="namespace-1",
-            )
-            with psycopg.connect(
-                langgraph_v2_migrated_database_url, autocommit=True
-            ) as connection:
-                connection.execute(
-                    "UPDATE langgraph_v2.runs SET expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id = %s AND run_id = %s",
-                    ("tenant-a", run_id),
-                )
-            return run_id
-
-    run_id = asyncio.run(seed_run())
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        SlowResumeGraph(),
-        resume_enabled=True,
-    )
-    with TestClient(app) as client:
-
-        def resume() -> int:
-            return client.post(
-                f"/v2/runs/{run_id}/resume/stream",
-                headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-            ).status_code
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            statuses = list(executor.map(lambda _: resume(), range(2)))
-
-    assert sorted(statuses) == [200, 409]
-
-    async def read_run_and_events() -> tuple[str, int, list]:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            recovered = await repository.get_run("tenant-a", run_id)
-            events = await repository.list_events("tenant-a", run_id)
-            return recovered.status, recovered.execution_epoch, events
-
-    status, epoch, events = asyncio.run(read_run_and_events())
-    assert (status, epoch) == ("completed", 2)
-    assert [event.event_key for event in events] == [
-        "lifecycle:interrupted:1",
-        "recovery:completed:1",
-    ]
+    assert response.status_code == 404
 
 
 def test_completed_tracer_persists_its_run_and_every_delivered_event(

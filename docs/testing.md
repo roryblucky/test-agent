@@ -25,10 +25,10 @@ LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms
 ```
 
 This gate covers the assembled route flag, Tenant isolation,
-persist-before-deliver, the Linear phases, history, replay/live following,
-explicit resume, and cancellation with deterministic dependencies. It is a
-functional gate only; admission, `429` capacity behavior, load, and production
-default enablement remain outside the Task 28 UAT scope.
+persist-before-deliver, the Linear phases, history, and the public query and
+thread resume streams with deterministic dependencies. It is a functional gate
+only; admission, `429` capacity behavior, load, and production default
+enablement remain outside the Task 28 UAT scope.
 
 ## Disposable PostgreSQL fixture
 
