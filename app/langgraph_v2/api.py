@@ -858,16 +858,19 @@ async def _authorize_thread_resume_target(
     message_repository: ConversationMessageRepository,
     context: TrustedRequestContext,
     thread_id: str,
+    expected_turn_id: uuid.UUID,
 ) -> ThreadResumeTarget:
     """Authorize one thread Resume and reject non-recoverable checkpoints."""
     conversation = await message_repository.get_conversation_by_thread(
         context=context,
         thread_id=thread_id,
     )
-    config = initial_checkpoint_config(
-        thread_id=conversation.thread_id,
-        checkpoint_ns="",
+    turn = await message_repository.get_turn_for_resume(
+        context=context,
+        conversation_id=conversation.conversation_id,
+        turn_id=expected_turn_id,
     )
+    config = initial_checkpoint_config(thread_id=conversation.thread_id, checkpoint_ns="")
     try:
         snapshot = await checkpoint_graph.aget_state(config)
     except ValueError as error:
@@ -884,18 +887,28 @@ async def _authorize_thread_resume_target(
         raise ThreadResumeConflict("checkpoint belongs to another Conversation")
 
     turn_id = _checkpoint_turn_id(snapshot.values)
-    turn = await message_repository.get_turn_for_resume(
-        context=context,
-        conversation_id=conversation.conversation_id,
-        turn_id=turn_id,
-    )
+    if turn_id != expected_turn_id:
+        raise ThreadResumeConflict("checkpoint does not match the expected Turn")
     latest_turn = await message_repository.get_latest_turn(
         context=context,
         conversation_id=conversation.conversation_id,
     )
     if latest_turn.turn_id != turn.turn_id:
         raise ThreadResumeConflict("checkpoint Turn has been superseded")
-    return ThreadResumeTarget(conversation=conversation, turn=turn, config=config)
+    checkpoint_configurable = snapshot.config.get("configurable", {})
+    checkpoint_id = checkpoint_configurable.get("checkpoint_id")
+    checkpoint_ns = checkpoint_configurable.get("checkpoint_ns")
+    if not isinstance(checkpoint_id, str) or not isinstance(checkpoint_ns, str):
+        raise ThreadResumeConflict("checkpoint is missing a valid checkpoint config")
+    return ThreadResumeTarget(
+        conversation=conversation,
+        turn=turn,
+        config=exact_checkpoint_config(
+            thread_id=conversation.thread_id,
+            checkpoint_ns=checkpoint_ns,
+            checkpoint_id=checkpoint_id,
+        ),
+    )
 
 
 def create_tracer_router(
@@ -1195,6 +1208,7 @@ def create_tracer_router(
         request_context: Annotated[
             TrustedRequestContext, Depends(get_trusted_request_context)
         ],
+        expected_turn_id: Annotated[uuid.UUID, Query(alias="expectedTurnId")],
     ) -> StreamingResponse:
         """Recover an authorized Conversation thread from its latest checkpoint."""
         x_application_id = request_context.tenant_id
@@ -1277,6 +1291,7 @@ def create_tracer_router(
                 message_repository=message_repository,
                 context=request_context,
                 thread_id=thread_id,
+                expected_turn_id=expected_turn_id,
             )
         except ConversationNotFound as error:
             raise HTTPException(status_code=404, detail="Thread not found") from error

@@ -17,6 +17,7 @@ LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms
   tests/integration/test_langgraph_v2_tracer.py \
   tests/integration/test_langgraph_v2_history_stream.py \
   tests/integration/test_langgraph_v2_replay.py \
+  tests/integration/test_langgraph_v2_thread_resume.py \
   tests/integration/test_langgraph_v2_live_follow.py \
   tests/integration/test_langgraph_v2_cancellation.py \
   tests/integration/test_langgraph_v2_finalization.py \
