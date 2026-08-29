@@ -176,6 +176,83 @@ class ConversationMessageRepository:
             raise ResumeExpired(str(turn_id))
         return turn
 
+    async def get_latest_turn(
+        self,
+        *,
+        context: TrustedRequestContext,
+        conversation_id: str,
+    ) -> TurnRecord:
+        """Return the latest authorized user Message Turn for a Conversation."""
+        await self.get_conversation(context=context, conversation_id=conversation_id)
+        async with self._pool.connection() as connection:
+            async with connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT tenant_id, conversation_id, turn_id, run_id, created_at,
+                           resume_deadline
+                    FROM langgraph_v2.messages
+                    WHERE tenant_id = %s AND conversation_id = %s
+                      AND role = 'user'
+                    ORDER BY created_at DESC, message_id DESC
+                    LIMIT 1
+                    """,
+                    (context.tenant_id, conversation_id),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            raise TurnNotFound(conversation_id)
+        return TurnRecord.model_validate(row)
+
+    async def associate_run_with_turn(
+        self,
+        *,
+        context: TrustedRequestContext,
+        conversation_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+        turn_id: UUID,
+    ) -> None:
+        """Bind a request-owned Run to an existing authorized Turn."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                await self._resolve_conversation_in_transaction(
+                    connection,
+                    context=context,
+                    conversation_id=conversation_id,
+                )
+                await self._require_user_turn_in_transaction(
+                    connection,
+                    tenant_id=context.tenant_id,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                )
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE langgraph_v2.runs
+                        SET turn_id = %s
+                        WHERE tenant_id = %s AND run_id = %s
+                          AND conversation_id = %s
+                          AND owner_instance_id = %s
+                          AND execution_epoch = %s
+                          AND status = 'running'
+                          AND expires_at > clock_timestamp()
+                        RETURNING turn_id
+                        """,
+                        (
+                            turn_id,
+                            context.tenant_id,
+                            run_id,
+                            conversation_id,
+                            owner_instance_id,
+                            execution_epoch,
+                        ),
+                    )
+                    row = await cursor.fetchone()
+        if row is None:
+            raise ClaimFenced(str(run_id))
+
     async def resolve_conversation(
         self,
         *,

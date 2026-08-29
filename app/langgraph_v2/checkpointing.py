@@ -90,7 +90,9 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
         translating only the checkpoint persistence config.
         """
         configurable = dict(config.get("configurable", {}))
-        configurable["checkpoint_ns"] = namespace or self._checkpoint_namespace
+        configurable["checkpoint_ns"] = (
+            self._checkpoint_namespace if namespace is None else namespace
+        )
         return {**config, "configurable": configurable}
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:

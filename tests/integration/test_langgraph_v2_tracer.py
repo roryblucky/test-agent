@@ -935,6 +935,7 @@ def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
         if getattr(route, "path", "").startswith("/v2/")
     } == {
         "/v2/query/stream",
+        "/v2/threads/{thread_id}/resume/stream",
         "/v2/runs/{run_id}/stream",
         "/v2/runs/{run_id}/resume/stream",
         "/v2/runs/{run_id}/cancel",
@@ -952,6 +953,9 @@ def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
 def test_resume_route_is_default_off() -> None:
     app = FastAPI()
     register_v2_routes(app, enabled=True)
+    assert "/v2/threads/{thread_id}/resume/stream" not in {
+        getattr(route, "path", None) for route in app.routes
+    }
     assert "/v2/runs/{run_id}/resume/stream" not in {
         getattr(route, "path", None) for route in app.routes
     }

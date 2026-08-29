@@ -9,6 +9,7 @@ import socket
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Coroutine
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Annotated, Any, Protocol, cast
 
@@ -39,6 +40,9 @@ from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
     ConversationRecord,
+    ResumeExpired,
+    TurnNotFound,
+    TurnRecord,
     turn_id_for_client_request,
 )
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
@@ -276,8 +280,10 @@ async def _persist_event_record(
         step=event.step,
         data=event.data,
     )
-    if event.type == "done" and isinstance(event.data, dict) and isinstance(
-        event.data.get("answer"), str
+    if (
+        event.type == "done"
+        and isinstance(event.data, dict)
+        and isinstance(event.data.get("answer"), str)
     ):
         try:
             resolved_turn_id = uuid.UUID(str(turn_id))
@@ -520,6 +526,23 @@ class TracerInvoker(Protocol):
 
 
 type TracerGraph = RequestOwnedGraph | TracerInvoker
+
+_PRE_ANSWER_RESUME_NODES = frozenset(
+    {"pre_moderation", "question_refinement", "retrieval", "reranking", "answer"}
+)
+
+
+class ThreadResumeConflict(RuntimeError):
+    """A thread checkpoint cannot be recovered by the pre-Answer Resume route."""
+
+
+@dataclass(frozen=True)
+class ThreadResumeTarget:
+    """Authorized checkpoint target for a request-owned thread Resume."""
+
+    conversation: ConversationRecord
+    turn: TurnRecord
+    config: RunnableConfig
 
 
 async def _stream_unseen_events(
@@ -821,6 +844,60 @@ async def _authorized_run_conversation(
     return conversation
 
 
+def _checkpoint_turn_id(values: dict[str, Any]) -> uuid.UUID:
+    """Extract the Turn bound into the latest checkpoint state."""
+    try:
+        return uuid.UUID(str(values["turn_id"]))
+    except (KeyError, TypeError, ValueError) as error:
+        raise ThreadResumeConflict("checkpoint is missing a valid turn_id") from error
+
+
+async def _authorize_thread_resume_target(
+    *,
+    checkpoint_graph: Any,
+    message_repository: ConversationMessageRepository,
+    context: TrustedRequestContext,
+    thread_id: str,
+) -> ThreadResumeTarget:
+    """Authorize one thread Resume and reject non-recoverable checkpoints."""
+    conversation = await message_repository.get_conversation_by_thread(
+        context=context,
+        thread_id=thread_id,
+    )
+    config = initial_checkpoint_config(
+        thread_id=conversation.thread_id,
+        checkpoint_ns="",
+    )
+    try:
+        snapshot = await checkpoint_graph.aget_state(config)
+    except ValueError as error:
+        raise ThreadResumeConflict(str(error)) from error
+    if snapshot.metadata is None:
+        raise ConversationNotFound(thread_id)
+    if not snapshot.next:
+        raise ThreadResumeConflict("checkpoint is already complete")
+    if any(node not in _PRE_ANSWER_RESUME_NODES for node in snapshot.next):
+        raise ThreadResumeConflict("checkpoint is not before the Answer phase")
+    if not isinstance(snapshot.values, dict):
+        raise ThreadResumeConflict("checkpoint state is not a mapping")
+    if snapshot.values.get("conversation_id") != conversation.conversation_id:
+        raise ThreadResumeConflict("checkpoint belongs to another Conversation")
+
+    turn_id = _checkpoint_turn_id(snapshot.values)
+    turn = await message_repository.get_turn_for_resume(
+        context=context,
+        conversation_id=conversation.conversation_id,
+        turn_id=turn_id,
+    )
+    latest_turn = await message_repository.get_latest_turn(
+        context=context,
+        conversation_id=conversation.conversation_id,
+    )
+    if latest_turn.turn_id != turn.turn_id:
+        raise ThreadResumeConflict("checkpoint Turn has been superseded")
+    return ThreadResumeTarget(conversation=conversation, turn=turn, config=config)
+
+
 def create_tracer_router(
     graph: TracerGraph | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
@@ -996,11 +1073,7 @@ def create_tracer_router(
                                 checkpoint_ns=checkpoint_ns,
                             )
 
-                        checkpoint_ns = checkpoint_namespace_for(
-                            x_application_id,
-                            str(run_id),
-                            claim.execution_epoch,
-                        )
+                        checkpoint_ns = ""
                         saver = FencedAsyncPostgresSaver(
                             pool,
                             checkpoint_namespace=checkpoint_ns,
@@ -1112,6 +1185,277 @@ def create_tracer_router(
                 "X-Conversation-Id": conversation_id,
                 "X-Turn-Id": str(turn_id),
                 "X-Thread-Id": conversation.thread_id,
+            },
+        )
+
+    @router.post("/v2/threads/{thread_id}/resume/stream")
+    async def thread_resume_stream(
+        thread_id: str,
+        http_request: Request,
+        request_context: Annotated[
+            TrustedRequestContext, Depends(get_trusted_request_context)
+        ],
+    ) -> StreamingResponse:
+        """Recover an authorized Conversation thread from its latest checkpoint."""
+        x_application_id = request_context.tenant_id
+        _ensure_tenant_available(http_request.app, x_application_id)
+        runtime = _local_runtime(http_request.app)
+        if not runtime.accepting:
+            raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
+        configured_pool = getattr(
+            http_request.app.state,
+            "langgraph_v2_postgres_pool",
+            None,
+        )
+        if configured_pool is None:
+            raise HTTPException(
+                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
+            )
+        configured_checkpointer = getattr(
+            http_request.app.state,
+            "langgraph_v2_checkpointer",
+            None,
+        )
+        if configured_checkpointer is None:
+            raise HTTPException(
+                status_code=500, detail="LangGraph v2 checkpointer is not configured"
+            )
+        pool = cast(AsyncConnectionPool[Any], configured_pool)
+        wakeups = _live_events(http_request.app)
+        repository = RunEventRepository(pool, live_events=wakeups)
+        cancellation_repository = CancellationRepository(pool, wakeups=wakeups)
+        message_repository = _message_repository(http_request.app, pool)
+        configured_refinement_actor = _resolve_refinement_actor(
+            http_request.app,
+            x_application_id,
+            refinement_actor,
+        )
+        configured_answer_actor = _resolve_answer_actor(
+            http_request.app, x_application_id, answer_actor
+        )
+        configured_groundedness_actor = _resolve_groundedness_actor_safely(
+            http_request.app, x_application_id, groundedness_actor
+        )
+        configured_output_assessment_audit = _resolve_output_assessment_audit(
+            http_request.app, output_assessment_audit
+        )
+        (
+            configured_retriever,
+            configured_ranker,
+            configured_moderation,
+        ) = _resolve_phase_providers(
+            http_request.app,
+            x_application_id,
+            retriever=retriever,
+            ranker=ranker,
+            moderation_provider=moderation_provider,
+        )
+        checkpoint_graph = build_tracer_graph(
+            configured_checkpointer,
+            phase_context=PhaseExecutionContext(
+                repository=PhaseResultRepository(pool, live_events=wakeups),
+                artifact_repository=ArtifactRepository(pool),
+                message_repository=message_repository,
+                request_context=request_context,
+                history_token_budget=history_token_budget,
+                tenant_id=x_application_id,
+                run_id=uuid.UUID(int=0),
+                owner_instance_id="",
+                execution_epoch=0,
+                output_assessment_audit=configured_output_assessment_audit,
+            ),
+            refinement_actor=configured_refinement_actor,
+            retriever=configured_retriever,
+            ranker=configured_ranker,
+            moderation_provider=configured_moderation,
+            answer_actor=configured_answer_actor,
+            groundedness_actor=configured_groundedness_actor,
+        )
+        try:
+            target = await _authorize_thread_resume_target(
+                checkpoint_graph=checkpoint_graph,
+                message_repository=message_repository,
+                context=request_context,
+                thread_id=thread_id,
+            )
+        except ConversationNotFound as error:
+            raise HTTPException(status_code=404, detail="Thread not found") from error
+        except ResumeExpired as error:
+            raise HTTPException(status_code=410, detail="Turn expired") from error
+        except (ThreadResumeConflict, TurnNotFound) as error:
+            raise HTTPException(
+                status_code=409, detail="Thread is not resumable"
+            ) from error
+
+        run_id = uuid.uuid4()
+        cancellation_observer = CancellationObserver(
+            cancellation_repository,
+            wakeups,
+            tenant_id=x_application_id,
+            run_id=run_id,
+        )
+
+        async def event_generator() -> AsyncIterator[str]:
+            claim = None
+            graph_stream: AsyncIterator[str] | None = None
+            heartbeat_task: asyncio.Task[None] | None = None
+            terminal = False
+            primary_error: BaseException | None = None
+            try:
+                claim = await repository.create_run(
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                    conversation_id=target.conversation.conversation_id,
+                    owner_instance_id=_INSTANCE_ID,
+                )
+                await message_repository.associate_run_with_turn(
+                    context=request_context,
+                    conversation_id=target.conversation.conversation_id,
+                    run_id=run_id,
+                    owner_instance_id=claim.owner_instance_id,
+                    execution_epoch=claim.execution_epoch,
+                    turn_id=target.turn.turn_id,
+                )
+                await cancellation_observer.start()
+                heartbeat_task = asyncio.create_task(
+                    _refresh_claim(
+                        repository,
+                        x_application_id,
+                        run_id,
+                        claim.owner_instance_id,
+                        claim.execution_epoch,
+                    )
+                )
+
+                async def write_checkpoint_pointer(
+                    checkpoint_id: str,
+                    checkpoint_ns: str,
+                ) -> None:
+                    await repository.update_checkpoint_pointer(
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                        checkpoint_id=checkpoint_id,
+                        checkpoint_ns=checkpoint_ns,
+                    )
+
+                selected_graph = graph or build_tracer_graph(
+                    FencedAsyncPostgresSaver(
+                        pool,
+                        checkpoint_namespace="",
+                        pointer_writer=write_checkpoint_pointer,
+                    ),
+                    phase_context=PhaseExecutionContext(
+                        repository=PhaseResultRepository(pool, live_events=wakeups),
+                        artifact_repository=ArtifactRepository(pool),
+                        message_repository=message_repository,
+                        request_context=request_context,
+                        history_token_budget=history_token_budget,
+                        current_turn_id=target.turn.turn_id,
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                        cancellation_check=_resolve_cancellation_check(
+                            http_request.app,
+                            x_application_id,
+                            run_id,
+                            cancellation_observer,
+                        ),
+                        output_assessment_audit=configured_output_assessment_audit,
+                    ),
+                    refinement_actor=configured_refinement_actor,
+                    retriever=configured_retriever,
+                    ranker=configured_ranker,
+                    moderation_provider=configured_moderation,
+                    answer_actor=configured_answer_actor,
+                    groundedness_actor=configured_groundedness_actor,
+                )
+
+                async def persist_event(event: TracerStreamEvent) -> None:
+                    nonlocal terminal
+                    await _persist_event_record(
+                        repository,
+                        message_repository,
+                        event,
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        conversation_id=target.conversation.conversation_id,
+                        turn_id=target.turn.turn_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                    )
+                    if event.type in {"done", "error"}:
+                        terminal = True
+
+                graph_stream = stream_graph(
+                    cast(RequestOwnedGraph, selected_graph),
+                    None,
+                    config=target.config,
+                    event_sink=persist_event,
+                )
+                async for frame in graph_stream:
+                    yield frame
+            except CancellationObserved:
+                if claim is not None:
+                    stopped = await cancellation_repository.apply_if_requested(
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                    )
+                    if stopped is not None:
+                        terminal = True
+                        yield TracerStreamEvent(
+                            event_key=stopped.event_key,
+                            type="stopped",
+                            sequence=stopped.sequence,
+                            data=stopped.data,
+                        ).to_sse()
+            except asyncio.CancelledError as error:
+                primary_error = error
+                raise
+            except GraphStreamCleanupError as error:
+                primary_error = error
+                raise
+            except Exception as error:
+                if claim is None:
+                    raise
+                if not terminal:
+                    with suppress(ClaimFenced, RunNotFound):
+                        failure = await _persist_setup_failure(
+                            repository,
+                            tenant_id=x_application_id,
+                            run_id=run_id,
+                            owner_instance_id=claim.owner_instance_id,
+                            execution_epoch=claim.execution_epoch,
+                            message=str(error) or "LangGraph execution failed.",
+                        )
+                        terminal = True
+                        yield failure
+            finally:
+                await _cleanup_request_execution(
+                    graph_stream,
+                    cancellation_observer,
+                    heartbeat_task,
+                    repository,
+                    claim=claim,
+                    terminal=terminal,
+                    primary_error=primary_error,
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                )
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Conversation-Id": target.conversation.conversation_id,
+                "X-Turn-Id": str(target.turn.turn_id),
+                "X-Thread-Id": target.conversation.thread_id,
             },
         )
 
@@ -1459,6 +1803,7 @@ def register_v2_routes(
         )
         disabled_control_paths: set[str] = set()
         if not resume_enabled:
+            disabled_control_paths.add("/v2/threads/{thread_id}/resume/stream")
             disabled_control_paths.add("/v2/runs/{run_id}/resume/stream")
         if not replay_enabled:
             disabled_control_paths.add("/v2/runs/{run_id}/stream")
