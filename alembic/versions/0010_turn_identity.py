@@ -26,10 +26,12 @@ def upgrade() -> None:
         WHERE turn_id IS NULL
         """
     )
+    # Legacy Turns have no reliable deployment TTL history. Expire them at
+    # their existing creation time rather than granting a new resume window.
     op.execute(
         """
         UPDATE langgraph_v2.messages
-        SET resume_deadline = created_at + interval '1 hour'
+        SET resume_deadline = created_at
         WHERE role = 'user' AND resume_deadline IS NULL
         """
     )

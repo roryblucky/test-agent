@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unicodedata
 from typing import Any, NotRequired, TypedDict, cast
+from uuid import UUID
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -108,7 +109,10 @@ async def _query(
             history = select_sliding_window_history(
                 messages,
                 token_budget=phase_context.history_token_budget,
-                current_run_id=phase_context.run_id,
+                current_turn_id=phase_context.current_turn_id
+                or (
+                    UUID(state["turn_id"]) if state.get("turn_id") is not None else None
+                ),
             )
         return PhaseResultInput(
             phase_name="query",

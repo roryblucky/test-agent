@@ -110,6 +110,7 @@ class PhaseExecutionContext:
     run_id: UUID
     owner_instance_id: str
     execution_epoch: int
+    current_turn_id: UUID | None = None
     artifact_repository: ArtifactStore | None = None
     message_repository: ConversationMessageRepository | None = None
     request_context: TrustedRequestContext | None = None

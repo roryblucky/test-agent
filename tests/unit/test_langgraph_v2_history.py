@@ -15,13 +15,14 @@ def _message(
     role: str,
     content: str,
     order: int,
+    turn_number: int | None = None,
 ) -> MessageRecord:
     return MessageRecord(
         tenant_id="tenant-a",
         message_id=UUID(int=order),
         conversation_id="conversation-1",
         run_id=UUID(int=run_number),
-        turn_id=UUID(int=run_number),
+        turn_id=UUID(int=turn_number or run_number),
         role=role,
         content=content,
         idempotency_key=f"{run_number}:{role}",
@@ -73,8 +74,8 @@ def test_old_turns_are_evicted_without_splitting_recent_turns() -> None:
     assert estimate_history_tokens(selected) == 20
 
 
-def test_current_and_incomplete_runs_never_enter_history() -> None:
-    current_run_id = UUID(int=3)
+def test_current_and_incomplete_turns_never_enter_history() -> None:
+    current_turn_id = UUID(int=3)
     messages = [
         *_turn(1, "complete", "answer", 1),
         _message(2, "user", "failed input", 3),
@@ -85,9 +86,22 @@ def test_current_and_incomplete_runs_never_enter_history() -> None:
     selected = select_sliding_window_history(
         messages,
         token_budget=100,
-        current_run_id=current_run_id,
+        current_turn_id=current_turn_id,
     )
 
     assert [turn.model_dump() for turn in selected] == [
         {"user": "complete", "assistant": "answer"}
+    ]
+
+
+def test_history_groups_retried_messages_by_turn_not_run() -> None:
+    messages = [
+        _message(1, "user", "question", 1, turn_number=9),
+        _message(2, "assistant", "answer", 2, turn_number=9),
+    ]
+
+    selected = select_sliding_window_history(messages, token_budget=100)
+
+    assert [turn.model_dump() for turn in selected] == [
+        {"user": "question", "assistant": "answer"}
     ]

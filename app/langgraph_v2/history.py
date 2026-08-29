@@ -77,30 +77,30 @@ def select_sliding_window_history(
     messages: Sequence[MessageRecord],
     *,
     token_budget: int,
-    current_run_id: UUID | None = None,
+    current_turn_id: UUID | None = None,
 ) -> list[ConversationTurn]:
     """Select the newest complete turns under the deterministic token budget."""
     if token_budget < 0:
         raise ValueError("token_budget must not be negative")
 
-    messages_by_run: dict[UUID, dict[str, MessageRecord]] = defaultdict(dict)
-    run_order: list[UUID] = []
+    messages_by_turn: dict[UUID, dict[str, MessageRecord]] = defaultdict(dict)
+    turn_order: list[UUID] = []
     for message in sorted(
         messages, key=lambda item: (item.created_at, item.message_id)
     ):
-        if message.run_id == current_run_id:
+        if message.turn_id == current_turn_id:
             continue
-        if message.run_id not in messages_by_run:
-            run_order.append(message.run_id)
-        messages_by_run[message.run_id][message.role] = message
+        if message.turn_id not in messages_by_turn:
+            turn_order.append(message.turn_id)
+        messages_by_turn[message.turn_id][message.role] = message
 
     complete_turns = [
         ConversationTurn(
-            user=messages_by_run[run_id]["user"].content,
-            assistant=messages_by_run[run_id]["assistant"].content,
+            user=messages_by_turn[turn_id]["user"].content,
+            assistant=messages_by_turn[turn_id]["assistant"].content,
         )
-        for run_id in run_order
-        if messages_by_run[run_id].keys() >= {"user", "assistant"}
+        for turn_id in turn_order
+        if messages_by_turn[turn_id].keys() >= {"user", "assistant"}
     ]
 
     selected: list[ConversationTurn] = []

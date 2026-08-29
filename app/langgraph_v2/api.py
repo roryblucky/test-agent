@@ -264,8 +264,8 @@ async def _persist_result_events(
                 event.data.get("answer"), str
             ):
                 try:
-                    turn_id = uuid.UUID(str(result["turn_id"]))
-                except (KeyError, TypeError, ValueError) as error:
+                    turn_id = uuid.UUID(str(result.get("turn_id", expected_turn_id)))
+                except (TypeError, ValueError) as error:
                     raise ValueError(
                         "completed Graph state is missing a valid turn_id"
                     ) from error
@@ -837,6 +837,7 @@ def create_tracer_router(
                     message_repository=message_repository,
                     request_context=request_context,
                     history_token_budget=history_token_budget,
+                    current_turn_id=turn_id,
                     tenant_id=x_application_id,
                     run_id=run_id,
                     owner_instance_id=claim.owner_instance_id,
@@ -987,6 +988,7 @@ def create_tracer_router(
                 run_id=run_id,
                 owner_instance_id=_INSTANCE_ID,
             )
+            resume_turn_id = await repository.get_run_turn_id(x_application_id, run_id)
         except (RunNotFound, ConversationNotFound) as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
         except ResumeConflict as error:
@@ -1066,6 +1068,7 @@ def create_tracer_router(
                         message_repository=message_repository,
                         request_context=request_context,
                         history_token_budget=history_token_budget,
+                        current_turn_id=resume_turn_id,
                         tenant_id=x_application_id,
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
@@ -1110,7 +1113,7 @@ def create_tracer_router(
                     tenant_id=x_application_id,
                     run_id=run_id,
                     conversation_id=claim.conversation_id,
-                    require_turn_run_match=True,
+                    expected_turn_id=resume_turn_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,

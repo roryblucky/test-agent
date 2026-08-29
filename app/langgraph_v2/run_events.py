@@ -230,6 +230,27 @@ class RunEventRepository:
             raise RunNotFound(str(run_id))
         return RunRecord.model_validate(row)
 
+    async def get_run_turn_id(self, tenant_id: str, run_id: UUID) -> UUID | None:
+        """Return the durable Turn associated with a transitional Run."""
+        async with self._pool.connection() as connection:
+            async with connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT COALESCE(runs.turn_id, messages.turn_id) AS turn_id
+                    FROM langgraph_v2.runs
+                    LEFT JOIN langgraph_v2.messages AS messages
+                      ON messages.tenant_id = runs.tenant_id
+                     AND messages.run_id = runs.run_id
+                     AND messages.role = 'user'
+                    WHERE runs.tenant_id = %s AND runs.run_id = %s
+                    """,
+                    (tenant_id, run_id),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            raise RunNotFound(str(run_id))
+        return row["turn_id"]
+
     async def resume_run(
         self,
         *,

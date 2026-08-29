@@ -127,6 +127,12 @@ class ConversationMessageRepository:
                     content=content,
                     idempotency_key=idempotency_key,
                 )
+                await self._associate_run_turn_in_transaction(
+                    connection,
+                    tenant_id=context.tenant_id,
+                    run_id=run_id,
+                    turn_id=turn_id,
+                )
                 return await self._get_turn_in_transaction(
                     connection,
                     tenant_id=context.tenant_id,
@@ -306,15 +312,41 @@ class ConversationMessageRepository:
         turn_id: UUID | None = None,
     ) -> MessageRecord:
         """Write the user Message inside a caller-owned start transaction."""
-        return await self._persist_message_in_transaction(
+        resolved_turn_id = turn_id or run_id
+        message = await self._persist_message_in_transaction(
             connection,
             tenant_id=tenant_id,
             conversation_id=conversation_id,
             run_id=run_id,
-            turn_id=turn_id or run_id,
+            turn_id=resolved_turn_id,
             role="user",
             content=content,
             idempotency_key=idempotency_key,
+        )
+        await self._associate_run_turn_in_transaction(
+            connection,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            turn_id=resolved_turn_id,
+        )
+        return message
+
+    async def _associate_run_turn_in_transaction(
+        self,
+        connection: Any,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        turn_id: UUID,
+    ) -> None:
+        """Record the Turn on a transitional Run when that Run exists."""
+        await connection.execute(
+            """
+            UPDATE langgraph_v2.runs
+            SET turn_id = %s
+            WHERE tenant_id = %s AND run_id = %s
+            """,
+            (turn_id, tenant_id, run_id),
         )
 
     async def persist_assistant_message_after_completion(

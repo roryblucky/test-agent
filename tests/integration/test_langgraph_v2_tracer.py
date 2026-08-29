@@ -1366,6 +1366,119 @@ def test_resume_route_runs_injected_graph_for_resumable_run(
     )
 
 
+def test_resume_after_retry_uses_run_turn_for_legacy_checkpoint_result(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    turn_id = uuid4()
+
+    class LegacyResumeGraph:
+        async def ainvoke(
+            self, state: TracerState | None, config: RunnableConfig | None = None
+        ) -> dict:
+            del state, config
+            return {
+                "events": [
+                    {
+                        "event_key": "recovery:completed:legacy",
+                        "type": "done",
+                        "data": {"answer": "recovered answer"},
+                        "sequence": 1,
+                    }
+                ]
+            }
+
+    async def seed_retry_run() -> UUID:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            await seed_subject_conversation(pool)
+            repository = RunEventRepository(pool)
+            messages = ConversationMessageRepository(pool)
+            original_run = await repository.create_run(
+                tenant_id="tenant-a",
+                run_id=uuid4(),
+                conversation_id="conversation-1",
+                owner_instance_id="instance-a",
+            )
+            await messages.create_turn(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="conversation-1",
+                run_id=original_run.run_id,
+                turn_id=turn_id,
+                content="question",
+                idempotency_key=f"turn:{turn_id}:user",
+            )
+            retry_run = await repository.create_run(
+                tenant_id="tenant-a",
+                run_id=uuid4(),
+                conversation_id="conversation-1",
+                owner_instance_id="instance-a",
+            )
+            await messages.create_turn(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="conversation-1",
+                run_id=retry_run.run_id,
+                turn_id=turn_id,
+                content="question",
+                idempotency_key=f"turn:{turn_id}:user",
+            )
+            await repository.update_checkpoint_pointer(
+                tenant_id="tenant-a",
+                run_id=retry_run.run_id,
+                owner_instance_id=retry_run.owner_instance_id,
+                execution_epoch=retry_run.execution_epoch,
+                checkpoint_id="legacy-checkpoint",
+                checkpoint_ns="legacy-namespace",
+            )
+            async with pool.connection() as connection:
+                await connection.execute(
+                    """
+                    UPDATE langgraph_v2.runs
+                    SET status = 'interrupted', owner_instance_id = ''
+                    WHERE tenant_id = %s AND run_id = %s
+                    """,
+                    ("tenant-a", retry_run.run_id),
+                )
+            return retry_run.run_id
+
+    run_id = asyncio.run(seed_retry_run())
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        LegacyResumeGraph(),
+        resume_enabled=True,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/runs/{run_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+
+    assert response.status_code == 200
+
+    async def read_state() -> tuple[str, list]:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            repository = RunEventRepository(pool)
+            messages = ConversationMessageRepository(pool)
+            run = await repository.get_run("tenant-a", run_id)
+            records = await messages.list_messages(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="conversation-1",
+            )
+            return run.status, [
+                message.role for message in records if message.turn_id == turn_id
+            ]
+
+    assert asyncio.run(read_state()) == ("completed", ["user", "assistant"])
+
+
 def test_resume_route_uses_real_checkpoint_recovery_path(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
