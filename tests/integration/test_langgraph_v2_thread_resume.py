@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -16,20 +18,39 @@ from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import initial_checkpoint_config
+from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     MessageRecord,
     TurnRecord,
 )
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.groundedness import GroundednessResult
 from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
+from app.langgraph_v2.post_moderation import ModerationDecision
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import (
     parse_sse,
     persistent_tracer_app,
+    seed_subject_conversation,
+    stream_request,
+    v2_stream_endpoint,
 )
+
+
+def _event_frame(frame: str) -> dict[str, object]:
+    return json.loads(frame.removeprefix("data: ").strip())
+
+
+def _thread_resume_endpoint(app):
+    return next(
+        route.endpoint
+        for route in app.router.routes
+        if getattr(route, "path", None) == "/v2/threads/{thread_id}/resume/stream"
+    )
 
 
 class _AnswerActor:
@@ -58,6 +79,121 @@ class _AnswerActor:
         yield AnswerStreamChunk(delta="recovered ")
         yield AnswerStreamChunk(delta="answer")
         yield AnswerStreamChunk(result=result)
+
+
+class _StreamingAnswerActor:
+    def __init__(
+        self,
+        *,
+        answer: str,
+        stream_tokens: list[str],
+        block_after_first_token: bool = False,
+    ) -> None:
+        self.answer_text = answer
+        self.stream_tokens = stream_tokens
+        self.block_after_first_token = block_after_first_token
+        self.calls = 0
+        self.blocked_on_followup_read = asyncio.Event()
+        self.close_completed = asyncio.Event()
+
+    async def answer(
+        self,
+        query: str,
+        documents: list[Document],
+        history: Sequence[ConversationTurn],
+    ) -> AnswerResult:
+        self.calls += 1
+        assert query == "hello"
+        assert [document.id for document in documents] == ["mock-doc-1"]
+        assert history == []
+        return AnswerResult(answer=self.answer_text)
+
+    async def answer_stream(
+        self,
+        query: str,
+        documents: list[Document],
+        history: Sequence[ConversationTurn],
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        if self.block_after_first_token:
+            yield AnswerStreamChunk(delta=self.stream_tokens[0])
+            self.blocked_on_followup_read.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.close_completed.set()
+            return
+        for token in self.stream_tokens:
+            yield AnswerStreamChunk(delta=token)
+        yield AnswerStreamChunk(result=result)
+
+
+class _AssertingGroundednessActor:
+    def __init__(self, expected_answer: str) -> None:
+        self.calls = 0
+        self.expected_answer = expected_answer
+
+    async def evaluate(
+        self, answer: str, documents: list[Document]
+    ) -> GroundednessResult:
+        self.calls += 1
+        assert answer == self.expected_answer
+        assert [document.id for document in documents] == ["mock-doc-1"]
+        return GroundednessResult(is_grounded=True, score=1.0, details="advisory")
+
+
+class _AssertingModerationProvider:
+    def __init__(self, expected_answer: str) -> None:
+        self.calls = 0
+        self.seen_texts: list[str] = []
+        self.expected_answer = expected_answer
+
+    async def check(self, text: str) -> ModerationDecision:
+        self.calls += 1
+        self.seen_texts.append(text)
+        assert text in {"hello", self.expected_answer}
+        return ModerationDecision(is_flagged=False)
+
+
+async def _interrupt_query_after_answer_token(
+    database_url: str,
+) -> tuple[str, UUID, UUID, datetime]:
+    await seed_subject_conversation(database_url, "conversation-1")
+    answer_actor = _StreamingAnswerActor(
+        answer="partial answer [1]",
+        stream_tokens=["partial "],
+        block_after_first_token=True,
+    )
+    app = persistent_tracer_app(
+        database_url,
+        answer_actor=answer_actor,
+    )
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            stream_request(app),
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
+        )
+        subscriber = response.body_iterator
+        token_frame: dict[str, object] | None = None
+        while token_frame is None or token_frame["type"] != "token":
+            token_frame = _event_frame(await anext(subscriber))
+        pending_read = asyncio.create_task(anext(subscriber))
+        await answer_actor.blocked_on_followup_read.wait()
+        pending_read.cancel()
+        with suppress(asyncio.CancelledError):
+            await pending_read
+        await subscriber.aclose()
+        assert answer_actor.close_completed.is_set() is True
+        assert token_frame["data"] == "partial "
+        return (
+            response.headers["x-thread-id"],
+            UUID(response.headers["x-turn-id"]),
+            UUID(response.headers["x-run-id"]),
+            (await _read_turn(database_url, UUID(response.headers["x-turn-id"]))).resume_deadline,
+        )
 
 
 async def _seed_pre_answer_checkpoint(
@@ -154,6 +290,11 @@ async def _read_turn(database_url: str, turn_id: UUID) -> TurnRecord:
             conversation_id="conversation-1",
             turn_id=turn_id,
         )
+
+
+async def _read_run(database_url: str, run_id: UUID):
+    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
+        return await RunEventRepository(pool).get_run("tenant-a", run_id)
 
 
 async def _read_messages(database_url: str) -> list[MessageRecord]:
@@ -586,3 +727,228 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
     assert configurable["checkpoint_id"] == original_checkpoint_id
     assert configurable["checkpoint_id"] != advanced_checkpoint_id
     assert [event["type"] for event in delivered] == ["token", "done"]
+
+
+def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_advisory_inputs(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    thread_id, turn_id, run_id, resume_deadline = asyncio.run(
+        _interrupt_query_after_answer_token(
+            langgraph_v2_migrated_database_url,
+        )
+    )
+    answer_text = "replacement answer [1]"
+    answer_actor = _StreamingAnswerActor(
+        answer=answer_text,
+        stream_tokens=["replacement ", "answer [1]"],
+    )
+    groundedness_actor = _AssertingGroundednessActor(answer_text)
+    moderation_provider = _AssertingModerationProvider(answer_text)
+    audit = MockOutputAssessmentAudit()
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        resume_enabled=True,
+        moderation_provider=moderation_provider,
+        answer_actor=answer_actor,
+    )
+    app.state.langgraph_v2_groundedness_actor = groundedness_actor
+    app.state.langgraph_v2_output_assessment_audit = audit
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+            params={"expectedTurnId": str(turn_id)},
+        )
+
+    delivered = parse_sse(response.text)
+    assert response.status_code == 200
+    assert response.headers["x-thread-id"] == thread_id
+    assert response.headers["x-turn-id"] == str(turn_id)
+    assert answer_actor.calls == 1
+    assert groundedness_actor.calls == 1
+    assert moderation_provider.calls == 1
+    assert moderation_provider.seen_texts == [answer_text]
+    assert [event["data"] for event in delivered if event["type"] == "token"] == [
+        "replacement ",
+        "answer [1]",
+    ]
+    assert delivered[-1]["type"] == "done"
+    assert delivered[-1]["data"]["answer"] == answer_text
+
+    turn_after_resume = asyncio.run(
+        _read_turn(langgraph_v2_migrated_database_url, turn_id)
+    )
+    messages = asyncio.run(_read_messages(langgraph_v2_migrated_database_url))
+    assistant_run_id = next(
+        message.run_id
+        for message in messages
+        if message.turn_id == turn_id and message.role == "assistant"
+    )
+    original_run = asyncio.run(
+        _read_run(langgraph_v2_migrated_database_url, run_id)
+    )
+    assistant_run = asyncio.run(
+        _read_run(langgraph_v2_migrated_database_url, assistant_run_id)
+    )
+
+    assert turn_after_resume.resume_deadline == resume_deadline
+    assert original_run.status == "interrupted"
+    assert assistant_run.status == "completed"
+    assert assistant_run.run_id != run_id
+    assert [
+        (message.role, message.content)
+        for message in messages
+        if message.turn_id == turn_id
+    ] == [("user", "hello"), ("assistant", answer_text)]
+    assert {record.assessment_type for record in audit.records} == {
+        "groundedness",
+        "post_moderation",
+    }
+
+
+def test_second_interruption_can_resume_before_original_deadline(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    thread_id, turn_id, run_id, resume_deadline = asyncio.run(
+        _interrupt_query_after_answer_token(
+            langgraph_v2_migrated_database_url,
+        )
+    )
+    blocking_answer_actor = _StreamingAnswerActor(
+        answer="replacement answer [1]",
+        stream_tokens=["replacement "],
+        block_after_first_token=True,
+    )
+    blocking_app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        resume_enabled=True,
+        answer_actor=blocking_answer_actor,
+    )
+
+    async def interrupt_resumed_stream() -> None:
+        async with blocking_app.router.lifespan_context(blocking_app):
+            response = await _thread_resume_endpoint(blocking_app)(
+                thread_id,
+                stream_request(blocking_app),
+                request_context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                expected_turn_id=turn_id,
+            )
+            subscriber = response.body_iterator
+            token_frame: dict[str, object] | None = None
+            while token_frame is None or token_frame["type"] != "token":
+                token_frame = _event_frame(await anext(subscriber))
+            assert token_frame["data"] == "replacement "
+            pending_read = asyncio.create_task(anext(subscriber))
+            await blocking_answer_actor.blocked_on_followup_read.wait()
+            pending_read.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_read
+            await subscriber.aclose()
+
+    asyncio.run(interrupt_resumed_stream())
+
+    turn_after_second_interrupt = asyncio.run(
+        _read_turn(langgraph_v2_migrated_database_url, turn_id)
+    )
+    messages_after_interrupt = asyncio.run(
+        _read_messages(langgraph_v2_migrated_database_url)
+    )
+    assert turn_after_second_interrupt.resume_deadline == resume_deadline
+    assert [
+        (message.role, message.content)
+        for message in messages_after_interrupt
+        if message.turn_id == turn_id
+    ] == [("user", "hello")]
+
+    complete_answer_actor = _StreamingAnswerActor(
+        answer="replacement answer [1]",
+        stream_tokens=["replacement ", "answer [1]"],
+    )
+    complete_app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        resume_enabled=True,
+        answer_actor=complete_answer_actor,
+    )
+
+    with TestClient(complete_app) as client:
+        response = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+            params={"expectedTurnId": str(turn_id)},
+        )
+
+    delivered = parse_sse(response.text)
+    assert response.status_code == 200
+    assert complete_answer_actor.calls == 1
+    assert [event["data"] for event in delivered if event["type"] == "token"] == [
+        "replacement ",
+        "answer [1]",
+    ]
+    assert delivered[-1]["data"]["answer"] == "replacement answer [1]"
+
+
+def test_second_interruption_returns_410_after_original_deadline_expires(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    thread_id, turn_id, _run_id, _ = asyncio.run(
+        _interrupt_query_after_answer_token(
+            langgraph_v2_migrated_database_url,
+        )
+    )
+    blocking_answer_actor = _StreamingAnswerActor(
+        answer="replacement answer [1]",
+        stream_tokens=["replacement "],
+        block_after_first_token=True,
+    )
+    blocking_app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        resume_enabled=True,
+        answer_actor=blocking_answer_actor,
+    )
+
+    async def interrupt_resumed_stream() -> None:
+        async with blocking_app.router.lifespan_context(blocking_app):
+            response = await _thread_resume_endpoint(blocking_app)(
+                thread_id,
+                stream_request(blocking_app),
+                request_context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                expected_turn_id=turn_id,
+            )
+            subscriber = response.body_iterator
+            token_frame: dict[str, object] | None = None
+            while token_frame is None or token_frame["type"] != "token":
+                token_frame = _event_frame(await anext(subscriber))
+            pending_read = asyncio.create_task(anext(subscriber))
+            await blocking_answer_actor.blocked_on_followup_read.wait()
+            pending_read.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_read
+            await subscriber.aclose()
+
+    asyncio.run(interrupt_resumed_stream())
+    asyncio.run(_expire_turn(langgraph_v2_migrated_database_url, turn_id))
+
+    expired_answer_actor = _StreamingAnswerActor(
+        answer="replacement answer [1]",
+        stream_tokens=["replacement ", "answer [1]"],
+    )
+    expired_app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        resume_enabled=True,
+        answer_actor=expired_answer_actor,
+    )
+
+    with TestClient(expired_app) as client:
+        response = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+            params={"expectedTurnId": str(turn_id)},
+        )
+
+    assert response.status_code == 410
+    assert expired_answer_actor.calls == 0

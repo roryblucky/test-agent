@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from typing import Any
 from uuid import UUID
@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 from psycopg_pool import AsyncConnectionPool
 
+from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
@@ -117,6 +118,40 @@ class _RealtimeGraph:
     def astream(self, state: Any, **options: Any) -> _RealtimeStream:
         del state, options
         return self.stream
+
+
+class _BlockingAnswerActor:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.blocked_on_followup_read = asyncio.Event()
+        self.close_completed = asyncio.Event()
+
+    async def answer(
+        self,
+        query: str,
+        documents: list[Any],
+        history: Sequence[Any],
+    ) -> AnswerResult:
+        self.calls += 1
+        assert query == "hello"
+        assert [document.id for document in documents] == ["mock-doc-1"]
+        assert history == []
+        return AnswerResult(answer="partial answer [1]")
+
+    async def answer_stream(
+        self,
+        query: str,
+        documents: list[Any],
+        history: Sequence[Any],
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        result = await self.answer(query, documents, history)
+        yield AnswerStreamChunk(delta="partial ")
+        self.blocked_on_followup_read.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.close_completed.set()
+        yield AnswerStreamChunk(result=result)
 
 
 @pytest.mark.asyncio
@@ -272,14 +307,17 @@ async def test_query_yields_answer_delta_before_graph_completion(
 
 
 @pytest.mark.asyncio
-async def test_closing_query_after_answer_token_closes_graph_and_persists_no_partial_assistant_message(
+async def test_closing_query_after_answer_token_closes_answer_stream_and_persists_no_partial_assistant_message(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
         langgraph_v2_migrated_database_url, "conversation-1"
     )
-    graph = _RealtimeGraph()
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    answer_actor = _BlockingAnswerActor()
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        answer_actor=answer_actor,
+    )
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
@@ -290,12 +328,13 @@ async def test_closing_query_after_answer_token_closes_graph_and_persists_no_par
             ),
         )
         subscriber = response.body_iterator
-        token_frame = _event_frame(await anext(subscriber))
-        assert token_frame["type"] == "token"
-        assert token_frame["data"] == "partial"
+        token_frame: dict[str, Any] | None = None
+        while token_frame is None or token_frame["type"] != "token":
+            token_frame = _event_frame(await anext(subscriber))
+        assert token_frame["data"] == "partial "
 
         pending_read = asyncio.create_task(anext(subscriber))
-        await graph.stream.started.wait()
+        await answer_actor.blocked_on_followup_read.wait()
         pending_read.cancel()
         with pytest.raises(asyncio.CancelledError):
             await pending_read
@@ -315,8 +354,8 @@ async def test_closing_query_after_answer_token_closes_graph_and_persists_no_par
                 "tenant-a", UUID(response.headers["x-run-id"])
             )
 
-    assert graph.stream.closed is True
-    assert graph.stream.close_completed is True
+    assert answer_actor.calls == 1
+    assert answer_actor.close_completed.is_set() is True
     assert run.status == "interrupted"
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
