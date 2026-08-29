@@ -69,6 +69,7 @@ from app.langgraph_v2.run_events import (
     CancellationObserved,
     ClaimFenced,
     EventInput,
+    EventInvariantConflict,
     ResumeConflict,
     RunEventRepository,
     RunNotFound,
@@ -240,6 +241,8 @@ async def _persist_result_events(
     run_id: uuid.UUID,
     conversation_id: str,
     result: dict[str, Any],
+    expected_turn_id: uuid.UUID | None = None,
+    require_turn_run_match: bool = False,
     owner_instance_id: str,
     execution_epoch: int,
     suppress_sse_for_event_keys: set[str] | None = None,
@@ -266,26 +269,42 @@ async def _persist_result_events(
                     raise ValueError(
                         "completed Graph state is missing a valid turn_id"
                     ) from error
+                if expected_turn_id is not None and turn_id != expected_turn_id:
+                    raise ValueError("completed Graph state turn_id does not match Run")
+                conflict: EventInvariantConflict | None = None
                 async with repository.transaction() as connection:
-                    await message_repository.persist_assistant_message_in_terminal_transaction(
-                        connection,
-                        tenant_id=tenant_id,
-                        conversation_id=conversation_id,
-                        run_id=run_id,
-                        owner_instance_id=owner_instance_id,
-                        execution_epoch=execution_epoch,
-                        turn_id=turn_id,
-                        content=event.data["answer"],
-                        idempotency_key=f"turn:{turn_id}:assistant",
-                    )
-                    persisted = await repository.complete_run_in_transaction(
-                        connection,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        event=event_input,
-                        owner_instance_id=owner_instance_id,
-                        execution_epoch=execution_epoch,
-                    )
+                    try:
+                        async with connection.transaction():
+                            await message_repository.persist_assistant_message_in_terminal_transaction(
+                                connection,
+                                tenant_id=tenant_id,
+                                conversation_id=conversation_id,
+                                run_id=run_id,
+                                owner_instance_id=owner_instance_id,
+                                execution_epoch=execution_epoch,
+                                turn_id=turn_id,
+                                require_run_match=require_turn_run_match,
+                                content=event.data["answer"],
+                                idempotency_key=f"turn:{turn_id}:assistant",
+                            )
+                            persisted = await repository.complete_run_in_transaction(
+                                connection,
+                                tenant_id=tenant_id,
+                                run_id=run_id,
+                                event=event_input,
+                                owner_instance_id=owner_instance_id,
+                                execution_epoch=execution_epoch,
+                            )
+                    except EventInvariantConflict as error:
+                        await repository.mark_event_conflict_in_transaction(
+                            connection,
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            event_key=event.event_key,
+                        )
+                        conflict = error
+                if conflict is not None:
+                    raise conflict
                 await repository.publish_wakeup(tenant_id, run_id)
             else:
                 persisted = await repository.complete_run(
@@ -403,6 +422,8 @@ async def _persist_graph_result(
     tenant_id: str,
     run_id: uuid.UUID,
     conversation_id: str,
+    expected_turn_id: uuid.UUID | None = None,
+    require_turn_run_match: bool = False,
     owner_instance_id: str,
     execution_epoch: int,
     answer_chunk_interval_ms: int,
@@ -435,6 +456,8 @@ async def _persist_graph_result(
             run_id=run_id,
             conversation_id=conversation_id,
             result=result,
+            expected_turn_id=expected_turn_id,
+            require_turn_run_match=require_turn_run_match,
             owner_instance_id=owner_instance_id,
             execution_epoch=execution_epoch,
             suppress_sse_for_event_keys=sent_keys,
@@ -467,6 +490,8 @@ async def _execute_graph_run(
     tenant_id: str,
     run_id: uuid.UUID,
     conversation_id: str,
+    expected_turn_id: uuid.UUID | None = None,
+    require_turn_run_match: bool = False,
     owner_instance_id: str,
     execution_epoch: int,
     answer_chunk_interval_ms: int,
@@ -494,6 +519,8 @@ async def _execute_graph_run(
             tenant_id=tenant_id,
             run_id=run_id,
             conversation_id=conversation_id,
+            expected_turn_id=expected_turn_id,
+            require_turn_run_match=require_turn_run_match,
             owner_instance_id=owner_instance_id,
             execution_epoch=execution_epoch,
             answer_chunk_interval_ms=answer_chunk_interval_ms,
@@ -881,6 +908,7 @@ def create_tracer_router(
                     tenant_id=x_application_id,
                     run_id=run_id,
                     conversation_id=conversation_id,
+                    expected_turn_id=turn_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,
@@ -1082,6 +1110,7 @@ def create_tracer_router(
                     tenant_id=x_application_id,
                     run_id=run_id,
                     conversation_id=claim.conversation_id,
+                    require_turn_run_match=True,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
                     answer_chunk_interval_ms=answer_chunk_interval_ms,

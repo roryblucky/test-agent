@@ -376,6 +376,7 @@ class ConversationMessageRepository:
         content: str,
         idempotency_key: str,
         turn_id: UUID,
+        require_run_match: bool = False,
     ) -> MessageRecord:
         """Write a safe answer through a caller-owned, epoch-fenced transaction."""
         async with connection.cursor(row_factory=dict_row) as cursor:
@@ -405,6 +406,7 @@ class ConversationMessageRepository:
             tenant_id=tenant_id,
             conversation_id=conversation_id,
             turn_id=turn_id,
+            run_id=run_id if require_run_match else None,
         )
         return await self._persist_message_in_transaction(
             connection,
@@ -453,17 +455,23 @@ class ConversationMessageRepository:
         tenant_id: str,
         conversation_id: str,
         turn_id: UUID,
+        run_id: UUID | None = None,
     ) -> None:
         """Ensure an assistant attaches to an existing user Message Turn."""
         async with connection.cursor(row_factory=dict_row) as cursor:
+            run_clause = " AND run_id = %s" if run_id is not None else ""
+            params: tuple[Any, ...] = (tenant_id, conversation_id, turn_id) + (
+                (run_id,) if run_id is not None else ()
+            )
             await cursor.execute(
-                """
+                f"""
                 SELECT turn_id
                 FROM langgraph_v2.messages
                 WHERE tenant_id = %s AND conversation_id = %s
                   AND turn_id = %s AND role = 'user'
+                  {run_clause}
                 """,
-                (tenant_id, conversation_id, turn_id),
+                params,
             )
             row = await cursor.fetchone()
         if row is None:

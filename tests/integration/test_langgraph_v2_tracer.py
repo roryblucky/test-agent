@@ -40,7 +40,11 @@ from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
-from app.langgraph_v2.run_events import EventInput, RunEventRepository
+from app.langgraph_v2.run_events import (
+    EventInput,
+    EventInvariantConflict,
+    RunEventRepository,
+)
 from app.langgraph_v2.runtime import LocalRunRuntime, RuntimeStopping
 from app.services.events import EventEmitter
 
@@ -366,7 +370,11 @@ async def test_done_answer_finalization_is_atomic_on_turn_validation(
         repository = RunEventRepository(pool)
         message_repository = ConversationMessageRepository(pool)
 
-        async def persist_done(run_id: UUID, result_turn_id: UUID) -> None:
+        async def persist_done(
+            run_id: UUID,
+            result_turn_id: UUID,
+            expected_turn_id: UUID | None = None,
+        ) -> None:
             result = {
                 "turn_id": str(result_turn_id),
                 "events": [
@@ -385,6 +393,7 @@ async def test_done_answer_finalization_is_atomic_on_turn_validation(
                 run_id=run_id,
                 conversation_id="conversation-1",
                 result=result,
+                expected_turn_id=expected_turn_id,
                 owner_instance_id="instance-a",
                 execution_epoch=1,
                 answer_chunk_interval_ms=0,
@@ -421,8 +430,17 @@ async def test_done_answer_finalization_is_atomic_on_turn_validation(
             content="question",
             idempotency_key=f"turn:{actual_turn}:user",
         )
-        with pytest.raises(TurnNotFound):
-            await persist_done(wrong_run.run_id, uuid4())
+        unrelated_turn = uuid4()
+        await message_repository.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="conversation-1",
+            run_id=uuid4(),
+            turn_id=unrelated_turn,
+            content="another question",
+            idempotency_key=f"turn:{unrelated_turn}:user",
+        )
+        with pytest.raises(ValueError, match="does not match Run"):
+            await persist_done(wrong_run.run_id, unrelated_turn, actual_turn)
         assert (await repository.get_run("tenant-a", wrong_run.run_id)).status == (
             "running"
         )
@@ -462,6 +480,55 @@ async def test_done_answer_finalization_is_atomic_on_turn_validation(
             "user",
             "assistant",
         ]
+
+        conflict_run = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        conflict_turn = uuid4()
+        await message_repository.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="conversation-1",
+            run_id=conflict_run.run_id,
+            turn_id=conflict_turn,
+            content="question",
+            idempotency_key=f"turn:{conflict_turn}:user",
+        )
+        await repository.append_event(
+            tenant_id="tenant-a",
+            run_id=conflict_run.run_id,
+            owner_instance_id="instance-a",
+            execution_epoch=1,
+            event=EventInput(
+                event_key="lifecycle:completed:0",
+                type="done",
+                data={"answer": "previous answer"},
+            ),
+        )
+        with pytest.raises(EventInvariantConflict):
+            await persist_done(conflict_run.run_id, conflict_turn, conflict_turn)
+        failed_conflict_run = await repository.get_run("tenant-a", conflict_run.run_id)
+        assert failed_conflict_run.status == "failed"
+        assert failed_conflict_run.terminal_outcome == {
+            "error": "event_invariant_conflict",
+            "event_key": "lifecycle:completed:0",
+        }
+        assert [
+            event.event_key
+            for event in await repository.list_events("tenant-a", conflict_run.run_id)
+        ] == ["lifecycle:completed:0"]
+        assert [
+            message
+            for message in await message_repository.list_messages(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="conversation-1",
+            )
+            if message.turn_id == conflict_turn and message.role == "assistant"
+        ] == []
 
 
 def test_query_authorizes_existing_conversation_before_streaming(

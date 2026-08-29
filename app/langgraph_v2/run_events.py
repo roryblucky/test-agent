@@ -112,6 +112,22 @@ class RunEventRepository:
         """Publish a committed Run change to live subscribers."""
         await self._publish_wakeup(tenant_id, run_id)
 
+    async def mark_event_conflict_in_transaction(
+        self,
+        connection: Any,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        event_key: str,
+    ) -> None:
+        """Persist the canonical failed status after a savepoint rollback."""
+        await _mark_event_conflict_in_transaction(
+            connection,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            event_key=event_key,
+        )
+
     async def _lock_and_validate_claim(
         self,
         cursor: Any,
@@ -691,23 +707,11 @@ class RunEventRepository:
 
             if row is not None:
                 if row["canonical_envelope"] != canonical_envelope:
-                    await connection.execute(
-                        """
-                            UPDATE langgraph_v2.runs
-                            SET status = 'failed', terminal_outcome = %s,
-                                completed_at = NULL
-                            WHERE tenant_id = %s AND run_id = %s
-                            """,
-                        (
-                            Jsonb(
-                                {
-                                    "error": "event_invariant_conflict",
-                                    "event_key": event.event_key,
-                                }
-                            ),
-                            tenant_id,
-                            run_id,
-                        ),
+                    await _mark_event_conflict_in_transaction(
+                        connection,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        event_key=event.event_key,
                     )
                     conflict = True
                 elif run_row["status"] == "completed" and not completes_run:
@@ -884,6 +888,28 @@ async def _set_terminal_status_in_transaction(
         WHERE tenant_id = %s AND run_id = %s
         """,
         (status, Jsonb(outcome), tenant_id, run_id),
+    )
+
+
+async def _mark_event_conflict_in_transaction(
+    connection: Any,
+    *,
+    tenant_id: str,
+    run_id: UUID,
+    event_key: str,
+) -> None:
+    """Mark a Run failed with the stable event-conflict outcome."""
+    await connection.execute(
+        """
+        UPDATE langgraph_v2.runs
+        SET status = 'failed', terminal_outcome = %s, completed_at = NULL
+        WHERE tenant_id = %s AND run_id = %s
+        """,
+        (
+            Jsonb({"error": "event_invariant_conflict", "event_key": event_key}),
+            tenant_id,
+            run_id,
+        ),
     )
 
 
