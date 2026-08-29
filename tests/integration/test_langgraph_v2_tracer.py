@@ -1207,6 +1207,83 @@ def test_resume_route_runs_injected_graph_for_resumable_run(
     )
 
 
+def test_resume_route_reads_query_created_root_checkpoint(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    conversation_id = "conversation-query-root-checkpoint"
+    asyncio.run(
+        seed_subject_conversation(
+            langgraph_v2_migrated_database_url, conversation_id
+        )
+    )
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, resume_enabled=True)
+
+    with TestClient(app) as client:
+        query_response = client.post(
+            "/v2/query/stream",
+            json={"query": "authoritative", "sessionId": conversation_id},
+            headers={
+                "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-a",
+            },
+        )
+
+        assert query_response.status_code == 200
+        run_id = UUID(query_response.headers["x-run-id"])
+
+        async def make_run_resumable() -> tuple[str, str]:
+            async with AsyncConnectionPool(
+                langgraph_v2_migrated_database_url, min_size=1, max_size=2
+            ) as pool:
+                repository = RunEventRepository(pool)
+                run = await repository.get_run("tenant-a", run_id)
+                assert run.checkpoint_id is not None
+                assert run.checkpoint_ns == ""
+                async with pool.connection() as connection:
+                    await connection.execute(
+                        """
+                        UPDATE langgraph_v2.runs
+                        SET status = 'running',
+                            expires_at = clock_timestamp() - interval '1 second'
+                        WHERE tenant_id = %s AND run_id = %s
+                        """,
+                        ("tenant-a", run_id),
+                    )
+                return run.checkpoint_id, run.checkpoint_ns
+
+        checkpoint_id, checkpoint_ns = asyncio.run(make_run_resumable())
+        assert checkpoint_ns == ""
+
+        response = client.post(
+            f"/v2/runs/{run_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+
+    delivered = parse_sse(response.text)
+    assert response.status_code == 200
+    assert response.headers["x-run-id"] == str(run_id)
+    assert delivered
+
+    async def read_resumed_run() -> tuple[str, int, str | None, str | None]:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            run = await RunEventRepository(pool).get_run("tenant-a", run_id)
+            return (
+                run.status,
+                run.execution_epoch,
+                run.checkpoint_id,
+                run.checkpoint_ns,
+            )
+
+    status, epoch, persisted_checkpoint_id, persisted_checkpoint_ns = asyncio.run(
+        read_resumed_run()
+    )
+    assert (status, epoch) == ("completed", 2)
+    assert persisted_checkpoint_id != checkpoint_id
+    assert persisted_checkpoint_ns is not None
+
+
 def test_resume_after_retry_uses_run_turn_for_legacy_checkpoint_result(
     langgraph_v2_migrated_database_url: str,
 ) -> None:

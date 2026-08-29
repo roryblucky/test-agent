@@ -1297,7 +1297,9 @@ def create_tracer_router(
             raise HTTPException(status_code=404, detail="Thread not found") from error
         except ResumeExpired as error:
             raise HTTPException(status_code=410, detail="Turn expired") from error
-        except (ThreadResumeConflict, TurnNotFound) as error:
+        except TurnNotFound as error:
+            raise HTTPException(status_code=404, detail="Turn not found") from error
+        except ThreadResumeConflict as error:
             raise HTTPException(
                 status_code=409, detail="Thread is not resumable"
             ) from error

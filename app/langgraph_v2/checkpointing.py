@@ -74,7 +74,9 @@ class FencedAsyncPostgresSaver(AsyncPostgresSaver):
     ) -> None:
         super().__init__(conn)
         self._checkpoint_namespace = checkpoint_namespace
-        self._read_namespace = read_namespace or checkpoint_namespace
+        self._read_namespace = (
+            checkpoint_namespace if read_namespace is None else read_namespace
+        )
         self._pointer_writer = pointer_writer
 
     def _scoped_config(

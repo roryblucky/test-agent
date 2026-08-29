@@ -63,6 +63,7 @@ class _AnswerActor:
 async def _seed_pre_answer_checkpoint(
     database_url: str,
     *,
+    conversation_id: str = "conversation-1",
     interrupt_before: str | None = "answer",
     checkpoint_turn_id: UUID | None = None,
     drop_origin_run_mapping: bool = False,
@@ -79,7 +80,7 @@ async def _seed_pre_answer_checkpoint(
         messages = ConversationMessageRepository(pool)
         conversation = await messages.resolve_conversation(
             context=context,
-            conversation_id="conversation-1",
+            conversation_id=conversation_id,
         )
         runs = RunEventRepository(pool)
         run = await runs.create_run(
@@ -400,6 +401,56 @@ def test_thread_resume_returns_404_for_missing_or_unauthorized_thread(
     assert cross_subject.status_code == 404
     assert cross_tenant.status_code == 404
     assert missing.status_code == 404
+
+
+def test_thread_resume_returns_404_for_missing_expected_turn(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    thread_id, turn_id, _ = asyncio.run(
+        _seed_pre_answer_checkpoint(langgraph_v2_migrated_database_url)
+    )
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        resume_enabled=True,
+        answer_actor=_AnswerActor(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+            params={"expectedTurnId": str(uuid4())},
+        )
+
+    assert response.status_code == 404
+
+
+def test_thread_resume_returns_404_for_expected_turn_from_other_conversation(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    thread_id, turn_id, _ = asyncio.run(
+        _seed_pre_answer_checkpoint(langgraph_v2_migrated_database_url)
+    )
+    _, foreign_turn_id, _ = asyncio.run(
+        _seed_pre_answer_checkpoint(
+            langgraph_v2_migrated_database_url,
+            conversation_id="conversation-2",
+        )
+    )
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        resume_enabled=True,
+        answer_actor=_AnswerActor(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+            params={"expectedTurnId": str(foreign_turn_id)},
+        )
+
+    assert response.status_code == 404
 
 
 def test_thread_resume_returns_410_for_expired_turn_without_graph_execution(
