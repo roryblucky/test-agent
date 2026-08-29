@@ -1589,21 +1589,30 @@ def test_long_running_request_refreshes_its_claim(
     monkeypatch.setattr(api_module, "CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
 
     class SlowGraph:
-        async def ainvoke(
-            self, state: TracerState | None, config: RunnableConfig | None = None
-        ) -> dict:
-            del config
-            await asyncio.sleep(0.05)
-            return {
-                "events": [
+        def astream(
+            self, state: TracerState | None, **options: Any
+        ) -> AsyncIterator:
+            del state, options
+
+            async def stream() -> AsyncIterator:
+                await asyncio.sleep(0.05)
+                yield (
+                    "updates",
                     {
-                        "event_key": "lifecycle:completed:0",
-                        "type": "done",
-                        "data": {"source": "slow"},
-                        "sequence": 1,
-                    }
-                ]
-            }
+                        "slow": {
+                            "events": [
+                                {
+                                    "event_key": "lifecycle:completed:0",
+                                    "type": "done",
+                                    "data": {"source": "slow"},
+                                    "sequence": 1,
+                                }
+                            ]
+                        }
+                    },
+                )
+
+            return stream()
 
     app = persistent_tracer_app(langgraph_v2_migrated_database_url, SlowGraph())
     with TestClient(app) as client:
