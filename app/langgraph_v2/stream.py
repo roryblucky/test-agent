@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -27,6 +27,7 @@ async def stream_graph(
     graph_input: Any | None,
     *,
     config: RunnableConfig | None = None,
+    event_sink: Callable[[TracerStreamEvent], Awaitable[None]] | None = None,
 ) -> AsyncIterator[str]:
     """Yield one legacy-compatible SSE frame for each public graph update.
 
@@ -63,6 +64,8 @@ async def stream_graph(
                     mode=mode,
                 )
                 seen_event_keys.add(event.event_key)
+                if event_sink is not None:
+                    await event_sink(event)
                 yield event.to_sse()
     finally:
         close = getattr(graph_iterator, "aclose", None)
