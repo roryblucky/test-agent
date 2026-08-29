@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -99,6 +100,17 @@ class RunEventRepository:
     ) -> None:
         self._pool = pool
         self._live_events = live_events
+
+    @asynccontextmanager
+    async def transaction(self):
+        """Yield a caller-owned PostgreSQL transaction for atomic finalization."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                yield connection
+
+    async def publish_wakeup(self, tenant_id: str, run_id: UUID) -> None:
+        """Publish a committed Run change to live subscribers."""
+        await self._publish_wakeup(tenant_id, run_id)
 
     async def _lock_and_validate_claim(
         self,
@@ -563,6 +575,28 @@ class RunEventRepository:
             completes_run=True,
         )
 
+    async def complete_run_in_transaction(
+        self,
+        connection: Any,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        event: EventInput,
+        owner_instance_id: str,
+        execution_epoch: int,
+    ) -> EventRecord:
+        """Append a terminal Event inside a caller-owned transaction."""
+        return await self._persist_event(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            event=event,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+            completes_run=True,
+            connection=connection,
+            publish_wakeup=False,
+        )
+
     async def fail_run(
         self,
         *,
@@ -593,100 +627,100 @@ class RunEventRepository:
         execution_epoch: int,
         completes_run: bool,
         terminal_status: TerminalStatus = "completed",
+        connection: Any | None = None,
+        publish_wakeup: bool = True,
     ) -> EventRecord:
         canonical_envelope = _canonical_envelope(event)
         conflict = False
         row = None
-        async with self._pool.connection() as connection:
-            async with connection.transaction():
-                async with connection.cursor(row_factory=dict_row) as run_cursor:
-                    await run_cursor.execute(
-                        """
+        async with self._transaction(connection) as connection:
+            async with connection.cursor(row_factory=dict_row) as run_cursor:
+                await run_cursor.execute(
+                    """
                         SELECT next_event_sequence, status, owner_instance_id,
                                execution_epoch
                         FROM langgraph_v2.runs
                         WHERE tenant_id = %s AND run_id = %s
                         FOR UPDATE
                         """,
-                        (tenant_id, run_id),
-                    )
-                    run_row = await run_cursor.fetchone()
-                if run_row is None:
-                    raise RunNotFound(str(run_id))
-                async with connection.cursor(row_factory=dict_row) as claim_cursor:
-                    await claim_cursor.execute(
-                        """
+                    (tenant_id, run_id),
+                )
+                run_row = await run_cursor.fetchone()
+            if run_row is None:
+                raise RunNotFound(str(run_id))
+            async with connection.cursor(row_factory=dict_row) as claim_cursor:
+                await claim_cursor.execute(
+                    """
                         SELECT expires_at <= clock_timestamp() AS claim_expired
                         FROM langgraph_v2.runs
                         WHERE tenant_id = %s AND run_id = %s
                         """,
-                        (tenant_id, run_id),
-                    )
-                    claim_row = await claim_cursor.fetchone()
-                if (
-                    run_row["owner_instance_id"] != owner_instance_id
-                    or run_row["execution_epoch"] != execution_epoch
-                    or claim_row is None
-                    or claim_row["claim_expired"]
-                ):
-                    raise ClaimFenced(str(run_id))
-                if completes_run and terminal_status == "completed":
-                    async with connection.cursor() as cancellation_cursor:
-                        await cancellation_cursor.execute(
-                            """
+                    (tenant_id, run_id),
+                )
+                claim_row = await claim_cursor.fetchone()
+            if (
+                run_row["owner_instance_id"] != owner_instance_id
+                or run_row["execution_epoch"] != execution_epoch
+                or claim_row is None
+                or claim_row["claim_expired"]
+            ):
+                raise ClaimFenced(str(run_id))
+            if completes_run and terminal_status == "completed":
+                async with connection.cursor() as cancellation_cursor:
+                    await cancellation_cursor.execute(
+                        """
                             SELECT 1
                             FROM langgraph_v2.cancellation_intents
                             WHERE tenant_id = %s AND run_id = %s
                             """,
-                            (tenant_id, run_id),
-                        )
-                        if await cancellation_cursor.fetchone() is not None:
-                            raise CancellationObserved(str(run_id))
-                async with connection.cursor(row_factory=dict_row) as existing_cursor:
-                    await existing_cursor.execute(
-                        """
+                        (tenant_id, run_id),
+                    )
+                    if await cancellation_cursor.fetchone() is not None:
+                        raise CancellationObserved(str(run_id))
+            async with connection.cursor(row_factory=dict_row) as existing_cursor:
+                await existing_cursor.execute(
+                    """
                         SELECT tenant_id, run_id, sequence, event_key, type, step,
                                data, canonical_envelope, created_at
                         FROM langgraph_v2.events
                         WHERE tenant_id = %s AND run_id = %s AND event_key = %s
                         """,
-                        (tenant_id, run_id, event.event_key),
-                    )
-                    row = await existing_cursor.fetchone()
+                    (tenant_id, run_id, event.event_key),
+                )
+                row = await existing_cursor.fetchone()
 
-                if row is not None:
-                    if row["canonical_envelope"] != canonical_envelope:
-                        await connection.execute(
-                            """
+            if row is not None:
+                if row["canonical_envelope"] != canonical_envelope:
+                    await connection.execute(
+                        """
                             UPDATE langgraph_v2.runs
                             SET status = 'failed', terminal_outcome = %s,
                                 completed_at = NULL
                             WHERE tenant_id = %s AND run_id = %s
                             """,
-                            (
-                                Jsonb(
-                                    {
-                                        "error": "event_invariant_conflict",
-                                        "event_key": event.event_key,
-                                    }
-                                ),
-                                tenant_id,
-                                run_id,
+                        (
+                            Jsonb(
+                                {
+                                    "error": "event_invariant_conflict",
+                                    "event_key": event.event_key,
+                                }
                             ),
-                        )
-                        conflict = True
-                    elif run_row["status"] == "completed" and not completes_run:
-                        raise ClaimFenced(str(run_id))
-                else:
-                    if (
-                        run_row["status"] not in {"running", "completed"}
-                        or (run_row["status"] == "completed" and not completes_run)
-                    ):
-                        raise ClaimFenced(str(run_id))
-                    sequence = run_row["next_event_sequence"]
-                    async with connection.cursor(row_factory=dict_row) as event_cursor:
-                        await event_cursor.execute(
-                            """
+                            tenant_id,
+                            run_id,
+                        ),
+                    )
+                    conflict = True
+                elif run_row["status"] == "completed" and not completes_run:
+                    raise ClaimFenced(str(run_id))
+            else:
+                if run_row["status"] not in {"running", "completed"} or (
+                    run_row["status"] == "completed" and not completes_run
+                ):
+                    raise ClaimFenced(str(run_id))
+                sequence = run_row["next_event_sequence"]
+                async with connection.cursor(row_factory=dict_row) as event_cursor:
+                    await event_cursor.execute(
+                        """
                             INSERT INTO langgraph_v2.events (
                                 tenant_id, run_id, sequence, event_key, type, step,
                                 data, canonical_envelope
@@ -694,39 +728,50 @@ class RunEventRepository:
                             RETURNING tenant_id, run_id, sequence, event_key, type,
                                       step, data, created_at
                             """,
-                            (
-                                tenant_id,
-                                run_id,
-                                sequence,
-                                event.event_key,
-                                event.type,
-                                event.step,
-                                Jsonb(event.data),
-                                canonical_envelope,
-                            ),
-                        )
-                        row = await event_cursor.fetchone()
-                    await connection.execute(
-                        """
+                        (
+                            tenant_id,
+                            run_id,
+                            sequence,
+                            event.event_key,
+                            event.type,
+                            event.step,
+                            Jsonb(event.data),
+                            canonical_envelope,
+                        ),
+                    )
+                    row = await event_cursor.fetchone()
+                await connection.execute(
+                    """
                         UPDATE langgraph_v2.runs
                         SET next_event_sequence = next_event_sequence + 1
                         WHERE tenant_id = %s AND run_id = %s
                         """,
-                        (tenant_id, run_id),
-                    )
-                if completes_run and not conflict:
-                    await _set_terminal_status_in_transaction(
-                        connection,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        status=terminal_status,
-                        outcome=event.data,
-                    )
+                    (tenant_id, run_id),
+                )
+            if completes_run and not conflict:
+                await _set_terminal_status_in_transaction(
+                    connection,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    status=terminal_status,
+                    outcome=event.data,
+                )
         if conflict:
             raise EventInvariantConflict(event.event_key)
         persisted = EventRecord.model_validate(row)
-        await self._publish_wakeup(tenant_id, run_id)
+        if publish_wakeup:
+            await self._publish_wakeup(tenant_id, run_id)
         return persisted
+
+    @asynccontextmanager
+    async def _transaction(self, connection: Any | None):
+        """Use a caller transaction or open one for a standalone operation."""
+        if connection is not None:
+            yield connection
+            return
+        async with self._pool.connection() as owned_connection:
+            async with owned_connection.transaction():
+                yield owned_connection
 
     async def _publish_wakeup(self, tenant_id: str, run_id: UUID) -> None:
         if self._live_events is not None:

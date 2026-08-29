@@ -257,13 +257,6 @@ async def _persist_result_events(
             data=event.data,
         )
         if event.type == "done":
-            persisted = await repository.complete_run(
-                tenant_id=tenant_id,
-                run_id=run_id,
-                event=event_input,
-                owner_instance_id=owner_instance_id,
-                execution_epoch=execution_epoch,
-            )
             if isinstance(event.data, dict) and isinstance(
                 event.data.get("answer"), str
             ):
@@ -273,13 +266,34 @@ async def _persist_result_events(
                     raise ValueError(
                         "completed Graph state is missing a valid turn_id"
                     ) from error
-                await message_repository.persist_assistant_message_after_completion(
+                async with repository.transaction() as connection:
+                    await message_repository.persist_assistant_message_in_terminal_transaction(
+                        connection,
+                        tenant_id=tenant_id,
+                        conversation_id=conversation_id,
+                        run_id=run_id,
+                        owner_instance_id=owner_instance_id,
+                        execution_epoch=execution_epoch,
+                        turn_id=turn_id,
+                        content=event.data["answer"],
+                        idempotency_key=f"turn:{turn_id}:assistant",
+                    )
+                    persisted = await repository.complete_run_in_transaction(
+                        connection,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        event=event_input,
+                        owner_instance_id=owner_instance_id,
+                        execution_epoch=execution_epoch,
+                    )
+                await repository.publish_wakeup(tenant_id, run_id)
+            else:
+                persisted = await repository.complete_run(
                     tenant_id=tenant_id,
-                    conversation_id=conversation_id,
                     run_id=run_id,
-                    turn_id=turn_id,
-                    content=event.data["answer"],
-                    idempotency_key=f"turn:{turn_id}:assistant",
+                    event=event_input,
+                    owner_instance_id=owner_instance_id,
+                    execution_epoch=execution_epoch,
                 )
         elif event.type == "error":
             persisted = await repository.fail_run(

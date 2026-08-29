@@ -31,6 +31,7 @@ from app.langgraph_v2.checkpointing import (
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
+    TurnNotFound,
 )
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
@@ -352,6 +353,115 @@ def test_request_header_and_generated_conversation_variants(
     assert turn.resume_deadline - turn.created_at == timedelta(hours=1)
     assert parse_sse(generated.text)[-1]["data"]["session_id"] == conversation_id
     assert invalid_client_id.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_done_answer_finalization_is_atomic_on_turn_validation(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        await seed_subject_conversation(pool)
+        repository = RunEventRepository(pool)
+        message_repository = ConversationMessageRepository(pool)
+
+        async def persist_done(run_id: UUID, result_turn_id: UUID) -> None:
+            result = {
+                "turn_id": str(result_turn_id),
+                "events": [
+                    {
+                        "event_key": "lifecycle:completed:0",
+                        "type": "done",
+                        "data": {"answer": "answer"},
+                        "sequence": 1,
+                    }
+                ],
+            }
+            frames = api_module._persist_result_events(
+                repository,
+                message_repository,
+                tenant_id="tenant-a",
+                run_id=run_id,
+                conversation_id="conversation-1",
+                result=result,
+                owner_instance_id="instance-a",
+                execution_epoch=1,
+                answer_chunk_interval_ms=0,
+            )
+            async for _ in frames:
+                pass
+
+        missing_run = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        missing_turn = uuid4()
+        with pytest.raises(TurnNotFound):
+            await persist_done(missing_run.run_id, missing_turn)
+        assert (await repository.get_run("tenant-a", missing_run.run_id)).status == (
+            "running"
+        )
+        assert await repository.list_events("tenant-a", missing_run.run_id) == []
+
+        wrong_run = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        actual_turn = uuid4()
+        await message_repository.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="conversation-1",
+            run_id=wrong_run.run_id,
+            turn_id=actual_turn,
+            content="question",
+            idempotency_key=f"turn:{actual_turn}:user",
+        )
+        with pytest.raises(TurnNotFound):
+            await persist_done(wrong_run.run_id, uuid4())
+        assert (await repository.get_run("tenant-a", wrong_run.run_id)).status == (
+            "running"
+        )
+        assert await repository.list_events("tenant-a", wrong_run.run_id) == []
+
+        valid_run = await repository.create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        valid_turn = uuid4()
+        await message_repository.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="conversation-1",
+            run_id=valid_run.run_id,
+            turn_id=valid_turn,
+            content="question",
+            idempotency_key=f"turn:{valid_turn}:user",
+        )
+        await persist_done(valid_run.run_id, valid_turn)
+
+        assert (await repository.get_run("tenant-a", valid_run.run_id)).status == (
+            "completed"
+        )
+        events = await repository.list_events("tenant-a", valid_run.run_id)
+        assert [(event.event_key, event.type) for event in events] == [
+            ("lifecycle:completed:0", "done")
+        ]
+        messages = await message_repository.list_messages(
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="conversation-1",
+        )
+        assert [
+            message.role for message in messages if message.turn_id == valid_turn
+        ] == [
+            "user",
+            "assistant",
+        ]
 
 
 def test_query_authorizes_existing_conversation_before_streaming(
