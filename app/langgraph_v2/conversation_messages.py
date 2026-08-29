@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -38,17 +39,16 @@ class ResumeExpired(RuntimeError):
 DEFAULT_RESUME_TTL = timedelta(hours=1)
 
 
-def resume_deadline_for(
-    created_at: datetime,
-    configured_resume_ttl: timedelta | int = DEFAULT_RESUME_TTL,
-) -> datetime:
-    """Calculate the immutable Resume deadline from the user Message timestamp."""
-    ttl = (
-        configured_resume_ttl
-        if isinstance(configured_resume_ttl, timedelta)
-        else timedelta(seconds=configured_resume_ttl)
+def turn_id_for_client_request(
+    tenant_id: str, conversation_id: str, client_request_id: str
+) -> UUID:
+    """Derive a collision-safe stable Turn ID for one client retry identity."""
+    payload = json.dumps(
+        [tenant_id, conversation_id, client_request_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
-    return created_at + ttl
+    return uuid5(NAMESPACE_URL, payload)
 
 
 class ConversationRecord(BaseModel):
@@ -73,6 +73,7 @@ class MessageRecord(BaseModel):
     content: str
     idempotency_key: str
     created_at: datetime
+    resume_deadline: datetime | None = None
 
 
 class TurnRecord(BaseModel):
@@ -93,14 +94,10 @@ class ConversationMessageRepository:
         self,
         pool: AsyncConnectionPool[Any],
         *,
-        resume_ttl: timedelta | int = DEFAULT_RESUME_TTL,
+        resume_ttl: timedelta = DEFAULT_RESUME_TTL,
     ) -> None:
         self._pool = pool
-        self._resume_ttl = (
-            resume_ttl
-            if isinstance(resume_ttl, timedelta)
-            else timedelta(seconds=resume_ttl)
-        )
+        self._resume_ttl = resume_ttl
 
     async def create_turn(
         self,
@@ -108,15 +105,11 @@ class ConversationMessageRepository:
         context: TrustedRequestContext,
         conversation_id: str,
         run_id: UUID,
+        turn_id: UUID,
         content: str,
         idempotency_key: str,
-        turn_id: UUID | None = None,
     ) -> TurnRecord:
         """Create one Turn and its exactly-once user Message atomically."""
-        resolved_turn_id = turn_id or uuid5(
-            NAMESPACE_URL,
-            f"{context.tenant_id}:{conversation_id}:{idempotency_key}",
-        )
         async with self._pool.connection() as connection:
             async with connection.transaction():
                 await self._resolve_conversation_in_transaction(
@@ -129,7 +122,7 @@ class ConversationMessageRepository:
                     tenant_id=context.tenant_id,
                     conversation_id=conversation_id,
                     run_id=run_id,
-                    turn_id=resolved_turn_id,
+                    turn_id=turn_id,
                     role="user",
                     content=content,
                     idempotency_key=idempotency_key,
@@ -138,7 +131,7 @@ class ConversationMessageRepository:
                     connection,
                     tenant_id=context.tenant_id,
                     conversation_id=conversation_id,
-                    turn_id=resolved_turn_id,
+                    turn_id=turn_id,
                 )
 
     async def get_turn(
@@ -332,7 +325,7 @@ class ConversationMessageRepository:
         run_id: UUID,
         content: str,
         idempotency_key: str,
-        turn_id: UUID | None = None,
+        turn_id: UUID,
     ) -> MessageRecord:
         """Persist an assistant Message only for an already completed Run."""
         async with self._pool.connection() as connection:
@@ -354,22 +347,18 @@ class ConversationMessageRepository:
                     or run["conversation_id"] != conversation_id
                 ):
                     raise ClaimFenced(str(run_id))
-                resolved_turn_id = (
-                    turn_id
-                    or await self._turn_id_for_run(
-                        connection,
-                        tenant_id=tenant_id,
-                        conversation_id=conversation_id,
-                        run_id=run_id,
-                    )
-                    or run_id
+                await self._require_user_turn_in_transaction(
+                    connection,
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
                 )
                 return await self._persist_message_in_transaction(
                     connection,
                     tenant_id=tenant_id,
                     conversation_id=conversation_id,
                     run_id=run_id,
-                    turn_id=resolved_turn_id,
+                    turn_id=turn_id,
                     role="assistant",
                     content=content,
                     idempotency_key=idempotency_key,
@@ -386,7 +375,7 @@ class ConversationMessageRepository:
         execution_epoch: int,
         content: str,
         idempotency_key: str,
-        turn_id: UUID | None = None,
+        turn_id: UUID,
     ) -> MessageRecord:
         """Write a safe answer through a caller-owned, epoch-fenced transaction."""
         async with connection.cursor(row_factory=dict_row) as cursor:
@@ -411,22 +400,18 @@ class ConversationMessageRepository:
             or not run["claim_active"]
         ):
             raise ClaimFenced(str(run_id))
-        resolved_turn_id = (
-            turn_id
-            or await self._turn_id_for_run(
-                connection,
-                tenant_id=tenant_id,
-                conversation_id=conversation_id,
-                run_id=run_id,
-            )
-            or run_id
+        await self._require_user_turn_in_transaction(
+            connection,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
         )
         return await self._persist_message_in_transaction(
             connection,
             tenant_id=tenant_id,
             conversation_id=conversation_id,
             run_id=run_id,
-            turn_id=resolved_turn_id,
+            turn_id=turn_id,
             role="assistant",
             content=content,
             idempotency_key=idempotency_key,
@@ -444,7 +429,8 @@ class ConversationMessageRepository:
         async with connection.cursor(row_factory=dict_row) as cursor:
             await cursor.execute(
                 """
-                SELECT tenant_id, conversation_id, turn_id, run_id, created_at
+                SELECT tenant_id, conversation_id, turn_id, run_id, created_at,
+                       resume_deadline
                 FROM langgraph_v2.messages
                 WHERE tenant_id = %s AND conversation_id = %s
                   AND turn_id = %s AND role = 'user'
@@ -457,33 +443,31 @@ class ConversationMessageRepository:
         return TurnRecord.model_validate(
             {
                 **row,
-                "resume_deadline": resume_deadline_for(
-                    row["created_at"], self._resume_ttl
-                ),
             }
         )
 
-    async def _turn_id_for_run(
+    async def _require_user_turn_in_transaction(
         self,
         connection: Any,
         *,
         tenant_id: str,
         conversation_id: str,
-        run_id: UUID,
-    ) -> UUID | None:
-        """Resolve the Turn from its authoritative user Message during migration."""
+        turn_id: UUID,
+    ) -> None:
+        """Ensure an assistant attaches to an existing user Message Turn."""
         async with connection.cursor(row_factory=dict_row) as cursor:
             await cursor.execute(
                 """
                 SELECT turn_id
                 FROM langgraph_v2.messages
                 WHERE tenant_id = %s AND conversation_id = %s
-                  AND run_id = %s AND role = 'user'
+                  AND turn_id = %s AND role = 'user'
                 """,
-                (tenant_id, conversation_id, run_id),
+                (tenant_id, conversation_id, turn_id),
             )
             row = await cursor.fetchone()
-        return None if row is None else row["turn_id"]
+        if row is None:
+            raise TurnNotFound(str(turn_id))
 
     async def get_message(
         self,
@@ -499,7 +483,8 @@ class ConversationMessageRepository:
                 await cursor.execute(
                     """
                     SELECT tenant_id, message_id, conversation_id, run_id, role,
-                           turn_id, content, idempotency_key, created_at
+                           turn_id, content, idempotency_key, created_at,
+                           resume_deadline
                     FROM langgraph_v2.messages
                     WHERE tenant_id = %s AND conversation_id = %s
                       AND message_id = %s
@@ -524,7 +509,8 @@ class ConversationMessageRepository:
                 await cursor.execute(
                     """
                     SELECT tenant_id, message_id, conversation_id, run_id, role,
-                           turn_id, content, idempotency_key, created_at
+                           turn_id, content, idempotency_key, created_at,
+                           resume_deadline
                     FROM langgraph_v2.messages
                     WHERE tenant_id = %s AND conversation_id = %s
                     ORDER BY created_at, message_id
@@ -547,46 +533,77 @@ class ConversationMessageRepository:
         idempotency_key: str,
     ) -> MessageRecord:
         message_id = uuid4()
-        async with connection.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(
-                """
+        if role == "user":
+            insert_sql = """
+                WITH turn_times AS (SELECT clock_timestamp() AS created_at)
                 INSERT INTO langgraph_v2.messages (
                     tenant_id, message_id, conversation_id, run_id, turn_id, role,
-                    content, idempotency_key
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    content, idempotency_key, created_at, resume_deadline
+                )
+                SELECT %s, %s, %s, %s, %s, %s, %s, %s, created_at,
+                       created_at + (%s * interval '1 second')
+                FROM turn_times
                 ON CONFLICT DO NOTHING
                 RETURNING tenant_id, message_id, conversation_id, run_id, role,
-                          turn_id, content, idempotency_key, created_at
-                """,
-                (
-                    tenant_id,
-                    message_id,
-                    conversation_id,
-                    run_id,
-                    turn_id,
-                    role,
-                    content,
-                    idempotency_key,
-                ),
+                          turn_id, content, idempotency_key, created_at,
+                          resume_deadline
+                """
+            insert_params = (
+                tenant_id,
+                message_id,
+                conversation_id,
+                run_id,
+                turn_id,
+                role,
+                content,
+                idempotency_key,
+                self._resume_ttl.total_seconds(),
             )
+        else:
+            insert_sql = """
+                INSERT INTO langgraph_v2.messages (
+                    tenant_id, message_id, conversation_id, run_id, turn_id, role,
+                    content, idempotency_key, resume_deadline
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                ON CONFLICT DO NOTHING
+                RETURNING tenant_id, message_id, conversation_id, run_id, role,
+                          turn_id, content, idempotency_key, created_at,
+                          resume_deadline
+                """
+            insert_params = (
+                tenant_id,
+                message_id,
+                conversation_id,
+                run_id,
+                turn_id,
+                role,
+                content,
+                idempotency_key,
+            )
+        async with connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(insert_sql, insert_params)
             row = await cursor.fetchone()
             if row is None:
                 await cursor.execute(
                     """
                     SELECT tenant_id, message_id, conversation_id, run_id, role,
-                           turn_id, content, idempotency_key, created_at
+                           turn_id, content, idempotency_key, created_at,
+                           resume_deadline
                     FROM langgraph_v2.messages
                     WHERE tenant_id = %s AND idempotency_key = %s
                     """,
                     (tenant_id, idempotency_key),
                 )
                 row = await cursor.fetchone()
-        if row is None or (
-            row["conversation_id"] != conversation_id
-            or row["run_id"] != run_id
-            or row["turn_id"] != turn_id
-            or row["role"] != role
-            or row["content"] != content
-        ):
+        if row is None:
+            raise MessageInvariantConflict(idempotency_key)
+        same_message = (
+            row["conversation_id"] == conversation_id
+            and row["turn_id"] == turn_id
+            and row["role"] == role
+            and row["content"] == content
+            and row["idempotency_key"] == idempotency_key
+        )
+        if not same_message:
             raise MessageInvariantConflict(idempotency_key)
         return MessageRecord.model_validate(row)

@@ -130,6 +130,7 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             tenant_id="tenant-a",
             conversation_id="c1",
             run_id=run.run_id,
+            turn_id=run.run_id,
             content=result["answer"],
             idempotency_key=f"run:{run.run_id}:assistant",
         )
@@ -212,6 +213,7 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
             tenant_id="tenant-a",
             conversation_id="c1",
             run_id=run.run_id,
+            turn_id=run.run_id,
             content=result["answer"],
             idempotency_key=f"run:{run.run_id}:assistant",
         )

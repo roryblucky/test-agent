@@ -42,6 +42,7 @@ from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
     ConversationRecord,
+    turn_id_for_client_request,
 )
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
@@ -266,12 +267,19 @@ async def _persist_result_events(
             if isinstance(event.data, dict) and isinstance(
                 event.data.get("answer"), str
             ):
+                try:
+                    turn_id = uuid.UUID(str(result["turn_id"]))
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        "completed Graph state is missing a valid turn_id"
+                    ) from error
                 await message_repository.persist_assistant_message_after_completion(
                     tenant_id=tenant_id,
                     conversation_id=conversation_id,
                     run_id=run_id,
+                    turn_id=turn_id,
                     content=event.data["answer"],
-                    idempotency_key=f"run:{run_id}:assistant",
+                    idempotency_key=f"turn:{turn_id}:assistant",
                 )
         elif event.type == "error":
             persisted = await repository.fail_run(
@@ -682,7 +690,6 @@ def create_tracer_router(
         if not runtime.accepting:
             raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
         run_id = uuid.uuid4()
-        turn_id = uuid.uuid4()
         x_application_id = request_context.tenant_id
         configured_pool = getattr(
             http_request.app.state,
@@ -719,6 +726,13 @@ def create_tracer_router(
                 status_code=404, detail="Conversation not found"
             ) from error
         conversation_id = conversation.conversation_id
+        if payload.client_request_id is None:
+            turn_id = uuid.uuid4()
+        else:
+            turn_id = turn_id_for_client_request(
+                x_application_id, conversation_id, payload.client_request_id
+            )
+        user_idempotency_key = f"turn:{turn_id}:user"
 
         async def event_generator() -> AsyncIterator[str]:
             claim = await repository.create_run(
@@ -733,7 +747,7 @@ def create_tracer_router(
                 run_id=run_id,
                 turn_id=turn_id,
                 content=payload.query,
-                idempotency_key=f"run:{run_id}:user",
+                idempotency_key=user_idempotency_key,
             )
             configured_checkpointer = getattr(
                 http_request.app.state,

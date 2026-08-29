@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -53,6 +53,8 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
 
         assert repeated == first
         assert first.turn_id == turn_id
+        original_deadline = first.resume_deadline
+        assert original_deadline - first.created_at == timedelta(minutes=5)
         message = (
             await repository.list_messages(context=context, conversation_id="session-1")
         )[0]
@@ -67,15 +69,20 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
                 content="changed",
                 idempotency_key="turn-1:user",
             )
+        with pytest.raises(MessageInvariantConflict):
+            await repository.create_turn(
+                context=context,
+                conversation_id="session-1",
+                turn_id=turn_id,
+                run_id=run_id,
+                content="hello",
+                idempotency_key="turn-1:different-key",
+            )
 
-        anchored_at = datetime(2026, 1, 1, tzinfo=UTC)
-        async with pool.connection() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    "UPDATE langgraph_v2.messages SET created_at = %s WHERE turn_id = %s",
-                    (anchored_at, turn_id),
-                )
-        retried_after_anchor = await repository.create_turn(
+        repository_with_longer_ttl = ConversationMessageRepository(
+            pool, resume_ttl=timedelta(minutes=30)
+        )
+        retried_after_config_change = await repository_with_longer_ttl.create_turn(
             context=context,
             conversation_id="session-1",
             turn_id=turn_id,
@@ -83,20 +90,19 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
             content="hello",
             idempotency_key="turn-1:user",
         )
-        turn = await repository.get_turn(
+        turn = await repository_with_longer_ttl.get_turn(
             context=context,
             conversation_id="session-1",
             turn_id=turn_id,
         )
-        assert retried_after_anchor.created_at == anchored_at
-        assert turn.created_at == anchored_at
-        assert turn.resume_deadline == anchored_at + timedelta(minutes=5)
+        assert retried_after_config_change == first
+        assert turn.resume_deadline == original_deadline
         with pytest.raises(ResumeExpired):
             await repository.get_turn_for_resume(
                 context=context,
                 conversation_id="session-1",
                 turn_id=turn_id,
-                now=datetime(2026, 1, 1, 0, 6, tzinfo=UTC),
+                now=original_deadline + timedelta(seconds=1),
             )
 
 
@@ -269,6 +275,7 @@ async def test_assistant_message_requires_successful_run_completion(
             tenant_id="tenant-a",
             conversation_id="session-1",
             run_id=completed.run_id,
+            turn_id=turn_id,
             content="safe answer",
             idempotency_key=f"run:{completed.run_id}:assistant",
         )
@@ -276,6 +283,7 @@ async def test_assistant_message_requires_successful_run_completion(
             tenant_id="tenant-a",
             conversation_id="session-1",
             run_id=completed.run_id,
+            turn_id=turn_id,
             content="safe answer",
             idempotency_key=f"run:{completed.run_id}:assistant",
         )
@@ -288,6 +296,7 @@ async def test_assistant_message_requires_successful_run_completion(
                     tenant_id="tenant-a",
                     conversation_id="session-1",
                     run_id=blocked.run_id,
+                    turn_id=turn_id,
                     content="must not persist",
                     idempotency_key=f"run:{blocked.run_id}:assistant",
                 )

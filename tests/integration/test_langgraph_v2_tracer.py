@@ -3,6 +3,7 @@ import json
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
+from datetime import timedelta
 from importlib import reload
 from pathlib import Path
 from typing import Any, cast
@@ -313,6 +314,15 @@ def test_request_header_and_generated_conversation_variants(
             json={"query": "hello", "clientRequestId": "request-1"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
+        repeated = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "hello",
+                "sessionId": generated.headers.get("x-conversation-id"),
+                "clientRequestId": "request-1",
+            },
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
         invalid_client_id = client.post(
             "/v2/query/stream",
             json={"query": "hello", "clientRequestId": "not allowed"},
@@ -321,8 +331,25 @@ def test_request_header_and_generated_conversation_variants(
 
     assert missing_tenant.status_code == 422
     assert generated.status_code == 200
+    assert repeated.status_code == 200
     conversation_id = generated.headers["x-conversation-id"]
     UUID(conversation_id)
+    assert repeated.headers["x-turn-id"] == generated.headers["x-turn-id"]
+
+    async def read_turn():
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            return await ConversationMessageRepository(pool).get_turn(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id=conversation_id,
+                turn_id=UUID(generated.headers["x-turn-id"]),
+            )
+
+    turn = asyncio.run(read_turn())
+    assert turn.resume_deadline - turn.created_at == timedelta(hours=1)
     assert parse_sse(generated.text)[-1]["data"]["session_id"] == conversation_id
     assert invalid_client_id.status_code == 422
 

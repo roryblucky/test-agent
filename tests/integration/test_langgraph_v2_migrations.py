@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -16,6 +18,77 @@ from app.langgraph_v2.conversation_messages import (
 )
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.migrations import build_alembic_config
+
+
+def test_turn_migration_backfills_user_deadline_from_authoritative_message(
+    langgraph_v2_test_database_url: str,
+) -> None:
+    """Expand/backfill preserves old Run identity and anchors a one-hour TTL."""
+    config = build_alembic_config(langgraph_v2_test_database_url)
+    command.upgrade(config, "0008_cancellation_intents")
+    tenant_id = "tenant-a"
+    conversation_id = "conversation-1"
+    run_id = uuid4()
+    user_id = uuid4()
+    assistant_id = uuid4()
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        connection.execute(
+            "INSERT INTO langgraph_v2.conversations (tenant_id, conversation_id) VALUES (%s, %s)",
+            (tenant_id, conversation_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO langgraph_v2.runs (tenant_id, run_id, conversation_id, status)
+            VALUES (%s, %s, %s, 'completed')
+            """,
+            (tenant_id, run_id, conversation_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO langgraph_v2.messages (
+                tenant_id, message_id, conversation_id, run_id, role, content,
+                idempotency_key, created_at
+            ) VALUES (%s, %s, %s, %s, 'user', 'question', 'legacy:user', %s),
+                     (%s, %s, %s, %s, 'assistant', 'answer', 'legacy:assistant', %s)
+            """,
+            (
+                tenant_id,
+                user_id,
+                conversation_id,
+                run_id,
+                created_at,
+                tenant_id,
+                assistant_id,
+                conversation_id,
+                run_id,
+                created_at,
+            ),
+        )
+
+    command.upgrade(config, "head")
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        rows = connection.execute(
+            """
+            SELECT role, turn_id, resume_deadline, run_id, content
+            FROM langgraph_v2.messages
+            ORDER BY role
+            """
+        ).fetchall()
+    assert rows[0] == ("assistant", run_id, None, run_id, "answer")
+    assert rows[1] == (
+        "user",
+        run_id,
+        datetime(2026, 1, 1, 1, tzinfo=UTC),
+        run_id,
+        "question",
+    )
+
+    command.downgrade(config, "0009_conversation_authorization")
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        assert connection.execute(
+            "SELECT run_id, content FROM langgraph_v2.messages ORDER BY role"
+        ).fetchall() == [(run_id, "answer"), (run_id, "question")]
 
 
 def test_application_base_revision_upgrades_and_downgrades(
