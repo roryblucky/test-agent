@@ -66,6 +66,7 @@ class _RealtimeStream:
         self.release = asyncio.Event()
         self.started = asyncio.Event()
         self.completed = False
+        self.close_completed = False
 
     def __aiter__(self) -> AsyncIterator[Any]:
         return self
@@ -104,6 +105,8 @@ class _RealtimeStream:
 
     async def aclose(self) -> None:
         self.closed = True
+        await asyncio.sleep(0)
+        self.close_completed = True
         self.release.set()
 
 
@@ -265,6 +268,58 @@ async def test_query_yields_answer_delta_before_graph_completion(
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
         ("assistant", "partial complete"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_closing_query_after_answer_token_closes_graph_and_persists_no_partial_assistant_message(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url, "conversation-1"
+    )
+    graph = _RealtimeGraph()
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            stream_request(app),
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
+        )
+        subscriber = response.body_iterator
+        token_frame = _event_frame(await anext(subscriber))
+        assert token_frame["type"] == "token"
+        assert token_frame["data"] == "partial"
+
+        pending_read = asyncio.create_task(anext(subscriber))
+        await graph.stream.started.wait()
+        pending_read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending_read
+
+        await subscriber.aclose()
+
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            messages = await ConversationMessageRepository(pool).list_messages(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="conversation-1",
+            )
+            run = await RunEventRepository(pool).get_run(
+                "tenant-a", UUID(response.headers["x-run-id"])
+            )
+
+    assert graph.stream.closed is True
+    assert graph.stream.close_completed is True
+    assert run.status == "interrupted"
+    assert [(message.role, message.content) for message in messages] == [
+        ("user", "hello"),
     ]
 
 

@@ -363,10 +363,11 @@ def test_thread_resume_recovers_pre_answer_checkpoint_from_fresh_app(
     )
     messages = asyncio.run(_read_messages(langgraph_v2_migrated_database_url))
     assert turn_after_resume.resume_deadline == resume_deadline
-    assert [message.role for message in messages if message.turn_id == turn_id] == [
-        "user",
-        "assistant",
-    ]
+    assert [
+        (message.role, message.content)
+        for message in messages
+        if message.turn_id == turn_id
+    ] == [("user", "resume me"), ("assistant", "recovered answer")]
 
 
 def test_thread_resume_returns_404_for_missing_or_unauthorized_thread(
