@@ -242,7 +242,7 @@ def test_answer_model_failure_fails_the_public_run(
     )
     with TestClient(app) as client:
         response = client.post(
-            "/v2/query/stream", json={"query": "hello"}, headers={"X-Application-Id": "tenant-a"}
+            "/v2/query/stream", json={"query": "hello"}, headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
         )
 
     events = parse_sse(response.text)
@@ -273,7 +273,7 @@ def test_answer_chunks_are_streamed_before_finalization(
     )
     with TestClient(app) as client:
         response = client.post(
-            "/v2/query/stream", json={"query": "hello"}, headers={"X-Application-Id": "tenant-a"}
+            "/v2/query/stream", json={"query": "hello"}, headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
         )
 
     assert response.status_code == 200

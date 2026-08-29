@@ -14,6 +14,10 @@ from fastapi import FastAPI, Request
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.api import register_v2_routes
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.conversation_messages import (
+    ConversationMessageRepository,
+)
 from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.replay import PersistedEventFollower
@@ -24,10 +28,17 @@ from app.langgraph_v2.run_events import (
     RunRecord,
 )
 
-LiveEndpoint = Callable[[UUID, Request, str, int], Awaitable[Any]]
+LiveEndpoint = Callable[[UUID, Request, TrustedRequestContext, int], Awaitable[Any]]
 
 
-async def _seed(repository: RunEventRepository) -> tuple[UUID, str, int]:
+async def _seed(
+    repository: RunEventRepository,
+    pool: AsyncConnectionPool[Any],
+) -> tuple[UUID, str, int]:
+    await ConversationMessageRepository(pool).resolve_conversation(
+        context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+        conversation_id="conversation-1",
+    )
     run = await repository.create_run(
         tenant_id="tenant-a",
         run_id=uuid4(),
@@ -91,11 +102,11 @@ async def test_public_replay_then_live_is_gapless_and_closes_at_terminal(
         repository = RunEventRepository(
             pool, live_events=app.state.langgraph_v2_live_events
         )
-        run_id, owner, _ = await _seed(repository)
+        run_id, owner, _ = await _seed(repository, pool)
         response = await _live_endpoint(app)(
             run_id,
             _request(app),
-            "tenant-a",
+            TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
             after_sequence=0,
         )
         frames = response.body_iterator
@@ -143,7 +154,7 @@ async def test_remote_wakeup_loss_uses_polling_without_sequence_loss(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         writer = RunEventRepository(pool, live_events=LiveEventWakeups())
-        run_id, owner, _ = await _seed(writer)
+        run_id, owner, _ = await _seed(writer, pool)
         follower = PersistedEventFollower(
             RunEventRepository(pool),
             LiveEventWakeups(),
@@ -175,7 +186,7 @@ async def test_cursor_beyond_latest_waits_for_running_run_then_closes_terminal(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = RunEventRepository(pool)
-        run_id, owner, _ = await _seed(repository)
+        run_id, owner, _ = await _seed(repository, pool)
         follower = PersistedEventFollower(
             repository,
             LiveEventWakeups(),
@@ -207,7 +218,7 @@ async def test_follower_converts_one_expired_claim_to_interrupted_event(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = RunEventRepository(pool)
-        run_id, _, _ = await _seed(repository)
+        run_id, _, _ = await _seed(repository, pool)
         async with pool.connection() as connection:
             await connection.execute(
                 """
@@ -244,7 +255,7 @@ async def test_only_one_expiry_cas_wins_and_losers_replay_its_event(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = RunEventRepository(pool)
-        run_id, _, _ = await _seed(repository)
+        run_id, _, _ = await _seed(repository, pool)
         async with pool.connection() as connection:
             await connection.execute(
                 """
@@ -283,7 +294,7 @@ async def test_direct_stale_resume_wakes_old_follower_with_boundary_below_cursor
     ) as pool:
         wakeups = LiveEventWakeups()
         repository = RunEventRepository(pool, live_events=wakeups)
-        run_id, owner, _ = await _seed(repository)
+        run_id, owner, _ = await _seed(repository, pool)
         await repository.update_checkpoint_pointer(
             tenant_id="tenant-a",
             run_id=run_id,
@@ -377,7 +388,7 @@ async def test_terminal_event_committed_at_snapshot_boundary_is_not_skipped(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = RunEventRepository(pool)
-        run_id, owner, _ = await _seed(repository)
+        run_id, owner, _ = await _seed(repository, pool)
         racing_repository = _CompleteAfterEventRead(
             repository, run_id=run_id, owner=owner
         )
@@ -460,7 +471,7 @@ async def test_old_follower_emits_interruption_but_not_replacement_epoch_events(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = RunEventRepository(pool)
-        run_id, owner, _ = await _seed(repository)
+        run_id, owner, _ = await _seed(repository, pool)
         await repository.update_checkpoint_pointer(
             tenant_id="tenant-a",
             run_id=run_id,

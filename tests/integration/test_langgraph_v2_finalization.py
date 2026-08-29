@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -18,6 +19,8 @@ from app.api.router import router as legacy_router
 from app.langgraph_v2.answer import AnswerResult
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.history import ConversationTurn
@@ -276,6 +279,19 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
 def test_public_v2_sse_matches_final_output_golden(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    async def seed() -> None:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            await ConversationMessageRepository(pool).resolve_conversation(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="c1",
+            )
+
+    asyncio.run(seed())
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         async with postgres_lifespan(
@@ -299,7 +315,7 @@ def test_public_v2_sse_matches_final_output_golden(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello", "sessionId": "c1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     fixture = json.loads(

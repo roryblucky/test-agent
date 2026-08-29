@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Coroutine
 from contextlib import suppress
 from typing import Annotated, Any, Protocol, cast
 
-from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from psycopg_pool import AsyncConnectionPool
@@ -21,20 +21,27 @@ from app.langgraph_v2.answer import (
     build_answer_actor,
 )
 from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
+from app.langgraph_v2.authorization import (
+    TrustedRequestContext,
+    get_trusted_request_context,
+)
 from app.langgraph_v2.cancellation import CancellationObserver, CancellationRepository
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
     checkpoint_namespace_for,
     exact_checkpoint_config,
     initial_checkpoint_config,
-    thread_id_for,
 )
 from app.langgraph_v2.contracts import (
     CancellationResponse,
     TracerStreamEvent,
     V2QueryRequest,
 )
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.conversation_messages import (
+    ConversationMessageRepository,
+    ConversationNotFound,
+    ConversationRecord,
+)
 from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
@@ -612,6 +619,22 @@ async def _start_execution_or_interrupt(
         return None
 
 
+async def _authorized_run_conversation(
+    repository: RunEventRepository,
+    message_repository: ConversationMessageRepository,
+    *,
+    context: TrustedRequestContext,
+    run_id: uuid.UUID,
+) -> ConversationRecord:
+    """Load a Run and authorize its Conversation as one API boundary."""
+    run = await repository.get_run(context.tenant_id, run_id)
+    conversation = await message_repository.get_conversation(
+        context=context,
+        conversation_id=run.conversation_id,
+    )
+    return conversation
+
+
 def create_tracer_router(
     graph: TracerGraph | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
@@ -634,50 +657,61 @@ def create_tracer_router(
     async def query_stream(
         payload: V2QueryRequest,
         http_request: Request,
-        x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+        request_context: Annotated[
+            TrustedRequestContext, Depends(get_trusted_request_context)
+        ],
         x_user_groups: Annotated[str, Header(alias="X-User-Groups")] = "",
     ) -> StreamingResponse:
         """Run the deterministic tracer and return its events as SSE."""
         del x_user_groups
-        _ensure_tenant_available(http_request.app, x_application_id)
+        _ensure_tenant_available(http_request.app, request_context.tenant_id)
         runtime = _local_runtime(http_request.app)
         if not runtime.accepting:
             raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
         run_id = uuid.uuid4()
-        conversation_id = (
-            payload.conversation_id
-            if payload.conversation_id is not None
-            else str(uuid.uuid4())
+        x_application_id = request_context.tenant_id
+        configured_pool = getattr(
+            http_request.app.state,
+            "langgraph_v2_postgres_pool",
+            None,
         )
+        if configured_pool is None:
+            raise HTTPException(
+                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
+            )
+        pool = cast(AsyncConnectionPool[Any], configured_pool)
+        wakeups = _live_events(http_request.app)
+        repository = RunEventRepository(pool, live_events=wakeups)
+        cancellation_repository = CancellationRepository(pool, wakeups=wakeups)
+        cancellation_observer = CancellationObserver(
+            cancellation_repository,
+            wakeups,
+            tenant_id=x_application_id,
+            run_id=run_id,
+        )
+        message_repository = ConversationMessageRepository(pool)
+        try:
+            if payload.conversation_id is None:
+                conversation = await message_repository.resolve_conversation(
+                    context=request_context,
+                )
+            else:
+                conversation = await message_repository.get_conversation(
+                    context=request_context,
+                    conversation_id=payload.conversation_id,
+                )
+        except ConversationNotFound as error:
+            raise HTTPException(
+                status_code=404, detail="Conversation not found"
+            ) from error
+        conversation_id = conversation.conversation_id
 
         async def event_generator() -> AsyncIterator[str]:
-            configured_pool = getattr(
-                http_request.app.state,
-                "langgraph_v2_postgres_pool",
-                None,
-            )
-            if configured_pool is None:
-                raise RuntimeError("LangGraph v2 PostgreSQL is not configured")
-            pool = cast(AsyncConnectionPool[Any], configured_pool)
-            wakeups = _live_events(http_request.app)
-            repository = RunEventRepository(pool, live_events=wakeups)
-            cancellation_repository = CancellationRepository(pool, wakeups=wakeups)
-            cancellation_observer = CancellationObserver(
-                cancellation_repository,
-                wakeups,
-                tenant_id=x_application_id,
-                run_id=run_id,
-            )
-            message_repository = ConversationMessageRepository(pool)
             claim = await repository.create_run(
                 tenant_id=x_application_id,
                 run_id=run_id,
                 conversation_id=conversation_id,
                 owner_instance_id=_INSTANCE_ID,
-            )
-            await message_repository.resolve_conversation(
-                tenant_id=x_application_id,
-                conversation_id=conversation_id,
             )
             await message_repository.persist_user_message(
                 tenant_id=x_application_id,
@@ -731,6 +765,7 @@ def create_tracer_router(
                     repository=PhaseResultRepository(pool, live_events=wakeups),
                     artifact_repository=ArtifactRepository(pool),
                     message_repository=message_repository,
+                    request_context=request_context,
                     history_token_budget=history_token_budget,
                     tenant_id=x_application_id,
                     run_id=run_id,
@@ -770,10 +805,7 @@ def create_tracer_router(
                         pointer_writer=write_checkpoint_pointer,
                     )
                     graph_config = initial_checkpoint_config(
-                        thread_id=thread_id_for(
-                            x_application_id,
-                            conversation_id,
-                        ),
+                        thread_id=conversation.thread_id,
                         checkpoint_ns=checkpoint_ns,
                     )
                 selected_graph = build_tracer_graph(
@@ -841,10 +873,13 @@ def create_tracer_router(
     async def resume_stream(
         run_id: uuid.UUID,
         http_request: Request,
-        x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+        request_context: Annotated[
+            TrustedRequestContext, Depends(get_trusted_request_context)
+        ],
         after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
     ) -> StreamingResponse:
         """Resume one stale or interrupted Run from its exact checkpoint."""
+        x_application_id = request_context.tenant_id
         _ensure_tenant_available(http_request.app, x_application_id)
         runtime = _local_runtime(http_request.app)
         if not runtime.accepting:
@@ -868,12 +903,18 @@ def create_tracer_router(
         )
         message_repository = ConversationMessageRepository(pool)
         try:
+            conversation = await _authorized_run_conversation(
+                repository,
+                message_repository,
+                context=request_context,
+                run_id=run_id,
+            )
             claim = await repository.resume_run(
                 tenant_id=x_application_id,
                 run_id=run_id,
                 owner_instance_id=_INSTANCE_ID,
             )
-        except RunNotFound as error:
+        except (RunNotFound, ConversationNotFound) as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
         except ResumeConflict as error:
             raise HTTPException(
@@ -950,6 +991,7 @@ def create_tracer_router(
                         repository=PhaseResultRepository(pool, live_events=wakeups),
                         artifact_repository=ArtifactRepository(pool),
                         message_repository=message_repository,
+                        request_context=request_context,
                         history_token_budget=history_token_budget,
                         tenant_id=x_application_id,
                         run_id=run_id,
@@ -970,7 +1012,7 @@ def create_tracer_router(
                     groundedness_actor=configured_groundedness_actor,
                 )
                 graph_config = exact_checkpoint_config(
-                    thread_id=thread_id_for(x_application_id, claim.conversation_id),
+                    thread_id=conversation.thread_id,
                     checkpoint_ns="",
                     checkpoint_id=previous_checkpoint_id,
                 )
@@ -1028,7 +1070,9 @@ def create_tracer_router(
     async def replay_stream(
         run_id: uuid.UUID,
         http_request: Request,
-        x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+        request_context: Annotated[
+            TrustedRequestContext, Depends(get_trusted_request_context)
+        ],
         after_sequence: Annotated[int, Query(alias="afterSequence", ge=0)] = 0,
     ) -> StreamingResponse:
         """Replay and then follow one Run from the requested sequence cursor."""
@@ -1039,11 +1083,18 @@ def create_tracer_router(
             raise HTTPException(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
+        x_application_id = request_context.tenant_id
         wakeups = _live_events(http_request.app)
         repository = RunEventRepository(configured_pool, live_events=wakeups)
+        messages = ConversationMessageRepository(configured_pool)
         try:
-            await repository.get_run(x_application_id, run_id)
-        except RunNotFound as error:
+            await _authorized_run_conversation(
+                repository,
+                messages,
+                context=request_context,
+                run_id=run_id,
+            )
+        except (RunNotFound, ConversationNotFound) as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
 
         async def event_generator() -> AsyncIterator[str]:
@@ -1071,7 +1122,9 @@ def create_tracer_router(
     async def cancel_run(
         run_id: uuid.UUID,
         http_request: Request,
-        x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+        request_context: Annotated[
+            TrustedRequestContext, Depends(get_trusted_request_context)
+        ],
     ) -> JSONResponse:
         """Accept a durable cancellation intent without claiming completion."""
         configured_pool = getattr(
@@ -1081,12 +1134,21 @@ def create_tracer_router(
             raise HTTPException(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
+        x_application_id = request_context.tenant_id
         try:
+            repository = RunEventRepository(configured_pool)
+            messages = ConversationMessageRepository(configured_pool)
+            await _authorized_run_conversation(
+                repository,
+                messages,
+                context=request_context,
+                run_id=run_id,
+            )
             result = await CancellationRepository(
                 configured_pool,
                 wakeups=_live_events(http_request.app),
             ).request(tenant_id=x_application_id, run_id=run_id)
-        except RunNotFound as error:
+        except (RunNotFound, ConversationNotFound) as error:
             raise HTTPException(status_code=404, detail="Run not found") from error
         response = CancellationResponse(
             status="accepted" if result.accepted else "already_terminal",

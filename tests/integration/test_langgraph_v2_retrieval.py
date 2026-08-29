@@ -86,7 +86,7 @@ def test_empty_retrieval_is_explicit_on_public_stream(
     app = persistent_tracer_app(langgraph_v2_migrated_database_url, retriever=EmptyRetriever())
     with TestClient(app) as client:
         response = client.post(
-            "/v2/query/stream", json={"query": "empty"}, headers={"X-Application-Id": "tenant-a"}
+            "/v2/query/stream", json={"query": "empty"}, headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
         )
     events = parse_sse(response.text)
     retrieval = next(event for event in events if event.get("step") == "retriever" and event["type"] == "step_completed")
@@ -105,7 +105,7 @@ def test_failed_retrieval_is_error_without_finalization_on_public_stream(
     app = persistent_tracer_app(langgraph_v2_migrated_database_url, retriever=FailingRetriever())
     with TestClient(app) as client:
         response = client.post(
-            "/v2/query/stream", json={"query": "fail"}, headers={"X-Application-Id": "tenant-a"}
+            "/v2/query/stream", json={"query": "fail"}, headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
         )
     events = parse_sse(response.text)
     assert response.status_code == 200

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from uuid import uuid4
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
@@ -237,6 +240,19 @@ async def test_pydantic_ai_actor_returns_agent_output() -> None:
 def test_http_query_uses_injected_refinement_actor(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    async def seed() -> None:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            await ConversationMessageRepository(pool).resolve_conversation(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="conversation-1",
+            )
+
+    asyncio.run(seed())
+
     class CountingActor:
         calls = 0
 
@@ -259,7 +275,7 @@ def test_http_query_uses_injected_refinement_actor(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello", "sessionId": "conversation-1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     assert response.status_code == 200

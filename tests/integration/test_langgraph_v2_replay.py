@@ -14,6 +14,10 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.api import register_v2_routes
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.conversation_messages import (
+    ConversationMessageRepository,
+)
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.run_events import EventInput, RunEventRepository
 
@@ -39,6 +43,10 @@ async def _seed_run(
     terminal: bool = False,
 ) -> UUID:
     async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
+        await ConversationMessageRepository(pool).resolve_conversation(
+            context=TrustedRequestContext(tenant_id=tenant_id, subject_id="subject-a"),
+            conversation_id="conversation-1",
+        )
         repository = RunEventRepository(pool)
         run = await repository.create_run(
             tenant_id=tenant_id,
@@ -116,7 +124,7 @@ def test_replay_returns_only_events_after_sequence_when_terminal(
     with TestClient(app) as client:
         response = client.get(
             f"/v2/runs/{run_id}/stream?afterSequence=1",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     assert response.status_code == 200
@@ -140,19 +148,17 @@ def test_replay_returns_only_events_after_sequence_when_terminal(
 def test_replay_of_terminal_run_closes_and_sequence_beyond_latest_is_empty(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    run_id = asyncio.run(
-        _seed_run(langgraph_v2_migrated_database_url, terminal=True)
-    )
+    run_id = asyncio.run(_seed_run(langgraph_v2_migrated_database_url, terminal=True))
     app = _replay_app(langgraph_v2_migrated_database_url, replay_enabled=True)
 
     with TestClient(app) as client:
         replay = client.get(
             f"/v2/runs/{run_id}/stream",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         beyond_latest = client.get(
             f"/v2/runs/{run_id}/stream?afterSequence=99",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     assert [event["sequence"] for event in _events(replay.text)] == [1, 2, 3]
@@ -169,19 +175,19 @@ def test_replay_validates_cursor_and_hides_missing_or_cross_tenant_runs(
     with TestClient(app) as client:
         negative = client.get(
             f"/v2/runs/{run_id}/stream?afterSequence=-1",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         malformed = client.get(
             f"/v2/runs/{run_id}/stream?afterSequence=not-a-number",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         missing = client.get(
             f"/v2/runs/{uuid4()}/stream",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         cross_tenant = client.get(
             f"/v2/runs/{run_id}/stream",
-            headers={"X-Application-Id": "tenant-b"},
+            headers={"X-Application-Id": "tenant-b", "X-Subject-Id": "subject-a"},
         )
 
     assert negative.status_code == 422
@@ -193,18 +199,20 @@ def test_replay_validates_cursor_and_hides_missing_or_cross_tenant_runs(
 def test_replay_from_another_fastapi_instance_does_not_write_durable_records(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    run_id = asyncio.run(
-        _seed_run(langgraph_v2_migrated_database_url, terminal=True)
+    run_id = asyncio.run(_seed_run(langgraph_v2_migrated_database_url, terminal=True))
+    first_instance = _replay_app(
+        langgraph_v2_migrated_database_url, replay_enabled=True
     )
-    first_instance = _replay_app(langgraph_v2_migrated_database_url, replay_enabled=True)
-    second_instance = _replay_app(langgraph_v2_migrated_database_url, replay_enabled=True)
+    second_instance = _replay_app(
+        langgraph_v2_migrated_database_url, replay_enabled=True
+    )
 
     with TestClient(first_instance):
         before = asyncio.run(_durable_counts(langgraph_v2_migrated_database_url))
         with TestClient(second_instance) as client:
             response = client.get(
                 f"/v2/runs/{run_id}/stream",
-                headers={"X-Application-Id": "tenant-a"},
+                headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
             )
         after = asyncio.run(_durable_counts(langgraph_v2_migrated_database_url))
 

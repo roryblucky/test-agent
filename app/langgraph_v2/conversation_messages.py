@@ -10,6 +10,8 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
 
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.checkpointing import thread_id_for
 from app.langgraph_v2.run_events import ClaimFenced, RepositoryNotFound
 
 
@@ -30,6 +32,8 @@ class ConversationRecord(BaseModel):
 
     tenant_id: str
     conversation_id: str
+    owner_subject_id: str
+    thread_id: str
     created_at: datetime
 
 
@@ -55,23 +59,24 @@ class ConversationMessageRepository:
     async def resolve_conversation(
         self,
         *,
-        tenant_id: str,
-        conversation_id: str,
+        context: TrustedRequestContext,
+        conversation_id: str | None = None,
     ) -> ConversationRecord:
-        """Resolve or create the Conversation for a legacy session identity."""
+        """Resolve or create a Conversation for the trusted Subject."""
+        resolved_conversation_id = conversation_id or str(uuid4())
         async with self._pool.connection() as connection:
             async with connection.transaction():
-                return await self.resolve_conversation_in_transaction(
+                return await self._resolve_conversation_in_transaction(
                     connection,
-                    tenant_id=tenant_id,
-                    conversation_id=conversation_id,
+                    context=context,
+                    conversation_id=resolved_conversation_id,
                 )
 
-    async def resolve_conversation_in_transaction(
+    async def _resolve_conversation_in_transaction(
         self,
         connection: Any,
         *,
-        tenant_id: str,
+        context: TrustedRequestContext,
         conversation_id: str,
     ) -> ConversationRecord:
         """Resolve within a caller-owned transaction for the admission seam."""
@@ -79,42 +84,77 @@ class ConversationMessageRepository:
             await cursor.execute(
                 """
                 INSERT INTO langgraph_v2.conversations (
-                    tenant_id, conversation_id
-                ) VALUES (%s, %s)
+                    tenant_id, conversation_id, owner_subject_id, thread_id
+                ) VALUES (%s, %s, %s, %s)
                 ON CONFLICT (tenant_id, conversation_id) DO NOTHING
                 """,
-                (tenant_id, conversation_id),
+                (
+                    context.tenant_id,
+                    conversation_id,
+                    context.subject_id,
+                    thread_id_for(context.tenant_id, conversation_id),
+                ),
             )
             await cursor.execute(
                 """
-                SELECT tenant_id, conversation_id, created_at
+                SELECT tenant_id, conversation_id, owner_subject_id, thread_id,
+                       created_at
                 FROM langgraph_v2.conversations
                 WHERE tenant_id = %s AND conversation_id = %s
                 """,
-                (tenant_id, conversation_id),
+                (context.tenant_id, conversation_id),
             )
             row = await cursor.fetchone()
+        if row is None or row["owner_subject_id"] != context.subject_id:
+            raise ConversationNotFound(conversation_id)
         return ConversationRecord.model_validate(row)
 
     async def get_conversation(
         self,
-        tenant_id: str,
+        *,
+        context: TrustedRequestContext,
         conversation_id: str,
     ) -> ConversationRecord:
-        """Return a Conversation without crossing Tenant boundaries."""
+        """Return only a Conversation owned by the trusted Subject."""
         async with self._pool.connection() as connection:
             async with connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
                     """
-                    SELECT tenant_id, conversation_id, created_at
+                    SELECT tenant_id, conversation_id, owner_subject_id, thread_id,
+                           created_at
                     FROM langgraph_v2.conversations
-                    WHERE tenant_id = %s AND conversation_id = %s
+                    WHERE tenant_id = %s AND owner_subject_id = %s
+                      AND conversation_id = %s
                     """,
-                    (tenant_id, conversation_id),
+                    (context.tenant_id, context.subject_id, conversation_id),
                 )
                 row = await cursor.fetchone()
         if row is None:
             raise ConversationNotFound(conversation_id)
+        return ConversationRecord.model_validate(row)
+
+    async def get_conversation_by_thread(
+        self,
+        *,
+        context: TrustedRequestContext,
+        thread_id: str,
+    ) -> ConversationRecord:
+        """Resolve a thread only through its authorized Conversation owner."""
+        async with self._pool.connection() as connection:
+            async with connection.cursor(row_factory=dict_row) as cursor:
+                await cursor.execute(
+                    """
+                    SELECT tenant_id, conversation_id, owner_subject_id, thread_id,
+                           created_at
+                    FROM langgraph_v2.conversations
+                    WHERE tenant_id = %s AND owner_subject_id = %s
+                      AND thread_id = %s
+                    """,
+                    (context.tenant_id, context.subject_id, thread_id),
+                )
+                row = await cursor.fetchone()
+        if row is None:
+            raise ConversationNotFound(thread_id)
         return ConversationRecord.model_validate(row)
 
     async def persist_user_message(
@@ -243,8 +283,15 @@ class ConversationMessageRepository:
             idempotency_key=idempotency_key,
         )
 
-    async def get_message(self, tenant_id: str, message_id: UUID) -> MessageRecord:
-        """Return a Message without revealing another Tenant's record."""
+    async def get_message(
+        self,
+        *,
+        context: TrustedRequestContext,
+        conversation_id: str,
+        message_id: UUID,
+    ) -> MessageRecord:
+        """Return a Message only after authorizing its Conversation owner."""
+        await self.get_conversation(context=context, conversation_id=conversation_id)
         async with self._pool.connection() as connection:
             async with connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
@@ -252,9 +299,10 @@ class ConversationMessageRepository:
                     SELECT tenant_id, message_id, conversation_id, run_id, role,
                            content, idempotency_key, created_at
                     FROM langgraph_v2.messages
-                    WHERE tenant_id = %s AND message_id = %s
+                    WHERE tenant_id = %s AND conversation_id = %s
+                      AND message_id = %s
                     """,
-                    (tenant_id, message_id),
+                    (context.tenant_id, conversation_id, message_id),
                 )
                 row = await cursor.fetchone()
         if row is None:
@@ -263,11 +311,12 @@ class ConversationMessageRepository:
 
     async def list_messages(
         self,
-        tenant_id: str,
+        *,
+        context: TrustedRequestContext,
         conversation_id: str,
     ) -> list[MessageRecord]:
-        """Return one Conversation's Messages in durable chronological order."""
-        await self.get_conversation(tenant_id, conversation_id)
+        """Return authorized Conversation Messages chronologically."""
+        await self.get_conversation(context=context, conversation_id=conversation_id)
         async with self._pool.connection() as connection:
             async with connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
@@ -278,7 +327,7 @@ class ConversationMessageRepository:
                     WHERE tenant_id = %s AND conversation_id = %s
                     ORDER BY created_at, message_id
                     """,
-                    (tenant_id, conversation_id),
+                    (context.tenant_id, conversation_id),
                 )
                 rows = await cursor.fetchall()
         return [MessageRecord.model_validate(row) for row in rows]

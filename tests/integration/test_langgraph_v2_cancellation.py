@@ -18,7 +18,11 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult
 from app.langgraph_v2.api import register_v2_routes
+from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.cancellation import CancellationRepository
+from app.langgraph_v2.conversation_messages import (
+    ConversationMessageRepository,
+)
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationDecision
@@ -60,6 +64,10 @@ async def _seed_run(
     terminal: bool = False,
 ) -> UUID:
     async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
+        await ConversationMessageRepository(pool).resolve_conversation(
+            context=TrustedRequestContext(tenant_id=tenant_id, subject_id="subject-a"),
+            conversation_id="conversation-1",
+        )
         repository = RunEventRepository(pool)
         run = await repository.create_run(
             tenant_id=tenant_id,
@@ -157,11 +165,11 @@ def test_running_run_cancellation_is_durable_and_idempotent(
     with TestClient(app) as client:
         first = client.post(
             f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         repeated = client.post(
             f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     assert first.status_code == repeated.status_code == 202
@@ -202,11 +210,11 @@ def test_cancellation_hides_missing_and_cross_tenant_runs(
     with TestClient(app) as client:
         missing = client.post(
             f"/v2/runs/{uuid4()}/cancel",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         cross_tenant = client.post(
             f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-b"},
+            headers={"X-Application-Id": "tenant-b", "X-Subject-Id": "subject-a"},
         )
 
     assert missing.status_code == 404
@@ -225,11 +233,11 @@ def test_terminal_cancellation_is_a_non_mutating_idempotent_response(
     with TestClient(app) as client:
         first = client.post(
             f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         repeated = client.post(
             f"/v2/runs/{run_id}/cancel",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     assert first.status_code == repeated.status_code == 200
@@ -566,7 +574,7 @@ def test_public_executor_observes_cancellation_before_answer_batch(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     events = parse_sse(response.text)
@@ -608,7 +616,7 @@ def test_public_executor_checks_cancellation_at_next_graph_boundary(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     events = parse_sse(response.text)
@@ -634,7 +642,7 @@ def test_committed_answer_batch_is_fully_delivered_before_stopped(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     events = parse_sse(response.text)

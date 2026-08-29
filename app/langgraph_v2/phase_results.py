@@ -15,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
+from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.live_events import LiveEventWakeups
@@ -111,8 +112,19 @@ class PhaseExecutionContext:
     execution_epoch: int
     artifact_repository: ArtifactStore | None = None
     message_repository: ConversationMessageRepository | None = None
+    request_context: TrustedRequestContext | None = None
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET
     cancellation_check: Callable[[], Awaitable[bool]] | None = None
+
+    def __post_init__(self) -> None:
+        """Require trusted identity whenever graph history can be read."""
+        if self.message_repository is not None and self.request_context is None:
+            raise ValueError("request_context is required with message_repository")
+        if (
+            self.request_context is not None
+            and self.request_context.tenant_id != self.tenant_id
+        ):
+            raise ValueError("request_context tenant_id must match tenant_id")
 
 
 PhaseInvoker = Callable[[], Awaitable[PhaseResultInput]]

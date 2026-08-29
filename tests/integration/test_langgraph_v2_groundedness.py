@@ -261,7 +261,7 @@ async def test_groundedness_actor_setup_failure_terminalizes_run(
             response = client.post(
                 "/v2/query/stream",
                 json={"query": "hello"},
-                headers={"X-Application-Id": "tenant-a"},
+                headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
             )
 
     events = parse_sse(response.text)

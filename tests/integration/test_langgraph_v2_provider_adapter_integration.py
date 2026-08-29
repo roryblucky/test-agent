@@ -40,7 +40,7 @@ def test_configured_provider_failure_is_persisted_as_v2_error(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     assert response.status_code == 200
@@ -63,7 +63,7 @@ def test_missing_tenant_providers_do_not_fall_back_to_mocks(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     events = parse_sse(response.text)
@@ -83,7 +83,7 @@ def test_unknown_tenant_is_rejected_before_run_creation(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello"},
-            headers={"X-Application-Id": "missing"},
+            headers={"X-Application-Id": "missing", "X-Subject-Id": "subject-a"},
         )
 
     assert response.status_code == 404

@@ -8,6 +8,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult
 from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
@@ -85,7 +86,10 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             owner_instance_id="i1",
         )
         messages = ConversationMessageRepository(pool)
-        await messages.resolve_conversation(tenant_id="tenant-a", conversation_id="c1")
+        await messages.resolve_conversation(
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="c1",
+        )
         await messages.persist_user_message(
             tenant_id="tenant-a",
             conversation_id="c1",
@@ -129,7 +133,10 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             content=result["answer"],
             idempotency_key=f"run:{run.run_id}:assistant",
         )
-        persisted_messages = await messages.list_messages("tenant-a", "c1")
+        persisted_messages = await messages.list_messages(
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="c1",
+        )
 
     assert moderation.calls == 2
     assert result["answer"] == "generated answer"
@@ -162,7 +169,10 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
             owner_instance_id="i1",
         )
         messages = ConversationMessageRepository(pool)
-        await messages.resolve_conversation(tenant_id="tenant-a", conversation_id="c1")
+        await messages.resolve_conversation(
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="c1",
+        )
         await messages.persist_user_message(
             tenant_id="tenant-a",
             conversation_id="c1",
@@ -205,7 +215,10 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
             content=result["answer"],
             idempotency_key=f"run:{run.run_id}:assistant",
         )
-        persisted_messages = await messages.list_messages("tenant-a", "c1")
+        persisted_messages = await messages.list_messages(
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="c1",
+        )
 
     assert result["answer"] == (
         "The generated response was flagged by content moderation and has been removed."

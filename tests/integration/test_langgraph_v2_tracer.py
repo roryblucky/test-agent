@@ -20,6 +20,7 @@ import app.langgraph_v2.api as api_module
 from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import ANSWER_CHUNK_INTERVAL_MS, AnswerActor
 from app.langgraph_v2.api import TracerGraph, register_v2_routes
+from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
     checkpoint_namespace_for,
@@ -27,7 +28,9 @@ from app.langgraph_v2.checkpointing import (
     thread_id_for,
 )
 from app.langgraph_v2.contracts import V2QueryRequest
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.conversation_messages import (
+    ConversationMessageRepository,
+)
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
@@ -118,6 +121,23 @@ def stream_request(app: FastAPI) -> Request:
     )
 
 
+async def seed_subject_conversation(
+    pool_or_database_url: AsyncConnectionPool[Any] | str,
+    conversation_id: str = "conversation-1",
+) -> None:
+    """Seed the Conversation authorization required by v2 Run tests."""
+    if isinstance(pool_or_database_url, str):
+        async with AsyncConnectionPool(
+            pool_or_database_url, min_size=1, max_size=2
+        ) as pool:
+            await seed_subject_conversation(pool, conversation_id)
+        return
+    await ConversationMessageRepository(pool_or_database_url).resolve_conversation(
+        context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+        conversation_id=conversation_id,
+    )
+
+
 @pytest.mark.asyncio
 async def test_captured_fixture_matches_the_legacy_wire_implementation() -> None:
     fixture = json.loads(FIXTURE_PATH.read_text())
@@ -178,6 +198,11 @@ async def test_in_memory_graph_sequences_events_additively() -> None:
 def test_enabled_tracer_preserves_the_minimal_stream_contract(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    asyncio.run(
+        seed_subject_conversation(
+            langgraph_v2_migrated_database_url, "conversation-123"
+        )
+    )
     fixture = json.loads(FIXTURE_PATH.read_text())
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
 
@@ -187,6 +212,7 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
             json=fixture["request"],
             headers={
                 "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-a",
                 "X-User-Groups": "research,wealth",
             },
         )
@@ -285,12 +311,12 @@ def test_request_header_and_generated_conversation_variants(
         generated = client.post(
             "/v2/query/stream",
             json={"query": "hello", "clientRequestId": "request-1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         invalid_client_id = client.post(
             "/v2/query/stream",
             json={"query": "hello", "clientRequestId": "not allowed"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     assert missing_tenant.status_code == 422
@@ -301,16 +327,67 @@ def test_request_header_and_generated_conversation_variants(
     assert invalid_client_id.status_code == 422
 
 
+def test_query_authorizes_existing_conversation_before_streaming(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    asyncio.run(seed_subject_conversation(langgraph_v2_migrated_database_url))
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    with TestClient(app) as client:
+        owner = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "conversation-1"},
+            headers={
+                "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-a",
+            },
+        )
+        missing = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "missing-conversation"},
+            headers={
+                "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-a",
+            },
+        )
+        cross_subject = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "conversation-1"},
+            headers={
+                "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-b",
+            },
+        )
+        missing_subject = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "conversation-1"},
+            headers={"X-Application-Id": "tenant-a"},
+        )
+        empty_subject = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "conversation-1"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": ""},
+        )
+
+    assert owner.status_code == 200
+    assert missing.status_code == 404
+    assert cross_subject.status_code == 404
+    assert missing.json() == cross_subject.json()
+    assert missing_subject.status_code == empty_subject.status_code == 422
+
+
 def test_flagged_query_emits_error_before_finalization(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    asyncio.run(
+        seed_subject_conversation(langgraph_v2_migrated_database_url, "conversation-1")
+    )
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
             json={"query": "please blocked this", "sessionId": "conversation-1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     delivered = parse_sse(response.text)
@@ -381,6 +458,10 @@ def test_failed_moderation_error_retry_is_idempotent(
 async def test_http_adapter_accepts_a_deterministic_graph_fake(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url, "conversation-1"
+    )
+
     class DeterministicGraphFake:
         def __init__(self) -> None:
             self.received_state: TracerState | None = None
@@ -414,7 +495,7 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello", "sessionId": "conversation-1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     assert [event["type"] for event in parse_sse(response.text)] == [
@@ -433,6 +514,10 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
 async def test_closing_the_public_sse_subscription_keeps_its_run_executing(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url, "conversation-1"
+    )
+
     class BlockingGraph:
         def __init__(self) -> None:
             self.started = asyncio.Event()
@@ -463,7 +548,9 @@ async def test_closing_the_public_sse_subscription_keeps_its_run_executing(
         response = await v2_stream_endpoint(app)(
             V2QueryRequest(query="hello", conversation_id="conversation-1"),
             stream_request(app),
-            x_application_id="tenant-a",
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
         )
         subscriber = response.body_iterator
         pending_read = asyncio.create_task(anext(subscriber))
@@ -500,6 +587,10 @@ async def test_closing_the_public_sse_subscription_keeps_its_run_executing(
 async def test_lifespan_shutdown_interrupts_unfinished_locally_owned_runs(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url, "conversation-1"
+    )
+
     class BlockingGraph:
         def __init__(self) -> None:
             self.started = asyncio.Event()
@@ -523,7 +614,9 @@ async def test_lifespan_shutdown_interrupts_unfinished_locally_owned_runs(
         response = await v2_stream_endpoint(app)(
             V2QueryRequest(query="hello", conversation_id="conversation-1"),
             stream_request(app),
-            x_application_id="tenant-a",
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
         )
         subscriber = response.body_iterator
         pending_read = asyncio.create_task(anext(subscriber))
@@ -550,6 +643,9 @@ async def test_start_rejection_releases_the_newly_claimed_run(
     langgraph_v2_migrated_database_url: str,
     monkeypatch,
 ) -> None:
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url, "conversation-1"
+    )
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
     runtime = app.state.langgraph_v2_runtime
 
@@ -562,7 +658,9 @@ async def test_start_rejection_releases_the_newly_claimed_run(
         response = await v2_stream_endpoint(app)(
             V2QueryRequest(query="hello", conversation_id="conversation-1"),
             stream_request(app),
-            x_application_id="tenant-a",
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
         )
         with pytest.raises(StopAsyncIteration):
             await anext(response.body_iterator)
@@ -604,6 +702,7 @@ async def test_resume_registration_starts_before_its_sse_body_is_consumed(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = RunEventRepository(pool)
+        await seed_subject_conversation(pool)
         run = await repository.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -639,7 +738,9 @@ async def test_resume_registration_starts_before_its_sse_body_is_consumed(
         response = await v2_resume_endpoint(app)(
             run.run_id,
             stream_request(app),
-            x_application_id="tenant-a",
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
         )
         await graph.started.wait()
         await response.body_iterator.aclose()
@@ -685,6 +786,7 @@ async def test_resume_stream_is_fenced_to_claim_captured_before_body_consumption
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = RunEventRepository(pool)
+        await seed_subject_conversation(pool)
         run = await repository.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -719,7 +821,9 @@ async def test_resume_stream_is_fenced_to_claim_captured_before_body_consumption
         response = await v2_resume_endpoint(app)(
             run.run_id,
             stream_request(app),
-            x_application_id="tenant-a",
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
         )
         await graph.started.wait()
         repository = RunEventRepository(app.state.langgraph_v2_postgres_pool)
@@ -817,6 +921,7 @@ def test_resume_route_returns_404_for_missing_or_cross_tenant_run(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
             repository = RunEventRepository(pool)
+            await seed_subject_conversation(pool)
             run_id = uuid4()
             run = await repository.create_run(
                 tenant_id="tenant-a",
@@ -839,11 +944,11 @@ def test_resume_route_returns_404_for_missing_or_cross_tenant_run(
     with TestClient(app) as client:
         cross_tenant = client.post(
             f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-b"},
+            headers={"X-Application-Id": "tenant-b", "X-Subject-Id": "subject-a"},
         )
         missing = client.post(
             f"/v2/runs/{uuid4()}/resume/stream",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
     assert cross_tenant.status_code == 404
     assert missing.status_code == 404
@@ -857,6 +962,7 @@ def test_resume_route_returns_409_for_an_active_owner(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
             repository = RunEventRepository(pool)
+            await seed_subject_conversation(pool)
             run_id = uuid4()
             run = await repository.create_run(
                 tenant_id="tenant-a",
@@ -879,7 +985,7 @@ def test_resume_route_returns_409_for_an_active_owner(
     with TestClient(app) as client:
         response = client.post(
             f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
     assert response.status_code == 409
 
@@ -914,6 +1020,7 @@ def test_resume_replays_existing_event_without_duplicate_publication(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
             repository = RunEventRepository(pool)
+            await seed_subject_conversation(pool)
             run_id = uuid4()
             run = await repository.create_run(
                 tenant_id="tenant-a",
@@ -958,7 +1065,7 @@ def test_resume_replays_existing_event_without_duplicate_publication(
     with TestClient(app) as client:
         response = client.post(
             f"/v2/runs/{run_id}/resume/stream?afterSequence=1",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
     delivered = parse_sse(response.text)
     assert [event["type"] for event in delivered] == ["error", "done"]
@@ -1004,6 +1111,7 @@ def test_resume_route_runs_injected_graph_for_resumable_run(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
             repository = RunEventRepository(pool)
+            await seed_subject_conversation(pool)
             run_id = uuid4()
             run = await repository.create_run(
                 tenant_id="tenant-a",
@@ -1043,7 +1151,7 @@ def test_resume_route_runs_injected_graph_for_resumable_run(
     with TestClient(app) as client:
         response = client.post(
             f"/v2/runs/{run_id}/resume/stream",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
     assert response.status_code == 200
     assert [event["type"] for event in parse_sse(response.text)] == (
@@ -1062,6 +1170,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
             kwargs={"autocommit": True, "prepare_threshold": 0},
         ) as pool:
             repository = RunEventRepository(pool)
+            await seed_subject_conversation(pool)
             run_id = uuid4()
             run = await repository.create_run(
                 tenant_id="tenant-a",
@@ -1071,7 +1180,9 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
             )
             messages = ConversationMessageRepository(pool)
             await messages.resolve_conversation(
-                tenant_id="tenant-a",
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
                 conversation_id="conversation-1",
             )
             await messages.persist_user_message(
@@ -1133,7 +1244,7 @@ def test_resume_route_uses_real_checkpoint_recovery_path(
     with TestClient(app) as client:
         response = client.post(
             f"/v2/runs/{run_id}/resume/stream?afterSequence=10",
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     delivered = parse_sse(response.text)
@@ -1187,6 +1298,7 @@ def test_concurrent_resume_requests_have_one_http_winner(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
             repository = RunEventRepository(pool)
+            await seed_subject_conversation(pool)
             run_id = uuid4()
             run = await repository.create_run(
                 tenant_id="tenant-a",
@@ -1222,7 +1334,7 @@ def test_concurrent_resume_requests_have_one_http_winner(
         def resume() -> int:
             return client.post(
                 f"/v2/runs/{run_id}/resume/stream",
-                headers={"X-Application-Id": "tenant-a"},
+                headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
             ).status_code
 
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1250,13 +1362,16 @@ def test_concurrent_resume_requests_have_one_http_winner(
 def test_completed_tracer_persists_its_run_and_every_delivered_event(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    asyncio.run(
+        seed_subject_conversation(langgraph_v2_migrated_database_url, "conversation-1")
+    )
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello", "sessionId": "conversation-1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     delivered = parse_sse(response.text)
@@ -1273,7 +1388,12 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
             return (
                 await repository.get_run("tenant-a", run_id),
                 await repository.list_events("tenant-a", run_id),
-                await messages.list_messages("tenant-a", "conversation-1"),
+                await messages.list_messages(
+                    context=TrustedRequestContext(
+                        tenant_id="tenant-a", subject_id="subject-a"
+                    ),
+                    conversation_id="conversation-1",
+                ),
             )
 
     run, persisted, messages = asyncio.run(load_persisted_result())
@@ -1306,6 +1426,9 @@ def test_long_running_request_refreshes_its_claim(
     langgraph_v2_migrated_database_url: str,
     monkeypatch,
 ) -> None:
+    asyncio.run(
+        seed_subject_conversation(langgraph_v2_migrated_database_url, "conversation-1")
+    )
     monkeypatch.setattr(api_module, "CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
 
     class SlowGraph:
@@ -1330,7 +1453,7 @@ def test_long_running_request_refreshes_its_claim(
         response = client.post(
             "/v2/query/stream",
             json={"query": "hello", "sessionId": "conversation-1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     run_id = UUID(response.headers["x-run-id"])
@@ -1379,7 +1502,10 @@ def test_persistence_failure_emits_no_unpersisted_event(
                 client.post(
                     "/v2/query/stream",
                     json={"query": "hello"},
-                    headers={"X-Application-Id": "tenant-a"},
+                    headers={
+                        "X-Application-Id": "tenant-a",
+                        "X-Subject-Id": "subject-a",
+                    },
                 )
 
         with psycopg.connect(langgraph_v2_migrated_database_url) as connection:

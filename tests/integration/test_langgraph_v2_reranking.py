@@ -158,7 +158,7 @@ def test_failed_ranker_terminates_public_stream(
     )
     with TestClient(app) as client:
         response = client.post(
-            "/v2/query/stream", json={"query": "hello"}, headers={"X-Application-Id": "tenant-a"}
+            "/v2/query/stream", json={"query": "hello"}, headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
         )
     events = parse_sse(response.text)
     assert response.status_code == 200

@@ -11,6 +11,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef
+from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
@@ -100,8 +101,8 @@ async def _query(
         history: list[ConversationTurn] = []
         if phase_context is not None and phase_context.message_repository is not None:
             messages = await phase_context.message_repository.list_messages(
-                phase_context.tenant_id,
-                state["conversation_id"],
+                context=cast(TrustedRequestContext, phase_context.request_context),
+                conversation_id=state["conversation_id"],
             )
             history = select_sliding_window_history(
                 messages,

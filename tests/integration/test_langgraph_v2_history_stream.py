@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+
 # Public-stream coverage complements the pure selector unit tests.
 import json
 from collections.abc import Sequence
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
@@ -68,6 +73,18 @@ class _Ranker:
 def test_second_public_stream_receives_one_complete_prior_turn(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    async def seed() -> None:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            await ConversationMessageRepository(pool).resolve_conversation(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="conversation-1",
+            )
+
+    asyncio.run(seed())
     refinement = _RefinementActor()
     answer = _AnswerActor()
     app = persistent_tracer_app(
@@ -82,12 +99,12 @@ def test_second_public_stream_receives_one_complete_prior_turn(
         first = client.post(
             "/v2/query/stream",
             json={"query": "first question", "sessionId": "conversation-1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         second = client.post(
             "/v2/query/stream",
             json={"query": "follow up", "sessionId": "conversation-1"},
-            headers={"X-Application-Id": "tenant-a"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     expected_history = [

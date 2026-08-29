@@ -5,11 +5,11 @@ from uuid import uuid4
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
     MessageInvariantConflict,
-    MessageNotFound,
 )
 from app.langgraph_v2.run_events import ClaimFenced, EventInput, RunEventRepository
 
@@ -24,20 +24,28 @@ async def test_session_identity_resolves_once_per_tenant(
         repository = ConversationMessageRepository(pool)
 
         first = await repository.resolve_conversation(
-            tenant_id="tenant-a", conversation_id="session-1"
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="session-1",
         )
         repeated = await repository.resolve_conversation(
-            tenant_id="tenant-a", conversation_id="session-1"
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="session-1",
         )
         isolated = await repository.resolve_conversation(
-            tenant_id="tenant-b", conversation_id="session-1"
+            context=TrustedRequestContext(tenant_id="tenant-b", subject_id="subject-a"),
+            conversation_id="session-1",
         )
 
         assert first == repeated
         assert first.conversation_id == isolated.conversation_id
         assert first.tenant_id != isolated.tenant_id
         with pytest.raises(ConversationNotFound):
-            await repository.get_conversation("tenant-c", first.conversation_id)
+            await repository.get_conversation(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-c", subject_id="subject-a"
+                ),
+                conversation_id=first.conversation_id,
+            )
 
 
 @pytest.mark.asyncio
@@ -50,7 +58,8 @@ async def test_user_message_is_idempotent_and_tenant_scoped(
         repository = ConversationMessageRepository(pool)
         run_id = uuid4()
         await repository.resolve_conversation(
-            tenant_id="tenant-a", conversation_id="session-1"
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="session-1",
         )
 
         first = await repository.persist_user_message(
@@ -69,7 +78,10 @@ async def test_user_message_is_idempotent_and_tenant_scoped(
         )
 
         assert repeated == first
-        assert await repository.list_messages("tenant-a", "session-1") == [first]
+        assert await repository.list_messages(
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="session-1",
+        ) == [first]
         with pytest.raises(MessageInvariantConflict):
             await repository.persist_user_message(
                 tenant_id="tenant-a",
@@ -78,8 +90,14 @@ async def test_user_message_is_idempotent_and_tenant_scoped(
                 content="changed",
                 idempotency_key="request-1:user",
             )
-        with pytest.raises(MessageNotFound):
-            await repository.get_message("tenant-b", first.message_id)
+        with pytest.raises(ConversationNotFound):
+            await repository.get_message(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-b", subject_id="subject-a"
+                ),
+                conversation_id="session-1",
+                message_id=first.message_id,
+            )
 
 
 @pytest.mark.asyncio
@@ -92,7 +110,8 @@ async def test_assistant_message_requires_successful_run_completion(
         messages = ConversationMessageRepository(pool)
         runs = RunEventRepository(pool)
         await messages.resolve_conversation(
-            tenant_id="tenant-a", conversation_id="session-1"
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="session-1",
         )
         completed = await runs.create_run(
             tenant_id="tenant-a",
@@ -178,7 +197,12 @@ async def test_assistant_message_requires_successful_run_completion(
                 )
         assert [
             message.content
-            for message in await messages.list_messages("tenant-a", "session-1")
+            for message in await messages.list_messages(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="session-1",
+            )
         ] == ["safe answer"]
 
 
@@ -192,7 +216,8 @@ async def test_resume_retry_reuses_the_user_message(
         messages = ConversationMessageRepository(pool)
         runs = RunEventRepository(pool)
         await messages.resolve_conversation(
-            tenant_id="tenant-a", conversation_id="session-1"
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            conversation_id="session-1",
         )
         run = await runs.create_run(
             tenant_id="tenant-a",
@@ -235,4 +260,14 @@ async def test_resume_retry_reuses_the_user_message(
         )
 
         assert repeated.run_id == run.run_id
-        assert len(await messages.list_messages("tenant-a", "session-1")) == 1
+        assert (
+            len(
+                await messages.list_messages(
+                    context=TrustedRequestContext(
+                        tenant_id="tenant-a", subject_id="subject-a"
+                    ),
+                    conversation_id="session-1",
+                )
+            )
+            == 1
+        )
