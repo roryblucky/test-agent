@@ -8,6 +8,10 @@ This context defines the language for a tenant-isolated platform that produces e
 The isolation boundary for an organization's data, configuration, credentials, conversations, and runs within one deployment.
 _Avoid_: App, workspace, account
 
+**Subject**:
+The authenticated security principal identity within a Tenant, supplied by the trusted authentication boundary and used to authorize Conversation access; distinct from the User, the person and domain actor.
+_Avoid_: User, caller, client identity
+
 **User**:
 A person within a Tenant who owns or participates in Conversations and initiates Runs.
 _Avoid_: Caller, operator
@@ -15,6 +19,9 @@ _Avoid_: Caller, operator
 **Conversation**:
 A persistent, user-visible exchange that can contain multiple Runs and be continued over time.
 _Avoid_: Session, thread, chat session
+
+**Turn**:
+One user Message and its resulting assistant Message or recovery identity within a Conversation; distinct from a Run execution.
 
 **Conversation Summary**:
 A versioned compression of earlier Messages within one Conversation, used only to construct model context while the original Messages remain authoritative.
