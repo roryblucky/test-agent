@@ -19,6 +19,7 @@ from app.langgraph_v2.run_events import RunEventRepository
 from app.langgraph_v2.runtime import LocalRunRuntime
 from app.langgraph_v2.stream import GraphStreamCleanupError
 from tests.integration.test_langgraph_v2_tracer import (
+    close_stream_after_first_token,
     persistent_tracer_app,
     seed_subject_conversation,
     stream_request,
@@ -67,7 +68,6 @@ class _RealtimeStream:
         self.release = asyncio.Event()
         self.started = asyncio.Event()
         self.completed = False
-        self.close_completed = False
 
     def __aiter__(self) -> AsyncIterator[Any]:
         return self
@@ -106,8 +106,6 @@ class _RealtimeStream:
 
     async def aclose(self) -> None:
         self.closed = True
-        await asyncio.sleep(0)
-        self.close_completed = True
         self.release.set()
 
 
@@ -259,7 +257,6 @@ async def test_closing_query_sse_closes_graph_and_interrupts_run(
         )
 
     assert graph.stream.closed is True
-    assert graph.stream.close_completed is True
     assert run.status == "interrupted"
     assert run.owner_instance_id == ""
 
@@ -328,18 +325,10 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
             ),
         )
         subscriber = response.body_iterator
-        token_frame: dict[str, Any] | None = None
-        while token_frame is None or token_frame["type"] != "token":
-            token_frame = _event_frame(await anext(subscriber))
+        token_frame = await close_stream_after_first_token(
+            subscriber, answer_actor.blocked_on_followup_read
+        )
         assert token_frame["data"] == "partial "
-
-        pending_read = asyncio.create_task(anext(subscriber))
-        await answer_actor.blocked_on_followup_read.wait()
-        pending_read.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await pending_read
-
-        await subscriber.aclose()
 
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2

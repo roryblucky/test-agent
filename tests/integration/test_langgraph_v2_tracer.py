@@ -2,7 +2,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from importlib import reload
 from pathlib import Path
@@ -120,6 +120,25 @@ def stream_request(app: FastAPI) -> Request:
             "app": app,
         }
     )
+
+
+async def close_stream_after_first_token(
+    body_iterator: Any,
+    blocked_on_followup_read: asyncio.Event,
+) -> dict[str, Any]:
+    """Consume one token, cancel the blocked follow-up read, and close cleanly."""
+    token_frame: dict[str, Any] | None = None
+    while token_frame is None or token_frame["type"] != "token":
+        token_frame = json.loads(
+            (await anext(body_iterator)).removeprefix("data: ").strip()
+        )
+    pending_read = asyncio.create_task(anext(body_iterator))
+    await blocked_on_followup_read.wait()
+    pending_read.cancel()
+    with suppress(asyncio.CancelledError):
+        await pending_read
+    await body_iterator.aclose()
+    return token_frame
 
 
 async def seed_subject_conversation(

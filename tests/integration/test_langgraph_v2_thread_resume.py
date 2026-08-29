@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -33,16 +31,13 @@ from app.langgraph_v2.post_moderation import ModerationDecision
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import (
+    close_stream_after_first_token,
     parse_sse,
     persistent_tracer_app,
     seed_subject_conversation,
     stream_request,
     v2_stream_endpoint,
 )
-
-
-def _event_frame(frame: str) -> dict[str, object]:
-    return json.loads(frame.removeprefix("data: ").strip())
 
 
 def _thread_resume_endpoint(app):
@@ -176,16 +171,9 @@ async def _interrupt_query_after_answer_token(
                 tenant_id="tenant-a", subject_id="subject-a"
             ),
         )
-        subscriber = response.body_iterator
-        token_frame: dict[str, object] | None = None
-        while token_frame is None or token_frame["type"] != "token":
-            token_frame = _event_frame(await anext(subscriber))
-        pending_read = asyncio.create_task(anext(subscriber))
-        await answer_actor.blocked_on_followup_read.wait()
-        pending_read.cancel()
-        with suppress(asyncio.CancelledError):
-            await pending_read
-        await subscriber.aclose()
+        token_frame = await close_stream_after_first_token(
+            response.body_iterator, answer_actor.blocked_on_followup_read
+        )
         assert answer_actor.close_completed.is_set() is True
         assert token_frame["data"] == "partial "
         return (
@@ -836,17 +824,11 @@ def test_second_interruption_can_resume_before_original_deadline(
                 ),
                 expected_turn_id=turn_id,
             )
-            subscriber = response.body_iterator
-            token_frame: dict[str, object] | None = None
-            while token_frame is None or token_frame["type"] != "token":
-                token_frame = _event_frame(await anext(subscriber))
+            token_frame = await close_stream_after_first_token(
+                response.body_iterator,
+                blocking_answer_actor.blocked_on_followup_read,
+            )
             assert token_frame["data"] == "replacement "
-            pending_read = asyncio.create_task(anext(subscriber))
-            await blocking_answer_actor.blocked_on_followup_read.wait()
-            pending_read.cancel()
-            with suppress(asyncio.CancelledError):
-                await pending_read
-            await subscriber.aclose()
 
     asyncio.run(interrupt_resumed_stream())
 
@@ -919,16 +901,11 @@ def test_second_interruption_returns_410_after_original_deadline_expires(
                 ),
                 expected_turn_id=turn_id,
             )
-            subscriber = response.body_iterator
-            token_frame: dict[str, object] | None = None
-            while token_frame is None or token_frame["type"] != "token":
-                token_frame = _event_frame(await anext(subscriber))
-            pending_read = asyncio.create_task(anext(subscriber))
-            await blocking_answer_actor.blocked_on_followup_read.wait()
-            pending_read.cancel()
-            with suppress(asyncio.CancelledError):
-                await pending_read
-            await subscriber.aclose()
+            token_frame = await close_stream_after_first_token(
+                response.body_iterator,
+                blocking_answer_actor.blocked_on_followup_read,
+            )
+            assert token_frame["data"] == "replacement "
 
     asyncio.run(interrupt_resumed_stream())
     asyncio.run(_expire_turn(langgraph_v2_migrated_database_url, turn_id))
