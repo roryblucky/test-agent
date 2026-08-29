@@ -390,7 +390,7 @@ def build_tracer_graph(
 
             async def groundedness_node(state: TracerState) -> TracerStateUpdate:
                 await _check_cancellation(phase_context)
-                events, result, halted, error = await run_groundedness(
+                events, result, error = await run_groundedness(
                     state,
                     context=phase_context,
                     artifacts=selected_artifact_repository,
@@ -401,7 +401,6 @@ def build_tracer_graph(
                         *state["events"],
                         *[_event_state(event, event.sequence) for event in events],
                     ],
-                    "halted": halted,
                 }
                 if result is not None:
                     update["groundedness"] = result
@@ -413,7 +412,7 @@ def build_tracer_graph(
 
         async def post_moderation_node(state: TracerState) -> TracerStateUpdate:
             await _check_cancellation(phase_context)
-            events, decision, safe_answer, halted, error = await run_post_moderation(
+            events, decision, error = await run_post_moderation(
                 state,
                 context=phase_context,
                 provider=selected_moderation_provider,
@@ -423,12 +422,9 @@ def build_tracer_graph(
                     *state["events"],
                     *[_event_state(event, event.sequence) for event in events],
                 ],
-                "halted": halted,
             }
             if decision is not None:
                 update["post_moderation"] = decision.model_dump(exclude_none=True)
-            if safe_answer is not None:
-                update["answer"] = safe_answer
             if error is not None:
                 update["post_moderation_error"] = error
             return update
@@ -509,18 +505,8 @@ def build_tracer_graph(
             answer_routes,
         )
         if groundedness_actor is not None:
-            builder.add_conditional_edges(
-                "groundedness",
-                lambda state: (
-                    "end" if state.get("halted", False) else "post_moderation"
-                ),
-                {"post_moderation": "post_moderation", "end": END},
-            )
-        builder.add_conditional_edges(
-            "post_moderation",
-            lambda state: "end" if state.get("halted", False) else "finalization",
-            {"finalization": "finalization", "end": END},
-        )
+            builder.add_edge("groundedness", "post_moderation")
+        builder.add_edge("post_moderation", "finalization")
     builder.add_edge("finalization", END)
     return builder.compile(checkpointer=checkpointer)
 

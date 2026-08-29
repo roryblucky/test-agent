@@ -19,6 +19,7 @@ from app.langgraph_v2.groundedness import (
     PydanticAIGroundednessActor,
 )
 from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
@@ -92,6 +93,12 @@ class _EmptyDocumentGroundedness:
         return GroundednessResult(is_grounded=False, score=0.0, details="uncited")
 
 
+class _FailingAssessmentAudit:
+    async def record(self, assessment: object) -> None:
+        del assessment
+        raise RuntimeError("audit unavailable")
+
+
 @pytest.mark.asyncio
 async def test_low_groundedness_is_advisory_and_replayed(
     langgraph_v2_migrated_database_url: str,
@@ -102,16 +109,20 @@ async def test_low_groundedness_is_advisory_and_replayed(
             tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
         evaluator = _Groundedness()
+        audit = MockOutputAssessmentAudit()
+        turn_id = uuid4()
         context = PhaseExecutionContext(
             repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
             tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
+            current_turn_id=turn_id,
+            output_assessment_audit=audit,
         )
         graph = build_tracer_graph(
             phase_context=context, retriever=_Retriever(), ranker=_Ranker(),
             answer_actor=_Answer(), groundedness_actor=evaluator,
         )
-        state = {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
+        state = {"query": "hello", "conversation_id": "c1", "turn_id": str(turn_id), "client_request_id": None, "events": []}
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
         phase = await context.repository.get_completed("tenant-a", run.run_id, "groundedness")
@@ -120,6 +131,16 @@ async def test_low_groundedness_is_advisory_and_replayed(
     assert first["answer"] == second["answer"] == "answer [1]"
     assert first["groundedness"] == second["groundedness"]
     assert first["groundedness"].score == 0.2
+    assert first["events"][-1]["type"] == "done"
+    assert first["events"][-1]["data"]["answer"] == "answer [1]"
+    assert len(audit.records) == 2
+    groundedness_audit = next(
+        record for record in audit.records if record.assessment_type == "groundedness"
+    )
+    assert groundedness_audit.tenant_id == "tenant-a"
+    assert groundedness_audit.conversation_id == "c1"
+    assert groundedness_audit.turn_id == turn_id
+    assert groundedness_audit.assessment_id == groundedness_audit.assessment_identity
     assert phase is not None
     assert phase.normalized_result["usage"] == {}
     assert any(event.get("step") == "groundedness" for event in first["events"])
@@ -142,22 +163,49 @@ async def test_groundedness_failure_is_explicit_and_replayed(
             tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
         )
         evaluator = Failing()
+        audit = MockOutputAssessmentAudit()
+        turn_id = uuid4()
         context = PhaseExecutionContext(
             repository=PhaseResultRepository(pool), artifact_repository=ArtifactRepository(pool),
             tenant_id="tenant-a", run_id=run.run_id, owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
+            current_turn_id=turn_id,
+            output_assessment_audit=audit,
         )
         graph = build_tracer_graph(
             phase_context=context, retriever=_Retriever(), ranker=_Ranker(),
             answer_actor=_Answer(), groundedness_actor=evaluator,
         )
-        state = {"query": "hello", "conversation_id": "c1", "client_request_id": None, "events": []}
+        state = {"query": "hello", "conversation_id": "c1", "turn_id": str(turn_id), "client_request_id": None, "events": []}
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
 
     assert evaluator.calls == 1
     assert first["groundedness_error"] == second["groundedness_error"] == "evaluator unavailable"
-    assert any(event["type"] == "error" for event in first["events"])
+    assert first["events"][-1]["type"] == "done"
+    assert first["events"][-1]["data"]["answer"] == "answer [1]"
+    assert len(audit.records) == 2
+    groundedness_audit = next(
+        record for record in audit.records if record.assessment_type == "groundedness"
+    )
+    assert groundedness_audit.result == {
+        "failed": True,
+        "error": "evaluator unavailable",
+    }
+    failure_events = [
+        event
+        for event in first["events"]
+        if event["event_key"] == "phase:groundedness:error:1"
+    ]
+    assert failure_events == [
+        {
+            "event_key": "phase:groundedness:error:1",
+            "type": "step_completed",
+            "step": "groundedness",
+            "data": {"failed": True, "error": "evaluator unavailable"},
+            "sequence": failure_events[0]["sequence"],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -287,6 +335,41 @@ async def test_groundedness_actor_setup_failure_terminalizes_run(
             "tenant-a", UUID(response.headers["x-run-id"])
         )
     assert run.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_assessment_audit_failure_does_not_gate_answer(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
+        runs = RunEventRepository(pool)
+        run = await runs.create_run(
+            tenant_id="tenant-a", run_id=uuid4(), conversation_id="c1", owner_instance_id="i1"
+        )
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool),
+            artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+            current_turn_id=uuid4(),
+            output_assessment_audit=_FailingAssessmentAudit(),
+        )
+        graph = build_tracer_graph(
+            phase_context=context,
+            retriever=_Retriever(),
+            ranker=_Ranker(),
+            answer_actor=_Answer(),
+            groundedness_actor=_Groundedness(),
+        )
+
+        result = await graph.ainvoke(
+            {"query": "hello", "conversation_id": "c1", "events": []}
+        )
+
+    assert result["answer"] == "answer [1]"
+    assert result["events"][-1]["type"] == "done"
 
 
 @pytest.mark.asyncio

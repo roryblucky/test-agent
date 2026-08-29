@@ -5,13 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from app.langgraph_v2.output_assessments import record_output_assessment
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.pre_moderation import ModerationDecision, ModerationProvider
 from app.langgraph_v2.run_events import EventInput, EventRecord
-
-SAFE_MODERATION_MESSAGE = (
-    "The generated response was flagged by content moderation and has been removed."
-)
 
 
 async def run_post_moderation(
@@ -19,16 +16,24 @@ async def run_post_moderation(
     *,
     context: PhaseExecutionContext,
     provider: ModerationProvider,
-) -> tuple[list[EventRecord], ModerationDecision | None, str | None, bool, str | None]:
-    """Moderate the generated answer and journal only its safe publication state."""
+) -> tuple[list[EventRecord], ModerationDecision | None, str | None]:
+    """Assess the generated answer without changing its publication state."""
 
     async def invoke() -> PhaseResultInput:
         answer = state.get("answer")
         if not isinstance(answer, str) or not answer:
             message = "Post-moderation requires a generated answer."
+            failed_result = {"failed": True, "error": message}
+            await record_output_assessment(
+                context.output_assessment_audit,
+                state=state,
+                context=context,
+                assessment_type="post_moderation",
+                result=failed_result,
+            )
             return PhaseResultInput(
                 phase_name="post_moderation",
-                normalized_result={"failed": True, "error": message},
+                normalized_result=failed_result,
                 events=(
                     EventInput(
                         event_key="phase:post_moderation:step_start:1",
@@ -37,19 +42,27 @@ async def run_post_moderation(
                     ),
                     EventInput(
                         event_key="phase:post_moderation:error:1",
-                        type="error",
-                        data=message,
+                        type="step_completed",
+                        step="moderation:post",
+                        data=failed_result,
                     ),
                 ),
-                terminal_status="failed",
             )
         try:
             decision = await provider.check(answer)
         except Exception as exc:
             message = str(exc) or "Post-moderation failed."
+            failed_result = {"failed": True, "error": message}
+            await record_output_assessment(
+                context.output_assessment_audit,
+                state=state,
+                context=context,
+                assessment_type="post_moderation",
+                result=failed_result,
+            )
             return PhaseResultInput(
                 phase_name="post_moderation",
-                normalized_result={"failed": True, "error": message},
+                normalized_result=failed_result,
                 events=(
                     EventInput(
                         event_key="phase:post_moderation:step_start:1",
@@ -58,19 +71,25 @@ async def run_post_moderation(
                     ),
                     EventInput(
                         event_key="phase:post_moderation:error:1",
-                        type="error",
-                        data=message,
+                        type="step_completed",
+                        step="moderation:post",
+                        data=failed_result,
                     ),
                 ),
-                terminal_status="failed",
             )
-        safe_answer = SAFE_MODERATION_MESSAGE if decision.is_flagged else answer
+        normalized_result = {
+            "decision": decision.model_dump(exclude_none=True),
+        }
+        await record_output_assessment(
+            context.output_assessment_audit,
+            state=state,
+            context=context,
+            assessment_type="post_moderation",
+            result=normalized_result,
+        )
         return PhaseResultInput(
             phase_name="post_moderation",
-            normalized_result={
-                "decision": decision.model_dump(exclude_none=True),
-                "safe_answer": safe_answer,
-            },
+            normalized_result=normalized_result,
             events=(
                 EventInput(
                     event_key="phase:post_moderation:step_start:1",
@@ -98,15 +117,11 @@ async def run_post_moderation(
         return (
             list(result.events),
             None,
-            None,
-            True,
             str(result.normalized_result["error"]),
         )
     decision = ModerationDecision.model_validate(result.normalized_result["decision"])
     return (
         list(result.events),
         decision,
-        str(result.normalized_result["safe_answer"]),
-        False,
         None,
     )

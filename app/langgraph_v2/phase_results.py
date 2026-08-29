@@ -19,6 +19,7 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.live_events import LiveEventWakeups
+from app.langgraph_v2.output_assessments import OutputAssessmentAudit
 from app.langgraph_v2.run_events import (
     CancellationObserved,
     ClaimFenced,
@@ -114,6 +115,7 @@ class PhaseExecutionContext:
     artifact_repository: ArtifactStore | None = None
     message_repository: ConversationMessageRepository | None = None
     request_context: TrustedRequestContext | None = None
+    output_assessment_audit: OutputAssessmentAudit | None = None
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET
     cancellation_check: Callable[[], Awaitable[bool]] | None = None
 

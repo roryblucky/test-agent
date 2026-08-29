@@ -23,9 +23,9 @@ def _steps(state: Mapping[str, Any]) -> list[str]:
     ]
     if "answer" in state:
         steps.append("answer")
-    if "groundedness" in state:
+    if "groundedness" in state or "groundedness_error" in state:
         steps.append("groundedness")
-    if "post_moderation" in state:
+    if "post_moderation" in state or "post_moderation_error" in state:
         steps.append("moderation:post")
     steps.append("finalization")
     return steps

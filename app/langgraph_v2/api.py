@@ -44,6 +44,10 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
 from app.langgraph_v2.groundedness import GroundednessActor, build_groundedness_actor
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.live_events import LiveEventWakeups
+from app.langgraph_v2.output_assessments import (
+    LoggingOutputAssessmentAudit,
+    OutputAssessmentAudit,
+)
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.provider_adapters import (
@@ -150,6 +154,17 @@ def _resolve_groundedness_actor(
     if manager is None or not hasattr(manager, "get_model_registry"):
         return None
     return build_groundedness_actor(manager.get_model_registry(tenant_id))
+
+
+def _resolve_output_assessment_audit(
+    app: FastAPI,
+    injected: OutputAssessmentAudit | None,
+) -> OutputAssessmentAudit:
+    """Resolve the optional audit port, defaulting to the logging POC adapter."""
+    if injected is not None:
+        return injected
+    configured = getattr(app.state, "langgraph_v2_output_assessment_audit", None)
+    return configured or LoggingOutputAssessmentAudit()
 
 
 def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
@@ -312,8 +327,6 @@ async def _persist_result_events(
             )
         if event.event_key not in prior_keys:
             yield event.model_copy(update={"sequence": persisted.sequence}).to_sse()
-
-
 async def _persist_setup_failure(
     repository: RunEventRepository,
     *,
@@ -663,6 +676,7 @@ def create_tracer_router(
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
+    output_assessment_audit: OutputAssessmentAudit | None = None,
 ) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
     if history_token_budget < 0:
@@ -771,6 +785,9 @@ def create_tracer_router(
                     message=str(exc) or "Groundedness actor construction failed.",
                 )
                 return
+            configured_output_assessment_audit = _resolve_output_assessment_audit(
+                http_request.app, output_assessment_audit
+            )
             (
                 configured_retriever,
                 configured_ranker,
@@ -802,6 +819,7 @@ def create_tracer_router(
                         run_id,
                         cancellation_observer,
                     ),
+                    output_assessment_audit=configured_output_assessment_audit,
                 )
                 saver: FencedAsyncPostgresSaver | None = None
                 if configured_checkpointer is not None:
@@ -976,6 +994,9 @@ def create_tracer_router(
             )
 
         else:
+            configured_output_assessment_audit = _resolve_output_assessment_audit(
+                http_request.app, output_assessment_audit
+            )
             (
                 configured_retriever,
                 configured_ranker,
@@ -1031,6 +1052,7 @@ def create_tracer_router(
                             run_id,
                             cancellation_observer,
                         ),
+                        output_assessment_audit=configured_output_assessment_audit,
                     ),
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
@@ -1229,6 +1251,7 @@ def register_v2_routes(
     replay_enabled: bool = False,
     cancellation_enabled: bool = False,
     artifact_lookup_enabled: bool = True,
+    output_assessment_audit: OutputAssessmentAudit | None = None,
 ) -> None:
     """Register the default-off v2 routes when explicitly enabled."""
     if enabled:
@@ -1242,6 +1265,7 @@ def register_v2_routes(
             answer_actor,
             groundedness_actor,
             history_token_budget,
+            output_assessment_audit,
         )
         disabled_control_paths: set[str] = set()
         if not resume_enabled:

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.output_assessments import record_output_assessment
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document, GroundednessResult
@@ -81,7 +82,7 @@ async def run_groundedness(
     context: PhaseExecutionContext,
     artifacts: ArtifactStore,
     actor: GroundednessActor,
-) -> tuple[list[EventRecord], GroundednessResult | None, bool, str | None]:
+) -> tuple[list[EventRecord], GroundednessResult | None, str | None]:
     """Evaluate an answer once and journal the advisory result atomically."""
 
     async def invoke() -> PhaseResultInput:
@@ -118,6 +119,13 @@ async def run_groundedness(
                 **result.model_dump(),
                 "usage": raw_result.get("usage", {}),
             }
+            await record_output_assessment(
+                context.output_assessment_audit,
+                state=state,
+                context=context,
+                assessment_type="groundedness",
+                result=normalized_result,
+            )
             return PhaseResultInput(
                 phase_name="groundedness",
                 normalized_result=normalized_result,
@@ -137,9 +145,17 @@ async def run_groundedness(
             )
         except Exception as exc:
             message = str(exc) or "Groundedness evaluation failed."
+            failed_result = {"failed": True, "error": message}
+            await record_output_assessment(
+                context.output_assessment_audit,
+                state=state,
+                context=context,
+                assessment_type="groundedness",
+                result=failed_result,
+            )
             return PhaseResultInput(
                 phase_name="groundedness",
-                normalized_result={"failed": True, "error": message},
+                normalized_result=failed_result,
                 events=(
                     EventInput(
                         event_key="phase:groundedness:step_start:1",
@@ -148,11 +164,11 @@ async def run_groundedness(
                     ),
                     EventInput(
                         event_key="phase:groundedness:error:1",
-                        type="error",
-                        data=message,
+                        type="step_completed",
+                        step="groundedness",
+                        data=failed_result,
                     ),
                 ),
-                terminal_status="failed",
             )
 
     result = await context.repository.get_or_invoke(
@@ -164,10 +180,9 @@ async def run_groundedness(
         invoke=invoke,
     )
     if result.normalized_result.get("failed") is True:
-        return list(result.events), None, True, str(result.normalized_result["error"])
+        return list(result.events), None, str(result.normalized_result["error"])
     return (
         list(result.events),
         GroundednessResult.model_validate(result.normalized_result),
-        False,
         None,
     )

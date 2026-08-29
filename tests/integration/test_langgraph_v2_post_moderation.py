@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -12,6 +13,7 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
@@ -67,6 +69,14 @@ class _FlaggingModeration:
         return ModerationDecision(
             is_flagged=text == "generated answer", reason="unsafe output"
         )
+
+
+class _FailingPostModeration:
+    async def check(self, text: str) -> ModerationDecision:
+        if text == "hello":
+            return ModerationDecision(is_flagged=False)
+        assert text == "generated answer"
+        raise RuntimeError("post evaluator unavailable")
 
 
 def _state() -> dict[str, object]:
@@ -163,7 +173,7 @@ async def test_safe_answer_passes_post_moderation_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_flagged_answer_is_replaced_only_in_final_state(
+async def test_flagged_answer_remains_canonical_through_finalization(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -196,6 +206,13 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
             owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
+        turn_id = uuid4()
+        audit = MockOutputAssessmentAudit()
+        context = replace(
+            context,
+            current_turn_id=turn_id,
+            output_assessment_audit=audit,
+        )
         graph = build_tracer_graph(
             phase_context=context,
             moderation_provider=_FlaggingModeration(),
@@ -203,7 +220,9 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
             ranker=_Ranker(),
             answer_actor=_Answer(),
         )
-        result = await graph.ainvoke(_state())
+        state = _state()
+        state["turn_id"] = str(turn_id)
+        result = await graph.ainvoke(state)
         done = result["events"][-1]
         await runs.complete_run(
             tenant_id="tenant-a",
@@ -229,20 +248,23 @@ async def test_flagged_answer_is_replaced_only_in_final_state(
             conversation_id="c1",
         )
 
-    assert result["answer"] == (
-        "The generated response was flagged by content moderation and has been removed."
-    )
+    assert result["answer"] == "generated answer"
     assert any(
         event["type"] == "token" and event["data"] == "generated answer"
         for event in result["events"]
     )
     assert result["events"][-1]["type"] == "done"
-    assert result["events"][-1]["data"]["answer"] == result["answer"]
+    assert result["events"][-1]["data"]["answer"] == "generated answer"
     assert [message.content for message in persisted_messages] == [
         "hello",
-        "The generated response was flagged by content moderation and has been removed.",
+        "generated answer",
     ]
-    assert all(message.content != "generated answer" for message in persisted_messages)
+    assert result["post_moderation"]["is_flagged"] is True
+    assert len(audit.records) == 1
+    assert audit.records[0].tenant_id == "tenant-a"
+    assert audit.records[0].conversation_id == "c1"
+    assert audit.records[0].turn_id == turn_id
+    assert audit.records[0].assessment_type == "post_moderation"
 
 
 @pytest.mark.asyncio
@@ -291,7 +313,7 @@ async def test_post_moderation_replays_after_commit_window_crash(
         events = await runs.list_events("tenant-a", run.run_id)
 
     assert moderation.calls == 2
-    assert recovered["answer"].startswith("The generated response was flagged")
+    assert recovered["answer"] == "generated answer"
     assert len({event.event_key for event in events}) == len(events)
     assert (
         sum(
@@ -300,3 +322,50 @@ async def test_post_moderation_replays_after_commit_window_crash(
         )
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        run = await RunEventRepository(pool).create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="c1",
+            owner_instance_id="i1",
+        )
+        context = PhaseExecutionContext(
+            repository=PhaseResultRepository(pool),
+            artifact_repository=ArtifactRepository(pool),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            owner_instance_id=run.owner_instance_id,
+            execution_epoch=run.execution_epoch,
+        )
+        graph = build_tracer_graph(
+            phase_context=context,
+            moderation_provider=_FailingPostModeration(),
+            retriever=_Retriever(),
+            ranker=_Ranker(),
+            answer_actor=_Answer(),
+        )
+
+        result = await graph.ainvoke(_state())
+
+    assert result["answer"] == "generated answer"
+    assert result["post_moderation_error"] == "post evaluator unavailable"
+    failure_event = next(
+        event
+        for event in result["events"]
+        if event["event_key"] == "phase:post_moderation:error:1"
+    )
+    assert failure_event["data"] == {
+        "failed": True,
+        "error": "post evaluator unavailable",
+    }
+    assert failure_event["type"] == "step_completed"
+    assert result["events"][-1]["type"] == "done"
+    assert result["events"][-1]["data"]["answer"] == "generated answer"
