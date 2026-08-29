@@ -263,11 +263,10 @@ async def run_answer(
                     step="llm:answer",
                 )
             ]
-            if stream_writer is not None:
-                stream_writer(events[0].model_dump(exclude_none=True))
 
             chunks: list[str] = []
             streamed_result: AnswerResult | None = None
+            answer_started = False
             answer_iterator = actor.answer_stream(answer_query, documents, history)
             try:
                 async for chunk in answer_iterator:
@@ -284,6 +283,10 @@ async def run_answer(
                         raise AnswerCancelled(
                             "answer generation cancelled before publication"
                         )
+                    if not answer_started:
+                        answer_started = True
+                        if stream_writer is not None:
+                            stream_writer(events[0].model_dump(exclude_none=True))
                     chunks.append(chunk.delta)
                     event = EventInput(
                         event_key=f"phase:answer:token:{len(chunks) - 1}",
