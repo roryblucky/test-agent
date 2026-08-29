@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any, Protocol
 
 from langchain_core.runnables import RunnableConfig
 
 from app.langgraph_v2.contracts import TracerStreamEvent
+
+_LOGGER = logging.getLogger(__name__)
 
 _STREAM_MODES = ["updates", "custom"]
 _EVENT_TYPES = {
@@ -41,6 +44,32 @@ class GraphStreamCleanupError(RuntimeError):
     """The underlying LangGraph iterator failed while being closed."""
 
 
+async def _close_graph_iterator(graph_iterator: Any) -> tuple[bool, BaseException | None]:
+    """Await graph cleanup despite repeated cancellation signals."""
+    close = getattr(graph_iterator, "aclose", None)
+    if close is None:
+        return False, None
+    close_task = asyncio.ensure_future(close())
+    cancelled = False
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            # Retrieve the task's exception below while retaining ownership of
+            # the cleanup task until it has reached a terminal state.
+            break
+    cleanup_error: BaseException | None = None
+    try:
+        await close_task
+    except asyncio.CancelledError as error:
+        cleanup_error = error
+    except BaseException as error:
+        cleanup_error = GraphStreamCleanupError(str(error))
+    return cancelled, cleanup_error
+
+
 async def stream_graph(
     graph: RequestOwnedGraph,
     graph_input: Any | None,
@@ -65,6 +94,7 @@ async def stream_graph(
     seen_event_keys: set[str] = set()
     next_sequence = 0
 
+    primary_error: BaseException | None = None
     try:
         async for stream_part in graph_iterator:
             mode, data = _stream_part(stream_part)
@@ -86,18 +116,24 @@ async def stream_graph(
                 if event_sink is not None:
                     await event_sink(event)
                 yield event.to_sse()
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        close = getattr(graph_iterator, "aclose", None)
-        if close is not None:
-            close_task = asyncio.ensure_future(close())
-            try:
-                await asyncio.shield(close_task)
-            except asyncio.CancelledError:
-                # Cancellation of the graph must not leave its cleanup half-done.
-                await asyncio.shield(close_task)
-                raise
-            except Exception as error:
-                raise GraphStreamCleanupError(str(error)) from error
+        cleanup_cancelled, cleanup_error = await _close_graph_iterator(graph_iterator)
+        if cleanup_error is not None and (
+            primary_error is not None or cleanup_cancelled
+        ):
+            _LOGGER.warning(
+                "Request-owned graph cleanup failed after a primary exception",
+                exc_info=(
+                    type(cleanup_error), cleanup_error, cleanup_error.__traceback__
+                ),
+            )
+        elif primary_error is None and cleanup_cancelled:
+            raise asyncio.CancelledError
+        elif primary_error is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 def _stream_part(part: Any) -> tuple[str | None, Any]:

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import socket
 import uuid
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Coroutine
 from contextlib import suppress
 from datetime import timedelta
 from typing import Annotated, Any, Protocol, cast
@@ -89,6 +90,7 @@ from app.langgraph_v2.stream import (
 from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
+_LOGGER = logging.getLogger(__name__)
 
 
 def _resolve_refinement_actor(
@@ -352,50 +354,86 @@ async def _cleanup_request_execution(
     *,
     claim: RunRecord | None,
     terminal: bool,
+    primary_error: BaseException | None,
     tenant_id: str,
     run_id: uuid.UUID,
 ) -> None:
     """Close request-owned work before releasing an unfinished transitional Run."""
     cleanup_error: BaseException | None = None
+    cleanup_cancelled = False
 
-    try:
-        if graph_stream is not None:
-            await graph_stream.aclose()
-    except BaseException as error:
+    if graph_stream is not None:
+        cancelled, error = await _await_cleanup_operation(graph_stream.aclose())
+        cleanup_cancelled |= cancelled
         cleanup_error = error
 
-    try:
-        await cancellation_observer.close()
-    except BaseException as error:
-        if cleanup_error is None:
-            cleanup_error = error
+    cancelled, error = await _await_cleanup_operation(cancellation_observer.close())
+    cleanup_cancelled |= cancelled
+    if cleanup_error is None:
+        cleanup_error = error
 
     if heartbeat_task is not None:
         heartbeat_task.cancel()
-        try:
-            await heartbeat_task
-        except asyncio.CancelledError:
-            pass
-        except BaseException as error:
-            if cleanup_error is None:
-                cleanup_error = error
+        _, heartbeat_error = await _await_cleanup_task(heartbeat_task)
+        if cleanup_error is None and not isinstance(
+            heartbeat_error, asyncio.CancelledError
+        ):
+            cleanup_error = heartbeat_error
 
     if claim is not None and not terminal:
-        try:
-            await repository.interrupt_run(
+        cancelled, error = await _await_cleanup_operation(
+            repository.interrupt_run(
                 tenant_id=tenant_id,
                 run_id=run_id,
                 owner_instance_id=claim.owner_instance_id,
                 execution_epoch=claim.execution_epoch,
             )
-        except (ClaimFenced, RunNotFound):
-            pass
-        except BaseException as error:
-            if cleanup_error is None:
-                cleanup_error = error
+        )
+        cleanup_cancelled |= cancelled
+        if isinstance(error, (ClaimFenced, RunNotFound)):
+            error = None
+        if cleanup_error is None:
+            cleanup_error = error
 
+    if cleanup_error is not None and (primary_error is not None or cleanup_cancelled):
+        _LOGGER.warning(
+            "Request-owned cleanup failed after a primary exception",
+            exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+        )
+    if primary_error is not None:
+        return
+    if cleanup_cancelled:
+        raise asyncio.CancelledError
     if cleanup_error is not None:
         raise cleanup_error
+
+
+async def _await_cleanup_task(
+    task: asyncio.Task[Any],
+) -> tuple[bool, BaseException | None]:
+    """Await a cleanup task to completion despite repeated cancellation."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    try:
+        await task
+    except asyncio.CancelledError as error:
+        return cancelled, error
+    except BaseException as error:
+        return cancelled, error
+    return cancelled, None
+
+
+async def _await_cleanup_operation(
+    operation: Awaitable[Any],
+) -> tuple[bool, BaseException | None]:
+    """Own and await one cleanup operation until it reaches a terminal state."""
+    return await _await_cleanup_task(asyncio.ensure_future(operation))
 
 
 async def _persist_result_events(
@@ -481,8 +519,7 @@ class TracerInvoker(Protocol):
         ...
 
 
-class TracerGraph(TracerInvoker, RequestOwnedGraph, Protocol):
-    """Combined compatibility seam for injected Query and Resume graphs."""
+type TracerGraph = RequestOwnedGraph | TracerInvoker
 
 
 async def _stream_unseen_events(
@@ -812,6 +849,9 @@ def create_tracer_router(
         """Run the deterministic tracer and return its events as SSE."""
         del x_user_groups
         _ensure_tenant_available(http_request.app, request_context.tenant_id)
+        runtime = _local_runtime(http_request.app)
+        if not runtime.accepting:
+            raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
         run_id = uuid.uuid4()
         x_application_id = request_context.tenant_id
         configured_pool = getattr(
@@ -862,6 +902,7 @@ def create_tracer_router(
             graph_stream: AsyncIterator[str] | None = None
             heartbeat_task: asyncio.Task[None] | None = None
             terminal = False
+            primary_error: BaseException | None = None
             try:
                 claim = await repository.create_run(
                     tenant_id=x_application_id,
@@ -1027,9 +1068,11 @@ def create_tracer_router(
                             sequence=stopped.sequence,
                             data=stopped.data,
                         ).to_sse()
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as error:
+                primary_error = error
                 raise
-            except GraphStreamCleanupError:
+            except GraphStreamCleanupError as error:
+                primary_error = error
                 raise
             except Exception as error:
                 if claim is None:
@@ -1054,6 +1097,7 @@ def create_tracer_router(
                     repository,
                     claim=claim,
                     terminal=terminal,
+                    primary_error=primary_error,
                     tenant_id=x_application_id,
                     run_id=run_id,
                 )
@@ -1223,7 +1267,7 @@ def create_tracer_router(
         await _start_execution_or_interrupt(
             runtime,
             _execute_graph_run(
-                selected_graph,
+                cast(TracerInvoker, selected_graph),
                 None,
                 graph_config,
                 repository,
