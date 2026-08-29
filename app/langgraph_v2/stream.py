@@ -130,10 +130,11 @@ async def stream_graph(
                     type(cleanup_error), cleanup_error, cleanup_error.__traceback__
                 ),
             )
-        elif primary_error is None and cleanup_cancelled:
-            raise asyncio.CancelledError
-        elif primary_error is None and cleanup_error is not None:
-            raise cleanup_error
+        if primary_error is None:
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
+            if cleanup_error is not None:
+                raise cleanup_error
 
 
 def _stream_part(part: Any) -> tuple[str | None, Any]:

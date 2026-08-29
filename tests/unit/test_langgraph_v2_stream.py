@@ -198,3 +198,36 @@ async def test_stream_graph_closes_and_awaits_iterator_when_consumer_closes() ->
 
     assert stream.closed is True
     assert stream.close_completed is True
+
+
+@pytest.mark.asyncio
+async def test_stream_graph_preserves_cancellation_during_failing_close() -> None:
+    class CloseBlockingStream:
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.close_completed = False
+
+        def __aiter__(self) -> AsyncIterator[Any]:
+            return self
+
+        async def __anext__(self) -> Any:
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.close_completed = True
+            raise RuntimeError("close failed")
+
+    stream = CloseBlockingStream()
+    consumer = stream_graph(_FakeGraph(stream), {"query": "hello"})
+    task = asyncio.create_task(anext(consumer))
+    await stream.close_started.wait()
+
+    task.cancel()
+    stream.release_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stream.close_completed is True
