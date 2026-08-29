@@ -16,11 +16,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.cancellation import CancellationRepository
-from app.langgraph_v2.conversation_messages import (
-    ConversationMessageRepository,
-)
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.question_refinement import V2ResolvedQuery
@@ -34,39 +30,6 @@ from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tra
 STOPPED_FIXTURE_PATH = (
     Path(__file__).parents[1] / "fixtures" / "langgraph_v2" / "v1_stopped_wire.json"
 )
-
-
-async def _seed_run(
-    database_url: str,
-    *,
-    tenant_id: str = "tenant-a",
-    terminal: bool = False,
-) -> UUID:
-    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
-        await ConversationMessageRepository(pool).resolve_conversation(
-            context=TrustedRequestContext(tenant_id=tenant_id, subject_id="subject-a"),
-            conversation_id="conversation-1",
-        )
-        repository = RunEventRepository(pool)
-        run = await repository.create_run(
-            tenant_id=tenant_id,
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="seed-instance",
-        )
-        if terminal:
-            await repository.complete_run(
-                tenant_id=tenant_id,
-                run_id=run.run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-                event=EventInput(
-                    event_key="lifecycle:completed:0",
-                    type="done",
-                    data={"status": "completed"},
-                ),
-            )
-        return run.run_id
 
 
 async def _persisted_state(

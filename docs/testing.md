@@ -16,7 +16,6 @@ LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms
   PYTHONPATH=. uv run pytest \
   tests/integration/test_langgraph_v2_tracer.py \
   tests/integration/test_langgraph_v2_history_stream.py \
-  tests/integration/test_langgraph_v2_replay.py \
   tests/integration/test_langgraph_v2_thread_resume.py \
   tests/integration/test_langgraph_v2_live_follow.py \
   tests/integration/test_langgraph_v2_cancellation.py \
@@ -28,7 +27,7 @@ This gate covers the assembled route flag, Tenant isolation,
 persist-before-deliver, the Linear phases, history, and the public query and
 thread resume streams with deterministic dependencies. It is a functional gate
 only; admission, `429` capacity behavior, load, and production default
-enablement remain outside the Task 28 UAT scope.
+enablement remain outside this UAT scope.
 
 ## Disposable PostgreSQL fixture
 

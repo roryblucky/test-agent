@@ -7,7 +7,7 @@ import logging
 import os
 import socket
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Coroutine
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
@@ -65,7 +65,6 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementActor,
     build_question_refinement_actor,
 )
-from app.langgraph_v2.replay import PersistedEventFollower
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import (
@@ -79,7 +78,7 @@ from app.langgraph_v2.run_events import (
     RunNotFound,
     RunRecord,
 )
-from app.langgraph_v2.runtime import LocalRunRuntime, RuntimeStopping
+from app.langgraph_v2.runtime import LocalRunRuntime
 from app.langgraph_v2.stream import (
     GraphStreamCleanupError,
     RequestOwnedGraph,
@@ -568,134 +567,6 @@ async def _stream_unseen_events(
         ).to_sse()
 
 
-async def _persist_graph_result(
-    selected_graph: TracerInvoker,
-    state: TracerState | None,
-    graph_config: RunnableConfig | None,
-    repository: RunEventRepository,
-    cancellation_repository: CancellationRepository,
-    message_repository: ConversationMessageRepository,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    conversation_id: str,
-    expected_turn_id: uuid.UUID | None = None,
-    owner_instance_id: str,
-    execution_epoch: int,
-    initial_sent_keys: set[str] | None = None,
-) -> None:
-    """Run a graph and persist its durable result independently of subscribers."""
-    if graph_config is None:
-        graph_task = asyncio.create_task(selected_graph.ainvoke(state))
-    else:
-        graph_task = asyncio.create_task(
-            selected_graph.ainvoke(state, config=graph_config)
-        )
-    try:
-        while not graph_task.done():
-            await asyncio.sleep(0.01)
-        result = await graph_task
-        sent_keys = set(initial_sent_keys or ())
-        sent_keys.update(
-            event["event_key"]
-            for event in result["events"]
-            if event["event_key"].startswith("phase:")
-            if event["type"] != "token"
-            and not event["event_key"].startswith("phase:finalization:")
-            and event["event_key"] != "lifecycle:completed:0"
-        )
-        async for _ in _persist_result_events(
-            repository,
-            message_repository,
-            tenant_id=tenant_id,
-            run_id=run_id,
-            conversation_id=conversation_id,
-            result=result,
-            expected_turn_id=expected_turn_id,
-            owner_instance_id=owner_instance_id,
-            execution_epoch=execution_epoch,
-            suppress_sse_for_event_keys=sent_keys,
-        ):
-            pass
-    except CancellationObserved:
-        await cancellation_repository.apply_if_requested(
-            tenant_id=tenant_id,
-            run_id=run_id,
-            owner_instance_id=owner_instance_id,
-            execution_epoch=execution_epoch,
-        )
-    finally:
-        if not graph_task.done():
-            graph_task.cancel()
-        with suppress(asyncio.CancelledError, CancellationObserved):
-            await graph_task
-
-
-async def _execute_graph_run(
-    selected_graph: TracerInvoker,
-    state: TracerState | None,
-    graph_config: RunnableConfig | None,
-    repository: RunEventRepository,
-    cancellation_repository: CancellationRepository,
-    cancellation_observer: CancellationObserver,
-    message_repository: ConversationMessageRepository,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    conversation_id: str,
-    expected_turn_id: uuid.UUID | None = None,
-    owner_instance_id: str,
-    execution_epoch: int,
-    initial_sent_keys: set[str] | None = None,
-) -> None:
-    """Execute a Run independently of any one SSE subscriber."""
-    heartbeat_task = asyncio.create_task(
-        _refresh_claim(
-            repository,
-            tenant_id,
-            run_id,
-            owner_instance_id,
-            execution_epoch,
-        )
-    )
-    await cancellation_observer.start()
-    try:
-        await _persist_graph_result(
-            selected_graph,
-            state,
-            graph_config,
-            repository,
-            cancellation_repository,
-            message_repository,
-            tenant_id=tenant_id,
-            run_id=run_id,
-            conversation_id=conversation_id,
-            expected_turn_id=expected_turn_id,
-            owner_instance_id=owner_instance_id,
-            execution_epoch=execution_epoch,
-            initial_sent_keys=initial_sent_keys,
-        )
-    except (CancellationObserved, ClaimFenced):
-        return
-    except Exception as exc:
-        try:
-            await _persist_setup_failure(
-                repository,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                owner_instance_id=owner_instance_id,
-                execution_epoch=execution_epoch,
-                message=str(exc) or "LangGraph execution failed.",
-            )
-        except ClaimFenced:
-            return
-    finally:
-        await cancellation_observer.close()
-        heartbeat_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await heartbeat_task
-
-
 async def _subscribe_to_run(
     repository: RunEventRepository,
     execution_task: asyncio.Task[None],
@@ -761,32 +632,6 @@ def _message_repository(
     )
 
 
-async def _follow_persisted_events(
-    repository: RunEventRepository,
-    wakeups: LiveEventWakeups,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    after_sequence: int,
-    expected_execution_epoch: int | None = None,
-) -> AsyncIterator[str]:
-    """Serialize replay/live Event records from their durable sequence space."""
-    follower = PersistedEventFollower(repository, wakeups)
-    async for event in follower.follow(
-        tenant_id=tenant_id,
-        run_id=run_id,
-        after_sequence=after_sequence,
-        expected_execution_epoch=expected_execution_epoch,
-    ):
-        yield TracerStreamEvent(
-            event_key=event.event_key,
-            type=cast(Any, event.type),
-            step=event.step,
-            data=event.data,
-            sequence=event.sequence,
-        ).to_sse()
-
-
 def _local_runtime(app: FastAPI) -> LocalRunRuntime:
     """Return the instance-local runtime used to retain detached executions."""
     runtime = getattr(app.state, "langgraph_v2_runtime", None)
@@ -794,48 +639,6 @@ def _local_runtime(app: FastAPI) -> LocalRunRuntime:
         runtime = LocalRunRuntime()
         app.state.langgraph_v2_runtime = runtime
     return cast(LocalRunRuntime, runtime)
-
-
-async def _start_execution_or_interrupt(
-    runtime: LocalRunRuntime,
-    execution: Coroutine[Any, Any, None],
-    repository: RunEventRepository,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    owner_instance_id: str,
-    execution_epoch: int,
-) -> asyncio.Task[None] | None:
-    """Register execution or release the just-claimed Run during shutdown."""
-    try:
-        return runtime.start(execution)
-    except RuntimeStopping:
-        try:
-            await repository.interrupt_run(
-                tenant_id=tenant_id,
-                run_id=run_id,
-                owner_instance_id=owner_instance_id,
-                execution_epoch=execution_epoch,
-            )
-        except ClaimFenced:
-            pass
-        return None
-
-
-async def _authorized_run_conversation(
-    repository: RunEventRepository,
-    message_repository: ConversationMessageRepository,
-    *,
-    context: TrustedRequestContext,
-    run_id: uuid.UUID,
-) -> ConversationRecord:
-    """Load a Run and authorize its Conversation as one API boundary."""
-    run = await repository.get_run(context.tenant_id, run_id)
-    conversation = await message_repository.get_conversation(
-        context=context,
-        conversation_id=run.conversation_id,
-    )
-    return conversation
 
 
 def _checkpoint_turn_id(values: dict[str, Any]) -> uuid.UUID:
