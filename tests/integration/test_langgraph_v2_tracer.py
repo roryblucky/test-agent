@@ -502,9 +502,12 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
         "step_start",
         "done",
     ]
+    turn_id = response.headers["X-Turn-Id"]
+    UUID(turn_id)
     assert graph.received_state == {
         "query": "hello",
         "conversation_id": "conversation-1",
+        "turn_id": turn_id,
         "client_request_id": None,
         "events": [],
     }

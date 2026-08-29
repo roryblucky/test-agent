@@ -43,6 +43,7 @@ class TracerState(TypedDict):
 
     query: str
     conversation_id: str
+    turn_id: NotRequired[str]
     client_request_id: str | None
     events: list[dict[str, Any]]
     history: NotRequired[list[ConversationTurn]]

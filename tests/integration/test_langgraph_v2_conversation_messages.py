@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -10,8 +11,93 @@ from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
     MessageInvariantConflict,
+    ResumeExpired,
 )
 from app.langgraph_v2.run_events import ClaimFenced, EventInput, RunEventRepository
+
+
+@pytest.mark.asyncio
+async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message_time(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+        repository = ConversationMessageRepository(
+            pool, resume_ttl=timedelta(minutes=5)
+        )
+        await repository.resolve_conversation(
+            context=context,
+            conversation_id="session-1",
+        )
+        turn_id = uuid4()
+        run_id = uuid4()
+
+        first = await repository.create_turn(
+            context=context,
+            conversation_id="session-1",
+            turn_id=turn_id,
+            run_id=run_id,
+            content="hello",
+            idempotency_key="turn-1:user",
+        )
+        repeated = await repository.create_turn(
+            context=context,
+            conversation_id="session-1",
+            turn_id=turn_id,
+            run_id=run_id,
+            content="hello",
+            idempotency_key="turn-1:user",
+        )
+
+        assert repeated == first
+        assert first.turn_id == turn_id
+        message = (
+            await repository.list_messages(context=context, conversation_id="session-1")
+        )[0]
+        assert message.turn_id == turn_id
+
+        with pytest.raises(MessageInvariantConflict):
+            await repository.create_turn(
+                context=context,
+                conversation_id="session-1",
+                turn_id=turn_id,
+                run_id=run_id,
+                content="changed",
+                idempotency_key="turn-1:user",
+            )
+
+        anchored_at = datetime(2026, 1, 1, tzinfo=UTC)
+        async with pool.connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "UPDATE langgraph_v2.messages SET created_at = %s WHERE turn_id = %s",
+                    (anchored_at, turn_id),
+                )
+        retried_after_anchor = await repository.create_turn(
+            context=context,
+            conversation_id="session-1",
+            turn_id=turn_id,
+            run_id=run_id,
+            content="hello",
+            idempotency_key="turn-1:user",
+        )
+        turn = await repository.get_turn(
+            context=context,
+            conversation_id="session-1",
+            turn_id=turn_id,
+        )
+        assert retried_after_anchor.created_at == anchored_at
+        assert turn.created_at == anchored_at
+        assert turn.resume_deadline == anchored_at + timedelta(minutes=5)
+        with pytest.raises(ResumeExpired):
+            await repository.get_turn_for_resume(
+                context=context,
+                conversation_id="session-1",
+                turn_id=turn_id,
+                now=datetime(2026, 1, 1, 0, 6, tzinfo=UTC),
+            )
 
 
 @pytest.mark.asyncio
@@ -137,6 +223,15 @@ async def test_assistant_message_requires_successful_run_completion(
             conversation_id="session-1",
             owner_instance_id="instance-1",
         )
+        turn_id = uuid4()
+        await messages.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="session-1",
+            run_id=completed.run_id,
+            turn_id=turn_id,
+            content="question",
+            idempotency_key=f"run:{completed.run_id}:user",
+        )
         await runs.complete_run(
             tenant_id="tenant-a",
             run_id=completed.run_id,
@@ -186,6 +281,7 @@ async def test_assistant_message_requires_successful_run_completion(
         )
 
         assert repeated == first
+        assert first.turn_id == turn_id
         for blocked in (failed, cancelled, interrupted):
             with pytest.raises(ClaimFenced):
                 await messages.persist_assistant_message_after_completion(
@@ -203,7 +299,7 @@ async def test_assistant_message_requires_successful_run_completion(
                 ),
                 conversation_id="session-1",
             )
-        ] == ["safe answer"]
+        ] == ["question", "safe answer"]
 
 
 @pytest.mark.asyncio

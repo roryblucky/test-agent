@@ -25,13 +25,16 @@ async def _setup_saver(pool: Any) -> AsyncPostgresSaver:
     return saver
 
 
-def _state(query: str, conversation_id: str) -> dict:
-    return {
+def _state(query: str, conversation_id: str, turn_id: str | None = None) -> dict:
+    state = {
         "query": query,
         "conversation_id": conversation_id,
         "client_request_id": None,
         "events": [],
     }
+    if turn_id is not None:
+        state["turn_id"] = turn_id
+    return state
 
 
 def test_identifier_encoding_keeps_tenant_boundaries_and_tuple_shapes_distinct() -> (
@@ -64,6 +67,7 @@ async def test_committed_checkpoint_is_read_by_a_fresh_saver(
             owner_instance_id="instance-a",
         )
         await _setup_saver(pool)
+        turn_id = str(uuid4())
 
         async def write_pointer(checkpoint_id: str, checkpoint_ns: str) -> None:
             await repository.update_checkpoint_pointer(
@@ -86,7 +90,7 @@ async def test_committed_checkpoint_is_read_by_a_fresh_saver(
             )
         )
         await graph.ainvoke(
-            _state("hello", "conversation-1"),
+            _state("hello", "conversation-1", turn_id),
             config=initial_checkpoint_config(
                 thread_id=thread_id_for("tenant-a", "conversation-1"),
                 checkpoint_ns=checkpoint_ns,
@@ -106,6 +110,7 @@ async def test_committed_checkpoint_is_read_by_a_fresh_saver(
             )
         )
         assert checkpoint is not None
+        assert checkpoint["channel_values"]["turn_id"] == turn_id
 
 
 @pytest.mark.asyncio

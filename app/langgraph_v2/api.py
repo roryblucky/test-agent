@@ -8,6 +8,7 @@ import socket
 import uuid
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import suppress
+from datetime import timedelta
 from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -558,6 +559,18 @@ def _live_events(app: FastAPI) -> LiveEventWakeups:
     return cast(LiveEventWakeups, wakeups)
 
 
+def _message_repository(
+    app: FastAPI, pool: AsyncConnectionPool[Any]
+) -> ConversationMessageRepository:
+    """Build the Message repository with the deployment's fixed Resume TTL."""
+    return ConversationMessageRepository(
+        pool,
+        resume_ttl=timedelta(
+            seconds=getattr(app.state, "langgraph_v2_resume_ttl_seconds", 3600)
+        ),
+    )
+
+
 async def _follow_persisted_events(
     repository: RunEventRepository,
     wakeups: LiveEventWakeups,
@@ -669,6 +682,7 @@ def create_tracer_router(
         if not runtime.accepting:
             raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
         run_id = uuid.uuid4()
+        turn_id = uuid.uuid4()
         x_application_id = request_context.tenant_id
         configured_pool = getattr(
             http_request.app.state,
@@ -689,7 +703,7 @@ def create_tracer_router(
             tenant_id=x_application_id,
             run_id=run_id,
         )
-        message_repository = ConversationMessageRepository(pool)
+        message_repository = _message_repository(http_request.app, pool)
         try:
             if payload.conversation_id is None:
                 conversation = await message_repository.resolve_conversation(
@@ -713,10 +727,11 @@ def create_tracer_router(
                 conversation_id=conversation_id,
                 owner_instance_id=_INSTANCE_ID,
             )
-            await message_repository.persist_user_message(
-                tenant_id=x_application_id,
+            await message_repository.create_turn(
+                context=request_context,
                 conversation_id=conversation_id,
                 run_id=run_id,
+                turn_id=turn_id,
                 content=payload.query,
                 idempotency_key=f"run:{run_id}:user",
             )
@@ -821,6 +836,7 @@ def create_tracer_router(
             state: TracerState = {
                 "query": payload.query,
                 "conversation_id": conversation_id,
+                "turn_id": str(turn_id),
                 "client_request_id": payload.client_request_id,
                 "events": [],
             }
@@ -866,6 +882,7 @@ def create_tracer_router(
                 "X-Accel-Buffering": "no",
                 "X-Run-Id": str(run_id),
                 "X-Conversation-Id": conversation_id,
+                "X-Turn-Id": str(turn_id),
             },
         )
 
@@ -901,7 +918,7 @@ def create_tracer_router(
             tenant_id=x_application_id,
             run_id=run_id,
         )
-        message_repository = ConversationMessageRepository(pool)
+        message_repository = _message_repository(http_request.app, pool)
         try:
             conversation = await _authorized_run_conversation(
                 repository,
@@ -1086,7 +1103,7 @@ def create_tracer_router(
         x_application_id = request_context.tenant_id
         wakeups = _live_events(http_request.app)
         repository = RunEventRepository(configured_pool, live_events=wakeups)
-        messages = ConversationMessageRepository(configured_pool)
+        messages = _message_repository(http_request.app, configured_pool)
         try:
             await _authorized_run_conversation(
                 repository,
@@ -1137,7 +1154,7 @@ def create_tracer_router(
         x_application_id = request_context.tenant_id
         try:
             repository = RunEventRepository(configured_pool)
-            messages = ConversationMessageRepository(configured_pool)
+            messages = _message_repository(http_request.app, configured_pool)
             await _authorized_run_conversation(
                 repository,
                 messages,

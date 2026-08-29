@@ -21,6 +21,7 @@ def _message(
         message_id=UUID(int=order),
         conversation_id="conversation-1",
         run_id=UUID(int=run_number),
+        turn_id=UUID(int=run_number),
         role=role,
         content=content,
         idempotency_key=f"{run_number}:{role}",
