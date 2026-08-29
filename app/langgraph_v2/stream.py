@@ -10,7 +10,7 @@ from langchain_core.runnables import RunnableConfig
 
 from app.langgraph_v2.contracts import TracerStreamEvent
 
-_STREAM_MODES = ["updates", "custom", "messages"]
+_STREAM_MODES = ["updates", "custom"]
 _EVENT_TYPES = {
     "step_start",
     "step_completed",
@@ -51,10 +51,7 @@ async def stream_graph(
             if mode not in _STREAM_MODES:
                 continue
 
-            if mode == "messages":
-                candidates = _message_events(data)
-            else:
-                candidates = _event_mappings(data)
+            candidates = _event_mappings(data)
 
             for candidate in candidates:
                 event_key = candidate.get("event_key")
@@ -118,42 +115,6 @@ def _event_mappings(value: Any) -> list[Mapping[str, Any]]:
     return []
 
 
-def _message_events(value: Any) -> list[Mapping[str, Any]]:
-    """Turn text-bearing LangChain message chunks into public token events."""
-    if not isinstance(value, tuple) or len(value) != 2:
-        return []
-    message, metadata = value
-    if not isinstance(metadata, Mapping) or metadata.get("langgraph_node") != "answer":
-        return []
-    text = _message_text(message)
-    if not text:
-        return []
-    return [{"type": "token", "data": text}]
-
-
-def _message_text(message: Any) -> str:
-    if isinstance(message, str):
-        return message
-    mapping = _as_mapping(message)
-    content = mapping.get("content") if mapping is not None else getattr(message, "content", None)
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, (list, tuple)):
-        return ""
-
-    text_parts: list[str] = []
-    for block in content:
-        block_mapping = _as_mapping(block)
-        text = (
-            block_mapping.get("text")
-            if block_mapping is not None
-            else getattr(block, "text", None)
-        )
-        if isinstance(text, str):
-            text_parts.append(text)
-    return "".join(text_parts)
-
-
 def _event_from_mapping(
     mapping: Mapping[str, Any],
     *,
@@ -166,11 +127,7 @@ def _event_from_mapping(
 
     event_key = mapping.get("event_key")
     if not isinstance(event_key, str) or not event_key:
-        event_key = (
-            f"phase:answer:token:{sequence}"
-            if mode == "messages"
-            else f"stream:{mode}:{sequence}"
-        )
+        event_key = f"stream:{mode}:{sequence}"
     event = TracerStreamEvent(
         event_key=event_key,
         type=mapping["type"],

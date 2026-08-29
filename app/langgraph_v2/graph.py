@@ -7,6 +7,7 @@ from typing import Any, NotRequired, TypedDict, cast
 from uuid import UUID
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
@@ -360,6 +361,7 @@ def build_tracer_graph(
                 context=phase_context,
                 artifacts=selected_artifact_repository,
                 actor=answer_actor,
+                stream_writer=get_stream_writer(),
             )
             update: TracerStateUpdate = {
                 "events": [

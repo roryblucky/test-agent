@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -43,6 +44,14 @@ class AnswerResult(BaseModel):
     answer: str = Field(min_length=1)
     usage: dict[str, Any] = Field(default_factory=dict)
     citations: list[AnswerCitation] = Field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AnswerStreamChunk:
+    """One final-answer delta, with the validated result on stream completion."""
+
+    delta: str = ""
+    result: AnswerResult | None = None
 
 
 class BoundAnswerResult(BaseModel):
@@ -146,6 +155,22 @@ class PydanticAIAnswerActor:
     def __init__(self, agent: Agent[Any, AnswerOutput]) -> None:
         self._agent = agent
 
+    @staticmethod
+    def _prompt(
+        query: str,
+        documents: list[Document],
+    ) -> str:
+        evidence = "\n\n".join(
+            f"[{index}] {document.content}"
+            for index, document in enumerate(documents, 1)
+        )
+        return f"Question: {query}\n\nEvidence:\n{evidence}"
+
+    @staticmethod
+    def _usage_payload(result: Any) -> dict[str, Any]:
+        usage = result.usage()
+        return asdict(usage) if is_dataclass(usage) else dict(vars(usage))
+
     async def answer(
         self,
         query: str,
@@ -153,11 +178,7 @@ class PydanticAIAnswerActor:
         history: Sequence[ConversationTurn] = (),
     ) -> AnswerResult:
         """Run the model with only the query and ordered Documents as context."""
-        evidence = "\n\n".join(
-            f"[{index}] {document.content}"
-            for index, document in enumerate(documents, 1)
-        )
-        prompt = f"Question: {query}\n\nEvidence:\n{evidence}"
+        prompt = self._prompt(query, documents)
         if history:
             result = await self._agent.run(
                 prompt,
@@ -165,14 +186,52 @@ class PydanticAIAnswerActor:
             )
         else:
             result = await self._agent.run(prompt)
-        usage = result.usage()
-        usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
+        usage_payload = self._usage_payload(result)
         output = AnswerOutput.model_validate(result.output)
         return AnswerResult(
             answer=output.answer,
             usage=usage_payload,
             citations=output.citations,
         )
+
+    async def answer_stream(
+        self,
+        query: str,
+        documents: list[Document],
+        history: Sequence[ConversationTurn] = (),
+    ) -> AsyncIterator[AnswerStreamChunk]:
+        """Stream final ``AnswerOutput.answer`` deltas and return its full result.
+
+        PydanticAI's structured stream yields progressively validated snapshots,
+        rather than text deltas.  The answer field is append-only for a normal
+        structured output stream, so each public chunk is the newly produced
+        suffix.  Tool, reasoning, and other model events never enter this path.
+        """
+        prompt = self._prompt(query, documents)
+        run_kwargs: dict[str, Any] = {}
+        if history:
+            run_kwargs["message_history"] = to_model_message_history(history)
+
+        async with self._agent.run_stream(prompt, **run_kwargs) as stream:
+            previous = ""
+            async for partial in stream.stream_output(debounce_by=None):
+                answer = getattr(partial, "answer", None)
+                if not isinstance(answer, str):
+                    continue
+                if not answer.startswith(previous):
+                    raise ValueError("streamed Answer field is not append-only")
+                delta = answer[len(previous) :]
+                previous = answer
+                if delta:
+                    yield AnswerStreamChunk(delta=delta)
+
+            output = AnswerOutput.model_validate(await stream.get_output())
+            result = AnswerResult(
+                answer=output.answer,
+                usage=self._usage_payload(stream),
+                citations=output.citations,
+            )
+            yield AnswerStreamChunk(result=result)
 
 
 def build_answer_actor(
@@ -218,8 +277,9 @@ async def run_answer(
     context: PhaseExecutionContext,
     artifacts: ArtifactStore,
     actor: AnswerActor,
+    stream_writer: Any | None = None,
 ) -> tuple[list[EventRecord], BoundAnswerResult | None, bool, str | None]:
-    """Hydrate ranked evidence, journal the answer and all chunks atomically."""
+    """Hydrate ranked evidence, stream deltas, and journal the final result."""
 
     async def invoke() -> PhaseResultInput:
         try:
@@ -243,17 +303,7 @@ async def run_answer(
                 ConversationTurn.model_validate(turn)
                 for turn in state.get("history", [])
             ]
-            answer = await actor.answer(
-                state.get("refined_query", state["query"]),
-                documents,
-                history,
-            )
-            validated = AnswerResult.model_validate(answer)
-            chunks = split_answer_chunks(validated.answer)
-            normalized_answer = "".join(chunks)
-            citations = await build_inline_citations(normalized_answer, refs, documents)
-            if "[" not in normalized_answer and "]" not in normalized_answer:
-                citations = bind_answer_citations(validated.citations, refs, documents)
+            answer_query = state.get("refined_query", state["query"])
             events: list[EventInput] = [
                 EventInput(
                     event_key="phase:answer:step_start:1",
@@ -261,32 +311,97 @@ async def run_answer(
                     step="llm:answer",
                 )
             ]
-            events.extend(
-                EventInput(
-                    event_key=f"phase:answer:token:{index}",
-                    type="token",
-                    data=chunk,
-                )
-                for index, chunk in enumerate(chunks)
-            )
-            if citations:
-                events.append(
-                    EventInput(
-                        event_key="phase:answer:citations:1",
-                        type="citations",
-                        data=[
-                            citation.model_dump(mode="json") for citation in citations
-                        ],
+            if stream_writer is not None:
+                stream_writer(events[0].model_dump(exclude_none=True))
+
+            stream_answer = getattr(actor, "answer_stream", None)
+            chunks: list[str] = []
+            if callable(stream_answer):
+                streamed_result: AnswerResult | None = None
+                answer_iterator = stream_answer(answer_query, documents, history)
+                try:
+                    async for chunk in answer_iterator:
+                        if isinstance(chunk, AnswerStreamChunk):
+                            delta = chunk.delta
+                            if chunk.result is not None:
+                                streamed_result = chunk.result
+                        elif isinstance(chunk, str):
+                            # Keep the adapter tolerant of simple streaming actors.
+                            delta = chunk
+                        else:
+                            raise TypeError(
+                                "answer_stream yielded an unsupported chunk"
+                            )
+                        if not delta:
+                            continue
+                        if (
+                            context.cancellation_check is not None
+                            and await context.cancellation_check()
+                        ):
+                            raise AnswerCancelled(
+                                "answer generation cancelled before publication"
+                            )
+                        chunks.append(delta)
+                        event = EventInput(
+                            event_key=f"phase:answer:token:{len(chunks) - 1}",
+                            type="token",
+                            data=delta,
+                        )
+                        events.append(event)
+                        if stream_writer is not None:
+                            stream_writer(event.model_dump(exclude_none=True))
+                finally:
+                    close = getattr(answer_iterator, "aclose", None)
+                    if close is not None:
+                        close_task = asyncio.ensure_future(close())
+                        try:
+                            await asyncio.shield(close_task)
+                        except asyncio.CancelledError:
+                            await asyncio.shield(close_task)
+                            raise
+                if streamed_result is None:
+                    raise ValueError("answer stream did not return a final result")
+                validated = AnswerResult.model_validate(streamed_result)
+                normalized_answer = validated.answer
+                if "".join(chunks) != normalized_answer:
+                    raise ValueError("streamed Answer deltas do not match final Answer")
+            else:
+                answer = await actor.answer(answer_query, documents, history)
+                validated = AnswerResult.model_validate(answer)
+                # Legacy actors do not expose a model stream. Keep their durable
+                # replay behavior while the PydanticAI actor uses real deltas.
+                chunks = split_answer_chunks(validated.answer)
+                normalized_answer = "".join(chunks)
+                for index, chunk in enumerate(chunks):
+                    event = EventInput(
+                        event_key=f"phase:answer:token:{index}",
+                        type="token",
+                        data=chunk,
                     )
+                    events.append(event)
+                    if stream_writer is not None:
+                        stream_writer(event.model_dump(exclude_none=True))
+            citations = await build_inline_citations(normalized_answer, refs, documents)
+            if "[" not in normalized_answer and "]" not in normalized_answer:
+                citations = bind_answer_citations(validated.citations, refs, documents)
+            if citations:
+                event = EventInput(
+                    event_key="phase:answer:citations:1",
+                    type="citations",
+                    data=[citation.model_dump(mode="json") for citation in citations],
                 )
-            events.append(
-                EventInput(
-                    event_key="phase:answer:step_completed:1",
-                    type="step_completed",
-                    step="llm:answer",
-                    data={"chunk_count": len(chunks)},
-                )
+                events.append(event)
+                if stream_writer is not None:
+                    stream_writer(event.model_dump(exclude_none=True))
+            event = EventInput(
+                event_key="phase:answer:step_completed:1",
+                type="step_completed",
+                step="llm:answer",
+                data={"chunk_count": len(chunks)},
             )
+            events.append(event)
+            if stream_writer is not None:
+                stream_writer(event.model_dump(exclude_none=True))
             return PhaseResultInput(
                 phase_name="answer",
                 normalized_result={
@@ -299,8 +414,17 @@ async def run_answer(
                 events=tuple(events),
                 terminal_status=None,
             )
+        except AnswerCancelled:
+            raise
         except Exception as exc:
             message = str(exc) or "Answer generation failed."
+            error_event = EventInput(
+                event_key="phase:answer:error:1",
+                type="error",
+                data=message,
+            )
+            if stream_writer is not None:
+                stream_writer(error_event.model_dump(exclude_none=True))
             return PhaseResultInput(
                 phase_name="answer",
                 normalized_result={"failed": True, "error": message},
@@ -310,11 +434,7 @@ async def run_answer(
                         type="step_start",
                         step="llm:answer",
                     ),
-                    EventInput(
-                        event_key="phase:answer:error:1",
-                        type="error",
-                        data=message,
-                    ),
+                    error_event,
                 ),
                 terminal_status="failed",
             )

@@ -104,13 +104,12 @@ async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() 
     assert [_payload(frame) for frame in frames] == [
         {"type": "step_start", "sequence": 1, "step": "answer"},
         {"type": "token", "sequence": 2, "data": "hello"},
-        {"type": "token", "sequence": 3, "data": " world"},
     ]
     assert graph.inputs == [{"query": "hello"}]
     assert graph.options == [
         {
             "config": None,
-            "stream_mode": ["updates", "custom", "messages"],
+            "stream_mode": ["updates", "custom"],
             "durability": "sync",
         }
     ]
@@ -155,14 +154,16 @@ async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
     assert graph.options == [
         {
             "config": {"configurable": {"thread_id": "thread-1"}},
-            "stream_mode": ["updates", "custom", "messages"],
+            "stream_mode": ["updates", "custom"],
             "durability": "sync",
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_stream_graph_closes_and_awaits_iterator_on_consumer_cancellation() -> None:
+async def test_stream_graph_closes_and_awaits_iterator_on_consumer_cancellation() -> (
+    None
+):
     blocked = asyncio.Event()
     stream = _FakeGraphStream([("updates", blocked)])
     graph = _FakeGraph(stream)
