@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Any
+from typing import Any, Protocol
 
 from langchain_core.runnables import RunnableConfig
 
@@ -22,8 +22,27 @@ _EVENT_TYPES = {
 }
 
 
+class RequestOwnedGraph(Protocol):
+    """Minimal LangGraph stream interface owned by one receiving request."""
+
+    def astream(
+        self,
+        graph_input: Any | None,
+        *,
+        config: RunnableConfig | None = None,
+        stream_mode: list[str] | str | None = None,
+        durability: str | None = None,
+    ) -> AsyncIterator[Any]:
+        """Return the asynchronous graph iterator for this request."""
+        ...
+
+
+class GraphStreamCleanupError(RuntimeError):
+    """The underlying LangGraph iterator failed while being closed."""
+
+
 async def stream_graph(
-    graph: Any,
+    graph: RequestOwnedGraph,
     graph_input: Any | None,
     *,
     config: RunnableConfig | None = None,
@@ -77,6 +96,8 @@ async def stream_graph(
                 # Cancellation of the graph must not leave its cleanup half-done.
                 await asyncio.shield(close_task)
                 raise
+            except Exception as error:
+                raise GraphStreamCleanupError(str(error)) from error
 
 
 def _stream_part(part: Any) -> tuple[str | None, Any]:

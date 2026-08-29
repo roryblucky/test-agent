@@ -78,9 +78,14 @@ from app.langgraph_v2.run_events import (
     ResumeConflict,
     RunEventRepository,
     RunNotFound,
+    RunRecord,
 )
 from app.langgraph_v2.runtime import LocalRunRuntime, RuntimeStopping
-from app.langgraph_v2.stream import stream_graph
+from app.langgraph_v2.stream import (
+    GraphStreamCleanupError,
+    RequestOwnedGraph,
+    stream_graph,
+)
 from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
@@ -339,6 +344,60 @@ async def _persist_event_record(
     )
 
 
+async def _cleanup_request_execution(
+    graph_stream: AsyncIterator[str] | None,
+    cancellation_observer: CancellationObserver,
+    heartbeat_task: asyncio.Task[None] | None,
+    repository: RunEventRepository,
+    *,
+    claim: RunRecord | None,
+    terminal: bool,
+    tenant_id: str,
+    run_id: uuid.UUID,
+) -> None:
+    """Close request-owned work before releasing an unfinished transitional Run."""
+    cleanup_error: BaseException | None = None
+
+    try:
+        if graph_stream is not None:
+            await graph_stream.aclose()
+    except BaseException as error:
+        cleanup_error = error
+
+    try:
+        await cancellation_observer.close()
+    except BaseException as error:
+        if cleanup_error is None:
+            cleanup_error = error
+
+    if heartbeat_task is not None:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+
+    if claim is not None and not terminal:
+        try:
+            await repository.interrupt_run(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                owner_instance_id=claim.owner_instance_id,
+                execution_epoch=claim.execution_epoch,
+            )
+        except (ClaimFenced, RunNotFound):
+            pass
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 async def _persist_result_events(
     repository: RunEventRepository,
     message_repository: ConversationMessageRepository,
@@ -410,19 +469,8 @@ async def _persist_setup_failure(
     ).to_sse()
 
 
-class TracerGraph(Protocol):
-    """Graph seam used by request-owned Query and detached Resume execution."""
-
-    def astream(
-        self,
-        state: TracerState | None,
-        config: RunnableConfig | None = None,
-        *,
-        stream_mode: list[str] | str | None = None,
-        durability: str | None = None,
-    ) -> AsyncIterator[Any]:
-        """Stream Query updates/custom events owned by the receiving request."""
-        ...
+class TracerInvoker(Protocol):
+    """Legacy invocation seam retained by detached transitional execution."""
 
     async def ainvoke(
         self,
@@ -431,6 +479,10 @@ class TracerGraph(Protocol):
     ) -> dict[str, Any]:
         """Run one graph invocation and return its final state."""
         ...
+
+
+class TracerGraph(TracerInvoker, RequestOwnedGraph, Protocol):
+    """Combined compatibility seam for injected Query and Resume graphs."""
 
 
 async def _stream_unseen_events(
@@ -463,7 +515,7 @@ async def _stream_unseen_events(
 
 
 async def _persist_graph_result(
-    selected_graph: TracerGraph,
+    selected_graph: TracerInvoker,
     state: TracerState | None,
     graph_config: RunnableConfig | None,
     repository: RunEventRepository,
@@ -526,7 +578,7 @@ async def _persist_graph_result(
 
 
 async def _execute_graph_run(
-    selected_graph: TracerGraph,
+    selected_graph: TracerInvoker,
     state: TracerState | None,
     graph_config: RunnableConfig | None,
     repository: RunEventRepository,
@@ -952,7 +1004,7 @@ def create_tracer_router(
                         terminal = True
 
                 graph_stream = stream_graph(
-                    selected_graph,
+                    cast(RequestOwnedGraph, selected_graph),
                     state,
                     config=graph_config,
                     event_sink=persist_event,
@@ -977,6 +1029,8 @@ def create_tracer_router(
                         ).to_sse()
             except asyncio.CancelledError:
                 raise
+            except GraphStreamCleanupError:
+                raise
             except Exception as error:
                 if claim is None:
                     raise
@@ -993,21 +1047,16 @@ def create_tracer_router(
                         terminal = True
                         yield failure
             finally:
-                if graph_stream is not None:
-                    await graph_stream.aclose()
-                await cancellation_observer.close()
-                if heartbeat_task is not None:
-                    heartbeat_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await heartbeat_task
-                if claim is not None and not terminal:
-                    with suppress(ClaimFenced, RunNotFound):
-                        await repository.interrupt_run(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                        )
+                await _cleanup_request_execution(
+                    graph_stream,
+                    cancellation_observer,
+                    heartbeat_task,
+                    repository,
+                    claim=claim,
+                    terminal=terminal,
+                    tenant_id=x_application_id,
+                    run_id=run_id,
+                )
 
         return StreamingResponse(
             event_generator(),

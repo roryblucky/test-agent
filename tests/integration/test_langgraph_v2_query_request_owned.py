@@ -14,6 +14,7 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.stream import GraphStreamCleanupError
 from tests.integration.test_langgraph_v2_tracer import (
     persistent_tracer_app,
     seed_subject_conversation,
@@ -263,3 +264,60 @@ async def test_query_yields_answer_delta_before_graph_completion(
         ("user", "hello"),
         ("assistant", "partial complete"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_graph_close_failure_is_reported_after_request_cleanup(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url, "conversation-1"
+    )
+
+    class FailingCloseStream:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.close_calls = 0
+
+        def __aiter__(self) -> AsyncIterator[Any]:
+            return self
+
+        async def __anext__(self) -> Any:
+            self.started.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("graph close failed")
+
+    class FailingCloseGraph:
+        def __init__(self) -> None:
+            self.stream = FailingCloseStream()
+
+        def astream(self, state: Any, **options: Any) -> FailingCloseStream:
+            del state, options
+            return self.stream
+
+    graph = FailingCloseGraph()
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            stream_request(app),
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
+        )
+        pending_read = asyncio.create_task(anext(response.body_iterator))
+        await graph.stream.started.wait()
+        pending_read.cancel()
+        with pytest.raises(GraphStreamCleanupError, match="graph close failed"):
+            await pending_read
+        await response.body_iterator.aclose()
+        run = await RunEventRepository(app.state.langgraph_v2_postgres_pool).get_run(
+            "tenant-a", UUID(response.headers["x-run-id"])
+        )
+
+    assert graph.stream.close_calls == 1
+    assert run.status == "interrupted"
+    assert run.owner_instance_id == ""
