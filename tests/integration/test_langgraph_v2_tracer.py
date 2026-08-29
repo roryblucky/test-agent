@@ -1523,15 +1523,18 @@ def test_concurrent_resume_requests_have_one_http_winner(
 def test_completed_tracer_persists_its_run_and_every_delivered_event(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
+    conversation_id = "conversation-completed-tracer"
     asyncio.run(
-        seed_subject_conversation(langgraph_v2_migrated_database_url, "conversation-1")
+        seed_subject_conversation(
+            langgraph_v2_migrated_database_url, conversation_id
+        )
     )
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
+            json={"query": "hello", "sessionId": conversation_id},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
@@ -1553,7 +1556,7 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
                     context=TrustedRequestContext(
                         tenant_id="tenant-a", subject_id="subject-a"
                     ),
-                    conversation_id="conversation-1",
+                    conversation_id=conversation_id,
                 ),
             )
 
@@ -1579,7 +1582,7 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
     ]
     assert [event.type for event in persisted] == [event["type"] for event in delivered]
     assert [(message.role, message.content) for message in messages] == [
-        ("user", "hello")
+        ("user", "hello"),
     ]
 
 
