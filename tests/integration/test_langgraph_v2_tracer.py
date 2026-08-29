@@ -20,11 +20,7 @@ from psycopg_pool import AsyncConnectionPool
 import app.langgraph_v2.api as api_module
 from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import AnswerActor
-from app.langgraph_v2.api import (
-    ANSWER_CHUNK_INTERVAL_MS,
-    TracerGraph,
-    register_v2_routes,
-)
+from app.langgraph_v2.api import TracerGraph, register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
@@ -92,7 +88,6 @@ def persistent_tracer_app(
         ranker=ranker,
         moderation_provider=moderation_provider,
         answer_actor=answer_actor,
-        answer_chunk_interval_ms=ANSWER_CHUNK_INTERVAL_MS,
         resume_enabled=resume_enabled,
     )
     return app
@@ -398,7 +393,6 @@ async def test_done_answer_finalization_is_atomic_on_turn_validation(
                 expected_turn_id=expected_turn_id,
                 owner_instance_id="instance-a",
                 execution_epoch=1,
-                answer_chunk_interval_ms=0,
             )
             async for _ in frames:
                 pass

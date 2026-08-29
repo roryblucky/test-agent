@@ -2,6 +2,7 @@ import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Self
+from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -307,6 +308,15 @@ async def test_answer_tokens_are_delivered_before_post_moderation_boundary() -> 
             tenant_id="tenant-a",
             run_id=run_id,
             sequence=2,
+            event_key="phase:answer:token:1",
+            type="token",
+            data=" stream",
+            created_at=created_at,
+        ),
+        EventRecord(
+            tenant_id="tenant-a",
+            run_id=run_id,
+            sequence=3,
             event_key="phase:moderation:post:step_start:1",
             type="step_start",
             step="moderation:post",
@@ -322,18 +332,20 @@ async def test_answer_tokens_are_delivered_before_post_moderation_boundary() -> 
             assert requested_run_id == run_id
             return events
 
-    frames = [
-        frame
-        async for frame in _stream_unseen_events(
-            Repository(),
-            tenant_id="tenant-a",
-            run_id=run_id,
-            sent_keys=set(),
-            answer_chunk_count=[0],
-            answer_chunk_interval_ms=250,
-        )
-    ]
+    with patch("app.langgraph_v2.api.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        frames = [
+            frame
+            async for frame in _stream_unseen_events(
+                Repository(),
+                tenant_id="tenant-a",
+                run_id=run_id,
+                sent_keys=set(),
+            )
+        ]
 
-    assert frames[0].index('"type": "token"') < frames[1].index(
+    assert '"data": "answer"' in frames[0]
+    assert '"data": " stream"' in frames[1]
+    assert frames[2].index('"type": "step_start"') < frames[2].index(
         '"step": "moderation:post"'
     )
+    sleep.assert_not_awaited()

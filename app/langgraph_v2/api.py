@@ -74,19 +74,6 @@ from app.langgraph_v2.runtime import LocalRunRuntime, RuntimeStopping
 from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
-ANSWER_CHUNK_INTERVAL_MS = 250
-
-
-async def _pace_answer_chunk(
-    event: TracerStreamEvent | Any,
-    answer_chunk_count: list[int],
-    answer_chunk_interval_ms: int,
-) -> None:
-    """Apply the bounded answer-chunk interval to one newly delivered token."""
-    if event.type == "token" and event.event_key.startswith("phase:answer:token:"):
-        if answer_chunk_count[0]:
-            await asyncio.sleep(answer_chunk_interval_ms / 1000)
-        answer_chunk_count[0] += 1
 
 
 def _resolve_refinement_actor(
@@ -242,11 +229,9 @@ async def _persist_result_events(
     owner_instance_id: str,
     execution_epoch: int,
     suppress_sse_for_event_keys: set[str] | None = None,
-    answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
 ) -> AsyncIterator[str]:
     """Persist graph Events and serialize newly published SSE frames."""
     prior_keys = suppress_sse_for_event_keys or set()
-    answer_chunk_count = [0]
     for raw_event in result["events"]:
         event = TracerStreamEvent.model_validate(raw_event)
         event_input = EventInput(
@@ -326,10 +311,6 @@ async def _persist_result_events(
                 execution_epoch=execution_epoch,
             )
         if event.event_key not in prior_keys:
-            await _pace_answer_chunk(
-                event, answer_chunk_count, answer_chunk_interval_ms
-            )
-        if event.event_key not in prior_keys:
             yield event.model_copy(update={"sequence": persisted.sequence}).to_sse()
 
 
@@ -380,11 +361,9 @@ async def _stream_unseen_events(
     tenant_id: str,
     run_id: uuid.UUID,
     sent_keys: set[str],
-    answer_chunk_count: list[int],
-    answer_chunk_interval_ms: int,
     suppress_replayed_phase_events: bool = False,
 ) -> AsyncIterator[str]:
-    """Serialize newly journaled Events and pace answer chunks consistently."""
+    """Serialize newly journaled Events."""
     for event in await repository.list_events(tenant_id, run_id):
         if event.event_key in sent_keys:
             continue
@@ -396,7 +375,6 @@ async def _stream_unseen_events(
             and not event.event_key.startswith("phase:finalization:")
         ):
             continue
-        await _pace_answer_chunk(event, answer_chunk_count, answer_chunk_interval_ms)
         yield TracerStreamEvent(
             event_key=event.event_key,
             type=cast(Any, event.type),
@@ -420,7 +398,6 @@ async def _persist_graph_result(
     expected_turn_id: uuid.UUID | None = None,
     owner_instance_id: str,
     execution_epoch: int,
-    answer_chunk_interval_ms: int,
     initial_sent_keys: set[str] | None = None,
 ) -> None:
     """Run a graph and persist its durable result independently of subscribers."""
@@ -454,7 +431,6 @@ async def _persist_graph_result(
             owner_instance_id=owner_instance_id,
             execution_epoch=execution_epoch,
             suppress_sse_for_event_keys=sent_keys,
-            answer_chunk_interval_ms=answer_chunk_interval_ms,
         ):
             pass
     except CancellationObserved:
@@ -486,7 +462,6 @@ async def _execute_graph_run(
     expected_turn_id: uuid.UUID | None = None,
     owner_instance_id: str,
     execution_epoch: int,
-    answer_chunk_interval_ms: int,
     initial_sent_keys: set[str] | None = None,
 ) -> None:
     """Execute a Run independently of any one SSE subscriber."""
@@ -514,7 +489,6 @@ async def _execute_graph_run(
             expected_turn_id=expected_turn_id,
             owner_instance_id=owner_instance_id,
             execution_epoch=execution_epoch,
-            answer_chunk_interval_ms=answer_chunk_interval_ms,
             initial_sent_keys=initial_sent_keys,
         )
     except (CancellationObserved, ClaimFenced):
@@ -544,21 +518,17 @@ async def _subscribe_to_run(
     *,
     tenant_id: str,
     run_id: uuid.UUID,
-    answer_chunk_interval_ms: int,
     initial_sent_keys: set[str] | None = None,
     suppress_replayed_phase_events: bool = False,
 ) -> AsyncIterator[str]:
     """Stream durable Events without owning or cancelling graph execution."""
     sent_keys = set(initial_sent_keys or ())
-    answer_chunk_count = [0]
     while True:
         async for frame in _stream_unseen_events(
             repository,
             tenant_id=tenant_id,
             run_id=run_id,
             sent_keys=sent_keys,
-            answer_chunk_count=answer_chunk_count,
-            answer_chunk_interval_ms=answer_chunk_interval_ms,
             suppress_replayed_phase_events=suppress_replayed_phase_events,
         ):
             yield frame
@@ -569,8 +539,6 @@ async def _subscribe_to_run(
                 tenant_id=tenant_id,
                 run_id=run_id,
                 sent_keys=sent_keys,
-                answer_chunk_count=answer_chunk_count,
-                answer_chunk_interval_ms=answer_chunk_interval_ms,
                 suppress_replayed_phase_events=suppress_replayed_phase_events,
             ):
                 yield frame
@@ -581,8 +549,6 @@ async def _subscribe_to_run(
                 tenant_id=tenant_id,
                 run_id=run_id,
                 sent_keys=sent_keys,
-                answer_chunk_count=answer_chunk_count,
-                answer_chunk_interval_ms=answer_chunk_interval_ms,
                 suppress_replayed_phase_events=suppress_replayed_phase_events,
             ):
                 yield frame
@@ -696,12 +662,9 @@ def create_tracer_router(
     moderation_provider: ModerationProvider | None = None,
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
-    answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
 ) -> APIRouter:
     """Create the test-only router around an injected graph invocation seam."""
-    if not 200 <= answer_chunk_interval_ms <= 500:
-        raise ValueError("answer_chunk_interval_ms must be between 200 and 500")
     if history_token_budget < 0:
         raise ValueError("history_token_budget must not be negative")
     router = APIRouter(tags=["LangGraph v2 tracer"])
@@ -903,7 +866,6 @@ def create_tracer_router(
                     expected_turn_id=turn_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
-                    answer_chunk_interval_ms=answer_chunk_interval_ms,
                 ),
                 repository,
                 tenant_id=x_application_id,
@@ -918,7 +880,6 @@ def create_tracer_router(
                 execution_task,
                 tenant_id=x_application_id,
                 run_id=run_id,
-                answer_chunk_interval_ms=answer_chunk_interval_ms,
             ):
                 yield frame
 
@@ -1107,7 +1068,6 @@ def create_tracer_router(
                     expected_turn_id=resume_turn_id,
                     owner_instance_id=claim.owner_instance_id,
                     execution_epoch=claim.execution_epoch,
-                    answer_chunk_interval_ms=answer_chunk_interval_ms,
                     initial_sent_keys=initial_sent_keys,
                 ),
                 repository,
@@ -1264,7 +1224,6 @@ def register_v2_routes(
     moderation_provider: ModerationProvider | None = None,
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
-    answer_chunk_interval_ms: int = ANSWER_CHUNK_INTERVAL_MS,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     resume_enabled: bool = False,
     replay_enabled: bool = False,
@@ -1282,7 +1241,6 @@ def register_v2_routes(
             moderation_provider,
             answer_actor,
             groundedness_actor,
-            answer_chunk_interval_ms,
             history_token_budget,
         )
         disabled_control_paths: set[str] = set()
