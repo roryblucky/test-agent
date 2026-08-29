@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from app.langgraph_v2.output_assessments import record_output_assessment
+from app.langgraph_v2.output_assessments import (
+    build_output_assessment_scope,
+    record_output_assessment,
+)
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.pre_moderation import ModerationDecision, ModerationProvider
 from app.langgraph_v2.run_events import EventInput, EventRecord
@@ -18,6 +21,15 @@ async def run_post_moderation(
     provider: ModerationProvider,
 ) -> tuple[list[EventRecord], ModerationDecision | None, str | None]:
     """Assess the generated answer without changing its publication state."""
+    assessment_scope = build_output_assessment_scope(
+        tenant_id=context.tenant_id,
+        conversation_id=(
+            state.get("conversation_id")
+            if isinstance(state.get("conversation_id"), str)
+            else None
+        ),
+        turn_id=context.current_turn_id or state.get("turn_id"),
+    )
 
     async def invoke() -> PhaseResultInput:
         answer = state.get("answer")
@@ -26,8 +38,7 @@ async def run_post_moderation(
             failed_result = {"failed": True, "error": message}
             await record_output_assessment(
                 context.output_assessment_audit,
-                state=state,
-                context=context,
+                scope=assessment_scope,
                 assessment_type="post_moderation",
                 result=failed_result,
             )
@@ -55,8 +66,7 @@ async def run_post_moderation(
             failed_result = {"failed": True, "error": message}
             await record_output_assessment(
                 context.output_assessment_audit,
-                state=state,
-                context=context,
+                scope=assessment_scope,
                 assessment_type="post_moderation",
                 result=failed_result,
             )
@@ -82,8 +92,7 @@ async def run_post_moderation(
         }
         await record_output_assessment(
             context.output_assessment_audit,
-            state=state,
-            context=context,
+            scope=assessment_scope,
             assessment_type="post_moderation",
             result=normalized_result,
         )

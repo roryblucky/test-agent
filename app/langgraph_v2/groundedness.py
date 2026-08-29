@@ -11,7 +11,10 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactStore
-from app.langgraph_v2.output_assessments import record_output_assessment
+from app.langgraph_v2.output_assessments import (
+    build_output_assessment_scope,
+    record_output_assessment,
+)
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
 from app.langgraph_v2.run_events import EventInput, EventRecord
 from app.models.domain import Document, GroundednessResult
@@ -41,6 +44,22 @@ class GroundednessActor(Protocol):
     ) -> GroundednessAssessment:
         """Return a structured groundedness assessment."""
         ...
+
+
+class UnavailableGroundednessActor:
+    """Advisory actor used when groundedness setup cannot complete."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def evaluate(
+        self,
+        answer: str,
+        documents: list[Document],
+    ) -> GroundednessAssessment:
+        """Surface setup failure through the normal advisory phase boundary."""
+        del answer, documents
+        raise self._error
 
 
 class PydanticAIGroundednessActor:
@@ -84,6 +103,15 @@ async def run_groundedness(
     actor: GroundednessActor,
 ) -> tuple[list[EventRecord], GroundednessResult | None, str | None]:
     """Evaluate an answer once and journal the advisory result atomically."""
+    assessment_scope = build_output_assessment_scope(
+        tenant_id=context.tenant_id,
+        conversation_id=(
+            state.get("conversation_id")
+            if isinstance(state.get("conversation_id"), str)
+            else None
+        ),
+        turn_id=context.current_turn_id or state.get("turn_id"),
+    )
 
     async def invoke() -> PhaseResultInput:
         try:
@@ -121,8 +149,7 @@ async def run_groundedness(
             }
             await record_output_assessment(
                 context.output_assessment_audit,
-                state=state,
-                context=context,
+                scope=assessment_scope,
                 assessment_type="groundedness",
                 result=normalized_result,
             )
@@ -148,8 +175,7 @@ async def run_groundedness(
             failed_result = {"failed": True, "error": message}
             await record_output_assessment(
                 context.output_assessment_audit,
-                state=state,
-                context=context,
+                scope=assessment_scope,
                 assessment_type="groundedness",
                 result=failed_result,
             )

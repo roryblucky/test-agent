@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
@@ -23,11 +24,6 @@ class OutputAssessmentAuditRecord(BaseModel):
     assessment_id: str = Field(min_length=1)
     assessment_type: OutputAssessmentType
     result: dict[str, Any]
-
-    @property
-    def assessment_identity(self) -> str:
-        """Expose the stable identity using the domain vocabulary."""
-        return self.assessment_id
 
 
 class OutputAssessmentAudit(Protocol):
@@ -68,45 +64,56 @@ class MockOutputAssessmentAudit:
         self.records.append(assessment)
 
 
-def _turn_id_from_state(
-    state: Mapping[str, Any],
-    context: Any,
-) -> UUID | None:
-    turn_id = getattr(context, "current_turn_id", None)
-    if turn_id is not None:
-        return turn_id
-    raw_turn_id = state.get("turn_id")
-    if raw_turn_id is None:
+@dataclass(frozen=True)
+class OutputAssessmentScope:
+    """Trusted identity scope supplied by a phase to its audit port."""
+
+    tenant_id: str
+    conversation_id: str
+    turn_id: UUID
+
+
+def build_output_assessment_scope(
+    *,
+    tenant_id: str,
+    conversation_id: str | None,
+    turn_id: UUID | str | None,
+) -> OutputAssessmentScope | None:
+    """Build a scope only when the phase has complete Turn identity."""
+    if not conversation_id or turn_id is None:
+        logger.warning(
+            "Skipping output assessment audit without Conversation and Turn identity"
+        )
         return None
     try:
-        return UUID(str(raw_turn_id))
+        normalized_turn_id = UUID(str(turn_id))
     except (TypeError, ValueError):
+        logger.warning(
+            "Skipping output assessment audit without a valid Turn identity"
+        )
         return None
+    return OutputAssessmentScope(
+        tenant_id=tenant_id,
+        conversation_id=conversation_id,
+        turn_id=normalized_turn_id,
+    )
 
 
 async def record_output_assessment(
     audit: OutputAssessmentAudit | None,
     *,
-    state: Mapping[str, Any],
-    context: Any,
+    scope: OutputAssessmentScope | None,
     assessment_type: OutputAssessmentType,
     result: Mapping[str, Any],
 ) -> None:
     """Best-effort record one stable assessment inside its phase invocation."""
-    if audit is None:
-        return
-    turn_id = _turn_id_from_state(state, context)
-    conversation_id = state.get("conversation_id")
-    if turn_id is None or not isinstance(conversation_id, str):
-        logger.warning(
-            "Skipping output assessment audit without Conversation and Turn identity"
-        )
+    if audit is None or scope is None:
         return
     record = OutputAssessmentAuditRecord(
-        tenant_id=context.tenant_id,
-        conversation_id=conversation_id,
-        turn_id=turn_id,
-        assessment_id=output_assessment_id(turn_id, assessment_type),
+        tenant_id=scope.tenant_id,
+        conversation_id=scope.conversation_id,
+        turn_id=scope.turn_id,
+        assessment_id=output_assessment_id(scope.turn_id, assessment_type),
         assessment_type=assessment_type,
         result=dict(result),
     )

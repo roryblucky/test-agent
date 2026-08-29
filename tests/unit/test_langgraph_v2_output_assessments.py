@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -8,6 +7,7 @@ import pytest
 from app.langgraph_v2.output_assessments import (
     MockOutputAssessmentAudit,
     OutputAssessmentAuditRecord,
+    OutputAssessmentScope,
     output_assessment_id,
 )
 
@@ -52,8 +52,11 @@ async def test_audit_adapter_failure_is_best_effort() -> None:
 
     await record_output_assessment(
         FailingAudit(),
-        state={"conversation_id": "conversation-a", "turn_id": str(uuid4())},
-        context=SimpleNamespace(tenant_id="tenant-a", current_turn_id=None),
+        scope=OutputAssessmentScope(
+            tenant_id="tenant-a",
+            conversation_id="conversation-a",
+            turn_id=uuid4(),
+        ),
         assessment_type="groundedness",
         result={"failed": True, "error": "evaluator unavailable"},
     )

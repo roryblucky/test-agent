@@ -140,7 +140,9 @@ async def test_low_groundedness_is_advisory_and_replayed(
     assert groundedness_audit.tenant_id == "tenant-a"
     assert groundedness_audit.conversation_id == "c1"
     assert groundedness_audit.turn_id == turn_id
-    assert groundedness_audit.assessment_id == groundedness_audit.assessment_identity
+    assert groundedness_audit.assessment_id == (
+        f"turn:{turn_id}:assessment:groundedness"
+    )
     assert phase is not None
     assert phase.normalized_result["usage"] == {}
     assert any(event.get("step") == "groundedness" for event in first["events"])
@@ -306,7 +308,7 @@ async def test_groundedness_rejects_out_of_range_scores(
 
 
 @pytest.mark.asyncio
-async def test_groundedness_actor_setup_failure_terminalizes_run(
+async def test_groundedness_actor_setup_failure_is_advisory(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     app = persistent_tracer_app(
@@ -315,6 +317,8 @@ async def test_groundedness_actor_setup_failure_terminalizes_run(
         ranker=_Ranker(),
         answer_actor=_Answer(),
     )
+    audit = MockOutputAssessmentAudit()
+    app.state.langgraph_v2_output_assessment_audit = audit
     with patch(
         "app.langgraph_v2.api._resolve_groundedness_actor",
         side_effect=RuntimeError("groundedness model is unavailable"),
@@ -328,13 +332,37 @@ async def test_groundedness_actor_setup_failure_terminalizes_run(
 
     events = parse_sse(response.text)
     assert response.status_code == 200
-    assert events[-1]["type"] == "error"
-    assert events[-1]["data"] == "groundedness model is unavailable"
+    groundedness_failure = next(
+        event
+        for event in events
+        if event.get("type") == "step_completed"
+        and event.get("data") == {
+            "failed": True,
+            "error": "groundedness model is unavailable",
+        }
+    )
+    assert groundedness_failure["type"] == "step_completed"
+    assert groundedness_failure["data"] == {
+        "failed": True,
+        "error": "groundedness model is unavailable",
+    }
+    assert events[-1]["type"] == "done"
+    assert events[-1]["data"]["answer"] == "answer [1]"
     async with AsyncConnectionPool(langgraph_v2_migrated_database_url, min_size=1, max_size=2) as pool:
         run = await RunEventRepository(pool).get_run(
             "tenant-a", UUID(response.headers["x-run-id"])
         )
-    assert run.status == "failed"
+    assert run.status == "completed"
+    groundedness_audit = next(
+        record for record in audit.records if record.assessment_type == "groundedness"
+    )
+    assert groundedness_audit.tenant_id == "tenant-a"
+    assert groundedness_audit.conversation_id == response.headers["x-conversation-id"]
+    assert groundedness_audit.turn_id == UUID(response.headers["x-turn-id"])
+    assert groundedness_audit.result == {
+        "failed": True,
+        "error": "groundedness model is unavailable",
+    }
 
 
 @pytest.mark.asyncio
