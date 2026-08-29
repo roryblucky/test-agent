@@ -29,10 +29,7 @@ from app.langgraph_v2.checkpointing import (
     thread_id_for,
 )
 from app.langgraph_v2.contracts import V2QueryRequest
-from app.langgraph_v2.conversation_messages import (
-    ConversationMessageRepository,
-    TurnNotFound,
-)
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.phase_results import PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
@@ -41,6 +38,7 @@ from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.run_events import (
+    ClaimFenced,
     EventInput,
     EventInvariantConflict,
     RunEventRepository,
@@ -408,7 +406,7 @@ async def test_done_answer_finalization_is_atomic_on_turn_validation(
             owner_instance_id="instance-a",
         )
         missing_turn = uuid4()
-        with pytest.raises(TurnNotFound):
+        with pytest.raises(ClaimFenced):
             await persist_done(missing_run.run_id, missing_turn)
         assert (await repository.get_run("tenant-a", missing_run.run_id)).status == (
             "running"

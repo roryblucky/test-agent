@@ -288,6 +288,25 @@ async def test_assistant_message_requires_successful_run_completion(
             idempotency_key=f"run:{completed.run_id}:assistant",
         )
 
+        other_turn = uuid4()
+        await messages.persist_user_message(
+            tenant_id="tenant-a",
+            conversation_id="session-1",
+            run_id=interrupted.run_id,
+            turn_id=other_turn,
+            content="other question",
+            idempotency_key=f"turn:{other_turn}:user",
+        )
+        with pytest.raises(ClaimFenced):
+            await messages.persist_assistant_message_after_completion(
+                tenant_id="tenant-a",
+                conversation_id="session-1",
+                run_id=completed.run_id,
+                turn_id=other_turn,
+                content="must not persist",
+                idempotency_key=f"turn:{other_turn}:assistant",
+            )
+
         assert repeated == first
         assert first.turn_id == turn_id
         for blocked in (failed, cancelled, interrupted):
@@ -308,7 +327,7 @@ async def test_assistant_message_requires_successful_run_completion(
                 ),
                 conversation_id="session-1",
             )
-        ] == ["question", "safe answer"]
+        ] == ["question", "safe answer", "other question"]
 
 
 @pytest.mark.asyncio

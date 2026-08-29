@@ -365,7 +365,7 @@ class ConversationMessageRepository:
                 async with connection.cursor(row_factory=dict_row) as cursor:
                     await cursor.execute(
                         """
-                        SELECT status, conversation_id
+                        SELECT status, conversation_id, turn_id
                         FROM langgraph_v2.runs
                         WHERE tenant_id = %s AND run_id = %s
                         FOR SHARE
@@ -377,6 +377,7 @@ class ConversationMessageRepository:
                     run is None
                     or run["status"] != "completed"
                     or run["conversation_id"] != conversation_id
+                    or run["turn_id"] != turn_id
                 ):
                     raise ClaimFenced(str(run_id))
                 await self._require_user_turn_in_transaction(
@@ -408,14 +409,13 @@ class ConversationMessageRepository:
         content: str,
         idempotency_key: str,
         turn_id: UUID,
-        require_run_match: bool = False,
     ) -> MessageRecord:
         """Write a safe answer through a caller-owned, epoch-fenced transaction."""
         async with connection.cursor(row_factory=dict_row) as cursor:
             await cursor.execute(
                 """
                 SELECT status, conversation_id, owner_instance_id,
-                       execution_epoch,
+                       execution_epoch, turn_id,
                        expires_at > clock_timestamp() AS claim_active
                 FROM langgraph_v2.runs
                 WHERE tenant_id = %s AND run_id = %s
@@ -430,6 +430,7 @@ class ConversationMessageRepository:
             or run["conversation_id"] != conversation_id
             or run["owner_instance_id"] != owner_instance_id
             or run["execution_epoch"] != execution_epoch
+            or run["turn_id"] != turn_id
             or not run["claim_active"]
         ):
             raise ClaimFenced(str(run_id))
@@ -438,7 +439,6 @@ class ConversationMessageRepository:
             tenant_id=tenant_id,
             conversation_id=conversation_id,
             turn_id=turn_id,
-            run_id=run_id if require_run_match else None,
         )
         return await self._persist_message_in_transaction(
             connection,
@@ -487,23 +487,17 @@ class ConversationMessageRepository:
         tenant_id: str,
         conversation_id: str,
         turn_id: UUID,
-        run_id: UUID | None = None,
     ) -> None:
         """Ensure an assistant attaches to an existing user Message Turn."""
         async with connection.cursor(row_factory=dict_row) as cursor:
-            run_clause = " AND run_id = %s" if run_id is not None else ""
-            params: tuple[Any, ...] = (tenant_id, conversation_id, turn_id) + (
-                (run_id,) if run_id is not None else ()
-            )
             await cursor.execute(
-                f"""
+                """
                 SELECT turn_id
                 FROM langgraph_v2.messages
                 WHERE tenant_id = %s AND conversation_id = %s
                   AND turn_id = %s AND role = 'user'
-                  {run_clause}
                 """,
-                params,
+                (tenant_id, conversation_id, turn_id),
             )
             row = await cursor.fetchone()
         if row is None:
