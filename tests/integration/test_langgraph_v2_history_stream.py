@@ -21,9 +21,9 @@ from app.langgraph_v2.question_refinement import (
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.test_langgraph_v2_tracer import (
+from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
-    persistent_tracer_app,
+    persistent_linear_app,
 )
 
 _FIXTURE_PATH = (
@@ -99,7 +99,7 @@ def test_second_public_stream_receives_one_complete_prior_turn(
     asyncio.run(seed())
     refinement = _RefinementActor()
     answer = _AnswerActor()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         refinement_actor=refinement,
         retriever=_Retriever(),

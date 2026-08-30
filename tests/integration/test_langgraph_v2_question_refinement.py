@@ -8,7 +8,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
@@ -17,10 +17,13 @@ from app.langgraph_v2.question_refinement import (
     V2ResolvedQuery,
 )
 from app.models.workflow import ResolvedQuery
-from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
+from tests.integration.test_langgraph_v2_linear_core import (
+    parse_sse,
+    persistent_linear_app,
+)
 
 
-def _state() -> TracerState:
+def _state() -> LinearGraphState:
     return {
         "query": "compare gold and FX",
         "conversation_id": "conversation-1",
@@ -31,7 +34,7 @@ def _state() -> TracerState:
 @pytest.mark.asyncio
 async def test_safe_query_gets_structured_refinement(
 ) -> None:
-    graph = build_tracer_graph(
+    graph = build_linear_graph(
         tenant_id="tenant-a",
         refinement_actor=MockQuestionRefinementActor(),
     )
@@ -52,7 +55,7 @@ async def test_refinement_failure_halts_before_later_phases(
             del history
             raise ValueError(f"invalid output for {query}")
 
-    graph = build_tracer_graph(
+    graph = build_linear_graph(
         tenant_id="tenant-a",
         refinement_actor=FailingActor(),
     )
@@ -81,7 +84,7 @@ async def test_refinement_reexecution_reinvokes_actor(
             )
 
     actor = CountingActor()
-    graph = build_tracer_graph(
+    graph = build_linear_graph(
         tenant_id="tenant-a",
         refinement_actor=actor,
     )
@@ -145,7 +148,7 @@ def test_http_query_uses_injected_refinement_actor(
             )
 
     actor = CountingActor()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         refinement_actor=actor,
     )
@@ -163,3 +166,55 @@ def test_http_query_uses_injected_refinement_actor(
     assert actor.calls == 1
     delivered = parse_sse(response.text)
     assert delivered[-1]["data"]["refined_query"] == "http-refined"
+
+
+def test_new_turn_does_not_inherit_prior_refinement_usage(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class UsageThenNoUsageActor:
+        calls = 0
+
+        async def refine(
+            self, query: str, history: Sequence[ConversationTurn]
+        ) -> QuestionRefinementResult:
+            del history
+            self.calls += 1
+            return QuestionRefinementResult(
+                resolved_query=V2ResolvedQuery(
+                    original_query=query,
+                    standalone_query=query,
+                ),
+                usage={"input_tokens": 3} if self.calls == 1 else {},
+            )
+
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        refinement_actor=UsageThenNoUsageActor(),
+    )
+    headers = {
+        "X-Application-Id": "tenant-a",
+        "X-Subject-Id": "subject-a",
+    }
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/v2/query/stream",
+            json={"query": "first", "clientRequestId": "first-turn"},
+            headers=headers,
+        )
+        second = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "second",
+                "sessionId": first.headers["x-conversation-id"],
+                "clientRequestId": "second-turn",
+            },
+            headers=headers,
+        )
+
+    first_done = parse_sse(first.text)[-1]
+    second_done = parse_sse(second.text)[-1]
+    assert first_done["data"]["metadata"]["usage"]["input_tokens"] == 3
+    assert "usage" not in second_done["data"]["metadata"]

@@ -14,7 +14,6 @@
     "expectedTurnId": "uuid:query"
   },
   "query_response_headers": [
-    "x-run-id",
     "x-conversation-id",
     "x-turn-id",
     "x-thread-id"

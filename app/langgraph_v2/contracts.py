@@ -10,7 +10,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
-TracerEventType = Literal[
+LinearEventType = Literal[
     "step_start",
     "step_completed",
     "progress",
@@ -31,14 +31,14 @@ class V2QueryRequest(BaseModel):
     conversation_id: Annotated[
         str | None,
         Field(
-            validation_alias=AliasChoices("conversation_id", "sessionId"),
+            validation_alias=AliasChoices("sessionId", "conversation_id", "session_id"),
             serialization_alias="sessionId",
         ),
     ] = None
     client_request_id: Annotated[
         str | None,
         Field(
-            validation_alias=AliasChoices("client_request_id", "clientRequestId"),
+            validation_alias=AliasChoices("clientRequestId", "client_request_id"),
             serialization_alias="clientRequestId",
             min_length=1,
             max_length=128,
@@ -47,8 +47,8 @@ class V2QueryRequest(BaseModel):
     ] = None
 
 
-class TracerQueryResponse(BaseModel):
-    """Minimal v1-shaped final response emitted by the tracer."""
+class LinearQueryResponse(BaseModel):
+    """Minimal v1-shaped final response emitted by the Linear Graph."""
 
     query: str
     refined_query: str | None = None
@@ -66,7 +66,7 @@ class TracerQueryResponse(BaseModel):
 class LiveStreamEvent(BaseModel):
     """One public event emitted by the live request-owned Graph stream."""
 
-    type: TracerEventType
+    type: LinearEventType
     step: str | None = None
     data: Any = None
     checkpoint_terminal: bool = Field(default=False, exclude=True)

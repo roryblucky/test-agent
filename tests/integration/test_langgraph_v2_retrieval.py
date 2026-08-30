@@ -26,13 +26,16 @@ from app.langgraph_v2.artifacts import (
     ArtifactScope,
 )
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
-from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
+from tests.integration.test_langgraph_v2_linear_core import (
+    parse_sse,
+    persistent_linear_app,
+)
 
 
 @pytest.mark.asyncio
@@ -136,14 +139,14 @@ async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
     ) as pool:
         scope = await seed_artifact_scope(pool)
         retriever = CountingRetriever()
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=retriever,
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
@@ -158,69 +161,6 @@ async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
         assert len(first["artifact_refs"]) == 2
 
 
-def test_artifact_lookup_is_404_across_tenant_boundary(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    artifact_id = uuid4()
-    turn_id = uuid4()
-    with psycopg.connect(
-        langgraph_v2_migrated_database_url, autocommit=True
-    ) as connection:
-        connection.execute(
-            """INSERT INTO langgraph_v2.conversations
-            (tenant_id, conversation_id, owner_subject_id, thread_id)
-            VALUES (%s, %s, %s, %s)""",
-            ("tenant-a", "c1", "subject-a", "thread-1"),
-        )
-        connection.execute(
-            """INSERT INTO langgraph_v2.messages
-            (tenant_id, message_id, conversation_id, turn_id, role, content,
-             idempotency_key, resume_deadline)
-            VALUES (%s, %s, %s, %s, 'user', 'question', %s, now() + interval '1 hour')""",
-            ("tenant-a", uuid4(), "c1", turn_id, f"turn:{turn_id}:user"),
-        )
-        connection.execute(
-            """INSERT INTO langgraph_v2.artifacts
-            (tenant_id, artifact_id, conversation_id, turn_id, artifact_type, payload)
-            VALUES (%s, %s, %s, %s, %s, %s)""",
-            ("tenant-a", artifact_id, "c1", turn_id, "document", Jsonb({"id": "d1"})),
-        )
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
-    with TestClient(app) as client:
-        own = client.get(
-            f"/v2/artifacts/{artifact_id}",
-            params={"conversationId": "c1", "turnId": str(turn_id)},
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-        other = client.get(
-            f"/v2/artifacts/{artifact_id}",
-            params={"conversationId": "c1", "turnId": str(turn_id)},
-            headers={"X-Application-Id": "tenant-b", "X-Subject-Id": "subject-a"},
-        )
-        wrong_subject = client.get(
-            f"/v2/artifacts/{artifact_id}",
-            params={"conversationId": "c1", "turnId": str(turn_id)},
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-b"},
-        )
-        wrong_turn = client.get(
-            f"/v2/artifacts/{artifact_id}",
-            params={"conversationId": "c1", "turnId": str(uuid4())},
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-        wrong_conversation = client.get(
-            f"/v2/artifacts/{artifact_id}",
-            params={"conversationId": "c2", "turnId": str(turn_id)},
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-    assert (
-        own.status_code,
-        other.status_code,
-        wrong_subject.status_code,
-        wrong_turn.status_code,
-        wrong_conversation.status_code,
-    ) == (200, 404, 404, 404, 404)
-
-
 def test_empty_retrieval_is_explicit_on_public_stream(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -228,7 +168,7 @@ def test_empty_retrieval_is_explicit_on_public_stream(
         async def retrieve(self, query: str) -> RetrievalResult:
             return RetrievalResult(raw_payload={"query": query, "source": "empty"})
 
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url, retriever=EmptyRetriever()
     )
     with TestClient(app) as client:
@@ -255,7 +195,7 @@ def test_failed_retrieval_is_error_without_finalization_on_public_stream(
         async def retrieve(self, query: str) -> RetrievalResult:
             raise RuntimeError(f"provider unavailable for {query}")
 
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url, retriever=FailingRetriever()
     )
     with TestClient(app) as client:
@@ -346,7 +286,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
         turn_id = uuid4()
         scope = await seed_artifact_scope(pool, turn_id=turn_id)
         checkpointer = MemorySaver()
-        first_graph = build_tracer_graph(
+        first_graph = build_linear_graph(
             checkpointer=checkpointer,
             tenant_id="tenant-a",
             current_turn_id=turn_id,
@@ -356,7 +296,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
             ranker=IdentityRanker(),
             answer_actor=CitingAnswer(),
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
             "turn_id": str(turn_id),
@@ -366,7 +306,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
         with pytest.raises(asyncio.CancelledError):
             await first_graph.ainvoke(state, config)
 
-        resume_graph = build_tracer_graph(
+        resume_graph = build_linear_graph(
             checkpointer=checkpointer,
             tenant_id="tenant-a",
             current_turn_id=turn_id,

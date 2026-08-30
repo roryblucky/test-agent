@@ -19,7 +19,7 @@ from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
 )
-from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.graph import build_linear_graph
 from app.langgraph_v2.migrations import build_alembic_config
 
 
@@ -252,7 +252,7 @@ def test_upgrade_from_0013_preserves_product_and_checkpoint_data(
         ) as pool:
             saver = AsyncPostgresSaver(cast(Any, pool))
             await saver.setup()
-            graph = build_tracer_graph(checkpointer=saver)
+            graph = build_linear_graph(checkpointer=saver)
             await graph.ainvoke(
                 {
                     "query": "preserved checkpoint",
@@ -641,7 +641,7 @@ def test_conversation_authorization_migrates_existing_conversations_forward(
         ) as pool:
             saver = AsyncPostgresSaver(cast(Any, pool))
             await saver.setup()
-            graph = build_tracer_graph(checkpointer=saver)
+            graph = build_linear_graph(checkpointer=saver)
             await graph.ainvoke(
                 {
                     "query": "migration checkpoint",

@@ -1,4 +1,4 @@
-"""Minimal typed LangGraph used by the v2 tracer."""
+"""Production LangGraph Linear Core for the v2 query API."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from langgraph.types import StateSnapshot
 from app.langgraph_v2.answer import AnswerActor, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.contracts import LiveStreamEvent, TracerQueryResponse
+from app.langgraph_v2.contracts import LinearQueryResponse, LiveStreamEvent
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
@@ -47,8 +47,8 @@ from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
 
-class TracerState(TypedDict):
-    """Typed state for the ingress-to-finalization tracer graph."""
+class LinearGraphState(TypedDict):
+    """Typed state for the ingress-to-finalization Linear Graph."""
 
     query: str
     conversation_id: str
@@ -56,61 +56,61 @@ class TracerState(TypedDict):
     client_request_id: str | None
     history: NotRequired[list[ConversationTurn]]
     halted: NotRequired[bool]
-    moderation: NotRequired[dict[str, Any]]
-    refined_query: NotRequired[str]
+    moderation: NotRequired[dict[str, Any] | None]
+    refined_query: NotRequired[str | None]
     refinement_usage: NotRequired[dict[str, Any]]
-    refinement_error: NotRequired[str]
-    retrieval_error: NotRequired[str]
-    reranking_error: NotRequired[str]
+    refinement_error: NotRequired[str | None]
+    retrieval_error: NotRequired[str | None]
+    reranking_error: NotRequired[str | None]
     artifact_refs: NotRequired[list[ArtifactRef]]
     ranked_refs: NotRequired[list[ArtifactRef]]
-    answer: NotRequired[str]
+    answer: NotRequired[str | None]
     answer_usage: NotRequired[dict[str, Any]]
     citations: NotRequired[list[CitationReference]]
-    answer_error: NotRequired[str]
-    groundedness: NotRequired[GroundednessResult]
+    answer_error: NotRequired[str | None]
+    groundedness: NotRequired[GroundednessResult | None]
     groundedness_usage: NotRequired[dict[str, Any]]
-    groundedness_error: NotRequired[str]
-    post_moderation: NotRequired[dict[str, Any]]
-    post_moderation_error: NotRequired[str]
-    final_response: NotRequired[TracerQueryResponse]
+    groundedness_error: NotRequired[str | None]
+    post_moderation: NotRequired[dict[str, Any] | None]
+    post_moderation_error: NotRequired[str | None]
+    final_response: NotRequired[LinearQueryResponse | None]
 
 
-class TracerStateUpdate(TypedDict, total=False):
-    """Partial state update returned by one tracer node."""
+class LinearGraphStateUpdate(TypedDict, total=False):
+    """Partial state update returned by one Linear Graph node."""
 
     history: list[ConversationTurn]
     halted: bool
-    moderation: dict[str, Any]
-    refined_query: str
+    moderation: dict[str, Any] | None
+    refined_query: str | None
     refinement_usage: dict[str, Any]
-    refinement_error: str
-    retrieval_error: str
-    reranking_error: str
+    refinement_error: str | None
+    retrieval_error: str | None
+    reranking_error: str | None
     artifact_refs: list[ArtifactRef]
     ranked_refs: list[ArtifactRef]
-    answer: str
+    answer: str | None
     answer_usage: dict[str, Any]
     citations: list[CitationReference]
-    answer_error: str
-    groundedness: GroundednessResult
+    answer_error: str | None
+    groundedness: GroundednessResult | None
     groundedness_usage: dict[str, Any]
-    groundedness_error: str
-    post_moderation: dict[str, Any]
-    post_moderation_error: str
-    final_response: TracerQueryResponse
+    groundedness_error: str | None
+    post_moderation: dict[str, Any] | None
+    post_moderation_error: str | None
+    final_response: LinearQueryResponse | None
 
 
-class TracerGraph(Protocol):
+class LinearGraph(Protocol):
     """Typed application boundary around LangGraph's partially typed API."""
 
     async def ainvoke(
         self,
-        graph_input: TracerState | None,
+        graph_input: LinearGraphState | None,
         /,
         config: RunnableConfig | None = None,
         **kwargs: Any,
-    ) -> TracerState:
+    ) -> LinearGraphState:
         """Invoke a new graph turn or resume one from its checkpoint."""
         ...
 
@@ -132,13 +132,13 @@ class TracerGraph(Protocol):
 
 
 async def _query(
-    state: TracerState,
+    state: LinearGraphState,
     *,
     message_repository: ConversationMessageRepository | None = None,
     request_context: TrustedRequestContext | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     current_turn_id: UUID | None = None,
-) -> TracerStateUpdate:
+) -> LinearGraphStateUpdate:
     query = state["query"]
     canonical = canonical_query(query)
 
@@ -171,6 +171,25 @@ async def _query(
     )
     return {
         "history": history,
+        "halted": False,
+        "moderation": None,
+        "refined_query": None,
+        "refinement_usage": {},
+        "refinement_error": None,
+        "retrieval_error": None,
+        "reranking_error": None,
+        "artifact_refs": [],
+        "ranked_refs": [],
+        "answer": None,
+        "answer_usage": {},
+        "citations": [],
+        "answer_error": None,
+        "groundedness": None,
+        "groundedness_usage": {},
+        "groundedness_error": None,
+        "post_moderation": None,
+        "post_moderation_error": None,
+        "final_response": None,
     }
 
 
@@ -186,7 +205,7 @@ def canonical_query(query: str) -> str:
     return unicodedata.normalize("NFC", query.replace("\r\n", "\n")).strip()
 
 
-async def _finalize(state: TracerState) -> TracerStateUpdate:
+async def _finalize(state: LinearGraphState) -> LinearGraphStateUpdate:
     events, response = finalize_in_memory(state)
     _emit_events(events)
     _emit_events(
@@ -201,20 +220,20 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     return {"final_response": response}
 
 
-def _next_after_pre_moderation(state: TracerState) -> str:
+def _next_after_pre_moderation(state: LinearGraphState) -> str:
     """Stop the graph on a flagged query before any later phase."""
     return "end" if state.get("halted", False) else "question_refinement"
 
 
-def _next_after_question_refinement(state: TracerState) -> str:
+def _next_after_question_refinement(state: LinearGraphState) -> str:
     return "end" if state.get("halted", False) else "retrieval"
 
 
-def _next_after_retrieval(state: TracerState) -> str:
+def _next_after_retrieval(state: LinearGraphState) -> str:
     return "end" if state.get("halted", False) else "reranking"
 
 
-def build_tracer_graph(
+def build_linear_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     *,
     tenant_id: str | None = None,
@@ -230,8 +249,8 @@ def build_tracer_graph(
     ranker: Ranker | None = None,
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
-) -> TracerGraph:
-    """Compile the deterministic ingress-to-finalization LangGraph."""
+) -> LinearGraph:
+    """Compile the deterministic ingress-to-finalization Linear Graph."""
     if message_repository is not None and request_context is None:
         raise ValueError("request_context is required with message_repository")
     if (
@@ -241,11 +260,11 @@ def build_tracer_graph(
     ):
         raise ValueError("request_context tenant_id must match tenant_id")
 
-    builder: StateGraph[TracerState, None, TracerState, TracerState] = StateGraph(
-        TracerState
+    builder: StateGraph[LinearGraphState, None, LinearGraphState, LinearGraphState] = (
+        StateGraph(LinearGraphState)
     )
 
-    async def query_node(state: TracerState) -> TracerStateUpdate:
+    async def query_node(state: LinearGraphState) -> LinearGraphStateUpdate:
         return await _query(
             state,
             message_repository=message_repository,
@@ -261,7 +280,7 @@ def build_tracer_graph(
     selected_ranker = ranker or MockRanker()
     selected_artifact_repository = artifact_repository
 
-    def artifact_scope(state: TracerState) -> ArtifactScope | None:
+    def artifact_scope(state: LinearGraphState) -> ArtifactScope | None:
         if request_context is None:
             return None
         raw_turn_id = current_turn_id or state.get("turn_id")
@@ -277,7 +296,7 @@ def build_tracer_graph(
             turn_id=turn_id,
         )
 
-    async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
+    async def pre_moderation_node(state: LinearGraphState) -> LinearGraphStateUpdate:
         events, halted, decision = await run_pre_moderation(
             state, provider=selected_moderation_provider
         )
@@ -291,12 +310,14 @@ def build_tracer_graph(
         "pre_moderation", pre_moderation_node
     )
 
-    async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
+    async def question_refinement_node(
+        state: LinearGraphState,
+    ) -> LinearGraphStateUpdate:
         events, halted, result, error = await run_question_refinement(
             state, actor=selected_refinement_actor
         )
         _emit_events(events)
-        update: TracerStateUpdate = {
+        update: LinearGraphStateUpdate = {
             "halted": halted,
         }
         if result is not None:
@@ -311,7 +332,7 @@ def build_tracer_graph(
         "question_refinement", question_refinement_node
     )
 
-    async def retrieval_node(state: TracerState) -> TracerStateUpdate:
+    async def retrieval_node(state: LinearGraphState) -> LinearGraphStateUpdate:
         scope = artifact_scope(state)
         if scope is None or selected_artifact_repository is None:
             return {"artifact_refs": []}
@@ -322,7 +343,7 @@ def build_tracer_graph(
             retriever=selected_retriever,
         )
         _emit_events(events)
-        update: TracerStateUpdate = {
+        update: LinearGraphStateUpdate = {
             "halted": halted,
             "artifact_refs": refs,
         }
@@ -334,7 +355,7 @@ def build_tracer_graph(
         "retrieval", retrieval_node
     )
 
-    async def reranking_node(state: TracerState) -> TracerStateUpdate:
+    async def reranking_node(state: LinearGraphState) -> LinearGraphStateUpdate:
         scope = artifact_scope(state)
         if scope is None or selected_artifact_repository is None:
             return {"ranked_refs": state.get("artifact_refs", [])}
@@ -345,7 +366,7 @@ def build_tracer_graph(
             ranker=selected_ranker,
         )
         _emit_events(events)
-        update: TracerStateUpdate = {
+        update: LinearGraphStateUpdate = {
             "halted": halted,
             "ranked_refs": refs,
         }
@@ -364,7 +385,7 @@ def build_tracer_graph(
     )
     if answer_enabled:
 
-        async def answer_node(state: TracerState) -> TracerStateUpdate:
+        async def answer_node(state: LinearGraphState) -> LinearGraphStateUpdate:
             assert tenant_id is not None
             assert selected_artifact_repository is not None
             assert answer_actor is not None
@@ -377,7 +398,7 @@ def build_tracer_graph(
                 actor=answer_actor,
                 stream_writer=get_stream_writer(),
             )
-            update: TracerStateUpdate = {
+            update: LinearGraphStateUpdate = {
                 "halted": halted,
             }
             if result is not None:
@@ -394,7 +415,9 @@ def build_tracer_graph(
 
         if groundedness_actor is not None:
 
-            async def groundedness_node(state: TracerState) -> TracerStateUpdate:
+            async def groundedness_node(
+                state: LinearGraphState,
+            ) -> LinearGraphStateUpdate:
                 assert tenant_id is not None
                 assert selected_artifact_repository is not None
                 scope = artifact_scope(state)
@@ -408,20 +431,19 @@ def build_tracer_graph(
                     actor=groundedness_actor,
                 )
                 _emit_events(events)
-                update: TracerStateUpdate = {}
-                if result is not None:
-                    update["groundedness"] = result
-                if usage:
-                    update["groundedness_usage"] = usage
-                if error is not None:
-                    update["groundedness_error"] = error
-                return update
+                return {
+                    "groundedness": result,
+                    "groundedness_usage": usage,
+                    "groundedness_error": error,
+                }
 
             builder.add_node(  # pyright: ignore[reportUnknownMemberType]
                 "groundedness", groundedness_node
             )
 
-        async def post_moderation_node(state: TracerState) -> TracerStateUpdate:
+        async def post_moderation_node(
+            state: LinearGraphState,
+        ) -> LinearGraphStateUpdate:
             assert tenant_id is not None
             events, decision, error = await run_post_moderation(
                 state,
@@ -431,7 +453,7 @@ def build_tracer_graph(
                 provider=selected_moderation_provider,
             )
             _emit_events(events)
-            update: TracerStateUpdate = {}
+            update: LinearGraphStateUpdate = {}
             if decision is not None:
                 update["post_moderation"] = decision.model_dump(exclude_none=True)
             if error is not None:
@@ -442,7 +464,7 @@ def build_tracer_graph(
             "post_moderation", post_moderation_node
         )
 
-    async def finalization_node(state: TracerState) -> TracerStateUpdate:
+    async def finalization_node(state: LinearGraphState) -> LinearGraphStateUpdate:
         scope = artifact_scope(state)
         if scope is None or selected_artifact_repository is None:
             return await _finalize(state)
@@ -451,6 +473,14 @@ def build_tracer_graph(
             scope=scope,
             artifacts=selected_artifact_repository,
         )
+        if message_repository is not None and response.answer is not None:
+            await message_repository.persist_assistant_message(
+                context=scope.context,
+                conversation_id=scope.conversation_id,
+                turn_id=scope.turn_id,
+                content=response.answer,
+                idempotency_key=f"turn:{scope.turn_id}:assistant",
+            )
         _emit_events(events)
         _emit_events(
             (
@@ -492,7 +522,7 @@ def build_tracer_graph(
     if answer_enabled:
         reranking_routes["answer"] = "answer"
 
-    def next_after_reranking(state: TracerState) -> str:
+    def next_after_reranking(state: LinearGraphState) -> str:
         if state.get("halted", False):
             return "end"
         if answer_enabled:
@@ -514,7 +544,7 @@ def build_tracer_graph(
         else:
             answer_routes["post_moderation"] = "post_moderation"
 
-        def next_after_answer(state: TracerState) -> str:
+        def next_after_answer(state: LinearGraphState) -> str:
             if state.get("halted", False):
                 return "end"
             return (
@@ -531,11 +561,11 @@ def build_tracer_graph(
         builder.add_edge("post_moderation", "finalization")
     builder.add_edge("finalization", END)
     return cast(
-        TracerGraph,
+        LinearGraph,
         builder.compile(  # pyright: ignore[reportUnknownMemberType]
             checkpointer=checkpointer
         ),
     )
 
 
-tracer_graph = build_tracer_graph()
+linear_graph = build_linear_graph()

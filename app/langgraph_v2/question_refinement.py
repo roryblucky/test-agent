@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
@@ -11,6 +10,7 @@ from pydantic_ai import Agent
 
 from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
+from app.langgraph_v2.model_usage import model_usage_payload
 from app.models.workflow import ResolvedQuery
 
 REFINEMENT_ERROR_MESSAGE = "Question refinement failed."
@@ -69,17 +69,9 @@ class PydanticAIQuestionRefinementActor:
             )
         else:
             result = await self._agent.run(query)
-        usage_method = getattr(result, "usage", None)
-        usage_payload: dict[str, Any] = {}
-        if callable(usage_method):
-            usage = usage_method()
-            if is_dataclass(usage) and not isinstance(usage, type):
-                usage_payload = asdict(usage)
-            else:
-                usage_payload = dict(vars(usage))
         return QuestionRefinementResult(
             resolved_query=V2ResolvedQuery.model_validate(result.output.model_dump()),
-            usage=usage_payload,
+            usage=model_usage_payload(result),
         )
 
 

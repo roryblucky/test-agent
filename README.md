@@ -5,8 +5,7 @@ the disposable PostgreSQL fixture used by LangGraph v2 integration tests.
 
 Set `LANGGRAPH_V2_UAT_ENABLED=1` to expose the UAT routes for query streaming
 and thread resume. Configure `LANGGRAPH_V2_DATABASE_URL` before starting the
-application. Production keeps the routes disabled when the flag is absent. The earlier
-`LANGGRAPH_V2_TRACER_ENABLED=1` name remains a temporary compatibility alias.
+application. Production keeps the routes disabled when the flag is absent.
 
 This gate is for controlled functional testing only. It does not yet enforce
 deployment or Tenant active-Run capacity, return admission-related `429`

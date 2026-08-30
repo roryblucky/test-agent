@@ -21,6 +21,12 @@ class BaseRetrieverProvider(ABC):
         """Retrieve relevant documents for a query."""
         ...
 
+    async def retrieve_configured(
+        self, query: str, filter_expr: str | None = None
+    ) -> list[Document]:
+        """Retrieve with the provider's tenant-configured default limit."""
+        return await self.retrieve(query, filter_expr=filter_expr)
+
 
 class BaseRankerProvider(ABC):
     """Re-rank a list of documents against a query."""

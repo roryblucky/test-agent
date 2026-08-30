@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class ConcurrencyLimiterMiddleware(BaseHTTPMiddleware):
-    """Global request concurrency limiter."""
+    """Limit legacy requests without queueing request-owned v2 streams."""
 
     def __init__(self, app: ASGIApp, max_concurrent_requests: int = 100):
         super().__init__(app)
@@ -40,6 +40,11 @@ class ConcurrencyLimiterMiddleware(BaseHTTPMiddleware):
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
         """Apply concurrency limit to the request dispatch."""
+        path = request.url.path
+        if path == "/v2/query/stream" or (
+            path.startswith("/v2/threads/") and path.endswith("/resume/stream")
+        ):
+            return await call_next(request)
         async with self._semaphore:
             return await call_next(request)
 
@@ -168,8 +173,7 @@ register_v2_routes(
     app,
     enabled=(
         os.environ.get("LANGGRAPH_V2_UAT_ENABLED") == "1"
-        or os.environ.get("LANGGRAPH_V2_TRACER_ENABLED") == "1"
+        or os.environ.get("LANGGRAPH_V2_LINEAR_CORE_ENABLED") == "1"
     ),
     thread_resume_enabled=True,
-    artifact_lookup_enabled=False,
 )

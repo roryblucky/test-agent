@@ -5,11 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from app.langgraph_v2.groundedness import (
+    GroundednessActor,
+    GroundednessAssessment,
+)
 from app.langgraph_v2.pre_moderation import ModerationDecision, ModerationProvider
 from app.langgraph_v2.reranking import Ranker, RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult, Retriever
 from app.models.domain import Document
 from app.providers.base import (
+    BaseGroundednessProvider,
     BaseModerationProvider,
     BaseRankerProvider,
     BaseRetrieverProvider,
@@ -19,13 +24,18 @@ from app.providers.base import (
 class V2RetrieverAdapter:
     """Adapt a tenant's existing retriever to the v2 retrieval contract."""
 
-    def __init__(self, provider: BaseRetrieverProvider, *, top_k: int = 10) -> None:
+    def __init__(
+        self, provider: BaseRetrieverProvider, *, top_k: int | None = None
+    ) -> None:
         self._provider = provider
         self._top_k = top_k
 
     async def retrieve(self, query: str) -> RetrievalResult:
         """Retrieve Documents and attach stable provider provenance."""
-        documents = await self._provider.retrieve(query, top_k=self._top_k)
+        if self._top_k is None:
+            documents = await self._provider.retrieve_configured(query)
+        else:
+            documents = await self._provider.retrieve(query, top_k=self._top_k)
         return RetrievalResult(
             documents=documents,
             raw_payload={
@@ -47,8 +57,10 @@ class V2RankerAdapter:
 
     async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
         """Rank Documents through the existing query-aware provider."""
-        top_n = len(documents) if self._top_n is None else self._top_n
-        ranked = await self._provider.rank(query, documents, top_n=top_n)
+        if self._top_n is None:
+            ranked = await self._provider.rank(query, documents)
+        else:
+            ranked = await self._provider.rank(query, documents, top_n=self._top_n)
         return RerankingResult(documents=ranked)
 
 
@@ -68,6 +80,20 @@ class V2ModerationAdapter:
         )
 
 
+class V2GroundednessAdapter:
+    """Adapt a tenant groundedness provider to the v2 actor contract."""
+
+    def __init__(self, provider: BaseGroundednessProvider) -> None:
+        self._provider = provider
+
+    async def evaluate(
+        self, answer: str, documents: list[Document]
+    ) -> GroundednessAssessment:
+        """Evaluate groundedness through the tenant-configured provider."""
+        result = await self._provider.check(answer, documents)
+        return GroundednessAssessment(**result.model_dump(), usage={})
+
+
 class TenantProvidersLike(Protocol):
     """Provider bundle shape exposed by TenantManager without legacy imports."""
 
@@ -84,6 +110,11 @@ class TenantProvidersLike(Protocol):
     @property
     def moderation(self) -> BaseModerationProvider | None:
         """Return the configured moderation provider."""
+        ...
+
+    @property
+    def groundedness(self) -> BaseGroundednessProvider | None:
+        """Return the configured groundedness provider."""
         ...
 
 
@@ -121,9 +152,14 @@ class V2ProviderBundle:
     retriever: Retriever | None = None
     ranker: Ranker | None = None
     moderation: ModerationProvider | None = None
+    groundedness: GroundednessActor | None = None
 
 
-def adapt_tenant_providers(providers: TenantProvidersLike) -> V2ProviderBundle:
+def adapt_tenant_providers(
+    providers: TenantProvidersLike,
+    *,
+    ranker_top_n: int | None = None,
+) -> V2ProviderBundle:
     """Convert existing tenant providers without importing legacy orchestration."""
     return V2ProviderBundle(
         retriever=(
@@ -132,11 +168,18 @@ def adapt_tenant_providers(providers: TenantProvidersLike) -> V2ProviderBundle:
             else None
         ),
         ranker=(
-            V2RankerAdapter(providers.ranker) if providers.ranker is not None else None
+            V2RankerAdapter(providers.ranker, top_n=ranker_top_n)
+            if providers.ranker is not None
+            else None
         ),
         moderation=(
             V2ModerationAdapter(providers.moderation)
             if providers.moderation is not None
+            else None
+        ),
+        groundedness=(
+            V2GroundednessAdapter(providers.groundedness)
+            if providers.groundedness is not None
             else None
         ),
     )

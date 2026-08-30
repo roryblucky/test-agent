@@ -19,7 +19,7 @@ LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms
   PYTHONPATH=. uv run pytest \
   tests/unit/test_langgraph_v2_*.py \
   tests/integration/test_langgraph_v2_migrations.py \
-  tests/integration/test_langgraph_v2_tracer.py \
+  tests/integration/test_langgraph_v2_linear_core.py \
   tests/integration/test_langgraph_v2_thread_resume.py \
   tests/integration/test_langgraph_v2_groundedness.py \
   tests/integration/test_langgraph_v2_post_moderation.py \

@@ -167,6 +167,11 @@ class RecordingRetrieverProvider(BaseRetrieverProvider):
         self.calls.append((query, top_k, filter_expr))
         return self.docs[:top_k]
 
+    async def retrieve_configured(
+        self, query: str, filter_expr: str | None = None
+    ) -> list[Document]:
+        return await self.retrieve(query, self.top_k, filter_expr)
+
 
 class RecordingRankerProvider(BaseRankerProvider):
     """Ranker stub that reorders documents by score."""
@@ -314,7 +319,7 @@ async def test_existing_rag_workflow_end_to_end(
     steps = [
         FlowStep(type=FlowStepType.MODERATION, mode="pre"),
         FlowStep(type=FlowStepType.LLM, mode="refine_question", model="fast"),
-        FlowStep(type=FlowStepType.RETRIEVER, settings={"top_k": retriever.top_k}),
+        FlowStep(type=FlowStepType.RETRIEVER),
         FlowStep(type=FlowStepType.RANKING),
         FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
         FlowStep(type=FlowStepType.GROUNDEDNESS),

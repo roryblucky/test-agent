@@ -13,16 +13,16 @@ from fastapi import FastAPI
 from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerOutput, PydanticAIAnswerActor
-from app.langgraph_v2.api import TracerGraph, register_v2_routes
+from app.langgraph_v2.api import LinearGraphStream, register_v2_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import initial_checkpoint_config, thread_id_for
-from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.graph import build_linear_graph
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.test_langgraph_v2_tracer import seed_subject_conversation
+from tests.integration.test_langgraph_v2_linear_core import seed_subject_conversation
 
 
 class _Retriever:
@@ -76,7 +76,7 @@ class _PydanticAgent:
 
 class _TrackedGraph:
     def __init__(self, *, thread_id: str) -> None:
-        self.target: TracerGraph | None = None
+        self.target: LinearGraphStream | None = None
         self.config = initial_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
         self.cancelled = asyncio.Event()
         self.closed = asyncio.Event()
@@ -240,7 +240,7 @@ async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
             config=V2PostgresConfig(database_url=langgraph_v2_migrated_database_url),
         ):
             pool = app.state.langgraph_v2_postgres_pool
-            tracked_graph.target = build_tracer_graph(
+            tracked_graph.target = build_linear_graph(
                 app.state.langgraph_v2_checkpointer,
                 tenant_id="tenant-a",
                 artifact_repository=ArtifactRepository(pool),

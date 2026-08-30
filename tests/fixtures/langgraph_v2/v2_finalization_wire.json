@@ -1,6 +1,6 @@
 {
   "intentional_additive_fields": [],
-  "required_response_headers": ["x-run-id", "x-conversation-id"],
+  "required_response_headers": ["x-conversation-id"],
   "done_data_fields": [
     "query",
     "refined_query",

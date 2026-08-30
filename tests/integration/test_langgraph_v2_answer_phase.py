@@ -16,7 +16,7 @@ from app.langgraph_v2.answer import (
     AnswerStreamChunk,
 )
 from app.langgraph_v2.artifacts import ArtifactRepository
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
@@ -26,7 +26,10 @@ from app.models.workflow import AggregatedEvidence
 from app.services.citation_extractor import build_citations
 from app.services.events import EventEmitter
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
-from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
+from tests.integration.test_langgraph_v2_linear_core import (
+    parse_sse,
+    persistent_linear_app,
+)
 
 
 class _AnswerActor:
@@ -200,7 +203,7 @@ async def test_answer_receives_ranked_documents_on_each_execution(
     ) as pool:
         actor = _AnswerActor()
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -209,7 +212,7 @@ async def test_answer_receives_ranked_documents_on_each_execution(
             ranker=_Ranker(),
             answer_actor=actor,
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
@@ -234,7 +237,7 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             checkpointer=MemorySaver(),
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
@@ -244,7 +247,7 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
             ranker=_Ranker(),
             answer_actor=_StreamingAnswerActor(),
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
@@ -264,7 +267,7 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
 def test_answer_model_failure_fails_the_public_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         answer_actor=_FailingAnswer(),
         retriever=_Retriever(),
@@ -295,7 +298,7 @@ def test_answer_model_failure_fails_the_public_run(
 def test_answer_chunks_are_streamed_before_finalization(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         answer_actor=_AnswerActor(),
         retriever=_Retriever(),
@@ -322,6 +325,57 @@ def test_answer_chunks_are_streamed_before_finalization(
     assert max(token_positions) < finalization_position
 
 
+def test_new_turn_does_not_inherit_answer_when_answer_actor_is_unavailable(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+    )
+    app.state.langgraph_v2_answer_actor = _StreamingAnswerActor()
+    headers = {
+        "X-Application-Id": "tenant-a",
+        "X-Subject-Id": "subject-a",
+    }
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/v2/query/stream",
+            json={"query": "first", "clientRequestId": "first-turn"},
+            headers=headers,
+        )
+        conversation_id = first.headers["x-conversation-id"]
+        del app.state.langgraph_v2_answer_actor
+        second = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "second",
+                "sessionId": conversation_id,
+                "clientRequestId": "second-turn",
+            },
+            headers=headers,
+        )
+
+    first_events = parse_sse(first.text)
+    second_events = parse_sse(second.text)
+    assert first_events[-1]["type"] == "done"
+    assert first_events[-1]["data"]["answer"] == "One. Two."
+    assert second_events[-1]["type"] == "done"
+    assert second_events[-1]["data"]["query"] == "second"
+    assert second_events[-1]["data"]["answer"] is None
+    assert second_events[-1]["data"]["documents"] == []
+    assert second_events[-1]["data"]["metadata"]["steps_executed"] == [
+        "query",
+        "pre_moderation",
+        "question_refinement",
+        "retrieval",
+        "reranking",
+        "finalization",
+    ]
+    assert not any(event["type"] == "token" for event in second_events)
+
+
 @pytest.mark.asyncio
 async def test_answer_citation_subresult_is_bound_on_each_execution(
     langgraph_v2_migrated_database_url: str,
@@ -331,7 +385,7 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
     ) as pool:
         actor = _CitingAnswer()
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -340,7 +394,7 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
             ranker=_Ranker(),
             answer_actor=actor,
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
@@ -367,7 +421,7 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     ) as pool:
         actor = _InlineCitationAnswer()
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -376,7 +430,7 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
             ranker=_Ranker(),
             answer_actor=actor,
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
@@ -455,7 +509,7 @@ async def test_inline_citation_uses_reranked_artifact_position(
     ) as pool:
         actor = _RankedInlineAnswer()
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -487,7 +541,7 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
     ) as pool:
         actor = _MalformedCitationAnswer()
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),

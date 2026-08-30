@@ -63,8 +63,10 @@ async def run_reranking(
             )
             for ref in refs
         ]
+        refined_query = state.get("refined_query")
         ranked = await ranker.rank(
-            state.get("refined_query", state["query"]), documents
+            refined_query if isinstance(refined_query, str) else state["query"],
+            documents,
         )
         output_ids = [document.id for document in ranked.documents]
         input_keys = [_document_key(document) for document in documents]

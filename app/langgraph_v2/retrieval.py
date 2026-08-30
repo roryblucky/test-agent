@@ -51,7 +51,10 @@ async def run_retrieval(
 ) -> tuple[list[LiveStreamEvent], list[ArtifactRef], list[Document], bool, str | None]:
     """Persist retrieved Artifacts and return checkpoint-owned State data."""
     try:
-        result = await retriever.retrieve(state.get("refined_query", state["query"]))
+        refined_query = state.get("refined_query")
+        result = await retriever.retrieve(
+            refined_query if isinstance(refined_query, str) else state["query"]
+        )
         refs: list[ArtifactRef] = []
         for document in result.documents:
             payload = document.model_dump(mode="json", exclude_none=True)

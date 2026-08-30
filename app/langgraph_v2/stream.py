@@ -47,6 +47,19 @@ class GraphStreamCleanupError(RuntimeError):
     """The underlying LangGraph iterator failed while being closed."""
 
 
+async def await_task_completion(task: asyncio.Future[Any]) -> bool:
+    """Wait for an owned task despite cancellation; return whether it occurred."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except BaseException:
+            break
+    return cancelled
+
+
 async def _close_graph_iterator(
     graph_iterator: Any,
 ) -> tuple[bool, BaseException | None]:
@@ -55,16 +68,7 @@ async def _close_graph_iterator(
     if close is None:
         return False, None
     close_task = asyncio.ensure_future(close())
-    cancelled = False
-    while not close_task.done():
-        try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
-            cancelled = True
-        except BaseException:
-            # Retrieve the task's exception below while retaining ownership of
-            # the cleanup task until it has reached a terminal state.
-            break
+    cancelled = await await_task_completion(close_task)
     cleanup_error: BaseException | None = None
     try:
         await close_task
@@ -73,6 +77,18 @@ async def _close_graph_iterator(
     except BaseException as error:
         cleanup_error = GraphStreamCleanupError(str(error))
     return cancelled, cleanup_error
+
+
+async def _complete_terminal_sink(
+    sink: Callable[[LiveStreamEvent], Awaitable[None]],
+    event: LiveStreamEvent,
+) -> None:
+    """Finish the terminal durable write before propagating cancellation."""
+    sink_task: asyncio.Future[None] = asyncio.ensure_future(sink(event))
+    cancelled = await await_task_completion(sink_task)
+    await sink_task
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 async def stream_graph(
@@ -130,7 +146,7 @@ async def stream_graph(
                     "checkpoint terminal event was not confirmed by graph updates"
                 )
             if terminal_sink is not None:
-                await terminal_sink(pending_terminal)
+                await _complete_terminal_sink(terminal_sink, pending_terminal)
             for frame in deferred_frames:
                 yield frame
     except BaseException as error:

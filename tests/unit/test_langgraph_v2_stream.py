@@ -97,6 +97,55 @@ async def test_stream_graph_preserves_terminal_marker_from_event_model() -> None
 
 
 @pytest.mark.asyncio
+async def test_stream_graph_finishes_terminal_sink_before_propagating_cancellation() -> (
+    None
+):
+    sink_started = asyncio.Event()
+    release_sink = asyncio.Event()
+    sink_finished = asyncio.Event()
+    graph = _FakeGraph(
+        _FakeGraphStream(
+            [
+                (
+                    "custom",
+                    LiveStreamEvent(
+                        type="done",
+                        data={"answer": "complete"},
+                        checkpoint_terminal=True,
+                    ),
+                ),
+                ("updates", {"finalization": {"final_response": {}}}),
+            ]
+        )
+    )
+
+    async def terminal_sink(event: LiveStreamEvent) -> None:
+        assert event.type == "done"
+        sink_started.set()
+        await release_sink.wait()
+        sink_finished.set()
+
+    async def consume() -> None:
+        async for _ in stream_graph(
+            graph,
+            {"query": "hello"},
+            terminal_sink=terminal_sink,
+        ):
+            pass
+
+    consumer = asyncio.create_task(consume())
+    await sink_started.wait()
+    consumer.cancel()
+    await asyncio.sleep(0)
+    assert not consumer.done()
+
+    release_sink.set()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+    assert sink_finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() -> None:
     stream = _FakeGraphStream(
         [

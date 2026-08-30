@@ -28,7 +28,7 @@ from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
@@ -45,7 +45,7 @@ from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
-from tests.integration.test_langgraph_v2_tracer import (
+from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     seed_subject_conversation,
 )
@@ -59,7 +59,7 @@ class _FailingTerminalCheckpointSaver(AsyncPostgresSaver):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
-        if "final_response" in checkpoint.get("channel_values", {}):
+        if checkpoint.get("channel_values", {}).get("final_response") is not None:
             raise RuntimeError("forced terminal checkpoint failure")
         return await super().aput(config, checkpoint, metadata, new_versions)
 
@@ -209,7 +209,7 @@ class _LegacyManager:
         return self.flow
 
 
-def _state() -> TracerState:
+def _state() -> LinearGraphState:
     return {
         "query": "hello",
         "conversation_id": "c1",
@@ -227,7 +227,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
         answer = _Answer()
         moderation = _Moderation()
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -241,7 +241,9 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
         )
         result = await graph.ainvoke(_state())
     assert "final_response" in result
-    done = result["final_response"].model_dump(by_alias=True)
+    final_response = result["final_response"]
+    assert final_response is not None
+    done = final_response.model_dump(by_alias=True)
     assert done["session_id"] == "c1"
     assert done["answer"] == "grounded answer [1]"
     assert done["documents"][0]["id"] == "d1"
@@ -294,15 +296,13 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     stable_done["citations"][0]["evidence_id"] = "__artifact_id__"
     stable_done["citations"][0]["metadata"]["artifact_id"] = "__artifact_id__"
     assert stable_done == expected["event"]["data"]
-    assert "final_response" in result
-    assert "final_response" in result
-    assert result["final_response"].model_dump(by_alias=True) == done
+    assert final_response.model_dump(by_alias=True) == done
     assert answer.calls == 1
     assert moderation.calls == 2
 
 
 @pytest.mark.asyncio
-async def test_graph_completion_does_not_publish_message_before_done_is_consumed(
+async def test_graph_persists_assistant_before_finalization_checkpoint_completes(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     request_context = TrustedRequestContext(
@@ -325,7 +325,7 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
         )
         answer = _Answer()
         await seed_artifact_scope(pool, turn_id=turn_id, context=request_context)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -336,7 +336,7 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
             ranker=_Ranker(),
             answer_actor=answer,
         )
-        state: TracerState = {**_state(), "turn_id": str(turn_id)}
+        state: LinearGraphState = {**_state(), "turn_id": str(turn_id)}
 
         await graph.ainvoke(state)
         await graph.ainvoke(state)
@@ -349,7 +349,7 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
         (message.role, message.content)
         for message in retained
         if message.turn_id == turn_id
-    ] == [("user", "hello")]
+    ] == [("user", "hello"), ("assistant", "grounded answer [1]")]
 
 
 def test_public_v2_sse_matches_final_output_golden(
@@ -431,7 +431,7 @@ def test_public_v2_sse_matches_final_output_golden(
     stable_done["data"]["citations"][0]["metadata"]["artifact_id"] = "__artifact_id__"
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert response.headers["x-run-id"]
+    assert "x-run-id" not in response.headers
     assert response.headers["x-conversation-id"] == "c1"
     assert v2_fixture["intentional_additive_fields"] == []
     assert all("sequence" not in event for event in events), events
@@ -445,7 +445,7 @@ def test_public_v2_sse_matches_final_output_golden(
     ]
 
 
-def test_terminal_checkpoint_failure_publishes_error_without_assistant_or_run(
+def test_terminal_checkpoint_failure_retains_idempotent_assistant_for_resume(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = "terminal-checkpoint-failure"
@@ -500,4 +500,4 @@ def test_terminal_checkpoint_failure_publishes_error_without_assistant_or_run(
     assert all(event["type"] != "done" for event in delivered)
     assert delivered[-1]["type"] == "error"
     assert "forced terminal checkpoint failure" in delivered[-1]["data"]
-    assert asyncio.run(read_roles()) == ["user"]
+    assert asyncio.run(read_roles()) == ["user", "assistant"]

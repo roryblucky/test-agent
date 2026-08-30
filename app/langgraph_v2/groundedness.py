@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -12,6 +11,7 @@ from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
+from app.langgraph_v2.model_usage import model_usage_payload
 from app.langgraph_v2.output_assessments import (
     OutputAssessmentAudit,
     build_output_assessment_scope,
@@ -74,11 +74,9 @@ class PydanticAIGroundednessActor:
         """Evaluate the answer against the supplied evidence text."""
         evidence = "\n\n".join(document.content for document in documents)
         result = await self._agent.run(f"Answer:\n{answer}\n\nEvidence:\n{evidence}")
-        usage = result.usage()
-        usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
         return GroundednessAssessment(
             **result.output.model_dump(),
-            usage=usage_payload,
+            usage=model_usage_payload(result),
         )
 
 
@@ -145,7 +143,11 @@ async def run_groundedness(
             )
             for ref in refs
         ]
-        actor_result = await actor.evaluate(state.get("answer", ""), documents)
+        answer = state.get("answer")
+        actor_result = await actor.evaluate(
+            answer if isinstance(answer, str) else "",
+            documents,
+        )
         raw_result = actor_result.model_dump()
         output = GroundednessOutput.model_validate(raw_result)
         result = GroundednessResult.model_validate(output.model_dump())

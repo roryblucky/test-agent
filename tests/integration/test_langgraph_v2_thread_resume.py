@@ -28,7 +28,7 @@ from app.langgraph_v2.conversation_messages import (
     MessageRecord,
     TurnRecord,
 )
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
@@ -38,11 +38,11 @@ from app.langgraph_v2.question_refinement import (
     V2ResolvedQuery,
 )
 from app.models.domain import Document
-from tests.integration.test_langgraph_v2_tracer import (
+from tests.integration.test_langgraph_v2_linear_core import (
     UAT_CONTRACT_PATH,
     close_stream_after_first_token,
     parse_sse,
-    persistent_tracer_app,
+    persistent_linear_app,
     seed_subject_conversation,
     stream_request,
     v2_stream_endpoint,
@@ -204,7 +204,7 @@ async def _interrupt_query_after_answer_token(
         stream_tokens=["partial "],
         block_after_first_token=True,
     )
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         database_url,
         answer_actor=answer_actor,
     )
@@ -237,7 +237,7 @@ async def _interrupt_query_during_refinement(
     conversation_id = "conversation-task41-refinement-resume"
     await seed_subject_conversation(database_url, conversation_id)
     actor = _BlockingRefinementActor()
-    app = persistent_tracer_app(database_url, refinement_actor=actor)
+    app = persistent_linear_app(database_url, refinement_actor=actor)
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
             V2QueryRequest(query="hello", conversation_id=conversation_id),
@@ -294,7 +294,7 @@ async def _seed_pre_answer_checkpoint(
             content="resume me",
             idempotency_key=f"turn:{turn_id}:user",
         )
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             checkpointer,
             tenant_id="tenant-a",
             current_turn_id=turn_id,
@@ -305,7 +305,7 @@ async def _seed_pre_answer_checkpoint(
             answer_actor=_AnswerActor(),
             groundedness_actor=_AssertingGroundednessActor("recovered answer"),
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "resume me",
             "conversation_id": conversation.conversation_id,
             "turn_id": str(checkpoint_turn_id or turn_id),
@@ -401,7 +401,7 @@ async def _advance_same_turn_checkpoint(
             content="resume me",
             idempotency_key=f"turn:{turn_id}:user",
         )
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             checkpointer,
             tenant_id="tenant-a",
             current_turn_id=turn_id,
@@ -508,7 +508,7 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
         )
     )
     answer_actor = _AnswerActor()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=answer_actor,
@@ -588,7 +588,7 @@ def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
         answer="recovered answer",
         stream_tokens=["recovered ", "answer"],
     )
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         refinement_actor=resumed_actor,
@@ -636,7 +636,7 @@ def test_thread_resume_returns_404_for_missing_or_unauthorized_thread(
     thread_id, turn_id, _ = asyncio.run(
         _seed_pre_answer_checkpoint(langgraph_v2_migrated_database_url)
     )
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=_AnswerActor(),
@@ -670,7 +670,7 @@ def test_thread_resume_returns_404_for_missing_expected_turn(
     thread_id, _turn_id, _ = asyncio.run(
         _seed_pre_answer_checkpoint(langgraph_v2_migrated_database_url)
     )
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=_AnswerActor(),
@@ -698,7 +698,7 @@ def test_thread_resume_returns_404_for_expected_turn_from_other_conversation(
             conversation_id="conversation-2",
         )
     )
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=_AnswerActor(),
@@ -722,7 +722,7 @@ def test_thread_resume_returns_410_for_expired_turn_without_graph_execution(
     )
     asyncio.run(_expire_turn(langgraph_v2_migrated_database_url, turn_id))
     answer_actor = _AnswerActor()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=answer_actor,
@@ -765,7 +765,7 @@ def test_thread_resume_rejects_non_recoverable_checkpoint_without_graph_executio
         asyncio.run(_create_superseding_turn(langgraph_v2_migrated_database_url))
 
     answer_actor = _AnswerActor()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=answer_actor,
@@ -814,7 +814,7 @@ def test_thread_resume_rechecks_supersession_when_execution_starts(
         supersede_before_execution_check,
     )
     answer_actor = _AnswerActor()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=answer_actor,
@@ -860,7 +860,7 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
             },
         ]
     )
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         graph=graph,
         thread_resume_enabled=True,
@@ -924,7 +924,7 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
     groundedness_actor = _AssertingGroundednessActor(answer_text)
     moderation_provider = _AssertingModerationProvider(answer_text)
     audit = MockOutputAssessmentAudit()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         moderation_provider=moderation_provider,
@@ -985,7 +985,7 @@ def test_second_interruption_can_resume_before_original_deadline(
         stream_tokens=["replacement "],
         block_after_first_token=True,
     )
-    blocking_app = persistent_tracer_app(
+    blocking_app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=blocking_answer_actor,
@@ -1026,7 +1026,7 @@ def test_second_interruption_can_resume_before_original_deadline(
         answer="replacement answer [1]",
         stream_tokens=["replacement ", "answer [1]"],
     )
-    complete_app = persistent_tracer_app(
+    complete_app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=complete_answer_actor,
@@ -1062,7 +1062,7 @@ def test_second_interruption_returns_410_after_original_deadline_expires(
         stream_tokens=["replacement "],
         block_after_first_token=True,
     )
-    blocking_app = persistent_tracer_app(
+    blocking_app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=blocking_answer_actor,
@@ -1091,7 +1091,7 @@ def test_second_interruption_returns_410_after_original_deadline_expires(
         answer="replacement answer [1]",
         stream_tokens=["replacement ", "answer [1]"],
     )
-    expired_app = persistent_tracer_app(
+    expired_app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         thread_resume_enabled=True,
         answer_actor=expired_answer_actor,

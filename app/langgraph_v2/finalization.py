@@ -7,7 +7,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from app.langgraph_v2.artifacts import ArtifactScope, ArtifactStore
-from app.langgraph_v2.contracts import LiveStreamEvent, TracerQueryResponse
+from app.langgraph_v2.contracts import LinearQueryResponse, LiveStreamEvent
 from app.models.domain import Document
 
 
@@ -19,11 +19,13 @@ def _steps(state: Mapping[str, Any]) -> list[str]:
         "retrieval",
         "reranking",
     ]
-    if "answer" in state:
+    if isinstance(state.get("answer"), str):
         steps.append("answer")
-    if "groundedness" in state or "groundedness_error" in state:
+    if state.get("groundedness") is not None or state.get("groundedness_error"):
         steps.append("groundedness")
-    if "post_moderation" in state or "post_moderation_error" in state:
+    if state.get("post_moderation") is not None or state.get(
+        "post_moderation_error"
+    ):
         steps.append("moderation:post")
     steps.append("finalization")
     return steps
@@ -84,15 +86,50 @@ def _legacy_moderation(value: Mapping[str, Any] | None) -> dict[str, Any] | None
     return result
 
 
+def _build_response(
+    state: Mapping[str, Any],
+    *,
+    documents: list[Document],
+) -> LinearQueryResponse:
+    """Build the shared final response and aggregate current-Turn model usage."""
+    answer = state.get("answer")
+    has_answer = isinstance(answer, str)
+    response = LinearQueryResponse(
+        query=state["query"],
+        conversation_id=state["conversation_id"],
+        metadata={"steps_executed": _steps(state)},
+        refined_query=state.get("refined_query"),
+        answer=answer if has_answer else None,
+        documents=[document.model_dump(mode="json") for document in documents],
+        moderation=(
+            _legacy_moderation(state.get("moderation")) if has_answer else None
+        ),
+        groundedness=state.get("groundedness"),
+        citations=state.get("citations", []),
+    )
+    normalized = response.model_dump(mode="json")
+    usages: list[Mapping[str, Any]] = [
+        state.get("answer_usage", {}),
+        state.get("refinement_usage", {}),
+    ]
+    groundedness_usage = state.get("groundedness_usage", {})
+    if isinstance(groundedness_usage, Mapping):
+        usages.append(cast(Mapping[str, Any], groundedness_usage))
+    usage = _combine_usage(usages)
+    if usage is not None:
+        normalized["metadata"]["usage"] = usage
+    return LinearQueryResponse.model_validate(normalized)
+
+
 async def run_finalization(
     state: Mapping[str, Any],
     *,
     scope: ArtifactScope,
     artifacts: ArtifactStore,
-) -> tuple[list[LiveStreamEvent], TracerQueryResponse]:
+) -> tuple[list[LiveStreamEvent], LinearQueryResponse]:
     """Assemble the response and its checkpoint-owned finalization events."""
     documents = []
-    if "answer" in state:
+    if isinstance(state.get("answer"), str):
         documents = [
             Document.model_validate(
                 (
@@ -105,19 +142,7 @@ async def run_finalization(
             for ref in state.get("ranked_refs", state.get("artifact_refs", []))
             if ref.get("artifact_type") == "document"
         ]
-    response = TracerQueryResponse(
-        query=state["query"],
-        conversation_id=state["conversation_id"],
-        metadata={"steps_executed": _steps(state)},
-        refined_query=state.get("refined_query"),
-        answer=state.get("answer"),
-        documents=[document.model_dump(mode="json") for document in documents],
-        moderation=(
-            _legacy_moderation(state.get("moderation")) if "answer" in state else None
-        ),
-        groundedness=state.get("groundedness"),
-        citations=state.get("citations", []),
-    )
+    response = _build_response(state, documents=documents)
     events = [
         LiveStreamEvent(
             type="step_start",
@@ -129,45 +154,14 @@ async def run_finalization(
             data={"status": "completed"},
         ),
     ]
-    normalized = response.model_dump(mode="json")
-    usages: list[Mapping[str, Any]] = [
-        state.get("answer_usage", {}),
-        state.get("refinement_usage", {}),
-    ]
-    groundedness_usage = state.get("groundedness_usage", {})
-    if isinstance(groundedness_usage, Mapping):
-        usages.append(cast(Mapping[str, Any], groundedness_usage))
-    usage = _combine_usage(usages)
-    if usage is not None:
-        normalized["metadata"]["usage"] = usage
-    response = TracerQueryResponse.model_validate(normalized)
     return events, response
 
 
 def finalize_in_memory(
     state: Mapping[str, Any],
-) -> tuple[list[LiveStreamEvent], TracerQueryResponse]:
+) -> tuple[list[LiveStreamEvent], LinearQueryResponse]:
     """Assemble the same response shape for a non-persistent graph."""
-    response = TracerQueryResponse(
-        query=state["query"],
-        conversation_id=state["conversation_id"],
-        metadata={"steps_executed": _steps(state)},
-        refined_query=state.get("refined_query"),
-        answer=state.get("answer"),
-        moderation=(
-            _legacy_moderation(state.get("moderation")) if "answer" in state else None
-        ),
-        groundedness=state.get("groundedness"),
-        citations=state.get("citations", []),
-        documents=[],
-    )
-    normalized = response.model_dump(mode="json")
-    usage = _combine_usage(
-        [state.get("answer_usage", {}), state.get("refinement_usage", {})]
-    )
-    if usage is not None:
-        normalized["metadata"]["usage"] = usage
-    response = TracerQueryResponse.model_validate(normalized)
+    response = _build_response(state, documents=[])
     return [
         LiveStreamEvent(type="step_start", step="finalization"),
         LiveStreamEvent(

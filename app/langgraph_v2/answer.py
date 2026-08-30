@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -15,6 +15,8 @@ from pydantic_ai import Agent
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
+from app.langgraph_v2.model_usage import model_usage_payload
+from app.langgraph_v2.stream import await_task_completion
 from app.models.domain import Document
 from app.models.workflow import CitationReference
 
@@ -157,13 +159,6 @@ class PydanticAIAnswerActor:
         )
         return f"Question: {query}\n\nEvidence:\n{evidence}"
 
-    @staticmethod
-    def _usage_payload(result: Any) -> dict[str, Any]:
-        usage = result.usage()
-        if is_dataclass(usage) and not isinstance(usage, type):
-            return asdict(usage)
-        return dict(vars(usage))
-
     async def answer_stream(
         self,
         query: str,
@@ -198,7 +193,7 @@ class PydanticAIAnswerActor:
             output = AnswerOutput.model_validate(await stream.get_output())
             result = AnswerResult(
                 answer=output.answer,
-                usage=self._usage_payload(stream),
+                usage=model_usage_payload(stream),
                 citations=output.citations,
             )
             yield AnswerStreamChunk(result=result)
@@ -255,7 +250,10 @@ async def run_answer(
         history = [
             ConversationTurn.model_validate(turn) for turn in state.get("history", [])
         ]
-        answer_query = state.get("refined_query", state["query"])
+        refined_query = state.get("refined_query")
+        answer_query = (
+            refined_query if isinstance(refined_query, str) else state["query"]
+        )
         events: list[LiveStreamEvent] = [
             LiveStreamEvent(
                 type="step_start",
@@ -286,11 +284,15 @@ async def run_answer(
             close = getattr(answer_iterator, "aclose", None)
             if close is not None:
                 close_task = asyncio.ensure_future(close())
+                cancelled = await await_task_completion(close_task)
                 try:
-                    await asyncio.shield(close_task)
-                except asyncio.CancelledError:
-                    await asyncio.shield(close_task)
+                    await close_task
+                except BaseException:
+                    if cancelled:
+                        raise asyncio.CancelledError
                     raise
+                if cancelled:
+                    raise asyncio.CancelledError
         if streamed_result is None:
             raise ValueError("answer stream did not return a final result")
         validated = AnswerResult.model_validate(streamed_result)

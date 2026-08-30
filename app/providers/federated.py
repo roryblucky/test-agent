@@ -11,9 +11,18 @@ database or API to query, while maximizing speed through concurrent execution.
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from app.models.domain import Document
 from app.providers.base import BaseRetrieverProvider
+
+
+@dataclass(frozen=True)
+class ConfiguredRetrieverSource:
+    """One retriever together with its tenant-configured result limit."""
+
+    provider: BaseRetrieverProvider
+    top_k: int
 
 
 class FederatedRetrieverProvider(BaseRetrieverProvider):
@@ -24,13 +33,13 @@ class FederatedRetrieverProvider(BaseRetrieverProvider):
     for the current tenant (e.g., ConfluenceRetriever, VectorDBRetriever).
     """
 
-    def __init__(self, retrievers: Sequence[BaseRetrieverProvider]):
+    def __init__(self, sources: Sequence[ConfiguredRetrieverSource]):
         """Initialize with a list of active retrievers for the tenant.
 
         Args:
-            retrievers: A list of instantiated provider objects to query.
+            sources: Configured provider objects and their per-source limits.
         """
-        self.retrievers = retrievers
+        self.sources = sources
 
     async def retrieve(
         self, query: str, top_k: int = 10, filter_expr: str | None = None
@@ -47,13 +56,40 @@ class FederatedRetrieverProvider(BaseRetrieverProvider):
             Note: This list is typically sent to a `BaseRankerProvider`
             afterwards to establish a global ordering across sources.
         """
-        if not self.retrievers:
+        return await self._retrieve_sources(
+            query,
+            [(source, top_k) for source in self.sources],
+            filter_expr,
+        )
+
+    async def retrieve_configured(
+        self, query: str, filter_expr: str | None = None
+    ) -> list[Document]:
+        """Retrieve from every source using its tenant-configured limit."""
+        return await self._retrieve_sources(
+            query,
+            [(source, source.top_k) for source in self.sources],
+            filter_expr,
+        )
+
+    async def _retrieve_sources(
+        self,
+        query: str,
+        requests: Sequence[tuple[ConfiguredRetrieverSource, int]],
+        filter_expr: str | None,
+    ) -> list[Document]:
+        """Run configured source requests and merge their documents."""
+        if not requests:
             return []
 
         # 1. Fire off all retrieval tasks concurrently
         tasks = [
-            retriever.retrieve(query, top_k=top_k, filter_expr=filter_expr)
-            for retriever in self.retrievers
+            source.provider.retrieve(
+                query,
+                top_k=source_top_k,
+                filter_expr=filter_expr,
+            )
+            for source, source_top_k in requests
         ]
 
         # `return_exceptions=True` ensures that if one data source goes down

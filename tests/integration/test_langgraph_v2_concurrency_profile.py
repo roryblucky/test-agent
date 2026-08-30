@@ -8,8 +8,9 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient, Response
 
-from tests.integration.test_langgraph_v2_tracer import (
-    persistent_tracer_app,
+from app.main import ConcurrencyLimiterMiddleware
+from tests.integration.test_langgraph_v2_linear_core import (
+    persistent_linear_app,
     seed_subject_conversation,
 )
 
@@ -57,7 +58,8 @@ async def test_fifty_warmed_query_streams_enter_graph_without_application_queue(
 ) -> None:
     concurrency = 50
     graph = _EntryBarrierGraph()
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
+    app.add_middleware(ConcurrencyLimiterMiddleware, max_concurrent_requests=1)
     headers = {"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
 
     async with app.router.lifespan_context(app):

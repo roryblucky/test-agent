@@ -11,7 +11,7 @@ from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.pre_moderation import ModerationDecision
@@ -19,9 +19,9 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
-from tests.integration.test_langgraph_v2_tracer import (
+from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
-    persistent_tracer_app,
+    persistent_linear_app,
     seed_subject_conversation,
     stream_request,
     v2_stream_endpoint,
@@ -85,7 +85,7 @@ class _FailingPostModeration:
         raise RuntimeError("post evaluator unavailable")
 
 
-def _state() -> TracerState:
+def _state() -> LinearGraphState:
     return {
         "query": "hello",
         "conversation_id": "c1",
@@ -102,7 +102,7 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
         langgraph_v2_migrated_database_url, "conversation-1"
     )
     moderation = _FlaggingModeration()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         retriever=_Retriever(),
         ranker=_Ranker(),
@@ -160,7 +160,7 @@ async def test_safe_answer_passes_post_moderation_unchanged(
         )
         moderation = _SafeModeration()
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -176,9 +176,13 @@ async def test_safe_answer_passes_post_moderation_unchanged(
     assert "answer" in result
     assert result["answer"] == "generated answer"
     assert "post_moderation" in result
-    assert result["post_moderation"]["is_flagged"] is False
+    post_moderation = result["post_moderation"]
+    assert post_moderation is not None
+    assert post_moderation["is_flagged"] is False
     assert "final_response" in result
-    assert result["final_response"].answer == "generated answer"
+    final_response = result["final_response"]
+    assert final_response is not None
+    assert final_response.answer == "generated answer"
 
 
 @pytest.mark.asyncio
@@ -203,7 +207,7 @@ async def test_flagged_answer_remains_canonical_through_finalization(
         )
         audit = MockOutputAssessmentAudit()
         scope = await seed_artifact_scope(pool, turn_id=turn_id)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
@@ -225,10 +229,14 @@ async def test_flagged_answer_remains_canonical_through_finalization(
     assert "answer" in result
     assert result["answer"] == "generated answer"
     assert "final_response" in result
-    assert result["final_response"].answer == "generated answer"
+    final_response = result["final_response"]
+    assert final_response is not None
+    assert final_response.answer == "generated answer"
     assert [message.content for message in persisted_messages] == ["hello"]
     assert "post_moderation" in result
-    assert result["post_moderation"]["is_flagged"] is True
+    post_moderation = result["post_moderation"]
+    assert post_moderation is not None
+    assert post_moderation["is_flagged"] is True
     assert len(audit.records) == 1
     assert audit.records[0].tenant_id == "tenant-a"
     assert audit.records[0].conversation_id == "c1"
@@ -244,7 +252,7 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -262,4 +270,6 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
     assert "post_moderation_error" in result
     assert result["post_moderation_error"] == "post evaluator unavailable"
     assert "final_response" in result
-    assert result["final_response"].answer == "generated answer"
+    final_response = result["final_response"]
+    assert final_response is not None
+    assert final_response.answer == "generated answer"

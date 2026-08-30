@@ -1,11 +1,11 @@
-"""Test-only FastAPI registration for the minimal v2 tracer."""
+"""FastAPI registration for the production LangGraph Linear Core."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Annotated, Any, Protocol, cast
@@ -13,6 +13,7 @@ from typing import Annotated, Any, Protocol, cast
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import StateSnapshot
 from psycopg_pool import AsyncConnectionPool
 from starlette.requests import ClientDisconnect
@@ -20,9 +21,7 @@ from starlette.types import Receive, Scope, Send
 
 from app.langgraph_v2.answer import AnswerActor, build_answer_actor
 from app.langgraph_v2.artifacts import (
-    ArtifactNotFound,
     ArtifactRepository,
-    ArtifactScope,
 )
 from app.langgraph_v2.authorization import (
     TrustedRequestContext,
@@ -42,7 +41,12 @@ from app.langgraph_v2.conversation_messages import (
     TurnRecord,
     turn_id_for_client_request,
 )
-from app.langgraph_v2.graph import TracerState, build_tracer_graph, tracer_graph
+from app.langgraph_v2.graph import (
+    LinearGraph,
+    LinearGraphState,
+    build_linear_graph,
+    linear_graph,
+)
 from app.langgraph_v2.groundedness import (
     GroundednessActor,
     UnavailableGroundednessActor,
@@ -70,6 +74,7 @@ from app.langgraph_v2.retrieval import Retriever
 from app.langgraph_v2.stream import (
     GraphStreamCleanupError,
     RequestOwnedGraph,
+    await_task_completion,
     stream_graph,
 )
 from app.services.exceptions import TenantNotFoundError
@@ -159,7 +164,15 @@ def _resolve_provider_bundle(app: FastAPI, tenant_id: str) -> V2ProviderBundle |
     manager = getattr(app.state, "tenant_manager", None)
     if manager is None or not hasattr(manager, "get_providers"):
         return None
-    return adapt_tenant_providers(manager.get_providers(tenant_id))
+    ranker_top_n: int | None = None
+    if hasattr(manager, "get_tenant_config"):
+        tenant_config = manager.get_tenant_config(tenant_id)
+        if tenant_config.ranking_config is not None:
+            ranker_top_n = tenant_config.ranking_config.top_n
+    return adapt_tenant_providers(
+        manager.get_providers(tenant_id),
+        ranker_top_n=ranker_top_n,
+    )
 
 
 def _resolve_answer_actor(
@@ -183,6 +196,7 @@ def _resolve_groundedness_actor(
     app: FastAPI,
     tenant_id: str,
     injected: GroundednessActor | None,
+    provider_bundle: V2ProviderBundle | None,
 ) -> GroundednessActor | None:
     """Resolve an injected or tenant-registry groundedness evaluator."""
     if injected is not None:
@@ -190,6 +204,8 @@ def _resolve_groundedness_actor(
     configured = getattr(app.state, "langgraph_v2_groundedness_actor", None)
     if configured is not None:
         return configured
+    if provider_bundle is not None and provider_bundle.groundedness is not None:
+        return provider_bundle.groundedness
     manager = getattr(app.state, "tenant_manager", None)
     if manager is None or not hasattr(manager, "get_model_registry"):
         return None
@@ -200,10 +216,13 @@ def _resolve_groundedness_actor_safely(
     app: FastAPI,
     tenant_id: str,
     injected: GroundednessActor | None,
+    provider_bundle: V2ProviderBundle | None,
 ) -> GroundednessActor | None:
     """Keep groundedness setup failures inside the advisory phase."""
     try:
-        return _resolve_groundedness_actor(app, tenant_id, injected)
+        return _resolve_groundedness_actor(
+            app, tenant_id, injected, provider_bundle
+        )
     except Exception as exc:
         return UnavailableGroundednessActor(exc)
 
@@ -235,11 +254,11 @@ def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
 
 def _resolve_phase_providers(
     app: FastAPI,
-    tenant_id: str,
     *,
     retriever: Retriever | None,
     ranker: Ranker | None,
     moderation_provider: ModerationProvider | None,
+    provider_bundle: V2ProviderBundle | None,
 ) -> tuple[Retriever | None, Ranker | None, ModerationProvider | None]:
     """Resolve injected, app-level, and tenant-scoped v2 providers once."""
     configured_retriever = retriever or getattr(
@@ -249,7 +268,6 @@ def _resolve_phase_providers(
     configured_moderation = moderation_provider or getattr(
         app.state, "langgraph_v2_moderation_provider", None
     )
-    provider_bundle = _resolve_provider_bundle(app, tenant_id)
     if provider_bundle is not None:
         configured_retriever = (
             configured_retriever or provider_bundle.retriever or MissingRetriever()
@@ -261,6 +279,112 @@ def _resolve_phase_providers(
             configured_moderation or provider_bundle.moderation or MissingModeration()
         )
     return configured_retriever, configured_ranker, configured_moderation
+
+
+@dataclass(frozen=True)
+class LinearGraphDependencies:
+    """Resolved tenant and request dependencies for one Linear Graph."""
+
+    checkpointer: BaseCheckpointSaver[Any] | None
+    tenant_id: str
+    artifact_repository: ArtifactRepository
+    message_repository: ConversationMessageRepository
+    request_context: TrustedRequestContext
+    history_token_budget: int
+    output_assessment_audit: OutputAssessmentAudit
+    refinement_actor: QuestionRefinementActor | None
+    retriever: Retriever | None
+    ranker: Ranker | None
+    moderation_provider: ModerationProvider | None
+    answer_actor: AnswerActor | None
+    groundedness_actor: GroundednessActor | None
+
+
+@dataclass(frozen=True)
+class LinearGraphOverrides:
+    """Optional router-level implementations used instead of tenant defaults."""
+
+    refinement_actor: QuestionRefinementActor | None
+    retriever: Retriever | None
+    ranker: Ranker | None
+    moderation_provider: ModerationProvider | None
+    answer_actor: AnswerActor | None
+    groundedness_actor: GroundednessActor | None
+    history_token_budget: int
+    output_assessment_audit: OutputAssessmentAudit | None
+
+
+def _resolve_linear_graph_dependencies(
+    app: FastAPI,
+    *,
+    pool: AsyncConnectionPool[Any],
+    tenant_id: str,
+    request_context: TrustedRequestContext,
+    message_repository: ConversationMessageRepository,
+    overrides: LinearGraphOverrides,
+) -> LinearGraphDependencies:
+    """Resolve request-scoped graph dependencies in one place."""
+    provider_bundle = _resolve_provider_bundle(app, tenant_id)
+    configured_retriever, configured_ranker, configured_moderation = (
+        _resolve_phase_providers(
+            app,
+            retriever=overrides.retriever,
+            ranker=overrides.ranker,
+            moderation_provider=overrides.moderation_provider,
+            provider_bundle=provider_bundle,
+        )
+    )
+    return LinearGraphDependencies(
+        checkpointer=cast(
+            BaseCheckpointSaver[Any] | None,
+            getattr(app.state, "langgraph_v2_checkpointer", None),
+        ),
+        tenant_id=tenant_id,
+        artifact_repository=ArtifactRepository(pool),
+        message_repository=message_repository,
+        request_context=request_context,
+        history_token_budget=overrides.history_token_budget,
+        output_assessment_audit=_resolve_output_assessment_audit(
+            app, overrides.output_assessment_audit
+        ),
+        refinement_actor=_resolve_refinement_actor(
+            app, tenant_id, overrides.refinement_actor
+        ),
+        retriever=configured_retriever,
+        ranker=configured_ranker,
+        moderation_provider=configured_moderation,
+        answer_actor=_resolve_answer_actor(app, tenant_id, overrides.answer_actor),
+        groundedness_actor=_resolve_groundedness_actor_safely(
+            app,
+            tenant_id,
+            overrides.groundedness_actor,
+            provider_bundle,
+        ),
+    )
+
+
+def _build_request_graph(
+    dependencies: LinearGraphDependencies,
+    *,
+    turn_id: uuid.UUID | None = None,
+) -> LinearGraph:
+    """Build the concrete Linear Graph from resolved request dependencies."""
+    return build_linear_graph(
+        dependencies.checkpointer,
+        tenant_id=dependencies.tenant_id,
+        current_turn_id=turn_id,
+        artifact_repository=dependencies.artifact_repository,
+        message_repository=dependencies.message_repository,
+        request_context=dependencies.request_context,
+        history_token_budget=dependencies.history_token_budget,
+        output_assessment_audit=dependencies.output_assessment_audit,
+        refinement_actor=dependencies.refinement_actor,
+        retriever=dependencies.retriever,
+        ranker=dependencies.ranker,
+        moderation_provider=dependencies.moderation_provider,
+        answer_actor=dependencies.answer_actor,
+        groundedness_actor=dependencies.groundedness_actor,
+    )
 
 
 async def _terminalize_checkpoint_event(
@@ -321,14 +445,7 @@ async def _await_cleanup_task(
     task: asyncio.Task[Any],
 ) -> tuple[bool, BaseException | None]:
     """Await a cleanup task to completion despite repeated cancellation."""
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cancelled = True
-        except BaseException:
-            break
+    cancelled = await await_task_completion(task)
     try:
         await task
     except asyncio.CancelledError as error:
@@ -353,7 +470,32 @@ def _setup_failure_frame(message: str) -> str:
     ).to_sse()
 
 
-type TracerGraph = RequestOwnedGraph
+async def _stream_request_execution(
+    create_graph_stream: Callable[[], Awaitable[AsyncGenerator[str]]],
+) -> AsyncIterator[str]:
+    """Stream one request-owned Graph with shared error and cleanup semantics."""
+    graph_stream: AsyncGenerator[str] | None = None
+    primary_error: BaseException | None = None
+    try:
+        graph_stream = await create_graph_stream()
+        async for frame in graph_stream:
+            yield frame
+    except asyncio.CancelledError as error:
+        primary_error = error
+        raise
+    except GraphStreamCleanupError as error:
+        primary_error = error
+        raise
+    except Exception as error:
+        yield _setup_failure_frame(str(error) or "LangGraph execution failed.")
+    finally:
+        await _cleanup_request_execution(
+            graph_stream,
+            primary_error=primary_error,
+        )
+
+
+type LinearGraphStream = RequestOwnedGraph
 
 _REMOVED_REPLAY_QUERY_PARAMETERS = frozenset(
     {"afterSequence", "after_sequence", "cursor"}
@@ -479,21 +621,14 @@ async def _authorize_thread_resume_target(
     )
 
 
-def create_tracer_router(
-    graph: TracerGraph | None = None,
-    refinement_actor: QuestionRefinementActor | None = None,
-    retriever: Retriever | None = None,
-    ranker: Ranker | None = None,
-    moderation_provider: ModerationProvider | None = None,
-    answer_actor: AnswerActor | None = None,
-    groundedness_actor: GroundednessActor | None = None,
-    history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
-    output_assessment_audit: OutputAssessmentAudit | None = None,
+def create_linear_router(
+    graph: LinearGraphStream | None,
+    overrides: LinearGraphOverrides,
 ) -> APIRouter:
-    """Create the test-only router around an injected request-owned stream seam."""
-    if history_token_budget < 0:
+    """Create the production router around a request-owned Linear Graph."""
+    if overrides.history_token_budget < 0:
         raise ValueError("history_token_budget must not be negative")
-    router = APIRouter(tags=["LangGraph v2 tracer"])
+    router = APIRouter(tags=["LangGraph v2"])
 
     @router.post("/v2/query/stream")
     async def query_stream(  # pyright: ignore[reportUnusedFunction] -- FastAPI route
@@ -504,11 +639,10 @@ def create_tracer_router(
         ],
         x_user_groups: Annotated[str, Header(alias="X-User-Groups")] = "",
     ) -> StreamingResponse:
-        """Run the deterministic tracer and return its events as SSE."""
+        """Run the deterministic Linear Graph and return its events as SSE."""
         del x_user_groups
         _reject_removed_replay_query_parameters(http_request)
         _ensure_tenant_available(http_request.app, request_context.tenant_id)
-        run_id = uuid.uuid4()
         tenant_id = request_context.tenant_id
         configured_pool = getattr(
             http_request.app.state,
@@ -544,121 +678,65 @@ def create_tracer_router(
             )
         user_idempotency_key = f"turn:{turn_id}:user"
 
-        async def event_generator() -> AsyncIterator[str]:
-            graph_stream: AsyncGenerator[str] | None = None
-            primary_error: BaseException | None = None
-            try:
-                await message_repository.create_turn(
+        async def create_graph_stream() -> AsyncGenerator[str]:
+            await message_repository.create_turn(
+                context=request_context,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                content=payload.query,
+                idempotency_key=user_idempotency_key,
+            )
+            dependencies = _resolve_linear_graph_dependencies(
+                http_request.app,
+                pool=pool,
+                tenant_id=tenant_id,
+                request_context=request_context,
+                message_repository=message_repository,
+                overrides=overrides,
+            )
+            selected_graph = graph or linear_graph
+            graph_config: RunnableConfig | None = None
+            if graph is None:
+                if dependencies.checkpointer is not None:
+                    graph_config = initial_checkpoint_config(
+                        thread_id=conversation.thread_id,
+                        checkpoint_ns="",
+                    )
+                selected_graph = _build_request_graph(
+                    dependencies,
+                    turn_id=turn_id,
+                )
+            state: LinearGraphState = {
+                "query": payload.query,
+                "conversation_id": conversation_id,
+                "turn_id": str(turn_id),
+                "client_request_id": payload.client_request_id,
+            }
+
+            async def terminalize_checkpoint_event(event: LiveStreamEvent) -> None:
+                await _terminalize_checkpoint_event(
+                    message_repository,
+                    event,
                     context=request_context,
                     conversation_id=conversation_id,
                     turn_id=turn_id,
-                    content=payload.query,
-                    idempotency_key=user_idempotency_key,
                 )
-                configured_checkpointer = getattr(
-                    http_request.app.state,
-                    "langgraph_v2_checkpointer",
-                    None,
-                )
-                configured_refinement_actor = _resolve_refinement_actor(
-                    http_request.app,
-                    tenant_id,
-                    refinement_actor,
-                )
-                configured_answer_actor = _resolve_answer_actor(
-                    http_request.app, tenant_id, answer_actor
-                )
-                configured_groundedness_actor = _resolve_groundedness_actor_safely(
-                    http_request.app, tenant_id, groundedness_actor
-                )
-                configured_output_assessment_audit = _resolve_output_assessment_audit(
-                    http_request.app, output_assessment_audit
-                )
-                (
-                    configured_retriever,
-                    configured_ranker,
-                    configured_moderation,
-                ) = _resolve_phase_providers(
-                    http_request.app,
-                    tenant_id,
-                    retriever=retriever,
-                    ranker=ranker,
-                    moderation_provider=moderation_provider,
-                )
-                selected_graph = graph or tracer_graph
-                graph_config: RunnableConfig | None = None
-                if graph is None:
-                    if configured_checkpointer is not None:
-                        checkpoint_ns = ""
-                        graph_config = initial_checkpoint_config(
-                            thread_id=conversation.thread_id,
-                            checkpoint_ns=checkpoint_ns,
-                        )
-                    selected_graph = build_tracer_graph(
-                        configured_checkpointer,
-                        tenant_id=tenant_id,
-                        current_turn_id=turn_id,
-                        artifact_repository=ArtifactRepository(pool),
-                        message_repository=message_repository,
-                        request_context=request_context,
-                        history_token_budget=history_token_budget,
-                        output_assessment_audit=configured_output_assessment_audit,
-                        refinement_actor=configured_refinement_actor,
-                        retriever=configured_retriever,
-                        ranker=configured_ranker,
-                        moderation_provider=configured_moderation,
-                        answer_actor=configured_answer_actor,
-                        groundedness_actor=configured_groundedness_actor,
-                    )
-                state: TracerState = {
-                    "query": payload.query,
-                    "conversation_id": conversation_id,
-                    "turn_id": str(turn_id),
-                    "client_request_id": payload.client_request_id,
-                }
 
-                async def terminalize_checkpoint_event(
-                    event: LiveStreamEvent,
-                ) -> None:
-                    await _terminalize_checkpoint_event(
-                        message_repository,
-                        event,
-                        context=request_context,
-                        conversation_id=conversation_id,
-                        turn_id=turn_id,
-                    )
-
-                graph_stream = stream_graph(
-                    cast(RequestOwnedGraph, selected_graph),
-                    state,
-                    config=graph_config,
-                    terminal_sink=terminalize_checkpoint_event,
-                )
-                async for frame in graph_stream:
-                    yield frame
-            except asyncio.CancelledError as error:
-                primary_error = error
-                raise
-            except GraphStreamCleanupError as error:
-                primary_error = error
-                raise
-            except Exception as error:
-                yield _setup_failure_frame(
-                    str(error) or "LangGraph execution failed."
-                )
-            finally:
-                await _cleanup_request_execution(
-                    graph_stream,
-                    primary_error=primary_error,
-                )
+            return stream_graph(
+                selected_graph,
+                state,
+                config=graph_config,
+                terminal_sink=(
+                    terminalize_checkpoint_event if graph is not None else None
+                ),
+            )
 
         return _RequestOwnedStreamingResponse(
-            event_generator(),
+            _stream_request_execution(create_graph_stream),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
-                "X-Run-Id": str(run_id),
                 "X-Conversation-Id": conversation_id,
                 "X-Turn-Id": str(turn_id),
                 "X-Thread-Id": conversation.thread_id,
@@ -687,57 +765,21 @@ def create_tracer_router(
             raise HTTPException(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
-        configured_checkpointer = getattr(
-            http_request.app.state,
-            "langgraph_v2_checkpointer",
-            None,
+        pool = cast(AsyncConnectionPool[Any], configured_pool)
+        message_repository = _message_repository(http_request.app, pool)
+        dependencies = _resolve_linear_graph_dependencies(
+            http_request.app,
+            pool=pool,
+            tenant_id=tenant_id,
+            request_context=request_context,
+            message_repository=message_repository,
+            overrides=overrides,
         )
-        if configured_checkpointer is None:
+        if dependencies.checkpointer is None:
             raise HTTPException(
                 status_code=500, detail="LangGraph v2 checkpointer is not configured"
             )
-        pool = cast(AsyncConnectionPool[Any], configured_pool)
-        message_repository = _message_repository(http_request.app, pool)
-        configured_refinement_actor = _resolve_refinement_actor(
-            http_request.app,
-            tenant_id,
-            refinement_actor,
-        )
-        configured_answer_actor = _resolve_answer_actor(
-            http_request.app, tenant_id, answer_actor
-        )
-        configured_groundedness_actor = _resolve_groundedness_actor_safely(
-            http_request.app, tenant_id, groundedness_actor
-        )
-        configured_output_assessment_audit = _resolve_output_assessment_audit(
-            http_request.app, output_assessment_audit
-        )
-        (
-            configured_retriever,
-            configured_ranker,
-            configured_moderation,
-        ) = _resolve_phase_providers(
-            http_request.app,
-            tenant_id,
-            retriever=retriever,
-            ranker=ranker,
-            moderation_provider=moderation_provider,
-        )
-        checkpoint_graph = build_tracer_graph(
-            configured_checkpointer,
-            tenant_id=tenant_id,
-            artifact_repository=ArtifactRepository(pool),
-            message_repository=message_repository,
-            request_context=request_context,
-            history_token_budget=history_token_budget,
-            output_assessment_audit=configured_output_assessment_audit,
-            refinement_actor=configured_refinement_actor,
-            retriever=configured_retriever,
-            ranker=configured_ranker,
-            moderation_provider=configured_moderation,
-            answer_actor=configured_answer_actor,
-            groundedness_actor=configured_groundedness_actor,
-        )
+        checkpoint_graph = _build_request_graph(dependencies)
         try:
             target = await _authorize_thread_resume_target(
                 checkpoint_graph=checkpoint_graph,
@@ -757,70 +799,38 @@ def create_tracer_router(
                 status_code=409, detail="Thread is not resumable"
             ) from error
 
-        async def event_generator() -> AsyncIterator[str]:
-            graph_stream: AsyncGenerator[str] | None = None
-            primary_error: BaseException | None = None
-            try:
-                latest_turn = await message_repository.get_latest_turn(
+        async def create_graph_stream() -> AsyncGenerator[str]:
+            latest_turn = await message_repository.get_latest_turn(
+                context=request_context,
+                conversation_id=target.conversation.conversation_id,
+            )
+            if latest_turn.turn_id != target.turn.turn_id:
+                raise ThreadResumeConflict("checkpoint Turn has been superseded")
+            selected_graph = graph or _build_request_graph(
+                dependencies,
+                turn_id=target.turn.turn_id,
+            )
+
+            async def terminalize_checkpoint_event(event: LiveStreamEvent) -> None:
+                await _terminalize_checkpoint_event(
+                    message_repository,
+                    event,
                     context=request_context,
                     conversation_id=target.conversation.conversation_id,
-                )
-                if latest_turn.turn_id != target.turn.turn_id:
-                    raise ThreadResumeConflict("checkpoint Turn has been superseded")
-                selected_graph = graph or build_tracer_graph(
-                    configured_checkpointer,
-                    tenant_id=tenant_id,
-                    current_turn_id=target.turn.turn_id,
-                    artifact_repository=ArtifactRepository(pool),
-                    message_repository=message_repository,
-                    request_context=request_context,
-                    history_token_budget=history_token_budget,
-                    output_assessment_audit=configured_output_assessment_audit,
-                    refinement_actor=configured_refinement_actor,
-                    retriever=configured_retriever,
-                    ranker=configured_ranker,
-                    moderation_provider=configured_moderation,
-                    answer_actor=configured_answer_actor,
-                    groundedness_actor=configured_groundedness_actor,
+                    turn_id=target.turn.turn_id,
                 )
 
-                async def terminalize_checkpoint_event(
-                    event: LiveStreamEvent,
-                ) -> None:
-                    await _terminalize_checkpoint_event(
-                        message_repository,
-                        event,
-                        context=request_context,
-                        conversation_id=target.conversation.conversation_id,
-                        turn_id=target.turn.turn_id,
-                    )
-
-                graph_stream = stream_graph(
-                    cast(RequestOwnedGraph, selected_graph),
-                    None,
-                    config=target.config,
-                    terminal_sink=terminalize_checkpoint_event,
-                )
-                async for frame in graph_stream:
-                    yield frame
-            except asyncio.CancelledError as error:
-                primary_error = error
-                raise
-            except GraphStreamCleanupError as error:
-                primary_error = error
-                raise
-            except Exception as error:
-                yield _setup_failure_frame(
-                    str(error) or "LangGraph execution failed."
-                )
-            finally:
-                await _cleanup_request_execution(
-                    graph_stream,
-                    primary_error=primary_error,
-                )
+            return stream_graph(
+                selected_graph,
+                None,
+                config=target.config,
+                terminal_sink=(
+                    terminalize_checkpoint_event if graph is not None else None
+                ),
+            )
 
         return _RequestOwnedStreamingResponse(
-            event_generator(),
+            _stream_request_execution(create_graph_stream),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -831,37 +841,6 @@ def create_tracer_router(
             },
         )
 
-    @router.get("/v2/artifacts/{artifact_id}")
-    async def get_artifact(  # pyright: ignore[reportUnusedFunction] -- FastAPI route
-        artifact_id: uuid.UUID,
-        http_request: Request,
-        conversation_id: Annotated[str, Query(alias="conversationId", min_length=1)],
-        turn_id: Annotated[uuid.UUID, Query(alias="turnId")],
-        request_context: Annotated[
-            TrustedRequestContext, Depends(get_trusted_request_context)
-        ],
-    ) -> dict[str, Any]:
-        """Read one Artifact through the caller's Tenant boundary."""
-        configured_pool = getattr(
-            http_request.app.state, "langgraph_v2_postgres_pool", None
-        )
-        if configured_pool is None:
-            raise HTTPException(
-                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
-            )
-        try:
-            artifact = await ArtifactRepository(configured_pool).get(
-                scope=ArtifactScope(
-                    context=request_context,
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
-                ),
-                artifact_id=artifact_id,
-            )
-        except ArtifactNotFound as error:
-            raise HTTPException(status_code=404, detail="Artifact not found") from error
-        return artifact.model_dump(mode="json")
-
     return router
 
 
@@ -869,7 +848,7 @@ def register_v2_routes(
     app: FastAPI,
     *,
     enabled: bool,
-    graph: TracerGraph | None = None,
+    graph: LinearGraphStream | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
@@ -878,27 +857,26 @@ def register_v2_routes(
     groundedness_actor: GroundednessActor | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     thread_resume_enabled: bool = False,
-    artifact_lookup_enabled: bool = True,
     output_assessment_audit: OutputAssessmentAudit | None = None,
 ) -> None:
     """Register the default-off v2 routes when explicitly enabled."""
     if enabled:
-        router = create_tracer_router(
+        router = create_linear_router(
             graph,
-            refinement_actor,
-            retriever,
-            ranker,
-            moderation_provider,
-            answer_actor,
-            groundedness_actor,
-            history_token_budget,
-            output_assessment_audit,
+            LinearGraphOverrides(
+                refinement_actor=refinement_actor,
+                retriever=retriever,
+                ranker=ranker,
+                moderation_provider=moderation_provider,
+                answer_actor=answer_actor,
+                groundedness_actor=groundedness_actor,
+                history_token_budget=history_token_budget,
+                output_assessment_audit=output_assessment_audit,
+            ),
         )
         disabled_control_paths: set[str] = set()
         if not thread_resume_enabled:
             disabled_control_paths.add("/v2/threads/{thread_id}/resume/stream")
-        if not artifact_lookup_enabled:
-            disabled_control_paths.add("/v2/artifacts/{artifact_id}")
         if disabled_control_paths:
             router.routes = [
                 route

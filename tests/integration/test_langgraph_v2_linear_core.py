@@ -16,13 +16,13 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import AnswerActor
-from app.langgraph_v2.api import TracerGraph, register_v2_routes
+from app.langgraph_v2.api import LinearGraphStream, register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
 )
-from app.langgraph_v2.graph import TracerState
+from app.langgraph_v2.graph import LinearGraphState
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
@@ -92,9 +92,9 @@ def parse_sse(response_text: str) -> list[dict[str, Any]]:
     return events
 
 
-def persistent_tracer_app(
+def persistent_linear_app(
     database_url: str,
-    graph: TracerGraph | None = None,
+    graph: LinearGraphStream | None = None,
     thread_resume_enabled: bool = False,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
@@ -102,7 +102,7 @@ def persistent_tracer_app(
     moderation_provider: ModerationProvider | None = None,
     answer_actor: AnswerActor | None = None,
 ) -> FastAPI:
-    """Create the test-only tracer with its real application database pool."""
+    """Create the test-only Linear Core with its real application database pool."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
@@ -228,7 +228,7 @@ async def test_captured_legacy_moderation_error_fixture() -> None:
     )
 
 
-def test_enabled_tracer_preserves_the_minimal_stream_contract(
+def test_enabled_linear_core_preserves_the_minimal_stream_contract(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     asyncio.run(
@@ -237,7 +237,7 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
         )
     )
     fixture = json.loads(FIXTURE_PATH.read_text())
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         response = client.post(
@@ -252,7 +252,7 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    UUID(response.headers["x-run-id"])
+    assert "x-run-id" not in response.headers
     assert response.headers["x-conversation-id"] == "conversation-123"
     assert response.text.endswith("\n\n")
     actual_events = parse_sse(response.text)
@@ -367,7 +367,7 @@ def test_released_uat_contract_fixture_matches_public_http_shapes(
             "contract-conversation",
         )
     )
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url)
     with TestClient(app) as client:
         success = client.post(
             "/v2/query/stream",
@@ -398,7 +398,7 @@ def test_released_uat_contract_fixture_matches_public_http_shapes(
 def test_request_header_and_generated_conversation_variants(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         missing_tenant = client.post("/v2/query/stream", json={"query": "hello"})
@@ -451,7 +451,7 @@ def test_query_authorizes_existing_conversation_before_streaming(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     asyncio.run(seed_subject_conversation(langgraph_v2_migrated_database_url))
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url)
     with TestClient(app) as client:
         owner = client.post(
             "/v2/query/stream",
@@ -501,7 +501,7 @@ def test_flagged_query_emits_error_before_finalization(
     asyncio.run(
         seed_subject_conversation(langgraph_v2_migrated_database_url, "conversation-1")
     )
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         response = client.post(
@@ -533,14 +533,14 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
 
     class DeterministicGraphFake:
         def __init__(self) -> None:
-            self.received_state: TracerState | None = None
+            self.received_state: LinearGraphState | None = None
 
         def astream(
             self, state: object | None, **options: Any
         ) -> AsyncIterator[object]:
             del options
             self.received_state = (
-                cast(TracerState, state) if isinstance(state, dict) else None
+                cast(LinearGraphState, state) if isinstance(state, dict) else None
             )
 
             async def stream() -> AsyncIterator[object]:
@@ -564,7 +564,7 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
             return stream()
 
     graph = DeterministicGraphFake()
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
 
     with TestClient(app) as client:
         response = client.post(
@@ -589,7 +589,7 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
 
 @pytest.mark.parametrize(
     "feature_flag",
-    ["LANGGRAPH_V2_UAT_ENABLED", "LANGGRAPH_V2_TRACER_ENABLED"],
+    ["LANGGRAPH_V2_UAT_ENABLED", "LANGGRAPH_V2_LINEAR_CORE_ENABLED"],
 )
 def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
     monkeypatch: pytest.MonkeyPatch,
@@ -629,6 +629,24 @@ def test_thread_resume_route_is_default_off() -> None:
     }
 
 
+def test_query_openapi_preserves_released_camel_case_request_fields() -> None:
+    app = FastAPI()
+    register_v2_routes(app, enabled=True)
+
+    request_schema = app.openapi()["components"]["schemas"]["V2QueryRequest"]
+    assert set(request_schema["properties"]) == {
+        "query",
+        "sessionId",
+        "clientRequestId",
+    }
+    assert (
+        V2QueryRequest.model_validate(
+            {"query": "hello", "session_id": "conversation-1"}
+        ).conversation_id
+        == "conversation-1"
+    )
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [
@@ -646,6 +664,7 @@ def test_removed_run_control_routes_are_404(method: str, path: str) -> None:
     assert "/v2/runs/{run_id}/resume/stream" not in v2_paths
     assert "/v2/runs/{run_id}/stream" not in v2_paths
     assert "/v2/runs/{run_id}/cancel" not in v2_paths
+    assert "/v2/artifacts/{artifact_id}" not in v2_paths
 
     with TestClient(app) as client:
         response = getattr(client, method)(

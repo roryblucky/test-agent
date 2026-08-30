@@ -14,9 +14,9 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.stream import GraphStreamCleanupError
-from tests.integration.test_langgraph_v2_tracer import (
+from tests.integration.test_langgraph_v2_linear_core import (
     close_stream_after_first_token,
-    persistent_tracer_app,
+    persistent_linear_app,
     seed_subject_conversation,
     stream_request,
     v2_stream_endpoint,
@@ -166,7 +166,7 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
         langgraph_v2_migrated_database_url, "conversation-1"
     )
     graph = _CompletedGraph()
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
@@ -207,7 +207,7 @@ async def test_query_retry_does_not_duplicate_turn_messages(
     await seed_subject_conversation(
         langgraph_v2_migrated_database_url, "conversation-1"
     )
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url, _RetryCompletedGraph()
     )
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
@@ -275,7 +275,7 @@ async def test_closing_query_sse_closes_graph_without_persisting_a_run(
             return self.stream
 
     graph = BlockingGraph()
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
             V2QueryRequest(query="hello", conversation_id="conversation-1"),
@@ -304,7 +304,7 @@ async def test_query_yields_answer_delta_before_graph_completion(
         langgraph_v2_migrated_database_url, "conversation-1"
     )
     graph = _RealtimeGraph()
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
@@ -346,7 +346,7 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
         langgraph_v2_migrated_database_url, "conversation-1"
     )
     answer_actor = _BlockingAnswerActor()
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         answer_actor=answer_actor,
     )
@@ -415,7 +415,7 @@ async def test_graph_close_failure_is_reported_after_request_cleanup(
             return self.stream
 
     graph = FailingCloseGraph()
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, graph)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
             V2QueryRequest(query="hello", conversation_id="conversation-1"),
@@ -457,7 +457,7 @@ async def test_graph_close_failure_without_primary_error_is_reported(
             del state, options
             return FailingCloseStream()
 
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, FailingCloseGraph())
+    app = persistent_linear_app(langgraph_v2_migrated_database_url, FailingCloseGraph())
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
             V2QueryRequest(query="hello", conversation_id="conversation-1"),
@@ -475,7 +475,7 @@ async def test_graph_close_failure_without_primary_error_is_reported(
 async def test_query_uses_request_owned_execution_without_local_runtime_state(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    app = persistent_linear_app(langgraph_v2_migrated_database_url)
     assert not hasattr(app.state, "langgraph_v2_runtime")
 
     async with app.router.lifespan_context(app):

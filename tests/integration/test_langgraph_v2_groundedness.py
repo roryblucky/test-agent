@@ -14,7 +14,7 @@ from app.langgraph_v2.answer import AnswerCitation, AnswerResult, AnswerStreamCh
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.groundedness import (
     GroundednessAssessment,
     GroundednessOutput,
@@ -26,9 +26,9 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
-from tests.integration.test_langgraph_v2_tracer import (
+from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
-    persistent_tracer_app,
+    persistent_linear_app,
     seed_subject_conversation,
 )
 
@@ -119,7 +119,7 @@ async def test_low_groundedness_is_advisory_on_each_execution(
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
         scope = await seed_artifact_scope(pool, turn_id=turn_id)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
@@ -130,7 +130,7 @@ async def test_low_groundedness_is_advisory_on_each_execution(
             answer_actor=_Answer(),
             groundedness_actor=evaluator,
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
             "turn_id": str(turn_id),
@@ -146,10 +146,13 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     assert "groundedness" in first
     assert "groundedness" in second
     assert first["groundedness"] == second["groundedness"]
-    assert "groundedness" in first
-    assert first["groundedness"].score == 0.2
+    first_groundedness = first["groundedness"]
+    assert first_groundedness is not None
+    assert first_groundedness.score == 0.2
     assert "final_response" in first
-    assert first["final_response"].answer == "answer [1]"
+    first_response = first["final_response"]
+    assert first_response is not None
+    assert first_response.answer == "answer [1]"
     groundedness_records = [
         record for record in audit.records if record.assessment_type == "groundedness"
     ]
@@ -174,7 +177,7 @@ def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
             conversation_id,
         )
     )
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         retriever=_Retriever(),
         ranker=_Ranker(),
@@ -209,6 +212,78 @@ def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
     assert asyncio.run(read_assistant_message()) == token_text
 
 
+def test_new_turn_does_not_inherit_prior_groundedness_when_evaluation_fails(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class SucceedsThenFails:
+        calls = 0
+
+        async def evaluate(
+            self, answer: str, documents: list[Document]
+        ) -> GroundednessAssessment:
+            del answer, documents
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("second-turn evaluator unavailable")
+            return GroundednessAssessment(
+                is_grounded=False,
+                score=0.2,
+                details="first-turn assessment",
+            )
+
+    conversation_id = "groundedness-turn-isolation"
+    asyncio.run(
+        seed_subject_conversation(
+            langgraph_v2_migrated_database_url,
+            conversation_id,
+        )
+    )
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+    )
+    app.state.langgraph_v2_groundedness_actor = SucceedsThenFails()
+    headers = {
+        "X-Application-Id": "tenant-a",
+        "X-Subject-Id": "subject-a",
+    }
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "first",
+                "sessionId": conversation_id,
+                "clientRequestId": "first-turn",
+            },
+            headers=headers,
+        )
+        second = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "second",
+                "sessionId": conversation_id,
+                "clientRequestId": "second-turn",
+            },
+            headers=headers,
+        )
+
+    first_done = parse_sse(first.text)[-1]
+    second_events = parse_sse(second.text)
+    second_done = second_events[-1]
+    assert first_done["type"] == "done"
+    assert first_done["data"]["groundedness"] == {
+        "is_grounded": False,
+        "score": 0.2,
+        "details": "first-turn assessment",
+    }
+    assert second_done["type"] == "done"
+    assert second_done["data"]["query"] == "second"
+    assert second_done["data"]["groundedness"] is None
+
+
 @pytest.mark.asyncio
 async def test_groundedness_failure_is_explicit_on_each_execution(
     langgraph_v2_migrated_database_url: str,
@@ -229,7 +304,7 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
         scope = await seed_artifact_scope(pool, turn_id=turn_id)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
@@ -240,7 +315,7 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
             answer_actor=_Answer(),
             groundedness_actor=evaluator,
         )
-        state: TracerState = {
+        state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
             "turn_id": str(turn_id),
@@ -258,7 +333,9 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         == "evaluator unavailable"
     )
     assert "final_response" in first
-    assert first["final_response"].answer == "answer [1]"
+    first_response = first["final_response"]
+    assert first_response is not None
+    assert first_response.answer == "answer [1]"
     groundedness_records = [
         record for record in audit.records if record.assessment_type == "groundedness"
     ]
@@ -278,7 +355,7 @@ async def test_groundedness_uses_only_cited_documents(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -297,7 +374,9 @@ async def test_groundedness_uses_only_cited_documents(
         )
 
     assert "groundedness" in result
-    assert result["groundedness"].score == 0.0
+    groundedness = result["groundedness"]
+    assert groundedness is not None
+    assert groundedness.score == 0.0
 
 
 @pytest.mark.asyncio
@@ -315,7 +394,7 @@ async def test_groundedness_rejects_out_of_range_scores(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
@@ -335,14 +414,16 @@ async def test_groundedness_rejects_out_of_range_scores(
 
     assert result.get("groundedness") is None
     assert "groundedness_error" in result
-    assert "less than or equal to 1" in result["groundedness_error"]
+    groundedness_error = result["groundedness_error"]
+    assert groundedness_error is not None
+    assert "less than or equal to 1" in groundedness_error
 
 
 @pytest.mark.asyncio
 async def test_groundedness_actor_setup_failure_is_advisory(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    app = persistent_tracer_app(
+    app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         retriever=_Retriever(),
         ranker=_Ranker(),
@@ -400,7 +481,7 @@ async def test_assessment_audit_failure_does_not_gate_answer(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         scope = await seed_artifact_scope(pool)
-        graph = build_tracer_graph(
+        graph = build_linear_graph(
             tenant_id="tenant-a",
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=scope.turn_id,
@@ -413,7 +494,7 @@ async def test_assessment_audit_failure_does_not_gate_answer(
         )
 
         result = await graph.ainvoke(
-            TracerState(
+            LinearGraphState(
                 query="hello",
                 conversation_id="c1",
                 client_request_id=None,
@@ -423,7 +504,9 @@ async def test_assessment_audit_failure_does_not_gate_answer(
     assert "answer" in result
     assert result["answer"] == "answer [1]"
     assert "final_response" in result
-    assert result["final_response"].answer == "answer [1]"
+    final_response = result["final_response"]
+    assert final_response is not None
+    assert final_response.answer == "answer [1]"
 
 
 @pytest.mark.asyncio
