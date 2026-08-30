@@ -19,7 +19,10 @@ from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.cancellation import CancellationRepository
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.pre_moderation import ModerationDecision
-from app.langgraph_v2.question_refinement import V2ResolvedQuery
+from app.langgraph_v2.question_refinement import (
+    QuestionRefinementResult,
+    V2ResolvedQuery,
+)
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import ClaimFenced, EventInput, RunEventRepository
@@ -357,11 +360,13 @@ class _CancelDuringRefinement:
 
     async def refine(
         self, query: str, history: Sequence[ConversationTurn]
-    ) -> V2ResolvedQuery:
+    ) -> QuestionRefinementResult:
         del history
         assert self.app is not None
         await _request_current_run_cancellation(self.app)
-        return V2ResolvedQuery(original_query=query, standalone_query=query)
+        return QuestionRefinementResult(
+            resolved_query=V2ResolvedQuery(original_query=query, standalone_query=query)
+        )
 
 
 class _Answer:

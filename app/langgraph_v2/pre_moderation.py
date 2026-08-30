@@ -11,7 +11,7 @@ from app.langgraph_v2.run_events import EventInput
 
 
 class ModerationDecision(BaseModel):
-    """Normalized moderation output safe to store in the phase journal."""
+    """Normalized moderation output carried in Graph State."""
 
     is_flagged: bool
     categories: dict[str, float] = Field(default_factory=dict)

@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from langchain_core.runnables import RunnableConfig
 
-from app.langgraph_v2.contracts import TracerStreamEvent
+from app.langgraph_v2.contracts import EventPersistence, TracerStreamEvent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,7 +44,9 @@ class GraphStreamCleanupError(RuntimeError):
     """The underlying LangGraph iterator failed while being closed."""
 
 
-async def _close_graph_iterator(graph_iterator: Any) -> tuple[bool, BaseException | None]:
+async def _close_graph_iterator(
+    graph_iterator: Any,
+) -> tuple[bool, BaseException | None]:
     """Await graph cleanup despite repeated cancellation signals."""
     close = getattr(graph_iterator, "aclose", None)
     if close is None:
@@ -107,13 +109,13 @@ async def stream_graph(
                 event_key = candidate.get("event_key")
                 if isinstance(event_key, str) and event_key in seen_event_keys:
                     continue
-                event, next_sequence = _event_from_mapping(
+                event, next_sequence, persistence = _event_from_mapping(
                     candidate,
                     next_sequence=next_sequence,
                     mode=mode,
                 )
                 seen_event_keys.add(event.event_key)
-                if event_sink is not None:
+                if event_sink is not None and persistence == "transport":
                     await event_sink(event)
                 yield event.to_sse()
     except BaseException as error:
@@ -127,7 +129,9 @@ async def stream_graph(
             _LOGGER.warning(
                 "Request-owned graph cleanup failed after a primary exception",
                 exc_info=(
-                    type(cleanup_error), cleanup_error, cleanup_error.__traceback__
+                    type(cleanup_error),
+                    cleanup_error,
+                    cleanup_error.__traceback__,
                 ),
             )
         if primary_error is None:
@@ -181,7 +185,7 @@ def _event_from_mapping(
     *,
     next_sequence: int,
     mode: str,
-) -> tuple[TracerStreamEvent, int]:
+) -> tuple[TracerStreamEvent, int, EventPersistence]:
     # Graph state updates may carry node-local journal sequences (and repeated
     # snapshots), so the SSE projection owns one contiguous public sequence.
     sequence = next_sequence + 1
@@ -196,4 +200,7 @@ def _event_from_mapping(
         step=mapping.get("step"),
         data=mapping.get("data"),
     )
-    return event, sequence
+    persistence = mapping.get("persistence", "transport")
+    if persistence not in {"none", "transport"}:
+        raise ValueError(f"unknown Graph event persistence: {persistence!r}")
+    return event, sequence, cast(EventPersistence, persistence)

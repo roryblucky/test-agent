@@ -14,7 +14,12 @@ from langgraph.graph.state import CompiledStateGraph
 from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
+from app.langgraph_v2.contracts import (
+    EventPersistence,
+    TracerGraphEvent,
+    TracerQueryResponse,
+    TracerStreamEvent,
+)
 from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
 from app.langgraph_v2.history import ConversationTurn, select_sliding_window_history
@@ -125,20 +130,33 @@ async def _query(
         ),
     )
     return {
-        "events": [_event_state(event, index) for index, event in enumerate(events, 1)],
+        "events": [
+            _event_state(event, index, persistence="none")
+            for index, event in enumerate(events, 1)
+        ],
         "history": history,
     }
 
 
-def _event_state(event: EventInput | EventRecord, sequence: int) -> dict[str, Any]:
+def _event_state(
+    event: EventInput | EventRecord,
+    sequence: int,
+    *,
+    persistence: EventPersistence = "transport",
+) -> dict[str, Any]:
     """Convert journal or in-memory event data into graph state."""
-    return TracerStreamEvent(
+    state_event = TracerGraphEvent(
         event_key=event.event_key,
         type=cast(Any, event.type),
         step=event.step,
         data=event.data,
         sequence=sequence,
-    ).model_dump(exclude_none=True)
+        persistence=persistence,
+    )
+    return state_event.model_dump(
+        exclude_none=True,
+        exclude={"persistence"} if persistence == "transport" else None,
+    )
 
 
 def canonical_query(query: str) -> str:
@@ -201,7 +219,7 @@ def build_tracer_graph(
             "events": [
                 *state["events"],
                 *[
-                    _event_state(event, sequence_start + index)
+                    _event_state(event, sequence_start + index, persistence="none")
                     for index, event in enumerate(events, 1)
                 ],
             ],
@@ -220,17 +238,20 @@ def build_tracer_graph(
             "events": [
                 *state["events"],
                 *[
-                    _event_state(event, len(state["events"]) + index)
+                    _event_state(
+                        event,
+                        len(state["events"]) + index,
+                        persistence="none",
+                    )
                     for index, event in enumerate(events, 1)
                 ],
             ],
             "halted": halted,
         }
         if result is not None:
-            update["refined_query"] = result.standalone_query
-            usage = getattr(selected_refinement_actor, "last_usage", {})
-            if usage:
-                update["refinement_usage"] = usage
+            update["refined_query"] = result.resolved_query.standalone_query
+            if result.usage:
+                update["refinement_usage"] = result.usage
         if error is not None:
             update["refinement_error"] = error
         return update

@@ -142,12 +142,13 @@ async def run_finalization(
             state.get("answer_usage", {}),
             state.get("refinement_usage", {}),
         ]
-        for phase_name in ("groundedness",):
-            phase = await context.repository.get_completed(
-                context.tenant_id, context.run_id, phase_name
-            )
-            if phase is not None and isinstance(phase.normalized_result, Mapping):
-                usages.append(phase.normalized_result.get("usage", {}))
+        groundedness = await context.repository.get_completed(
+            context.tenant_id, context.run_id, "groundedness"
+        )
+        if groundedness is not None and isinstance(
+            groundedness.normalized_result, Mapping
+        ):
+            usages.append(groundedness.normalized_result.get("usage", {}))
         usage = _combine_usage(usages)
         if usage is not None:
             normalized["metadata"]["usage"] = usage

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -15,6 +15,8 @@ from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRep
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
     PydanticAIQuestionRefinementActor,
+    QuestionRefinementResult,
+    V2ResolvedQuery,
 )
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.workflow import ResolvedQuery
@@ -78,7 +80,7 @@ async def test_refinement_failure_halts_before_later_phases(
     class FailingActor:
         async def refine(
             self, query: str, history: Sequence[ConversationTurn]
-        ) -> ResolvedQuery:
+        ) -> QuestionRefinementResult:
             del history
             raise ValueError(f"invalid output for {query}")
 
@@ -125,10 +127,14 @@ async def test_refinement_reexecution_reinvokes_actor_without_journal_events(
 
         async def refine(
             self, query: str, history: Sequence[ConversationTurn]
-        ) -> ResolvedQuery:
+        ) -> QuestionRefinementResult:
             del history
             self.calls += 1
-            return ResolvedQuery(original_query=query, standalone_query="standalone")
+            return QuestionRefinementResult(
+                resolved_query=V2ResolvedQuery(
+                    original_query=query, standalone_query="standalone"
+                )
+            )
 
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
@@ -179,7 +185,7 @@ async def test_pydantic_ai_actor_returns_agent_output() -> None:
 
     result = await actor.refine("raw")
 
-    assert result.standalone_query == "refined"
+    assert result.resolved_query.standalone_query == "refined"
 
 
 def test_http_query_uses_injected_refinement_actor(
@@ -203,10 +209,14 @@ def test_http_query_uses_injected_refinement_actor(
 
         async def refine(
             self, query: str, history: Sequence[ConversationTurn]
-        ) -> ResolvedQuery:
+        ) -> QuestionRefinementResult:
             del history
             self.calls += 1
-            return ResolvedQuery(original_query=query, standalone_query="http-refined")
+            return QuestionRefinementResult(
+                resolved_query=V2ResolvedQuery(
+                    original_query=query, standalone_query="http-refined"
+                )
+            )
 
     actor = CountingActor()
     app = persistent_tracer_app(
@@ -225,4 +235,24 @@ def test_http_query_uses_injected_refinement_actor(
 
     assert response.status_code == 200
     assert actor.calls == 1
-    assert parse_sse(response.text)[-1]["data"]["refined_query"] == "http-refined"
+    delivered = parse_sse(response.text)
+    assert delivered[-1]["data"]["refined_query"] == "http-refined"
+
+    async def read_event_keys() -> list[str]:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            events = await RunEventRepository(pool).list_events(
+                "tenant-a", UUID(response.headers["x-run-id"])
+            )
+            return [event.event_key for event in events]
+
+    event_keys = asyncio.run(read_event_keys())
+    assert all(
+        not event_key.startswith(
+            ("phase:query:", "phase:pre_moderation:", "phase:question_refinement:")
+        )
+        for event_key in event_keys
+    )
+    assert "phase:retrieval:step_completed:1" in event_keys
+    assert "phase:finalization:step_completed:1" in event_keys

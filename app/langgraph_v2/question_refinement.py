@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from typing import Any, Protocol
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
@@ -22,13 +22,20 @@ class V2ResolvedQuery(ResolvedQuery):
     standalone_query: str = Field(min_length=1)
 
 
+class QuestionRefinementResult(BaseModel):
+    """Validated refinement plus usage returned through the actor port."""
+
+    resolved_query: V2ResolvedQuery
+    usage: dict[str, Any] = Field(default_factory=dict)
+
+
 class QuestionRefinementActor(Protocol):
     """PydanticAI-backed seam for producing structured standalone questions."""
 
     async def refine(
         self, query: str, history: Sequence[ConversationTurn]
-    ) -> ResolvedQuery:
-        """Return a validated standalone question."""
+    ) -> QuestionRefinementResult:
+        """Return a validated standalone question and its model usage."""
         ...
 
 
@@ -37,10 +44,12 @@ class MockQuestionRefinementActor:
 
     async def refine(
         self, query: str, history: Sequence[ConversationTurn] = ()
-    ) -> ResolvedQuery:
+    ) -> QuestionRefinementResult:
         """Keep the query unchanged while satisfying the structured contract."""
         del history
-        return ResolvedQuery(original_query=query, standalone_query=query)
+        return QuestionRefinementResult(
+            resolved_query=V2ResolvedQuery(original_query=query, standalone_query=query)
+        )
 
 
 class PydanticAIQuestionRefinementActor:
@@ -48,11 +57,10 @@ class PydanticAIQuestionRefinementActor:
 
     def __init__(self, agent: Agent[Any, V2ResolvedQuery]) -> None:
         self._agent = agent
-        self.last_usage: dict[str, Any] = {}
 
     async def refine(
         self, query: str, history: Sequence[ConversationTurn] = ()
-    ) -> ResolvedQuery:
+    ) -> QuestionRefinementResult:
         """Run the agent and return its validated structured output."""
         if history:
             result = await self._agent.run(
@@ -62,12 +70,14 @@ class PydanticAIQuestionRefinementActor:
         else:
             result = await self._agent.run(query)
         usage_method = getattr(result, "usage", None)
+        usage_payload: dict[str, Any] = {}
         if callable(usage_method):
             usage = usage_method()
-            self.last_usage = (
-                asdict(usage) if is_dataclass(usage) else dict(vars(usage))
-            )
-        return result.output
+            usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
+        return QuestionRefinementResult(
+            resolved_query=V2ResolvedQuery.model_validate(result.output.model_dump()),
+            usage=usage_payload,
+        )
 
 
 def build_question_refinement_actor(
@@ -123,15 +133,15 @@ async def run_question_refinement(
     state: Mapping[str, Any],
     *,
     actor: QuestionRefinementActor,
-) -> tuple[tuple[EventInput, ...], bool, ResolvedQuery | None, str | None]:
+) -> tuple[tuple[EventInput, ...], bool, QuestionRefinementResult | None, str | None]:
     """Return refinement State without reading or writing an application journal."""
     try:
         history = [
             ConversationTurn.model_validate(turn) for turn in state.get("history", [])
         ]
-        refined = await actor.refine(state["query"], history)
-        result = V2ResolvedQuery.model_validate(refined.model_dump())
+        result = await actor.refine(state["query"], history)
+        result = QuestionRefinementResult.model_validate(result)
     except Exception as exc:
         message = str(exc) or REFINEMENT_ERROR_MESSAGE
         return refinement_events(error=message), True, None, message
-    return refinement_events(result), False, result, None
+    return refinement_events(result.resolved_query), False, result, None

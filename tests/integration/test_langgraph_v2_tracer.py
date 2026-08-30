@@ -603,13 +603,19 @@ def test_flagged_query_emits_error_before_finalization(
 
     run_id = UUID(response.headers["x-run-id"])
 
-    async def read_status() -> str:
+    async def read_run() -> tuple[str, list]:
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
-            return (await RunEventRepository(pool).get_run("tenant-a", run_id)).status
+            repository = RunEventRepository(pool)
+            return (
+                (await repository.get_run("tenant-a", run_id)).status,
+                await repository.list_events("tenant-a", run_id),
+            )
 
-    assert asyncio.run(read_status()) == "failed"
+    status, persisted = asyncio.run(read_run())
+    assert status == "interrupted"
+    assert persisted == []
 
 
 def test_failed_moderation_error_retry_is_idempotent(
@@ -738,9 +744,7 @@ def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
         "/v2/threads/{thread_id}/resume/stream",
     }
     assert {
-        path
-        for path in enabled_app.openapi()["paths"]
-        if path.startswith("/v2/")
+        path for path in enabled_app.openapi()["paths"] if path.startswith("/v2/")
     } == enabled_routes
 
     monkeypatch.delenv(feature_flag)
@@ -772,9 +776,7 @@ def test_removed_run_control_routes_are_404(method: str, path: str) -> None:
     app = FastAPI()
     register_v2_routes(app, enabled=True)
 
-    v2_paths = {
-        path for path in app.openapi()["paths"] if path.startswith("/v2/")
-    }
+    v2_paths = {path for path in app.openapi()["paths"] if path.startswith("/v2/")}
     assert "/v2/query/stream" in v2_paths
     assert "/v2/runs/{run_id}/resume/stream" not in v2_paths
     assert "/v2/runs/{run_id}/stream" not in v2_paths
@@ -792,14 +794,12 @@ def test_removed_run_control_routes_are_404(method: str, path: str) -> None:
     assert response.status_code == 404
 
 
-def test_completed_tracer_persists_its_run_and_every_delivered_event(
+def test_completed_tracer_persists_only_later_phase_and_terminal_events(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = "conversation-completed-tracer"
     asyncio.run(
-        seed_subject_conversation(
-            langgraph_v2_migrated_database_url, conversation_id
-        )
+        seed_subject_conversation(langgraph_v2_migrated_database_url, conversation_id)
     )
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
 
@@ -836,14 +836,8 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
 
     assert run.status == "completed"
     assert run.terminal_outcome == delivered[-1]["data"]
-    assert [event.sequence for event in persisted] == list(range(1, 14))
+    assert [event.sequence for event in persisted] == list(range(1, 8))
     assert [event.event_key for event in persisted] == [
-        "phase:query:step_start:1",
-        "phase:query:step_completed:1",
-        "phase:pre_moderation:step_start:1",
-        "phase:pre_moderation:step_completed:1",
-        "phase:question_refinement:step_start:1",
-        "phase:question_refinement:step_completed:1",
         "phase:retrieval:step_start:1",
         "phase:retrieval:step_completed:1",
         "phase:reranking:step_start:1",
@@ -852,7 +846,9 @@ def test_completed_tracer_persists_its_run_and_every_delivered_event(
         "phase:finalization:step_completed:1",
         "lifecycle:completed:0",
     ]
-    assert [event.type for event in persisted] == [event["type"] for event in delivered]
+    assert [event.type for event in persisted] == [
+        event["type"] for event in delivered[6:]
+    ]
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
     ]
@@ -868,9 +864,7 @@ def test_long_running_request_refreshes_its_claim(
     monkeypatch.setattr(api_module, "CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
 
     class SlowGraph:
-        def astream(
-            self, state: TracerState | None, **options: Any
-        ) -> AsyncIterator:
+        def astream(self, state: TracerState | None, **options: Any) -> AsyncIterator:
             del state, options
 
             async def stream() -> AsyncIterator:

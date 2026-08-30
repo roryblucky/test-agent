@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
+EventPersistence = Literal["none", "transport"]
+
 
 class V2QueryRequest(BaseModel):
     """Legacy-compatible query input with optional additive idempotency data."""
@@ -64,3 +66,9 @@ class TracerStreamEvent(BaseModel):
         r"""Serialize the event using the established ``data: JSON\n\n`` frame."""
         payload = self.model_dump(exclude={"event_key"}, exclude_none=True)
         return f"data: {json.dumps(payload, default=str)}\n\n"
+
+
+class TracerGraphEvent(TracerStreamEvent):
+    """Graph-State event with an explicit transitional journal policy."""
+
+    persistence: EventPersistence = "transport"

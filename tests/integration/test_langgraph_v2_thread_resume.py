@@ -29,9 +29,12 @@ from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.post_moderation import ModerationDecision
+from app.langgraph_v2.question_refinement import (
+    QuestionRefinementResult,
+    V2ResolvedQuery,
+)
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.domain import Document
-from app.models.workflow import ResolvedQuery
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
     parse_sse,
@@ -160,7 +163,7 @@ class _BlockingRefinementActor:
 
     async def refine(
         self, query: str, history: Sequence[ConversationTurn]
-    ) -> ResolvedQuery:
+    ) -> QuestionRefinementResult:
         del history
         self.calls += 1
         assert query == "hello"
@@ -178,10 +181,12 @@ class _SuccessfulRefinementActor:
 
     async def refine(
         self, query: str, history: Sequence[ConversationTurn]
-    ) -> ResolvedQuery:
+    ) -> QuestionRefinementResult:
         del history
         self.calls += 1
-        return ResolvedQuery(original_query=query, standalone_query=query)
+        return QuestionRefinementResult(
+            resolved_query=V2ResolvedQuery(original_query=query, standalone_query=query)
+        )
 
 
 async def _interrupt_query_after_answer_token(
@@ -223,12 +228,13 @@ async def _interrupt_query_after_answer_token(
 async def _interrupt_query_during_refinement(
     database_url: str,
 ) -> tuple[str, UUID, _BlockingRefinementActor]:
-    await seed_subject_conversation(database_url, "conversation-1")
+    conversation_id = "conversation-task41-refinement-resume"
+    await seed_subject_conversation(database_url, conversation_id)
     actor = _BlockingRefinementActor()
     app = persistent_tracer_app(database_url, refinement_actor=actor)
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            V2QueryRequest(query="hello", conversation_id=conversation_id),
             stream_request(app),
             request_context=TrustedRequestContext(
                 tenant_id="tenant-a", subject_id="subject-a"
@@ -353,11 +359,20 @@ async def _read_run(database_url: str, run_id: UUID):
         return await RunEventRepository(pool).get_run("tenant-a", run_id)
 
 
-async def _read_messages(database_url: str) -> list[MessageRecord]:
+async def _read_run_events(database_url: str, run_id: UUID):
+    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
+        return await RunEventRepository(pool).list_events("tenant-a", run_id)
+
+
+async def _read_messages(
+    database_url: str,
+    *,
+    conversation_id: str = "conversation-1",
+) -> list[MessageRecord]:
     async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
         return await ConversationMessageRepository(pool).list_messages(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="conversation-1",
+            conversation_id=conversation_id,
         )
 
 
@@ -596,7 +611,20 @@ def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
         )
 
     delivered = parse_sse(response.text)
-    messages = asyncio.run(_read_messages(langgraph_v2_migrated_database_url))
+    messages = asyncio.run(
+        _read_messages(
+            langgraph_v2_migrated_database_url,
+            conversation_id="conversation-task41-refinement-resume",
+        )
+    )
+    assistant_run_id = next(
+        message.run_id
+        for message in messages
+        if message.turn_id == turn_id and message.role == "assistant"
+    )
+    continuation_events = asyncio.run(
+        _read_run_events(langgraph_v2_migrated_database_url, assistant_run_id)
+    )
     assert response.status_code == 200
     assert interrupted_actor.calls == resumed_actor.calls == 1
     assert answer_actor.calls == 1
@@ -606,6 +634,21 @@ def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
     ]
     assert sum(event["type"] == "done" for event in delivered) == 1
     assert delivered[-1]["data"]["answer"] == "recovered answer"
+    assert {event.get("step") for event in delivered} >= {
+        "query",
+        "moderation:pre",
+        "llm:refine_question",
+    }
+    assert all(
+        not event.event_key.startswith(
+            ("phase:query:", "phase:pre_moderation:", "phase:question_refinement:")
+        )
+        for event in continuation_events
+    )
+    assert any(
+        event.event_key == "phase:retrieval:step_completed:1"
+        for event in continuation_events
+    )
     assert [
         (message.role, message.content)
         for message in messages

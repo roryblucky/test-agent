@@ -14,10 +14,13 @@ from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.question_refinement import (
+    QuestionRefinementResult,
+    V2ResolvedQuery,
+)
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from app.models.workflow import ResolvedQuery
 from tests.integration.test_langgraph_v2_tracer import (
     parse_sse,
     persistent_tracer_app,
@@ -39,9 +42,11 @@ class _RefinementActor:
         self,
         query: str,
         history: Sequence[ConversationTurn],
-    ) -> ResolvedQuery:
+    ) -> QuestionRefinementResult:
         self.histories.append(list(history))
-        return ResolvedQuery(original_query=query, standalone_query=query)
+        return QuestionRefinementResult(
+            resolved_query=V2ResolvedQuery(original_query=query, standalone_query=query)
+        )
 
 
 class _AnswerActor:

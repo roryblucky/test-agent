@@ -27,11 +27,15 @@ from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationDecision
+from app.langgraph_v2.question_refinement import (
+    QuestionRefinementResult,
+    V2ResolvedQuery,
+)
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.domain import Document, GroundednessResult, ModerationResult
-from app.models.workflow import CitationReference, ResolvedQuery
+from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 
@@ -79,13 +83,16 @@ class _Answer:
 
 
 class _UsageRefinement:
-    last_usage = {"input_tokens": 2, "output_tokens": 3}
-
     async def refine(
         self, query: str, history: Sequence[ConversationTurn]
-    ) -> ResolvedQuery:
+    ) -> QuestionRefinementResult:
         del history
-        return ResolvedQuery(original_query=query, standalone_query=query)
+        return QuestionRefinementResult(
+            resolved_query=V2ResolvedQuery(
+                original_query=query, standalone_query=query
+            ),
+            usage={"input_tokens": 2, "output_tokens": 3},
+        )
 
 
 class _Groundedness:

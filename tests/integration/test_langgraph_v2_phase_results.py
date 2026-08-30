@@ -48,6 +48,16 @@ def _phase_input(
     )
 
 
+class RecordingPhaseResultRepository(PhaseResultRepository):
+    def __init__(self, pool: AsyncConnectionPool) -> None:
+        super().__init__(pool)
+        self.phase_reads: list[PhaseName] = []
+
+    async def get_or_invoke(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.phase_reads.append(kwargs["phase_name"])
+        return await super().get_or_invoke(**kwargs)
+
+
 @pytest.mark.asyncio
 async def test_phase_result_commit_is_atomic_and_idempotent(
     langgraph_v2_migrated_database_url: str,
@@ -167,13 +177,6 @@ async def test_phase_replay_reuses_result_without_invocation(
 async def test_input_nodes_bypass_phase_and_event_journals_while_retrieval_uses_them(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    class RecordingRepository(PhaseResultRepository):
-        phase_reads: list[PhaseName] = []
-
-        async def get_or_invoke(self, **kwargs):  # type: ignore[no-untyped-def]
-            self.phase_reads.append(kwargs["phase_name"])
-            return await super().get_or_invoke(**kwargs)
-
     class Retriever:
         async def retrieve(self, query: str) -> RetrievalResult:
             return RetrievalResult(
@@ -191,7 +194,7 @@ async def test_input_nodes_bypass_phase_and_event_journals_while_retrieval_uses_
             conversation_id="conversation-1",
             owner_instance_id="instance-a",
         )
-        phases = RecordingRepository(pool)
+        phases = RecordingPhaseResultRepository(pool)
         graph = build_tracer_graph(
             phase_context=PhaseExecutionContext(
                 repository=phases,
@@ -228,13 +231,6 @@ async def test_input_nodes_bypass_phase_and_event_journals_while_retrieval_uses_
 async def test_flagged_input_stops_before_refinement_and_provider_access(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    class RecordingRepository(PhaseResultRepository):
-        phase_reads: list[PhaseName] = []
-
-        async def get_or_invoke(self, **kwargs):  # type: ignore[no-untyped-def]
-            self.phase_reads.append(kwargs["phase_name"])
-            return await super().get_or_invoke(**kwargs)
-
     class UnexpectedRefinementActor:
         async def refine(self, query, history):  # type: ignore[no-untyped-def]
             raise AssertionError(f"refinement received flagged input: {query!r}")
@@ -252,7 +248,7 @@ async def test_flagged_input_stops_before_refinement_and_provider_access(
             conversation_id="conversation-1",
             owner_instance_id="instance-a",
         )
-        phases = RecordingRepository(pool)
+        phases = RecordingPhaseResultRepository(pool)
         result = await build_tracer_graph(
             phase_context=PhaseExecutionContext(
                 repository=phases,
