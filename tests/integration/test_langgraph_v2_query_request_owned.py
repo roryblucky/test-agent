@@ -65,6 +65,12 @@ class _CompletedGraph:
         return self.stream
 
 
+class _RetryCompletedGraph:
+    def astream(self, state: Any, **options: Any) -> _CompletedStream:
+        del state, options
+        return _CompletedStream()
+
+
 class _RealtimeStream:
     def __init__(self) -> None:
         self.release = asyncio.Event()
@@ -195,6 +201,46 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
     }
     assert response.headers["x-thread-id"]
     assert run.status == "completed"
+    assert [(message.role, message.content) for message in messages] == [
+        ("user", "hello"),
+        ("assistant", "canonical answer"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_query_retry_does_not_duplicate_turn_messages(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url, "conversation-1"
+    )
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url, _RetryCompletedGraph()
+    )
+    context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+    payload = V2QueryRequest(
+        query="hello",
+        conversation_id="conversation-1",
+        client_request_id="request-1",
+    )
+
+    async with app.router.lifespan_context(app):
+        first = await v2_stream_endpoint(app)(
+            payload, stream_request(app), request_context=context
+        )
+        _ = [frame async for frame in first.body_iterator]
+        repeated = await v2_stream_endpoint(app)(
+            payload, stream_request(app), request_context=context
+        )
+        _ = [frame async for frame in repeated.body_iterator]
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            messages = await ConversationMessageRepository(pool).list_messages(
+                context=context, conversation_id="conversation-1"
+            )
+
+    assert first.headers["x-turn-id"] == repeated.headers["x-turn-id"]
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
         ("assistant", "canonical answer"),

@@ -84,9 +84,13 @@ async def _persisted_message_roles(database_url: str, run_id: UUID) -> list[str]
         async with pool.connection() as connection:
             result = await connection.execute(
                 """
-                SELECT role FROM langgraph_v2.messages
-                WHERE tenant_id = 'tenant-a' AND run_id = %s
-                ORDER BY created_at
+                SELECT messages.role
+                FROM langgraph_v2.messages AS messages
+                JOIN langgraph_v2.runs AS runs
+                  ON runs.tenant_id = messages.tenant_id
+                 AND runs.turn_id = messages.turn_id
+                WHERE runs.tenant_id = 'tenant-a' AND runs.run_id = %s
+                ORDER BY messages.created_at
                 """,
                 (run_id,),
             )

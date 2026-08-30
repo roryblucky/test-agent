@@ -22,7 +22,6 @@ def _message(
         tenant_id="tenant-a",
         message_id=UUID(int=order),
         conversation_id="conversation-1",
-        run_id=UUID(int=run_number),
         turn_id=UUID(int=turn_number or run_number),
         role=role,
         content=content,

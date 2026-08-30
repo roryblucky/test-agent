@@ -618,19 +618,26 @@ def create_tracer_router(
             terminal = False
             primary_error: BaseException | None = None
             try:
+                await message_repository.create_turn(
+                    context=request_context,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    content=payload.query,
+                    idempotency_key=user_idempotency_key,
+                )
                 claim = await repository.create_run(
                     tenant_id=tenant_id,
                     run_id=run_id,
                     conversation_id=conversation_id,
                     owner_instance_id=_INSTANCE_ID,
                 )
-                await message_repository.create_turn(
+                await message_repository.associate_run_with_turn(
                     context=request_context,
                     conversation_id=conversation_id,
                     run_id=run_id,
+                    owner_instance_id=claim.owner_instance_id,
+                    execution_epoch=claim.execution_epoch,
                     turn_id=turn_id,
-                    content=payload.query,
-                    idempotency_key=user_idempotency_key,
                 )
                 heartbeat_task = asyncio.create_task(
                     _refresh_claim(

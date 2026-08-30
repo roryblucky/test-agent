@@ -71,29 +71,76 @@ def test_turn_migration_backfills_user_deadline_from_authoritative_message(
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
         rows = connection.execute(
             """
-            SELECT role, turn_id, resume_deadline, run_id, content
+            SELECT role, turn_id, resume_deadline, content
             FROM langgraph_v2.messages
             ORDER BY role
             """
         ).fetchall()
-    assert rows[0] == ("assistant", run_id, None, run_id, "answer")
+        run_column = connection.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'langgraph_v2'
+              AND table_name = 'messages' AND column_name = 'run_id'
+            """
+        ).fetchone()
+    assert rows[0] == ("assistant", run_id, None, "answer")
     assert rows[1] == (
         "user",
         run_id,
         created_at,
-        run_id,
         "question",
     )
+    assert run_column is None
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
         assert connection.execute(
             "SELECT turn_id FROM langgraph_v2.runs WHERE run_id = %s", (run_id,)
         ).fetchone() == (run_id,)
+        connection.execute(
+            """
+            UPDATE langgraph_v2.conversations
+            SET owner_subject_id = 'subject-a'
+            WHERE tenant_id = %s AND conversation_id = %s
+            """,
+            (tenant_id, conversation_id),
+        )
+
+    async def read_migrated_messages() -> list[tuple[str, str]]:
+        async with AsyncConnectionPool(
+            langgraph_v2_test_database_url, min_size=1, max_size=2
+        ) as pool:
+            records = await ConversationMessageRepository(pool).list_messages(
+                context=TrustedRequestContext(
+                    tenant_id=tenant_id, subject_id="subject-a"
+                ),
+                conversation_id=conversation_id,
+            )
+        return [(record.role, record.content) for record in records]
+
+    assert sorted(asyncio.run(read_migrated_messages())) == [
+        ("assistant", "answer"),
+        ("user", "question"),
+    ]
+
+    command.downgrade(config, "0011_run_turn_association")
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        assert connection.execute(
+            """
+            SELECT role, run_id, turn_id
+            FROM langgraph_v2.messages
+            ORDER BY role
+            """
+        ).fetchall() == [
+            ("assistant", run_id, run_id),
+            ("user", run_id, run_id),
+        ]
 
     command.downgrade(config, "0009_conversation_authorization")
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
         assert connection.execute(
             "SELECT run_id, content FROM langgraph_v2.messages ORDER BY role"
         ).fetchall() == [(run_id, "answer"), (run_id, "question")]
+    command.downgrade(config, "base")
 
 
 def test_application_base_revision_upgrades_and_downgrades(

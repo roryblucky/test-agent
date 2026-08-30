@@ -71,13 +71,19 @@ async def test_thread_lookup_and_messages_require_conversation_authorization(
         conversation = await repository.resolve_conversation(
             context=context, conversation_id="conversation-1"
         )
-        message = await repository.persist_user_message(
-            tenant_id="tenant-a",
+        turn_id = uuid4()
+        await repository.create_turn(
+            context=context,
             conversation_id=conversation.conversation_id,
-            run_id=uuid4(),
+            turn_id=turn_id,
             content="hello",
             idempotency_key="authorization:user",
         )
+        message = (
+            await repository.list_messages(
+                context=context, conversation_id=conversation.conversation_id
+            )
+        )[0]
 
         assert (
             await repository.get_conversation_by_thread(

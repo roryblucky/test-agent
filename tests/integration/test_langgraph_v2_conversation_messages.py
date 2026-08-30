@@ -15,13 +15,10 @@ from app.langgraph_v2.conversation_messages import (
     ConversationRecord,
     MessageInvariantConflict,
     ResumeExpired,
+    TurnNotFound,
     TurnSuperseded,
 )
-from app.langgraph_v2.runs import (
-    ClaimFenced,
-    RunRecord,
-    RunRepository,
-)
+from app.langgraph_v2.runs import RunRecord, RunRepository
 
 
 class _PausingAdmissionRepository(ConversationMessageRepository):
@@ -62,19 +59,12 @@ async def _seed_admission_case(
     messages: ConversationMessageRepository,
     runs: RunRepository,
     context: TrustedRequestContext,
-) -> tuple[UUID, RunRecord, RunRecord]:
+) -> tuple[UUID, RunRecord]:
     await messages.resolve_conversation(context=context, conversation_id="session-1")
-    original_run = await runs.create_run(
-        tenant_id="tenant-a",
-        run_id=uuid4(),
-        conversation_id="session-1",
-        owner_instance_id="original-instance",
-    )
     original_turn_id = uuid4()
     await messages.create_turn(
         context=context,
         conversation_id="session-1",
-        run_id=original_run.run_id,
         turn_id=original_turn_id,
         content="original question",
         idempotency_key=f"turn:{original_turn_id}:user",
@@ -85,13 +75,7 @@ async def _seed_admission_case(
         conversation_id="session-1",
         owner_instance_id="resume-instance",
     )
-    query_run = await runs.create_run(
-        tenant_id="tenant-a",
-        run_id=uuid4(),
-        conversation_id="session-1",
-        owner_instance_id="query-instance",
-    )
-    return original_turn_id, resume_run, query_run
+    return original_turn_id, resume_run
 
 
 @pytest.mark.asyncio
@@ -103,7 +87,7 @@ async def test_query_admission_blocks_resume_then_supersedes_it(
     ) as pool:
         context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
         messages = ConversationMessageRepository(pool)
-        original_turn_id, resume_run, query_run = await _seed_admission_case(
+        original_turn_id, resume_run = await _seed_admission_case(
             messages, RunRepository(pool), context
         )
         lock_acquired = asyncio.Event()
@@ -118,7 +102,6 @@ async def test_query_admission_blocks_resume_then_supersedes_it(
             query_messages.create_turn(
                 context=context,
                 conversation_id="session-1",
-                run_id=query_run.run_id,
                 turn_id=new_turn_id,
                 content="new question",
                 idempotency_key=f"turn:{new_turn_id}:user",
@@ -153,7 +136,7 @@ async def test_resume_admission_blocks_query_until_resume_is_bound(
     ) as pool:
         context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
         messages = ConversationMessageRepository(pool)
-        original_turn_id, resume_run, query_run = await _seed_admission_case(
+        original_turn_id, resume_run = await _seed_admission_case(
             messages, RunRepository(pool), context
         )
         lock_acquired = asyncio.Event()
@@ -179,7 +162,6 @@ async def test_resume_admission_blocks_query_until_resume_is_bound(
             messages.create_turn(
                 context=context,
                 conversation_id="session-1",
-                run_id=query_run.run_id,
                 turn_id=new_turn_id,
                 content="new question",
                 idempotency_key=f"turn:{new_turn_id}:user",
@@ -209,13 +191,10 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
             conversation_id="session-1",
         )
         turn_id = uuid4()
-        run_id = uuid4()
-
         first = await repository.create_turn(
             context=context,
             conversation_id="session-1",
             turn_id=turn_id,
-            run_id=run_id,
             content="hello",
             idempotency_key="turn-1:user",
         )
@@ -223,7 +202,6 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
             context=context,
             conversation_id="session-1",
             turn_id=turn_id,
-            run_id=run_id,
             content="hello",
             idempotency_key="turn-1:user",
         )
@@ -242,7 +220,6 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
                 context=context,
                 conversation_id="session-1",
                 turn_id=turn_id,
-                run_id=run_id,
                 content="changed",
                 idempotency_key="turn-1:user",
             )
@@ -251,7 +228,6 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
                 context=context,
                 conversation_id="session-1",
                 turn_id=turn_id,
-                run_id=run_id,
                 content="hello",
                 idempotency_key="turn-1:different-key",
             )
@@ -263,7 +239,6 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
             context=context,
             conversation_id="session-1",
             turn_id=turn_id,
-            run_id=run_id,
             content="hello",
             idempotency_key="turn-1:user",
         )
@@ -318,46 +293,65 @@ async def test_session_identity_resolves_once_per_tenant(
 
 
 @pytest.mark.asyncio
-async def test_user_message_is_idempotent_and_tenant_scoped(
+async def test_turn_messages_are_idempotent_without_a_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = ConversationMessageRepository(pool)
-        run_id = uuid4()
+        context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
         await repository.resolve_conversation(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            context=context,
             conversation_id="session-1",
         )
+        turn_id = uuid4()
 
-        first = await repository.persist_user_message(
-            tenant_id="tenant-a",
+        first_turn = await repository.create_turn(
+            context=context,
             conversation_id="session-1",
-            run_id=run_id,
+            turn_id=turn_id,
             content="hello",
-            idempotency_key="request-1:user",
+            idempotency_key=f"turn:{turn_id}:user",
         )
-        repeated = await repository.persist_user_message(
+        repeated_turn = await repository.create_turn(
+            context=context,
+            conversation_id="session-1",
+            turn_id=turn_id,
+            content="hello",
+            idempotency_key=f"turn:{turn_id}:user",
+        )
+        first = await repository.persist_assistant_message(
             tenant_id="tenant-a",
             conversation_id="session-1",
-            run_id=run_id,
-            content="hello",
-            idempotency_key="request-1:user",
+            turn_id=turn_id,
+            content="answer",
+            idempotency_key=f"turn:{turn_id}:assistant",
+        )
+        repeated = await repository.persist_assistant_message(
+            tenant_id="tenant-a",
+            conversation_id="session-1",
+            turn_id=turn_id,
+            content="answer",
+            idempotency_key=f"turn:{turn_id}:assistant",
         )
 
         assert repeated == first
-        assert await repository.list_messages(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="session-1",
-        ) == [first]
+        assert repeated_turn == first_turn
+        records = await repository.list_messages(
+            context=context, conversation_id="session-1"
+        )
+        assert [(record.role, record.content) for record in records] == [
+            ("user", "hello"),
+            ("assistant", "answer"),
+        ]
         with pytest.raises(MessageInvariantConflict):
-            await repository.persist_user_message(
+            await repository.persist_assistant_message(
                 tenant_id="tenant-a",
                 conversation_id="session-1",
-                run_id=run_id,
+                turn_id=turn_id,
                 content="changed",
-                idempotency_key="request-1:user",
+                idempotency_key=f"turn:{turn_id}:assistant",
             )
         with pytest.raises(ConversationNotFound):
             await repository.get_message(
@@ -370,197 +364,39 @@ async def test_user_message_is_idempotent_and_tenant_scoped(
 
 
 @pytest.mark.asyncio
-async def test_assistant_message_requires_successful_run_completion(
+async def test_assistant_message_requires_an_existing_user_turn(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         messages = ConversationMessageRepository(pool)
-        runs = RunRepository(pool)
+        context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
         await messages.resolve_conversation(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+            context=context,
             conversation_id="session-1",
-        )
-        completed = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="session-1",
-            owner_instance_id="instance-1",
-        )
-        failed = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="session-1",
-            owner_instance_id="instance-1",
-        )
-        cancelled = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="session-1",
-            owner_instance_id="instance-1",
-        )
-        interrupted = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="session-1",
-            owner_instance_id="instance-1",
         )
         turn_id = uuid4()
-        await messages.persist_user_message(
-            tenant_id="tenant-a",
+        await messages.create_turn(
+            context=context,
             conversation_id="session-1",
-            run_id=completed.run_id,
             turn_id=turn_id,
             content="question",
-            idempotency_key=f"run:{completed.run_id}:user",
+            idempotency_key=f"turn:{turn_id}:user",
         )
-        async with pool.connection() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    """
-                    UPDATE langgraph_v2.runs
-                    SET status = CASE
-                        WHEN run_id = %s THEN 'completed'
-                        WHEN run_id = %s THEN 'failed'
-                        WHEN run_id = %s THEN 'cancelled'
-                        ELSE 'interrupted'
-                    END
-                    WHERE tenant_id = %s AND run_id IN (%s, %s, %s, %s)
-                    """,
-                    (
-                        completed.run_id,
-                        failed.run_id,
-                        cancelled.run_id,
-                        "tenant-a",
-                        completed.run_id,
-                        failed.run_id,
-                        cancelled.run_id,
-                        interrupted.run_id,
-                    ),
-                )
-
-        first = await messages.persist_assistant_message_after_completion(
+        assistant = await messages.persist_assistant_message(
             tenant_id="tenant-a",
             conversation_id="session-1",
-            run_id=completed.run_id,
             turn_id=turn_id,
             content="safe answer",
-            idempotency_key=f"run:{completed.run_id}:assistant",
+            idempotency_key=f"turn:{turn_id}:assistant",
         )
-        repeated = await messages.persist_assistant_message_after_completion(
-            tenant_id="tenant-a",
-            conversation_id="session-1",
-            run_id=completed.run_id,
-            turn_id=turn_id,
-            content="safe answer",
-            idempotency_key=f"run:{completed.run_id}:assistant",
-        )
-
-        other_turn = uuid4()
-        await messages.persist_user_message(
-            tenant_id="tenant-a",
-            conversation_id="session-1",
-            run_id=interrupted.run_id,
-            turn_id=other_turn,
-            content="other question",
-            idempotency_key=f"turn:{other_turn}:user",
-        )
-        with pytest.raises(ClaimFenced):
-            await messages.persist_assistant_message_after_completion(
+        assert assistant.turn_id == turn_id
+        with pytest.raises(TurnNotFound):
+            await messages.persist_assistant_message(
                 tenant_id="tenant-a",
                 conversation_id="session-1",
-                run_id=completed.run_id,
-                turn_id=other_turn,
-                content="must not persist",
-                idempotency_key=f"turn:{other_turn}:assistant",
+                turn_id=uuid4(),
+                content="orphan",
+                idempotency_key="orphan:assistant",
             )
-
-        assert repeated == first
-        assert first.turn_id == turn_id
-        for blocked in (failed, cancelled, interrupted):
-            with pytest.raises(ClaimFenced):
-                await messages.persist_assistant_message_after_completion(
-                    tenant_id="tenant-a",
-                    conversation_id="session-1",
-                    run_id=blocked.run_id,
-                    turn_id=turn_id,
-                    content="must not persist",
-                    idempotency_key=f"run:{blocked.run_id}:assistant",
-                )
-        assert [
-            message.content
-            for message in await messages.list_messages(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="session-1",
-            )
-        ] == ["question", "safe answer", "other question"]
-
-
-@pytest.mark.asyncio
-async def test_resume_retry_reuses_the_user_message(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        messages = ConversationMessageRepository(pool)
-        runs = RunRepository(pool)
-        await messages.resolve_conversation(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="session-1",
-        )
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="session-1",
-            owner_instance_id="instance-1",
-        )
-        await messages.persist_user_message(
-            tenant_id="tenant-a",
-            conversation_id="session-1",
-            run_id=run.run_id,
-            content="hello",
-            idempotency_key="retry:user",
-        )
-        await runs.update_checkpoint_pointer(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-            checkpoint_id="checkpoint-1",
-            checkpoint_ns="namespace-1",
-        )
-        async with pool.connection() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    "UPDATE langgraph_v2.runs SET status = 'interrupted', owner_instance_id = '' WHERE tenant_id = %s AND run_id = %s",
-                    ("tenant-a", run.run_id),
-                )
-        resumed = await runs.resume_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id="instance-2",
-        )
-        repeated = await messages.persist_user_message(
-            tenant_id="tenant-a",
-            conversation_id=resumed.conversation_id,
-            run_id=run.run_id,
-            content="hello",
-            idempotency_key="retry:user",
-        )
-
-        assert repeated.run_id == run.run_id
-        assert (
-            len(
-                await messages.list_messages(
-                    context=TrustedRequestContext(
-                        tenant_id="tenant-a", subject_id="subject-a"
-                    ),
-                    conversation_id="session-1",
-                )
-            )
-            == 1
-        )

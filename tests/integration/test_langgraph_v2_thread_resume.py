@@ -297,7 +297,6 @@ async def _seed_pre_answer_checkpoint(
         turn = await messages.create_turn(
             context=context,
             conversation_id=conversation.conversation_id,
-            run_id=run.run_id,
             turn_id=turn_id,
             content="resume me",
             idempotency_key=f"turn:{turn_id}:user",
@@ -359,6 +358,24 @@ async def _read_run(database_url: str, run_id: UUID):
         return await RunRepository(pool).get_run("tenant-a", run_id)
 
 
+async def _read_completed_run_id_for_turn(database_url: str, turn_id: UUID) -> UUID:
+    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
+        async with pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    SELECT run_id
+                    FROM langgraph_v2.runs
+                    WHERE tenant_id = 'tenant-a' AND turn_id = %s
+                      AND status = 'completed'
+                    """,
+                    (turn_id,),
+                )
+            ).fetchone()
+    assert row is not None
+    return UUID(str(row[0]))
+
+
 async def _read_messages(
     database_url: str,
     *,
@@ -388,17 +405,10 @@ async def _expire_turn(database_url: str, turn_id: UUID) -> None:
 async def _create_superseding_turn(database_url: str) -> None:
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="superseding-instance",
-        )
         turn_id = uuid4()
         await ConversationMessageRepository(pool).create_turn(
             context=context,
             conversation_id="conversation-1",
-            run_id=run.run_id,
             turn_id=turn_id,
             content="newer question",
             idempotency_key=f"turn:{turn_id}:user",
@@ -434,7 +444,6 @@ async def _advance_same_turn_checkpoint(
         await messages.create_turn(
             context=context,
             conversation_id=conversation.conversation_id,
-            run_id=run.run_id,
             turn_id=turn_id,
             content="resume me",
             idempotency_key=f"turn:{turn_id}:user",
@@ -563,9 +572,15 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
             params={"expectedTurnId": str(turn_id)},
         )
+        repeated = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+            params={"expectedTurnId": str(turn_id)},
+        )
 
     delivered = parse_sse(response.text)
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
+    assert repeated.status_code == 409
     assert response.headers["x-thread-id"] == thread_id
     assert response.headers["x-conversation-id"] == "conversation-1"
     assert response.headers["x-turn-id"] == str(turn_id)
@@ -594,8 +609,6 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
         for message in messages
         if message.turn_id == turn_id
     ] == [("user", "resume me"), ("assistant", "recovered answer")]
-    turn_messages = [message for message in messages if message.turn_id == turn_id]
-    assert turn_messages[0].run_id != turn_messages[1].run_id
 
 
 def test_thread_resume_does_not_insert_transport_events(
@@ -1003,10 +1016,10 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
         _read_turn(langgraph_v2_migrated_database_url, turn_id)
     )
     messages = asyncio.run(_read_messages(langgraph_v2_migrated_database_url))
-    assistant_run_id = next(
-        message.run_id
-        for message in messages
-        if message.turn_id == turn_id and message.role == "assistant"
+    assistant_run_id = asyncio.run(
+        _read_completed_run_id_for_turn(
+            langgraph_v2_migrated_database_url, turn_id
+        )
     )
     original_run = asyncio.run(_read_run(langgraph_v2_migrated_database_url, run_id))
     assistant_run = asyncio.run(

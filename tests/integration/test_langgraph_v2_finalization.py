@@ -333,7 +333,6 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
         await messages.create_turn(
             context=request_context,
             conversation_id="c1",
-            run_id=run.run_id,
             turn_id=turn_id,
             content="hello",
             idempotency_key=f"turn:{turn_id}:user",

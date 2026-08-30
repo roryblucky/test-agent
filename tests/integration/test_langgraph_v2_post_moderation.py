@@ -9,6 +9,7 @@ from psycopg_pool import AsyncConnectionPool
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
@@ -18,6 +19,12 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
+from tests.integration.test_langgraph_v2_tracer import (
+    persistent_tracer_app,
+    seed_subject_conversation,
+    stream_request,
+    v2_stream_endpoint,
+)
 
 
 class _Retriever:
@@ -86,6 +93,44 @@ def _state() -> TracerState:
 
 
 @pytest.mark.asyncio
+async def test_flagged_answer_persists_original_complete_answer_through_http(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url, "conversation-1"
+    )
+    moderation = _FlaggingModeration()
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        moderation_provider=moderation,
+        answer_actor=_Answer(),
+    )
+
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            stream_request(app),
+            request_context=context,
+        )
+        _ = [frame async for frame in response.body_iterator]
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            messages = await ConversationMessageRepository(pool).list_messages(
+                context=context, conversation_id="conversation-1"
+            )
+
+    assert moderation.calls == 2
+    assert [(message.role, message.content) for message in messages] == [
+        ("user", "hello"),
+        ("assistant", "generated answer"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_safe_answer_passes_post_moderation_unchanged(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -104,12 +149,15 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
             conversation_id="c1",
         )
-        await messages.persist_user_message(
-            tenant_id="tenant-a",
+        turn_id = uuid4()
+        await messages.create_turn(
+            context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
             conversation_id="c1",
-            run_id=run.run_id,
+            turn_id=turn_id,
             content="hello",
-            idempotency_key=f"run:{run.run_id}:user",
+            idempotency_key=f"turn:{turn_id}:user",
         )
         moderation = _SafeModeration()
         graph = build_tracer_graph(
@@ -151,14 +199,16 @@ async def test_flagged_answer_remains_canonical_through_finalization(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
             conversation_id="c1",
         )
-        await messages.persist_user_message(
-            tenant_id="tenant-a",
-            conversation_id="c1",
-            run_id=run.run_id,
-            content="hello",
-            idempotency_key=f"run:{run.run_id}:user",
-        )
         turn_id = uuid4()
+        await messages.create_turn(
+            context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
+            conversation_id="c1",
+            turn_id=turn_id,
+            content="hello",
+            idempotency_key=f"turn:{turn_id}:user",
+        )
         audit = MockOutputAssessmentAudit()
         graph = build_tracer_graph(
             tenant_id="tenant-a",
