@@ -574,6 +574,9 @@ async def _persist_setup_failure(
 
 type TracerGraph = RequestOwnedGraph
 
+_REMOVED_REPLAY_QUERY_PARAMETERS = frozenset(
+    {"afterSequence", "after_sequence", "cursor"}
+)
 _RESUMABLE_NODES = frozenset(
     {
         "pre_moderation",
@@ -588,8 +591,19 @@ _RESUMABLE_NODES = frozenset(
 )
 
 
+def _reject_removed_replay_query_parameters(request: Request) -> None:
+    """Reject replay cursors removed with the old Run control API."""
+    removed = _REMOVED_REPLAY_QUERY_PARAMETERS.intersection(request.query_params)
+    if removed:
+        parameter = sorted(removed)[0]
+        raise HTTPException(
+            status_code=422,
+            detail=f"Replay query parameter is no longer supported: {parameter}",
+        )
+
+
 class ThreadResumeConflict(RuntimeError):
-    """A thread checkpoint cannot be recovered by the pre-Answer Resume route."""
+    """A thread checkpoint cannot be recovered by the thread Resume route."""
 
 
 @dataclass(frozen=True)
@@ -720,9 +734,10 @@ def create_tracer_router(
     ) -> StreamingResponse:
         """Run the deterministic tracer and return its events as SSE."""
         del x_user_groups
+        _reject_removed_replay_query_parameters(http_request)
         _ensure_tenant_available(http_request.app, request_context.tenant_id)
         run_id = uuid.uuid4()
-        x_application_id = request_context.tenant_id
+        tenant_id = request_context.tenant_id
         configured_pool = getattr(
             http_request.app.state,
             "langgraph_v2_postgres_pool",
@@ -739,7 +754,7 @@ def create_tracer_router(
         cancellation_observer = CancellationObserver(
             cancellation_repository,
             wakeups,
-            tenant_id=x_application_id,
+            tenant_id=tenant_id,
             run_id=run_id,
         )
         message_repository = _message_repository(http_request.app, pool)
@@ -762,7 +777,7 @@ def create_tracer_router(
             turn_id = uuid.uuid4()
         else:
             turn_id = turn_id_for_client_request(
-                x_application_id, conversation_id, payload.client_request_id
+                tenant_id, conversation_id, payload.client_request_id
             )
         user_idempotency_key = f"turn:{turn_id}:user"
 
@@ -774,7 +789,7 @@ def create_tracer_router(
             primary_error: BaseException | None = None
             try:
                 claim = await repository.create_run(
-                    tenant_id=x_application_id,
+                    tenant_id=tenant_id,
                     run_id=run_id,
                     conversation_id=conversation_id,
                     owner_instance_id=_INSTANCE_ID,
@@ -791,7 +806,7 @@ def create_tracer_router(
                 heartbeat_task = asyncio.create_task(
                     _refresh_claim(
                         repository,
-                        x_application_id,
+                        tenant_id,
                         run_id,
                         claim.owner_instance_id,
                         claim.execution_epoch,
@@ -804,14 +819,14 @@ def create_tracer_router(
                 )
                 configured_refinement_actor = _resolve_refinement_actor(
                     http_request.app,
-                    x_application_id,
+                    tenant_id,
                     refinement_actor,
                 )
                 configured_answer_actor = _resolve_answer_actor(
-                    http_request.app, x_application_id, answer_actor
+                    http_request.app, tenant_id, answer_actor
                 )
                 configured_groundedness_actor = _resolve_groundedness_actor_safely(
-                    http_request.app, x_application_id, groundedness_actor
+                    http_request.app, tenant_id, groundedness_actor
                 )
                 configured_output_assessment_audit = _resolve_output_assessment_audit(
                     http_request.app, output_assessment_audit
@@ -822,7 +837,7 @@ def create_tracer_router(
                     configured_moderation,
                 ) = _resolve_phase_providers(
                     http_request.app,
-                    x_application_id,
+                    tenant_id,
                     retriever=retriever,
                     ranker=ranker,
                     moderation_provider=moderation_provider,
@@ -837,13 +852,13 @@ def create_tracer_router(
                         request_context=request_context,
                         history_token_budget=history_token_budget,
                         current_turn_id=turn_id,
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
                         cancellation_check=_resolve_cancellation_check(
                             http_request.app,
-                            x_application_id,
+                            tenant_id,
                             run_id,
                             cancellation_observer,
                         ),
@@ -857,7 +872,7 @@ def create_tracer_router(
                             checkpoint_ns: str,
                         ) -> None:
                             await repository.update_checkpoint_pointer(
-                                tenant_id=x_application_id,
+                                tenant_id=tenant_id,
                                 run_id=run_id,
                                 owner_instance_id=claim.owner_instance_id,
                                 execution_epoch=claim.execution_epoch,
@@ -899,7 +914,7 @@ def create_tracer_router(
                         repository,
                         message_repository,
                         event,
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         conversation_id=conversation_id,
                         turn_id=turn_id,
@@ -917,7 +932,7 @@ def create_tracer_router(
                         repository,
                         message_repository,
                         event,
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         conversation_id=conversation_id,
                         turn_id=turn_id,
@@ -938,7 +953,7 @@ def create_tracer_router(
             except CancellationObserved:
                 if claim is not None:
                     stopped = await cancellation_repository.apply_if_requested(
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
@@ -964,7 +979,7 @@ def create_tracer_router(
                     with suppress(ClaimFenced, RunNotFound):
                         failure = await _persist_setup_failure(
                             repository,
-                            tenant_id=x_application_id,
+                            tenant_id=tenant_id,
                             run_id=run_id,
                             owner_instance_id=claim.owner_instance_id,
                             execution_epoch=claim.execution_epoch,
@@ -981,7 +996,7 @@ def create_tracer_router(
                     claim=claim,
                     terminal=terminal,
                     primary_error=primary_error,
-                    tenant_id=x_application_id,
+                    tenant_id=tenant_id,
                     run_id=run_id,
                 )
 
@@ -1008,8 +1023,9 @@ def create_tracer_router(
         expected_turn_id: Annotated[uuid.UUID, Query(alias="expectedTurnId")],
     ) -> StreamingResponse:
         """Recover an authorized Conversation thread from its latest checkpoint."""
-        x_application_id = request_context.tenant_id
-        _ensure_tenant_available(http_request.app, x_application_id)
+        _reject_removed_replay_query_parameters(http_request)
+        tenant_id = request_context.tenant_id
+        _ensure_tenant_available(http_request.app, tenant_id)
         configured_pool = getattr(
             http_request.app.state,
             "langgraph_v2_postgres_pool",
@@ -1035,14 +1051,14 @@ def create_tracer_router(
         message_repository = _message_repository(http_request.app, pool)
         configured_refinement_actor = _resolve_refinement_actor(
             http_request.app,
-            x_application_id,
+            tenant_id,
             refinement_actor,
         )
         configured_answer_actor = _resolve_answer_actor(
-            http_request.app, x_application_id, answer_actor
+            http_request.app, tenant_id, answer_actor
         )
         configured_groundedness_actor = _resolve_groundedness_actor_safely(
-            http_request.app, x_application_id, groundedness_actor
+            http_request.app, tenant_id, groundedness_actor
         )
         configured_output_assessment_audit = _resolve_output_assessment_audit(
             http_request.app, output_assessment_audit
@@ -1053,7 +1069,7 @@ def create_tracer_router(
             configured_moderation,
         ) = _resolve_phase_providers(
             http_request.app,
-            x_application_id,
+            tenant_id,
             retriever=retriever,
             ranker=ranker,
             moderation_provider=moderation_provider,
@@ -1066,7 +1082,7 @@ def create_tracer_router(
                 message_repository=message_repository,
                 request_context=request_context,
                 history_token_budget=history_token_budget,
-                tenant_id=x_application_id,
+                tenant_id=tenant_id,
                 run_id=uuid.UUID(int=0),
                 owner_instance_id="",
                 execution_epoch=0,
@@ -1102,7 +1118,7 @@ def create_tracer_router(
         cancellation_observer = CancellationObserver(
             cancellation_repository,
             wakeups,
-            tenant_id=x_application_id,
+            tenant_id=tenant_id,
             run_id=run_id,
         )
 
@@ -1114,7 +1130,7 @@ def create_tracer_router(
             primary_error: BaseException | None = None
             try:
                 claim = await repository.create_run(
-                    tenant_id=x_application_id,
+                    tenant_id=tenant_id,
                     run_id=run_id,
                     conversation_id=target.conversation.conversation_id,
                     owner_instance_id=_INSTANCE_ID,
@@ -1131,7 +1147,7 @@ def create_tracer_router(
                 heartbeat_task = asyncio.create_task(
                     _refresh_claim(
                         repository,
-                        x_application_id,
+                        tenant_id,
                         run_id,
                         claim.owner_instance_id,
                         claim.execution_epoch,
@@ -1143,7 +1159,7 @@ def create_tracer_router(
                     checkpoint_ns: str,
                 ) -> None:
                     await repository.update_checkpoint_pointer(
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
@@ -1164,13 +1180,13 @@ def create_tracer_router(
                         request_context=request_context,
                         history_token_budget=history_token_budget,
                         current_turn_id=target.turn.turn_id,
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
                         cancellation_check=_resolve_cancellation_check(
                             http_request.app,
-                            x_application_id,
+                            tenant_id,
                             run_id,
                             cancellation_observer,
                         ),
@@ -1190,7 +1206,7 @@ def create_tracer_router(
                         repository,
                         message_repository,
                         event,
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         conversation_id=target.conversation.conversation_id,
                         turn_id=target.turn.turn_id,
@@ -1208,7 +1224,7 @@ def create_tracer_router(
                         repository,
                         message_repository,
                         event,
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         conversation_id=target.conversation.conversation_id,
                         turn_id=target.turn.turn_id,
@@ -1229,7 +1245,7 @@ def create_tracer_router(
             except CancellationObserved:
                 if claim is not None:
                     stopped = await cancellation_repository.apply_if_requested(
-                        tenant_id=x_application_id,
+                        tenant_id=tenant_id,
                         run_id=run_id,
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
@@ -1255,7 +1271,7 @@ def create_tracer_router(
                     with suppress(ClaimFenced, RunNotFound):
                         failure = await _persist_setup_failure(
                             repository,
-                            tenant_id=x_application_id,
+                            tenant_id=tenant_id,
                             run_id=run_id,
                             owner_instance_id=claim.owner_instance_id,
                             execution_epoch=claim.execution_epoch,
@@ -1272,7 +1288,7 @@ def create_tracer_router(
                     claim=claim,
                     terminal=terminal,
                     primary_error=primary_error,
-                    tenant_id=x_application_id,
+                    tenant_id=tenant_id,
                     run_id=run_id,
                 )
 
@@ -1292,7 +1308,7 @@ def create_tracer_router(
     async def get_artifact(  # pyright: ignore[reportUnusedFunction] -- FastAPI route
         artifact_id: uuid.UUID,
         http_request: Request,
-        x_application_id: Annotated[str, Header(alias="X-Application-Id")],
+        tenant_id: Annotated[str, Header(alias="X-Application-Id")],
     ) -> dict[str, Any]:
         """Read one Artifact through the caller's Tenant boundary."""
         configured_pool = getattr(
@@ -1304,7 +1320,7 @@ def create_tracer_router(
             )
         try:
             artifact = await ArtifactRepository(configured_pool).get(
-                tenant_id=x_application_id, artifact_id=artifact_id
+                tenant_id=tenant_id, artifact_id=artifact_id
             )
         except ArtifactNotFound as error:
             raise HTTPException(status_code=404, detail="Artifact not found") from error

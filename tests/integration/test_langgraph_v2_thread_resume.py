@@ -836,6 +836,51 @@ def test_thread_resume_rejects_non_recoverable_checkpoint_without_graph_executio
     assert answer_actor.calls == 0
 
 
+def test_thread_resume_rechecks_supersession_when_execution_starts(
+    langgraph_v2_migrated_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    thread_id, turn_id, _ = asyncio.run(
+        _seed_pre_answer_checkpoint(langgraph_v2_migrated_database_url)
+    )
+    original_associate = ConversationMessageRepository.associate_run_with_turn
+    superseded = False
+
+    async def associate_after_new_turn(
+        repository: ConversationMessageRepository, **kwargs: Any
+    ) -> None:
+        nonlocal superseded
+        if not superseded:
+            superseded = True
+            await _create_superseding_turn(langgraph_v2_migrated_database_url)
+        await original_associate(repository, **kwargs)
+
+    monkeypatch.setattr(
+        ConversationMessageRepository,
+        "associate_run_with_turn",
+        associate_after_new_turn,
+    )
+    answer_actor = _AnswerActor()
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        thread_resume_enabled=True,
+        answer_actor=answer_actor,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+            params={"expectedTurnId": str(turn_id)},
+        )
+
+    delivered = parse_sse(response.text)
+    assert response.status_code == 200
+    assert delivered[-1]["type"] == "error"
+    assert "has been superseded" in delivered[-1]["data"]
+    assert answer_actor.calls == 0
+
+
 def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:

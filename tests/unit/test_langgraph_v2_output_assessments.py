@@ -5,11 +5,30 @@ from uuid import uuid4
 import pytest
 
 from app.langgraph_v2.output_assessments import (
+    BigQueryOutputAssessmentAudit,
     MockOutputAssessmentAudit,
     OutputAssessmentAuditRecord,
     OutputAssessmentScope,
     output_assessment_id,
 )
+
+
+class _BigQueryClient:
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, list[dict[str, object]], list[str]]] = []
+
+    def insert_rows_json(
+        self,
+        table_ref: str,
+        rows: list[dict[str, object]],
+        *,
+        row_ids: list[str],
+    ) -> list[object]:
+        self.rows.append((table_ref, rows, row_ids))
+        return []
+
+    def close(self) -> None:
+        pass
 
 
 def test_output_assessment_identity_is_stable_and_type_specific() -> None:
@@ -39,6 +58,32 @@ async def test_mock_audit_records_tenant_turn_and_assessment_identity() -> None:
     await audit.record(record)
 
     assert audit.records == [record]
+
+
+@pytest.mark.asyncio
+async def test_bigquery_audit_writes_assessment_schema_with_stable_row_id() -> None:
+    turn_id = uuid4()
+    assessment_id = output_assessment_id(turn_id, "groundedness")
+    client = _BigQueryClient()
+    audit = BigQueryOutputAssessmentAudit(project_id="project-a", client=client)
+
+    await audit.record(
+        OutputAssessmentAuditRecord(
+            tenant_id="tenant-a",
+            conversation_id="conversation-a",
+            turn_id=turn_id,
+            assessment_id=assessment_id,
+            assessment_type="groundedness",
+            result={"is_grounded": True, "score": 1.0},
+        )
+    )
+
+    table_ref, rows, row_ids = client.rows[0]
+    assert table_ref == "project-a.audit_logs.kms_output_assessments"
+    assert row_ids == [assessment_id]
+    assert rows[0]["tenant_id"] == "tenant-a"
+    assert rows[0]["turn_id"] == str(turn_id)
+    assert rows[0]["result"] == {"is_grounded": True, "score": 1.0}
 
 
 @pytest.mark.asyncio

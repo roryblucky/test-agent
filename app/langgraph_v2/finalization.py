@@ -92,7 +92,7 @@ async def run_finalization(
     context: PhaseExecutionContext,
     artifacts: ArtifactStore,
 ) -> tuple[list[EventInput], TracerQueryResponse]:
-    """Assemble the publication payload and persist its complete Answer once."""
+    """Assemble the response and its checkpoint-owned finalization events."""
     documents = []
     if "answer" in state:
         documents = [

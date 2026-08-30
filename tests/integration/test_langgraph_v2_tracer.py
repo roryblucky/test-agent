@@ -105,6 +105,7 @@ def stream_request(app: FastAPI) -> Request:
             "type": "http",
             "method": "POST",
             "path": "/v2/query/stream",
+            "query_string": b"",
             "headers": [],
             "app": app,
         }
@@ -804,6 +805,40 @@ def test_removed_run_control_routes_are_404(method: str, path: str) -> None:
         )
 
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("path", "json_body"),
+    [
+        ("/v2/query/stream?afterSequence=3", {"query": "hello"}),
+        (
+            "/v2/threads/thread-a/resume/stream"
+            "?expectedTurnId=00000000-0000-0000-0000-000000000001"
+            "&afterSequence=3",
+            None,
+        ),
+    ],
+)
+def test_removed_replay_cursor_is_rejected(
+    path: str, json_body: dict[str, str] | None
+) -> None:
+    app = FastAPI()
+    register_v2_routes(app, enabled=True, thread_resume_enabled=True)
+
+    with TestClient(app) as client:
+        response = client.post(
+            path,
+            json=json_body,
+            headers={
+                "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-a",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": "Replay query parameter is no longer supported: afterSequence"
+    }
 
 
 def test_completed_tracer_uses_checkpoint_events_without_transport_journal(

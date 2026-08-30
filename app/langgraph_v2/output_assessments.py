@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
@@ -51,6 +53,69 @@ class LoggingOutputAssessmentAudit:
             "langgraph_v2 output assessment",
             extra={"output_assessment": assessment.model_dump(mode="json")},
         )
+
+
+class BigQueryOutputAssessmentAudit:
+    """Append completed-output assessments to their dedicated BigQuery table."""
+
+    def __init__(
+        self,
+        project_id: str,
+        *,
+        dataset: str = "audit_logs",
+        table: str = "kms_output_assessments",
+        client: Any = None,
+    ) -> None:
+        self._project_id = project_id
+        self._dataset = dataset
+        self._table = table
+        self._table_ref = f"{project_id}.{dataset}.{table}"
+        self._client = client
+
+    def _ensure_client(self) -> Any:
+        if self._client is None:
+            bigquery: Any = importlib.import_module("google.cloud.bigquery")
+            client: Any = bigquery.Client(project=self._project_id)
+            self._ensure_table(bigquery, client)
+            self._client = client
+        return self._client
+
+    def _ensure_table(self, bigquery: Any, client: Any) -> None:
+        dataset_ref = bigquery.DatasetReference(self._project_id, self._dataset)
+        dataset = bigquery.Dataset(dataset_ref)
+        dataset.location = "US"
+        client.create_dataset(dataset, exists_ok=True)
+        schema = [
+            bigquery.SchemaField("recorded_at", "TIMESTAMP", mode="REQUIRED"),
+            bigquery.SchemaField("tenant_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("conversation_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("turn_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("assessment_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("assessment_type", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("result", "JSON", mode="REQUIRED"),
+        ]
+        table_ref = bigquery.TableReference(dataset_ref, self._table)
+        client.create_table(bigquery.Table(table_ref, schema=schema), exists_ok=True)
+
+    async def record(self, assessment: OutputAssessmentAuditRecord) -> None:
+        """Insert one assessment using its stable identity for retry deduplication."""
+        row = {
+            "recorded_at": datetime.now(UTC).isoformat(),
+            **assessment.model_dump(mode="json"),
+        }
+        errors = self._ensure_client().insert_rows_json(
+            self._table_ref,
+            [row],
+            row_ids=[assessment.assessment_id],
+        )
+        if errors:
+            raise RuntimeError(f"BigQuery assessment insert failed: {errors}")
+
+    async def close(self) -> None:
+        """Close the lazily-created client during application shutdown."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
 
 class MockOutputAssessmentAudit:

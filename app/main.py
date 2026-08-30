@@ -91,6 +91,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     from app.core.audit import AuditLogger, AuditSink, BigQueryAuditSink, FileAuditSink
     from app.core.rate_limiter import create_rate_limiter
     from app.core.telemetry import TelemetryService
+    from app.langgraph_v2.output_assessments import (
+        BigQueryOutputAssessmentAudit,
+        LoggingOutputAssessmentAudit,
+    )
 
     # Initialize OpenTelemetry
     TelemetryService("agent-kms-api")
@@ -107,12 +111,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # Audit logger with configured sinks
     audit_sinks: list[AuditSink] = [FileAuditSink()]  # Always available for dev/debug
     gcp_project = os.environ.get("GCP_PROJECT_ID")
+    bigquery_assessment_audit: BigQueryOutputAssessmentAudit | None = None
     if gcp_project:
         try:
             audit_sinks.append(BigQueryAuditSink(project_id=gcp_project))
+            bigquery_assessment_audit = BigQueryOutputAssessmentAudit(
+                project_id=gcp_project
+            )
         except Exception:
             logger.warning("BigQuery audit sink not available, using file only")
     app.state.audit_logger = AuditLogger(sinks=audit_sinks)
+    app.state.langgraph_v2_output_assessment_audit = (
+        bigquery_assessment_audit or LoggingOutputAssessmentAudit()
+    )
 
     # Config hot-reloader
     app.state.config_reloader = ConfigReloader(app, http_pool)
@@ -129,6 +140,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     # Close audit logger
     await app.state.audit_logger.close()
+    if bigquery_assessment_audit is not None:
+        await bigquery_assessment_audit.close()
 
     # Close rate limiter if Redis-backed
     await app.state.rate_limiter.close()

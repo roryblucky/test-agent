@@ -36,6 +36,10 @@ class ResumeExpired(RuntimeError):
     """A Turn is no longer inside its fixed Resume window."""
 
 
+class TurnSuperseded(RuntimeError):
+    """A newer Turn started before this Resume was admitted."""
+
+
 DEFAULT_RESUME_TTL = timedelta(hours=1)
 
 
@@ -116,6 +120,7 @@ class ConversationMessageRepository:
                     connection,
                     context=context,
                     conversation_id=conversation_id,
+                    for_update=True,
                 )
                 await self._persist_message_in_transaction(
                     connection,
@@ -185,23 +190,11 @@ class ConversationMessageRepository:
         """Return the latest authorized user Message Turn for a Conversation."""
         await self.get_conversation(context=context, conversation_id=conversation_id)
         async with self._pool.connection() as connection:
-            async with connection.cursor(row_factory=dict_row) as cursor:
-                await cursor.execute(
-                    """
-                    SELECT tenant_id, conversation_id, turn_id, run_id, created_at,
-                           resume_deadline
-                    FROM langgraph_v2.messages
-                    WHERE tenant_id = %s AND conversation_id = %s
-                      AND role = 'user'
-                    ORDER BY created_at DESC, message_id DESC
-                    LIMIT 1
-                    """,
-                    (context.tenant_id, conversation_id),
-                )
-                row = await cursor.fetchone()
-        if row is None:
-            raise TurnNotFound(conversation_id)
-        return TurnRecord.model_validate(row)
+            return await self._get_latest_turn_in_transaction(
+                connection,
+                tenant_id=context.tenant_id,
+                conversation_id=conversation_id,
+            )
 
     async def associate_run_with_turn(
         self,
@@ -220,6 +213,7 @@ class ConversationMessageRepository:
                     connection,
                     context=context,
                     conversation_id=conversation_id,
+                    for_update=True,
                 )
                 await self._require_user_turn_in_transaction(
                     connection,
@@ -227,6 +221,13 @@ class ConversationMessageRepository:
                     conversation_id=conversation_id,
                     turn_id=turn_id,
                 )
+                latest_turn = await self._get_latest_turn_in_transaction(
+                    connection,
+                    tenant_id=context.tenant_id,
+                    conversation_id=conversation_id,
+                )
+                if latest_turn.turn_id != turn_id:
+                    raise TurnSuperseded(f"Turn {turn_id} has been superseded")
                 async with connection.cursor() as cursor:
                     await cursor.execute(
                         """
@@ -275,6 +276,7 @@ class ConversationMessageRepository:
         *,
         context: TrustedRequestContext,
         conversation_id: str,
+        for_update: bool = False,
     ) -> ConversationRecord:
         """Resolve within a caller-owned transaction for the admission seam."""
         async with connection.cursor(row_factory=dict_row) as cursor:
@@ -292,6 +294,16 @@ class ConversationMessageRepository:
                     thread_id_for(context.tenant_id, conversation_id),
                 ),
             )
+            if for_update:
+                await cursor.execute(
+                    """
+                    SELECT 1
+                    FROM langgraph_v2.conversations
+                    WHERE tenant_id = %s AND conversation_id = %s
+                    FOR UPDATE
+                    """,
+                    (context.tenant_id, conversation_id),
+                )
             await cursor.execute(
                 """
                 SELECT tenant_id, conversation_id, owner_subject_id, thread_id,
@@ -305,6 +317,32 @@ class ConversationMessageRepository:
         if row is None or row["owner_subject_id"] != context.subject_id:
             raise ConversationNotFound(conversation_id)
         return ConversationRecord.model_validate(row)
+
+    async def _get_latest_turn_in_transaction(
+        self,
+        connection: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+    ) -> TurnRecord:
+        """Read the latest user Turn within an admission transaction."""
+        async with connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                SELECT tenant_id, conversation_id, turn_id, run_id, created_at,
+                       resume_deadline
+                FROM langgraph_v2.messages
+                WHERE tenant_id = %s AND conversation_id = %s
+                  AND role = 'user'
+                ORDER BY created_at DESC, message_id DESC
+                LIMIT 1
+                """,
+                (tenant_id, conversation_id),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise TurnNotFound(conversation_id)
+        return TurnRecord.model_validate(row)
 
     async def get_conversation(
         self,
