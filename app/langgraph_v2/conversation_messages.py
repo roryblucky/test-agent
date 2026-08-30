@@ -13,18 +13,17 @@ from pydantic import BaseModel
 
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import thread_id_for
-from app.langgraph_v2.runs import ClaimFenced, RepositoryNotFound
 
 
-class ConversationNotFound(RepositoryNotFound):
+class ConversationNotFound(LookupError):
     """A Conversation is absent from the requested Tenant boundary."""
 
 
-class MessageNotFound(RepositoryNotFound):
+class MessageNotFound(LookupError):
     """A Message is absent from the requested Tenant boundary."""
 
 
-class TurnNotFound(RepositoryNotFound):
+class TurnNotFound(LookupError):
     """A Turn is absent from the requested Tenant/Conversation boundary."""
 
 
@@ -34,10 +33,6 @@ class MessageInvariantConflict(RuntimeError):
 
 class ResumeExpired(RuntimeError):
     """A Turn is no longer inside its fixed Resume window."""
-
-
-class TurnSuperseded(RuntimeError):
-    """A newer Turn started before this Resume was admitted."""
 
 
 DEFAULT_RESUME_TTL = timedelta(hours=1)
@@ -185,64 +180,6 @@ class ConversationMessageRepository:
                 tenant_id=context.tenant_id,
                 conversation_id=conversation_id,
             )
-
-    async def associate_run_with_turn(
-        self,
-        *,
-        context: TrustedRequestContext,
-        conversation_id: str,
-        run_id: UUID,
-        owner_instance_id: str,
-        execution_epoch: int,
-        turn_id: UUID,
-    ) -> None:
-        """Bind a request-owned Run to an existing authorized Turn."""
-        async with self._pool.connection() as connection:
-            async with connection.transaction():
-                await self._resolve_conversation_in_transaction(
-                    connection,
-                    context=context,
-                    conversation_id=conversation_id,
-                    for_update=True,
-                )
-                await self._require_user_turn_in_transaction(
-                    connection,
-                    tenant_id=context.tenant_id,
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
-                )
-                latest_turn = await self._get_latest_turn_in_transaction(
-                    connection,
-                    tenant_id=context.tenant_id,
-                    conversation_id=conversation_id,
-                )
-                if latest_turn.turn_id != turn_id:
-                    raise TurnSuperseded(f"Turn {turn_id} has been superseded")
-                async with connection.cursor() as cursor:
-                    await cursor.execute(
-                        """
-                        UPDATE langgraph_v2.runs
-                        SET turn_id = %s
-                        WHERE tenant_id = %s AND run_id = %s
-                          AND conversation_id = %s
-                          AND owner_instance_id = %s
-                          AND execution_epoch = %s
-                          AND status = 'running'
-                          AND expires_at > clock_timestamp()
-                        RETURNING turn_id
-                        """,
-                        (
-                            turn_id,
-                            context.tenant_id,
-                            run_id,
-                            conversation_id,
-                            owner_instance_id,
-                            execution_epoch,
-                        ),
-                    )
-                    row = await cursor.fetchone()
-        if row is None:
-            raise ClaimFenced(str(run_id))
 
     async def resolve_conversation(
         self,
@@ -414,59 +351,6 @@ class ConversationMessageRepository:
                     content=content,
                     idempotency_key=idempotency_key,
                 )
-
-    async def persist_assistant_message_in_terminal_transaction(
-        self,
-        connection: Any,
-        *,
-        tenant_id: str,
-        conversation_id: str,
-        run_id: UUID,
-        owner_instance_id: str,
-        execution_epoch: int,
-        content: str,
-        idempotency_key: str,
-        turn_id: UUID,
-    ) -> MessageRecord:
-        """Write a safe answer through a caller-owned, epoch-fenced transaction."""
-        async with connection.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(
-                """
-                SELECT status, conversation_id, owner_instance_id,
-                       execution_epoch, turn_id,
-                       expires_at > clock_timestamp() AS claim_active
-                FROM langgraph_v2.runs
-                WHERE tenant_id = %s AND run_id = %s
-                FOR UPDATE
-                """,
-                (tenant_id, run_id),
-            )
-            run = await cursor.fetchone()
-        if (
-            run is None
-            or run["status"] != "running"
-            or run["conversation_id"] != conversation_id
-            or run["owner_instance_id"] != owner_instance_id
-            or run["execution_epoch"] != execution_epoch
-            or run["turn_id"] != turn_id
-            or not run["claim_active"]
-        ):
-            raise ClaimFenced(str(run_id))
-        await self._require_user_turn_in_transaction(
-            connection,
-            tenant_id=tenant_id,
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-        )
-        return await self._persist_message_in_transaction(
-            connection,
-            tenant_id=tenant_id,
-            conversation_id=conversation_id,
-            turn_id=turn_id,
-            role="assistant",
-            content=content,
-            idempotency_key=idempotency_key,
-        )
 
     async def _get_turn_in_transaction(
         self,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,7 +20,6 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.runs import RunRepository
 from app.langgraph_v2.stream import stream_graph
 from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence
@@ -200,18 +198,10 @@ async def test_answer_receives_ranked_documents_on_each_execution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         actor = _AnswerActor()
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -243,18 +233,10 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             checkpointer=MemorySaver(),
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -347,18 +329,10 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         actor = _CitingAnswer()
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -391,18 +365,10 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         actor = _InlineCitationAnswer()
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -487,18 +453,10 @@ async def test_inline_citation_uses_reranked_artifact_position(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         actor = _RankedInlineAnswer()
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -527,18 +485,10 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         actor = _MalformedCitationAnswer()
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,

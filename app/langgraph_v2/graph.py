@@ -17,7 +17,12 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 )
 from langgraph.types import StateSnapshot
 
-from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
+from app.langgraph_v2.answer import (
+    AnswerActor,
+    AnswerCancelled,
+    CancellationObserved,
+    run_answer,
+)
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import LiveStreamEvent, TracerQueryResponse
@@ -43,7 +48,6 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import MockRanker, Ranker, run_reranking
 from app.langgraph_v2.retrieval import MockRetriever, Retriever, run_retrieval
-from app.langgraph_v2.runs import CancellationObserved
 from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
@@ -227,7 +231,6 @@ def build_tracer_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     *,
     tenant_id: str | None = None,
-    run_id: UUID | None = None,
     current_turn_id: UUID | None = None,
     artifact_repository: ArtifactStore | None = None,
     message_repository: ConversationMessageRepository | None = None,

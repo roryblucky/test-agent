@@ -30,7 +30,6 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
@@ -135,18 +134,10 @@ async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         scope = await seed_artifact_scope(pool)
         retriever = CountingRetriever()
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -350,12 +341,6 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         artifacts = InterruptAfterArtifacts(ArtifactRepository(pool))
         retriever = CountingRetriever()
         turn_id = uuid4()
@@ -364,7 +349,6 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
         first_graph = build_tracer_graph(
             checkpointer=checkpointer,
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=turn_id,
             artifact_repository=artifacts,
             request_context=scope.context,
@@ -382,16 +366,9 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
         with pytest.raises(asyncio.CancelledError):
             await first_graph.ainvoke(state, config)
 
-        resume_run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i2",
-        )
         resume_graph = build_tracer_graph(
             checkpointer=checkpointer,
             tenant_id="tenant-a",
-            run_id=resume_run.run_id,
             current_turn_id=turn_id,
             artifact_repository=artifacts,
             request_context=scope.context,

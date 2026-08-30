@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import socket
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
-from contextlib import suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Annotated, Any, Protocol, cast
@@ -29,9 +26,7 @@ from app.langgraph_v2.authorization import (
     TrustedRequestContext,
     get_trusted_request_context,
 )
-from app.langgraph_v2.cancellation import CancellationRepository
 from app.langgraph_v2.checkpointing import (
-    FencedAsyncPostgresSaver,
     exact_checkpoint_config,
     initial_checkpoint_config,
 )
@@ -70,14 +65,6 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
-from app.langgraph_v2.runs import (
-    CLAIM_HEARTBEAT_INTERVAL_SECONDS,
-    CancellationObserved,
-    ClaimFenced,
-    RunNotFound,
-    RunRecord,
-    RunRepository,
-)
 from app.langgraph_v2.stream import (
     GraphStreamCleanupError,
     RequestOwnedGraph,
@@ -85,7 +72,6 @@ from app.langgraph_v2.stream import (
 )
 from app.services.exceptions import TenantNotFoundError
 
-_INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -139,26 +125,6 @@ def _resolve_answer_actor(
     return build_answer_actor(manager.get_model_registry(tenant_id))
 
 
-def _resolve_cancellation_check(
-    app: FastAPI,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    repository: CancellationRepository,
-) -> Callable[[], Awaitable[bool]]:
-    """Combine the authoritative PostgreSQL check with an optional test seam."""
-    async def authoritative_check() -> bool:
-        return await repository.is_requested(tenant_id=tenant_id, run_id=run_id)
-
-    checker = getattr(app.state, "langgraph_v2_cancellation_check", None)
-    if checker is None:
-        return authoritative_check
-
-    async def check() -> bool:
-        return bool(await checker(tenant_id, run_id)) or await authoritative_check()
-
-    return check
-
-
 def _resolve_groundedness_actor(
     app: FastAPI,
     tenant_id: str,
@@ -200,7 +166,7 @@ def _resolve_output_assessment_audit(
 
 
 def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
-    """Validate a configured tenant before creating a running v2 Run."""
+    """Validate a configured tenant before starting v2 execution."""
     manager = getattr(app.state, "tenant_manager", None)
     if manager is None:
         return
@@ -243,48 +209,16 @@ def _resolve_phase_providers(
     return configured_retriever, configured_ranker, configured_moderation
 
 
-async def _refresh_claim(
-    repository: RunRepository,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    owner_instance_id: str,
-    execution_epoch: int,
-) -> None:
-    """Refresh a request's claim until it is cancelled or fenced."""
-    while True:
-        await asyncio.sleep(CLAIM_HEARTBEAT_INTERVAL_SECONDS)
-        try:
-            await repository.heartbeat(
-                tenant_id=tenant_id,
-                run_id=run_id,
-                owner_instance_id=owner_instance_id,
-                execution_epoch=execution_epoch,
-            )
-        except ClaimFenced:
-            return
-
-
 async def _terminalize_checkpoint_event(
-    repository: RunRepository,
     message_repository: ConversationMessageRepository,
     event: LiveStreamEvent,
     *,
-    tenant_id: str,
-    run_id: uuid.UUID,
+    context: TrustedRequestContext,
     conversation_id: str,
     turn_id: uuid.UUID,
-    owner_instance_id: str,
-    execution_epoch: int,
 ) -> None:
-    """Publish a checkpoint-owned terminal outcome."""
+    """Persist a successful checkpoint outcome exactly once by Turn."""
     if event.type == "error":
-        await repository.fail_run(
-            tenant_id=tenant_id,
-            run_id=run_id,
-            owner_instance_id=owner_instance_id,
-            execution_epoch=execution_epoch,
-            error=event.data,
-        )
         return
     if event.type != "done":
         raise ValueError("checkpoint terminalization requires done or error")
@@ -292,41 +226,22 @@ async def _terminalize_checkpoint_event(
     raw_data: object = event.data
     data = cast(dict[str, Any], raw_data) if isinstance(raw_data, dict) else {}
     answer = data.get("answer")
-    async with repository.transaction() as connection:
-        if isinstance(answer, str):
-            await message_repository.persist_assistant_message_in_terminal_transaction(
-                connection,
-                tenant_id=tenant_id,
-                conversation_id=conversation_id,
-                run_id=run_id,
-                owner_instance_id=owner_instance_id,
-                execution_epoch=execution_epoch,
-                turn_id=turn_id,
-                content=answer,
-                idempotency_key=f"turn:{turn_id}:assistant",
-            )
-        await repository.complete_run_in_transaction(
-            connection,
-            tenant_id=tenant_id,
-            run_id=run_id,
-            owner_instance_id=owner_instance_id,
-            execution_epoch=execution_epoch,
-            outcome=event.data,
+    if isinstance(answer, str):
+        await message_repository.persist_assistant_message(
+            context=context,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            content=answer,
+            idempotency_key=f"turn:{turn_id}:assistant",
         )
 
 
 async def _cleanup_request_execution(
     graph_stream: AsyncGenerator[str] | None,
-    heartbeat_task: asyncio.Task[None] | None,
-    repository: RunRepository,
     *,
-    claim: RunRecord | None,
-    terminal: bool,
     primary_error: BaseException | None,
-    tenant_id: str,
-    run_id: uuid.UUID,
 ) -> None:
-    """Close request-owned work before releasing an unfinished transitional Run."""
+    """Close request-owned graph work without mutating durable lifecycle state."""
     cleanup_error: BaseException | None = None
     cleanup_cancelled = False
 
@@ -334,29 +249,6 @@ async def _cleanup_request_execution(
         cancelled, error = await _await_cleanup_operation(graph_stream.aclose())
         cleanup_cancelled |= cancelled
         cleanup_error = error
-
-    if heartbeat_task is not None:
-        heartbeat_task.cancel()
-        _, heartbeat_error = await _await_cleanup_task(heartbeat_task)
-        if cleanup_error is None and not isinstance(
-            heartbeat_error, asyncio.CancelledError
-        ):
-            cleanup_error = heartbeat_error
-
-    if claim is not None and not terminal:
-        cancelled, error = await _await_cleanup_operation(
-            repository.interrupt_run(
-                tenant_id=tenant_id,
-                run_id=run_id,
-                owner_instance_id=claim.owner_instance_id,
-                execution_epoch=claim.execution_epoch,
-            )
-        )
-        cleanup_cancelled |= cancelled
-        if isinstance(error, (ClaimFenced, RunNotFound)):
-            error = None
-        if cleanup_error is None:
-            cleanup_error = error
 
     if cleanup_error is not None and (primary_error is not None or cleanup_cancelled):
         _LOGGER.warning(
@@ -399,23 +291,8 @@ async def _await_cleanup_operation(
     return await _await_cleanup_task(asyncio.ensure_future(operation))
 
 
-async def _persist_setup_failure(
-    repository: RunRepository,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    owner_instance_id: str,
-    execution_epoch: int,
-    message: str,
-) -> str:
-    """Terminalize a Run when role actor construction fails before graph start."""
-    await repository.fail_run(
-        tenant_id=tenant_id,
-        run_id=run_id,
-        owner_instance_id=owner_instance_id,
-        execution_epoch=execution_epoch,
-        error=message,
-    )
+def _setup_failure_frame(message: str) -> str:
+    """Render a compatible live error before graph streaming starts."""
     return LiveStreamEvent(
         type="error",
         data=message,
@@ -589,8 +466,6 @@ def create_tracer_router(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
         pool = cast(AsyncConnectionPool[Any], configured_pool)
-        repository = RunRepository(pool)
-        cancellation_repository = CancellationRepository(pool)
         message_repository = _message_repository(http_request.app, pool)
         try:
             if payload.conversation_id is None:
@@ -616,10 +491,7 @@ def create_tracer_router(
         user_idempotency_key = f"turn:{turn_id}:user"
 
         async def event_generator() -> AsyncIterator[str]:
-            claim = None
             graph_stream: AsyncGenerator[str] | None = None
-            heartbeat_task: asyncio.Task[None] | None = None
-            terminal = False
             primary_error: BaseException | None = None
             try:
                 await message_repository.create_turn(
@@ -628,29 +500,6 @@ def create_tracer_router(
                     turn_id=turn_id,
                     content=payload.query,
                     idempotency_key=user_idempotency_key,
-                )
-                claim = await repository.create_run(
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    conversation_id=conversation_id,
-                    owner_instance_id=_INSTANCE_ID,
-                )
-                await message_repository.associate_run_with_turn(
-                    context=request_context,
-                    conversation_id=conversation_id,
-                    run_id=run_id,
-                    owner_instance_id=claim.owner_instance_id,
-                    execution_epoch=claim.execution_epoch,
-                    turn_id=turn_id,
-                )
-                heartbeat_task = asyncio.create_task(
-                    _refresh_claim(
-                        repository,
-                        tenant_id,
-                        run_id,
-                        claim.owner_instance_id,
-                        claim.execution_epoch,
-                    )
                 )
                 configured_checkpointer = getattr(
                     http_request.app.state,
@@ -685,47 +534,20 @@ def create_tracer_router(
                 selected_graph = graph or tracer_graph
                 graph_config: RunnableConfig | None = None
                 if graph is None:
-                    saver: FencedAsyncPostgresSaver | None = None
                     if configured_checkpointer is not None:
-
-                        async def write_checkpoint_pointer(
-                            checkpoint_id: str,
-                            checkpoint_ns: str,
-                        ) -> None:
-                            await repository.update_checkpoint_pointer(
-                                tenant_id=tenant_id,
-                                run_id=run_id,
-                                owner_instance_id=claim.owner_instance_id,
-                                execution_epoch=claim.execution_epoch,
-                                checkpoint_id=checkpoint_id,
-                                checkpoint_ns=checkpoint_ns,
-                            )
-
                         checkpoint_ns = ""
-                        saver = FencedAsyncPostgresSaver(
-                            pool,
-                            checkpoint_namespace=checkpoint_ns,
-                            pointer_writer=write_checkpoint_pointer,
-                        )
                         graph_config = initial_checkpoint_config(
                             thread_id=conversation.thread_id,
                             checkpoint_ns=checkpoint_ns,
                         )
                     selected_graph = build_tracer_graph(
-                        saver,
+                        configured_checkpointer,
                         tenant_id=tenant_id,
-                        run_id=run_id,
                         current_turn_id=turn_id,
                         artifact_repository=ArtifactRepository(pool),
                         message_repository=message_repository,
                         request_context=request_context,
                         history_token_budget=history_token_budget,
-                        cancellation_check=_resolve_cancellation_check(
-                            http_request.app,
-                            tenant_id,
-                            run_id,
-                            cancellation_repository,
-                        ),
                         output_assessment_audit=configured_output_assessment_audit,
                         refinement_actor=configured_refinement_actor,
                         retriever=configured_retriever,
@@ -744,19 +566,13 @@ def create_tracer_router(
                 async def terminalize_checkpoint_event(
                     event: LiveStreamEvent,
                 ) -> None:
-                    nonlocal terminal
                     await _terminalize_checkpoint_event(
-                        repository,
                         message_repository,
                         event,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
+                        context=request_context,
                         conversation_id=conversation_id,
                         turn_id=turn_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
                     )
-                    terminal = True
 
                 graph_stream = stream_graph(
                     cast(RequestOwnedGraph, selected_graph),
@@ -766,20 +582,6 @@ def create_tracer_router(
                 )
                 async for frame in graph_stream:
                     yield frame
-            except CancellationObserved:
-                if claim is not None:
-                    stopped = await cancellation_repository.apply_if_requested(
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                    )
-                    if stopped:
-                        terminal = True
-                        yield LiveStreamEvent(
-                            type="stopped",
-                            data={"partial": None},
-                        ).to_sse()
             except asyncio.CancelledError as error:
                 primary_error = error
                 raise
@@ -787,30 +589,13 @@ def create_tracer_router(
                 primary_error = error
                 raise
             except Exception as error:
-                if claim is None:
-                    raise
-                if not terminal:
-                    with suppress(ClaimFenced, RunNotFound):
-                        failure = await _persist_setup_failure(
-                            repository,
-                            tenant_id=tenant_id,
-                            run_id=run_id,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                            message=str(error) or "LangGraph execution failed.",
-                        )
-                        terminal = True
-                        yield failure
+                yield _setup_failure_frame(
+                    str(error) or "LangGraph execution failed."
+                )
             finally:
                 await _cleanup_request_execution(
                     graph_stream,
-                    heartbeat_task,
-                    repository,
-                    claim=claim,
-                    terminal=terminal,
                     primary_error=primary_error,
-                    tenant_id=tenant_id,
-                    run_id=run_id,
                 )
 
         return StreamingResponse(
@@ -858,8 +643,6 @@ def create_tracer_router(
                 status_code=500, detail="LangGraph v2 checkpointer is not configured"
             )
         pool = cast(AsyncConnectionPool[Any], configured_pool)
-        repository = RunRepository(pool)
-        cancellation_repository = CancellationRepository(pool)
         message_repository = _message_repository(http_request.app, pool)
         configured_refinement_actor = _resolve_refinement_actor(
             http_request.app,
@@ -889,7 +672,6 @@ def create_tracer_router(
         checkpoint_graph = build_tracer_graph(
             configured_checkpointer,
             tenant_id=tenant_id,
-            run_id=uuid.UUID(int=0),
             artifact_repository=ArtifactRepository(pool),
             message_repository=message_repository,
             request_context=request_context,
@@ -921,70 +703,24 @@ def create_tracer_router(
                 status_code=409, detail="Thread is not resumable"
             ) from error
 
-        run_id = uuid.uuid4()
         async def event_generator() -> AsyncIterator[str]:
-            claim = None
             graph_stream: AsyncGenerator[str] | None = None
-            heartbeat_task: asyncio.Task[None] | None = None
-            terminal = False
             primary_error: BaseException | None = None
             try:
-                claim = await repository.create_run(
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    conversation_id=target.conversation.conversation_id,
-                    owner_instance_id=_INSTANCE_ID,
-                )
-                await message_repository.associate_run_with_turn(
+                latest_turn = await message_repository.get_latest_turn(
                     context=request_context,
                     conversation_id=target.conversation.conversation_id,
-                    run_id=run_id,
-                    owner_instance_id=claim.owner_instance_id,
-                    execution_epoch=claim.execution_epoch,
-                    turn_id=target.turn.turn_id,
                 )
-                heartbeat_task = asyncio.create_task(
-                    _refresh_claim(
-                        repository,
-                        tenant_id,
-                        run_id,
-                        claim.owner_instance_id,
-                        claim.execution_epoch,
-                    )
-                )
-
-                async def write_checkpoint_pointer(
-                    checkpoint_id: str,
-                    checkpoint_ns: str,
-                ) -> None:
-                    await repository.update_checkpoint_pointer(
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                        checkpoint_id=checkpoint_id,
-                        checkpoint_ns=checkpoint_ns,
-                    )
-
+                if latest_turn.turn_id != target.turn.turn_id:
+                    raise ThreadResumeConflict("checkpoint Turn has been superseded")
                 selected_graph = graph or build_tracer_graph(
-                    FencedAsyncPostgresSaver(
-                        pool,
-                        checkpoint_namespace="",
-                        pointer_writer=write_checkpoint_pointer,
-                    ),
+                    configured_checkpointer,
                     tenant_id=tenant_id,
-                    run_id=run_id,
                     current_turn_id=target.turn.turn_id,
                     artifact_repository=ArtifactRepository(pool),
                     message_repository=message_repository,
                     request_context=request_context,
                     history_token_budget=history_token_budget,
-                    cancellation_check=_resolve_cancellation_check(
-                        http_request.app,
-                        tenant_id,
-                        run_id,
-                        cancellation_repository,
-                    ),
                     output_assessment_audit=configured_output_assessment_audit,
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
@@ -997,19 +733,13 @@ def create_tracer_router(
                 async def terminalize_checkpoint_event(
                     event: LiveStreamEvent,
                 ) -> None:
-                    nonlocal terminal
                     await _terminalize_checkpoint_event(
-                        repository,
                         message_repository,
                         event,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
+                        context=request_context,
                         conversation_id=target.conversation.conversation_id,
                         turn_id=target.turn.turn_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
                     )
-                    terminal = True
 
                 graph_stream = stream_graph(
                     cast(RequestOwnedGraph, selected_graph),
@@ -1019,20 +749,6 @@ def create_tracer_router(
                 )
                 async for frame in graph_stream:
                     yield frame
-            except CancellationObserved:
-                if claim is not None:
-                    stopped = await cancellation_repository.apply_if_requested(
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                    )
-                    if stopped:
-                        terminal = True
-                        yield LiveStreamEvent(
-                            type="stopped",
-                            data={"partial": None},
-                        ).to_sse()
             except asyncio.CancelledError as error:
                 primary_error = error
                 raise
@@ -1040,30 +756,13 @@ def create_tracer_router(
                 primary_error = error
                 raise
             except Exception as error:
-                if claim is None:
-                    raise
-                if not terminal:
-                    with suppress(ClaimFenced, RunNotFound):
-                        failure = await _persist_setup_failure(
-                            repository,
-                            tenant_id=tenant_id,
-                            run_id=run_id,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                            message=str(error) or "LangGraph execution failed.",
-                        )
-                        terminal = True
-                        yield failure
+                yield _setup_failure_frame(
+                    str(error) or "LangGraph execution failed."
+                )
             finally:
                 await _cleanup_request_execution(
                     graph_stream,
-                    heartbeat_task,
-                    repository,
-                    claim=claim,
-                    terminal=terminal,
                     primary_error=primary_error,
-                    tenant_id=tenant_id,
-                    run_id=run_id,
                 )
 
         return StreamingResponse(

@@ -5,7 +5,6 @@ import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from typing import Any
-from uuid import UUID
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -14,10 +13,10 @@ from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.runs import RunRepository
 from app.langgraph_v2.stream import GraphStreamCleanupError
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
+    count_run_rows,
     persistent_tracer_app,
     seed_subject_conversation,
     stream_request,
@@ -189,10 +188,9 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
                 ),
                 conversation_id="conversation-1",
             )
-
-            run = await RunRepository(pool).get_run(
-                "tenant-a", UUID(response.headers["x-run-id"])
-            )
+        persisted_run_count = await count_run_rows(
+            langgraph_v2_migrated_database_url
+        )
 
     assert graph.astream_called is True
     assert _event_frame(frames[0]) == {
@@ -200,7 +198,7 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
         "data": {"answer": "canonical answer"},
     }
     assert response.headers["x-thread-id"]
-    assert run.status == "completed"
+    assert persisted_run_count == 0
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
         ("assistant", "canonical answer"),
@@ -248,7 +246,7 @@ async def test_query_retry_does_not_duplicate_turn_messages(
 
 
 @pytest.mark.asyncio
-async def test_closing_query_sse_closes_graph_and_interrupts_run(
+async def test_closing_query_sse_closes_graph_without_persisting_a_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
@@ -299,14 +297,9 @@ async def test_closing_query_sse_closes_graph_and_interrupts_run(
             await pending_read
         await subscriber.aclose()
 
-        run = await RunRepository(app.state.langgraph_v2_postgres_pool).get_run(
-            "tenant-a", UUID(response.headers["x-run-id"])
-        )
-
     assert graph.stream.closed is True
     assert graph.stream.close_completed is True
-    assert run.status == "interrupted"
-    assert run.owner_instance_id == ""
+    assert await count_run_rows(langgraph_v2_migrated_database_url) == 0
 
 
 @pytest.mark.asyncio
@@ -387,13 +380,10 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
                 ),
                 conversation_id="conversation-1",
             )
-            run = await RunRepository(pool).get_run(
-                "tenant-a", UUID(response.headers["x-run-id"])
-            )
 
     assert answer_actor.calls == 1
     assert answer_actor.close_completed.is_set() is True
-    assert run.status == "interrupted"
+    assert await count_run_rows(langgraph_v2_migrated_database_url) == 0
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
     ]
@@ -447,13 +437,9 @@ async def test_graph_close_failure_is_reported_after_request_cleanup(
         with pytest.raises(asyncio.CancelledError):
             await pending_read
         await response.body_iterator.aclose()
-        run = await RunRepository(app.state.langgraph_v2_postgres_pool).get_run(
-            "tenant-a", UUID(response.headers["x-run-id"])
-        )
 
     assert graph.stream.close_calls == 1
-    assert run.status == "interrupted"
-    assert run.owner_instance_id == ""
+    assert await count_run_rows(langgraph_v2_migrated_database_url) == 0
 
 
 @pytest.mark.asyncio
@@ -490,12 +476,8 @@ async def test_graph_close_failure_without_primary_error_is_reported(
         )
         with pytest.raises(GraphStreamCleanupError, match="normal close failed"):
             await anext(response.body_iterator)
-        run = await RunRepository(app.state.langgraph_v2_postgres_pool).get_run(
-            "tenant-a", UUID(response.headers["x-run-id"])
-        )
 
-    assert run.status == "interrupted"
-    assert run.owner_instance_id == ""
+    assert await count_run_rows(langgraph_v2_migrated_database_url) == 0
 
 
 @pytest.mark.asyncio

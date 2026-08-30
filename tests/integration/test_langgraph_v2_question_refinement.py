@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from uuid import uuid4
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -17,7 +16,6 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementResult,
     V2ResolvedQuery,
 )
-from app.langgraph_v2.runs import RunRepository
 from app.models.workflow import ResolvedQuery
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
@@ -32,33 +30,20 @@ def _state() -> TracerState:
 
 @pytest.mark.asyncio
 async def test_safe_query_gets_structured_refinement(
-    langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        graph = build_tracer_graph(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            refinement_actor=MockQuestionRefinementActor(),
-        )
+    graph = build_tracer_graph(
+        tenant_id="tenant-a",
+        refinement_actor=MockQuestionRefinementActor(),
+    )
 
-        result = await graph.ainvoke(_state())
+    result = await graph.ainvoke(_state())
 
-        assert "refined_query" in result
-        assert result["refined_query"] == "compare gold and FX"
+    assert "refined_query" in result
+    assert result["refined_query"] == "compare gold and FX"
 
 
 @pytest.mark.asyncio
 async def test_refinement_failure_halts_before_later_phases(
-    langgraph_v2_migrated_database_url: str,
 ) -> None:
     class FailingActor:
         async def refine(
@@ -67,31 +52,19 @@ async def test_refinement_failure_halts_before_later_phases(
             del history
             raise ValueError(f"invalid output for {query}")
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        graph = build_tracer_graph(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            refinement_actor=FailingActor(),
-        )
+    graph = build_tracer_graph(
+        tenant_id="tenant-a",
+        refinement_actor=FailingActor(),
+    )
 
-        result = await graph.ainvoke(_state())
+    result = await graph.ainvoke(_state())
 
-        assert "halted" in result
-        assert result["halted"] is True
+    assert "halted" in result
+    assert result["halted"] is True
 
 
 @pytest.mark.asyncio
 async def test_refinement_reexecution_reinvokes_actor(
-    langgraph_v2_migrated_database_url: str,
 ) -> None:
     class CountingActor:
         calls = 0
@@ -107,27 +80,16 @@ async def test_refinement_reexecution_reinvokes_actor(
                 )
             )
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        actor = CountingActor()
-        graph = build_tracer_graph(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            refinement_actor=actor,
-        )
+    actor = CountingActor()
+    graph = build_tracer_graph(
+        tenant_id="tenant-a",
+        refinement_actor=actor,
+    )
 
-        await graph.ainvoke(_state())
-        await graph.ainvoke(_state())
+    await graph.ainvoke(_state())
+    await graph.ainvoke(_state())
 
-        assert actor.calls == 2
+    assert actor.calls == 2
 
 
 @pytest.mark.asyncio

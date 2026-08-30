@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
-import psycopg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -19,17 +17,16 @@ from langgraph.checkpoint.base import (
     Checkpoint,
     CheckpointMetadata,
 )
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 from pydantic_ai.usage import RunUsage
 
-import app.langgraph_v2.api as api_module
 from app.api.dependencies import TenantContext, get_tenant
 from app.api.router import router as legacy_router
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.checkpointing import FencedAsyncPostgresSaver
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
@@ -42,7 +39,6 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document, GroundednessResult, ModerationResult
 from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
@@ -50,13 +46,13 @@ from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import (
+    count_run_rows,
     parse_sse,
-    persistent_tracer_app,
     seed_subject_conversation,
 )
 
 
-class _FailingTerminalCheckpointSaver(FencedAsyncPostgresSaver):
+class _FailingTerminalCheckpointSaver(AsyncPostgresSaver):
     async def aput(
         self,
         config: RunnableConfig,
@@ -229,18 +225,11 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         answer = _Answer()
         moderation = _Moderation()
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -324,12 +313,6 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         messages = ConversationMessageRepository(pool)
         await messages.resolve_conversation(
             context=request_context, conversation_id="c1"
@@ -345,7 +328,6 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
         await seed_artifact_scope(pool, turn_id=turn_id, context=request_context)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=turn_id,
             artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
@@ -464,123 +446,46 @@ def test_public_v2_sse_matches_final_output_golden(
     ]
 
 
-def test_terminal_transaction_rolls_back_message_when_run_completion_crashes(
+def test_terminal_checkpoint_failure_publishes_error_without_assistant_or_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async def seed() -> None:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            await ConversationMessageRepository(pool).resolve_conversation(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="c1",
-            )
-
-    asyncio.run(seed())
-    with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
-        connection.execute(
-            """
-            CREATE FUNCTION langgraph_v2.reject_run_completion()
-            RETURNS trigger AS $$
-            BEGIN
-                IF NEW.status = 'completed' THEN
-                    RAISE EXCEPTION 'forced terminalization failure';
-                END IF;
-                RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql
-            """
-        )
-        connection.execute(
-            """
-            CREATE TRIGGER reject_run_completion
-            BEFORE UPDATE ON langgraph_v2.runs
-            FOR EACH ROW EXECUTE FUNCTION langgraph_v2.reject_run_completion()
-            """
-        )
-
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        retriever=_Retriever(),
-        ranker=_Ranker(),
-        moderation_provider=_Moderation(),
-        answer_actor=_Answer(),
-    )
-    try:
-        with TestClient(app) as client:
-            response = client.post(
-                "/v2/query/stream",
-                json={"query": "hello", "sessionId": "c1"},
-                headers={
-                    "X-Application-Id": "tenant-a",
-                    "X-Subject-Id": "subject-a",
-                },
-            )
-
-        async def read_roles() -> list[str]:
-            async with AsyncConnectionPool(
-                langgraph_v2_migrated_database_url, min_size=1, max_size=2
-            ) as pool:
-                messages = await ConversationMessageRepository(pool).list_messages(
-                    context=TrustedRequestContext(
-                        tenant_id="tenant-a", subject_id="subject-a"
-                    ),
-                    conversation_id="c1",
-                )
-                return [message.role for message in messages]
-
-        assert parse_sse(response.text)[-1]["type"] == "error"
-        assert "forced terminalization failure" in parse_sse(response.text)[-1]["data"]
-        assert asyncio.run(read_roles()) == ["user"]
-    finally:
-        with psycopg.connect(
-            langgraph_v2_migrated_database_url, autocommit=True
-        ) as connection:
-            connection.execute(
-                "DROP TRIGGER IF EXISTS reject_run_completion ON langgraph_v2.runs"
-            )
-            connection.execute(
-                "DROP FUNCTION IF EXISTS langgraph_v2.reject_run_completion()"
-            )
-
-
-def test_terminal_checkpoint_failure_does_not_publish_done_or_assistant_message(
-    langgraph_v2_migrated_database_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    conversation_id = "terminal-checkpoint-failure"
     asyncio.run(
         seed_subject_conversation(
-            langgraph_v2_migrated_database_url, "terminal-checkpoint-failure"
+            langgraph_v2_migrated_database_url,
+            conversation_id,
         )
     )
-    monkeypatch.setattr(
-        api_module,
-        "FencedAsyncPostgresSaver",
-        _FailingTerminalCheckpointSaver,
-    )
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        async with postgres_lifespan(
+            app,
+            config=V2PostgresConfig(database_url=langgraph_v2_migrated_database_url),
+            checkpointer_factory=_FailingTerminalCheckpointSaver,
+        ):
+            yield
+
+    app = FastAPI(lifespan=lifespan)
+    register_v2_routes(
+        app,
+        enabled=True,
         retriever=_Retriever(),
         ranker=_Ranker(),
         moderation_provider=_Moderation(),
         answer_actor=_Answer(),
     )
-
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "terminal-checkpoint-failure"},
+            json={"query": "hello", "sessionId": conversation_id},
             headers={
                 "X-Application-Id": "tenant-a",
                 "X-Subject-Id": "subject-a",
             },
         )
 
-    run_id = uuid.UUID(response.headers["x-run-id"])
-
-    async def read_publication() -> tuple[list[str], str]:
+    async def read_roles() -> list[str]:
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
@@ -588,13 +493,13 @@ def test_terminal_checkpoint_failure_does_not_publish_done_or_assistant_message(
                 context=TrustedRequestContext(
                     tenant_id="tenant-a", subject_id="subject-a"
                 ),
-                conversation_id="terminal-checkpoint-failure",
+                conversation_id=conversation_id,
             )
-            run = await RunRepository(pool).get_run("tenant-a", run_id)
-            return [message.role for message in messages], run.status
+            return [message.role for message in messages]
 
     delivered = parse_sse(response.text)
     assert all(event["type"] != "done" for event in delivered)
     assert delivered[-1]["type"] == "error"
     assert "forced terminal checkpoint failure" in delivered[-1]["data"]
-    assert asyncio.run(read_publication()) == (["user"], "failed")
+    assert asyncio.run(read_roles()) == ["user"]
+    assert asyncio.run(count_run_rows(langgraph_v2_migrated_database_url)) == 0

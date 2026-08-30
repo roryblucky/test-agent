@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,7 +12,6 @@ from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
@@ -44,17 +42,10 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         ranker = Ranker()
         scope = await seed_artifact_scope(pool)
         result = await build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -99,16 +90,9 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         scope = await seed_artifact_scope(pool)
         result = await build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -150,16 +134,9 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         scope = await seed_artifact_scope(pool)
         result = await build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -225,18 +202,11 @@ async def test_interrupted_reranking_repeats_provider_with_stable_artifact_refs(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         ranker = CountingRanker()
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             checkpointer=MemorySaver(),
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,

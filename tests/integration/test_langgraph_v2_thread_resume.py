@@ -36,10 +36,10 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementResult,
     V2ResolvedQuery,
 )
-from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
+    count_run_rows,
     parse_sse,
     persistent_tracer_app,
     reject_transport_event_inserts,
@@ -197,7 +197,7 @@ class _SuccessfulRefinementActor:
 
 async def _interrupt_query_after_answer_token(
     database_url: str,
-) -> tuple[str, UUID, UUID, datetime]:
+) -> tuple[str, UUID, datetime]:
     await seed_subject_conversation(database_url, "conversation-1")
     answer_actor = _StreamingAnswerActor(
         answer="partial answer [1]",
@@ -224,7 +224,6 @@ async def _interrupt_query_after_answer_token(
         return (
             response.headers["x-thread-id"],
             UUID(response.headers["x-turn-id"]),
-            UUID(response.headers["x-run-id"]),
             (
                 await _read_turn(database_url, UUID(response.headers["x-turn-id"]))
             ).resume_deadline,
@@ -270,7 +269,6 @@ async def _seed_pre_answer_checkpoint(
     conversation_id: str = "conversation-1",
     interrupt_before: str | None = "answer",
     checkpoint_turn_id: UUID | None = None,
-    drop_origin_run_mapping: bool = False,
 ) -> tuple[str, UUID, datetime]:
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     async with AsyncConnectionPool(
@@ -286,13 +284,6 @@ async def _seed_pre_answer_checkpoint(
             context=context,
             conversation_id=conversation_id,
         )
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id=conversation.conversation_id,
-            owner_instance_id="seed-instance",
-        )
         turn_id = uuid4()
         turn = await messages.create_turn(
             context=context,
@@ -304,7 +295,6 @@ async def _seed_pre_answer_checkpoint(
         graph = build_tracer_graph(
             checkpointer,
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=turn_id,
             artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
@@ -332,15 +322,6 @@ async def _seed_pre_answer_checkpoint(
                 interrupt_before=[interrupt_before],
                 durability="sync",
             )
-        if drop_origin_run_mapping:
-            async with pool.connection() as connection:
-                await connection.execute(
-                    """
-                    DELETE FROM langgraph_v2.runs
-                    WHERE tenant_id = %s AND run_id = %s
-                    """,
-                    ("tenant-a", run.run_id),
-                )
         return conversation.thread_id, turn_id, turn.resume_deadline
 
 
@@ -351,29 +332,6 @@ async def _read_turn(database_url: str, turn_id: UUID) -> TurnRecord:
             conversation_id="conversation-1",
             turn_id=turn_id,
         )
-
-
-async def _read_run(database_url: str, run_id: UUID):
-    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
-        return await RunRepository(pool).get_run("tenant-a", run_id)
-
-
-async def _read_completed_run_id_for_turn(database_url: str, turn_id: UUID) -> UUID:
-    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
-        async with pool.connection() as connection:
-            row = await (
-                await connection.execute(
-                    """
-                    SELECT run_id
-                    FROM langgraph_v2.runs
-                    WHERE tenant_id = 'tenant-a' AND turn_id = %s
-                      AND status = 'completed'
-                    """,
-                    (turn_id,),
-                )
-            ).fetchone()
-    assert row is not None
-    return UUID(str(row[0]))
 
 
 async def _read_messages(
@@ -434,13 +392,6 @@ async def _advance_same_turn_checkpoint(
             context=context,
             conversation_id="conversation-1",
         )
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id=conversation.conversation_id,
-            owner_instance_id="advance-instance",
-        )
         await messages.create_turn(
             context=context,
             conversation_id=conversation.conversation_id,
@@ -451,7 +402,6 @@ async def _advance_same_turn_checkpoint(
         graph = build_tracer_graph(
             checkpointer,
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=turn_id,
             artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
@@ -553,7 +503,6 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
         _seed_pre_answer_checkpoint(
             langgraph_v2_migrated_database_url,
             interrupt_before=interrupt_before,
-            drop_origin_run_mapping=True,
         )
     )
     answer_actor = _AnswerActor()
@@ -598,6 +547,7 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
     assert sum(event["type"] == "token" for event in delivered) == expected_token_count
     assert delivered[-1]["type"] == "done"
     assert delivered[-1]["data"]["answer"] == "recovered answer"
+    assert asyncio.run(count_run_rows(langgraph_v2_migrated_database_url)) == 0
 
     turn_after_resume = asyncio.run(
         _read_turn(langgraph_v2_migrated_database_url, turn_id)
@@ -617,7 +567,6 @@ def test_thread_resume_does_not_insert_transport_events(
     thread_id, turn_id, _ = asyncio.run(
         _seed_pre_answer_checkpoint(
             langgraph_v2_migrated_database_url,
-            drop_origin_run_mapping=True,
         )
     )
     app = persistent_tracer_app(
@@ -852,22 +801,29 @@ def test_thread_resume_rechecks_supersession_when_execution_starts(
     thread_id, turn_id, _ = asyncio.run(
         _seed_pre_answer_checkpoint(langgraph_v2_migrated_database_url)
     )
-    original_associate = ConversationMessageRepository.associate_run_with_turn
-    superseded = False
+    original_get_latest_turn = ConversationMessageRepository.get_latest_turn
+    calls = 0
 
-    async def associate_after_new_turn(
-        repository: ConversationMessageRepository, **kwargs: Any
-    ) -> None:
-        nonlocal superseded
-        if not superseded:
-            superseded = True
+    async def supersede_before_execution_check(
+        repository: ConversationMessageRepository,
+        *,
+        context: TrustedRequestContext,
+        conversation_id: str,
+    ) -> TurnRecord:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
             await _create_superseding_turn(langgraph_v2_migrated_database_url)
-        await original_associate(repository, **kwargs)
+        return await original_get_latest_turn(
+            repository,
+            context=context,
+            conversation_id=conversation_id,
+        )
 
     monkeypatch.setattr(
         ConversationMessageRepository,
-        "associate_run_with_turn",
-        associate_after_new_turn,
+        "get_latest_turn",
+        supersede_before_execution_check,
     )
     answer_actor = _AnswerActor()
     app = persistent_tracer_app(
@@ -888,6 +844,7 @@ def test_thread_resume_rechecks_supersession_when_execution_starts(
     assert delivered[-1]["type"] == "error"
     assert "has been superseded" in delivered[-1]["data"]
     assert answer_actor.calls == 0
+    assert asyncio.run(count_run_rows(langgraph_v2_migrated_database_url)) == 0
 
 
 def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
@@ -896,7 +853,6 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
     thread_id, turn_id, _ = asyncio.run(
         _seed_pre_answer_checkpoint(
             langgraph_v2_migrated_database_url,
-            drop_origin_run_mapping=True,
         )
     )
     original_checkpoint_id = asyncio.run(
@@ -960,7 +916,7 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
 def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_advisory_inputs(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, run_id, resume_deadline = asyncio.run(
+    thread_id, turn_id, resume_deadline = asyncio.run(
         _interrupt_query_after_answer_token(
             langgraph_v2_migrated_database_url,
         )
@@ -1016,20 +972,7 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
         _read_turn(langgraph_v2_migrated_database_url, turn_id)
     )
     messages = asyncio.run(_read_messages(langgraph_v2_migrated_database_url))
-    assistant_run_id = asyncio.run(
-        _read_completed_run_id_for_turn(
-            langgraph_v2_migrated_database_url, turn_id
-        )
-    )
-    original_run = asyncio.run(_read_run(langgraph_v2_migrated_database_url, run_id))
-    assistant_run = asyncio.run(
-        _read_run(langgraph_v2_migrated_database_url, assistant_run_id)
-    )
-
     assert turn_after_resume.resume_deadline == resume_deadline
-    assert original_run.status == "interrupted"
-    assert assistant_run.status == "completed"
-    assert assistant_run.run_id != run_id
     assert [
         (message.role, message.content)
         for message in messages
@@ -1044,7 +987,7 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
 def test_second_interruption_can_resume_before_original_deadline(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, _run_id, resume_deadline = asyncio.run(
+    thread_id, turn_id, resume_deadline = asyncio.run(
         _interrupt_query_after_answer_token(
             langgraph_v2_migrated_database_url,
         )
@@ -1077,6 +1020,7 @@ def test_second_interruption_can_resume_before_original_deadline(
             assert token_frame["data"] == "replacement "
 
     asyncio.run(interrupt_resumed_stream())
+    assert asyncio.run(count_run_rows(langgraph_v2_migrated_database_url)) == 0
 
     turn_after_second_interrupt = asyncio.run(
         _read_turn(langgraph_v2_migrated_database_url, turn_id)
@@ -1121,7 +1065,7 @@ def test_second_interruption_can_resume_before_original_deadline(
 def test_second_interruption_returns_410_after_original_deadline_expires(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, _run_id, _ = asyncio.run(
+    thread_id, turn_id, _ = asyncio.run(
         _interrupt_query_after_answer_token(
             langgraph_v2_migrated_database_url,
         )

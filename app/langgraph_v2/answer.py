@@ -15,7 +15,6 @@ from pydantic_ai import Agent
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
-from app.langgraph_v2.runs import CancellationObserved
 from app.models.domain import Document
 from app.models.workflow import CitationReference
 
@@ -139,6 +138,10 @@ class AnswerActor(Protocol):
     ) -> AsyncIterator[AnswerStreamChunk]:
         """Yield final-answer deltas and the complete validated result."""
         ...
+
+
+class CancellationObserved(RuntimeError):
+    """Request-owned execution observed cooperative cancellation."""
 
 
 class AnswerCancelled(CancellationObserved):

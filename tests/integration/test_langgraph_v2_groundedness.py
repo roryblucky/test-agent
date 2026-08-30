@@ -21,7 +21,6 @@ from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
@@ -109,20 +108,12 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         evaluator = _Groundedness()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
         scope = await seed_artifact_scope(pool, turn_id=turn_id)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             request_context=scope.context,
@@ -181,20 +172,12 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         evaluator = Failing()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
         scope = await seed_artifact_scope(pool, turn_id=turn_id)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             request_context=scope.context,
@@ -241,17 +224,9 @@ async def test_groundedness_uses_only_cited_documents(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -286,17 +261,9 @@ async def test_groundedness_rejects_out_of_range_scores(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -360,13 +327,6 @@ async def test_groundedness_actor_setup_failure_is_advisory(
     }
     assert events[-1]["type"] == "done"
     assert events[-1]["data"]["answer"] == "answer [1]"
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        run = await RunRepository(pool).get_run(
-            "tenant-a", UUID(response.headers["x-run-id"])
-        )
-    assert run.status == "completed"
     groundedness_audit = next(
         record for record in audit.records if record.assessment_type == "groundedness"
     )
@@ -386,17 +346,9 @@ async def test_assessment_audit_failure_does_not_gate_answer(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=scope.turn_id,
             request_context=scope.context,

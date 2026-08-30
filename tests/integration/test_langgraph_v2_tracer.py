@@ -15,7 +15,6 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
-import app.langgraph_v2.api as api_module
 from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import AnswerActor
 from app.langgraph_v2.api import TracerGraph, register_v2_routes
@@ -29,7 +28,6 @@ from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
-from app.langgraph_v2.runs import RunRepository
 from app.services.events import EventEmitter
 
 FIXTURE_PATH = (
@@ -160,7 +158,7 @@ async def seed_subject_conversation(
     pool_or_database_url: AsyncConnectionPool[Any] | str,
     conversation_id: str = "conversation-1",
 ) -> None:
-    """Seed the Conversation authorization required by v2 Run tests."""
+    """Seed the Conversation authorization required by v2 stream tests."""
     if isinstance(pool_or_database_url, str):
         async with AsyncConnectionPool(
             pool_or_database_url, min_size=1, max_size=2
@@ -171,6 +169,19 @@ async def seed_subject_conversation(
         context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
         conversation_id=conversation_id,
     )
+
+
+async def count_run_rows(database_url: str) -> int:
+    """Count transitional Run rows while task49 still owns their schema removal."""
+    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
+        async with pool.connection() as connection:
+            row = await (
+                await connection.execute("SELECT count(*) FROM langgraph_v2.runs")
+            ).fetchone()
+    assert row is not None
+    value: object = row[0]
+    assert isinstance(value, int)
+    return value
 
 
 @pytest.mark.asyncio
@@ -449,19 +460,6 @@ def test_flagged_query_emits_error_before_finalization(
     )
     assert all(event.get("step") != "finalization" for event in delivered)
 
-    run_id = UUID(response.headers["x-run-id"])
-
-    async def read_run() -> str:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunRepository(pool)
-            return (await repository.get_run("tenant-a", run_id)).status
-
-    status = asyncio.run(read_run())
-    assert status == "failed"
-
-
 @pytest.mark.asyncio
 async def test_http_adapter_accepts_a_deterministic_graph_fake(
     langgraph_v2_migrated_database_url: str,
@@ -630,57 +628,6 @@ def test_removed_replay_cursor_is_rejected(
     assert response.json() == {
         "detail": "Replay query parameter is no longer supported: afterSequence"
     }
-
-
-def test_long_running_request_refreshes_its_claim(
-    langgraph_v2_migrated_database_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    asyncio.run(
-        seed_subject_conversation(langgraph_v2_migrated_database_url, "conversation-1")
-    )
-    monkeypatch.setattr(api_module, "CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
-
-    class SlowGraph:
-        def astream(
-            self, state: object | None, **options: Any
-        ) -> AsyncIterator[object]:
-            del state, options
-
-            async def stream() -> AsyncIterator[object]:
-                await asyncio.sleep(0.05)
-                yield (
-                    "custom",
-                    {
-                        "type": "done",
-                        "data": {"source": "slow"},
-                        "checkpoint_terminal": True,
-                    },
-                )
-                yield ("updates", {"slow": {"final_response": {}}})
-
-            return stream()
-
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url, SlowGraph())
-    with TestClient(app) as client:
-        response = client.post(
-            "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-
-    run_id = UUID(response.headers["x-run-id"])
-
-    async def load_run():
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url,
-            min_size=1,
-            max_size=2,
-        ) as pool:
-            return await RunRepository(pool).get_run("tenant-a", run_id)
-
-    run = asyncio.run(load_run())
-    assert run.heartbeat_at > run.created_at
 
 
 def test_transport_event_table_is_not_used_by_completed_graph(

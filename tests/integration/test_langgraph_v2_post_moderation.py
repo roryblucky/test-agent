@@ -17,7 +17,6 @@ from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import (
@@ -138,13 +137,6 @@ async def test_safe_answer_passes_post_moderation_unchanged(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         messages = ConversationMessageRepository(pool)
         await messages.resolve_conversation(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
@@ -162,7 +154,6 @@ async def test_safe_answer_passes_post_moderation_unchanged(
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
@@ -189,13 +180,6 @@ async def test_flagged_answer_remains_canonical_through_finalization(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         messages = ConversationMessageRepository(pool)
         await messages.resolve_conversation(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
@@ -213,7 +197,6 @@ async def test_flagged_answer_remains_canonical_through_finalization(
         scope = await seed_artifact_scope(pool, turn_id=turn_id)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             request_context=scope.context,
@@ -252,16 +235,9 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunRepository(pool).create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
         scope = await seed_artifact_scope(pool)
         graph = build_tracer_graph(
             tenant_id="tenant-a",
-            run_id=run.run_id,
             current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
