@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 from uuid import uuid4
 
 import psycopg
@@ -34,11 +34,6 @@ from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.history import ConversationTurn
-from app.langgraph_v2.phase_results import (
-    PhaseExecutionContext,
-    PhaseName,
-    PhaseResultRepository,
-)
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.question_refinement import (
@@ -227,22 +222,6 @@ def _state() -> TracerState:
     }
 
 
-def _context(
-    pool: AsyncConnectionPool[Any],
-    run_id: uuid.UUID,
-    epoch: int,
-    repository: PhaseResultRepository,
-) -> PhaseExecutionContext:
-    return PhaseExecutionContext(
-        repository=repository,
-        artifact_repository=ArtifactRepository(pool),
-        tenant_id="tenant-a",
-        run_id=run_id,
-        owner_instance_id="i1",
-        execution_epoch=epoch,
-    )
-
-
 @pytest.mark.asyncio
 async def test_final_payload_preserves_documents_moderation_usage_and_session(
     langgraph_v2_migrated_database_url: str,
@@ -258,11 +237,10 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
         )
         answer = _Answer()
         moderation = _Moderation()
-        phase_repository = PhaseResultRepository(pool)
         graph = build_tracer_graph(
-            phase_context=_context(
-                pool, run.run_id, run.execution_epoch, phase_repository
-            ),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            artifact_repository=ArtifactRepository(pool),
             moderation_provider=moderation,
             refinement_actor=_UsageRefinement(),
             retriever=_Retriever(),
@@ -271,27 +249,11 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
             groundedness_actor=_Groundedness(),
         )
         result = await graph.ainvoke(_state())
-        phase_names: tuple[PhaseName, ...] = (
-            "query",
-            "pre_moderation",
-            "question_refinement",
-            "retrieval",
-            "reranking",
-            "answer",
-            "groundedness",
-            "post_moderation",
-            "finalization",
-        )
-        phase_results = [
-            await phase_repository.get_completed("tenant-a", run.run_id, phase_name)
-            for phase_name in phase_names
-        ]
         transport_events = await RunEventRepository(pool).list_events(
             "tenant-a", run.run_id
         )
 
     done = result["events"][-1]["data"]
-    assert phase_results == [None] * 9
     assert transport_events == []
     assert done["session_id"] == "c1"
     assert done["answer"] == "grounded answer [1]"
@@ -380,20 +342,14 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
             content="hello",
             idempotency_key=f"turn:{turn_id}:user",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
+        answer = _Answer()
+        graph = build_tracer_graph(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            current_turn_id=turn_id,
             artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
             request_context=request_context,
-            current_turn_id=turn_id,
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        answer = _Answer()
-        graph = build_tracer_graph(
-            phase_context=context,
             moderation_provider=_Moderation(),
             retriever=_Retriever(),
             ranker=_Ranker(),

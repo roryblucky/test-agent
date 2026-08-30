@@ -11,7 +11,6 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
@@ -51,16 +50,12 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
             owner_instance_id="i1",
         )
         ranker = Ranker()
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
+        result = await build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id="i1",
-            execution_epoch=run.execution_epoch,
             artifact_repository=ArtifactRepository(pool),
-        )
-        result = await build_tracer_graph(
-            phase_context=context, retriever=Retriever(), ranker=ranker
+            retriever=Retriever(),
+            ranker=ranker,
         ).ainvoke(
             {
                 "query": "hello",
@@ -116,16 +111,10 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
+        result = await build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id="i1",
-            execution_epoch=run.execution_epoch,
             artifact_repository=ArtifactRepository(pool),
-        )
-        result = await build_tracer_graph(
-            phase_context=context,
             retriever=DuplicateRetriever(),
             ranker=InvalidRanker(),
         ).ainvoke(
@@ -171,16 +160,10 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
+        result = await build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id="i1",
-            execution_epoch=run.execution_epoch,
             artifact_repository=ArtifactRepository(pool),
-        )
-        result = await build_tracer_graph(
-            phase_context=context,
             retriever=DuplicateRetriever(),
             ranker=ReverseRanker(),
         ).ainvoke(
@@ -250,18 +233,13 @@ async def test_interrupted_reranking_repeats_provider_with_stable_artifact_refs(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        repository = PhaseResultRepository(pool)
         ranker = CountingRanker()
-        context = PhaseExecutionContext(
-            repository=repository,
+        graph = build_tracer_graph(
+            checkpointer=MemorySaver(),
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id="i1",
-            execution_epoch=run.execution_epoch,
             artifact_repository=ArtifactRepository(pool),
-        )
-        graph = build_tracer_graph(
-            checkpointer=MemorySaver(), phase_context=context, ranker=ranker
+            ranker=ranker,
         )
         state: TracerState = {
             "query": "hello",

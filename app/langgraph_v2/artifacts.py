@@ -26,7 +26,7 @@ class ArtifactRecord(BaseModel):
 
 
 class ArtifactRef(TypedDict):
-    """Stable reference carried through graph state and PhaseResults."""
+    """Stable reference carried through graph state."""
 
     artifact_id: str
     artifact_type: str

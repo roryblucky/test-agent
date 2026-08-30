@@ -53,7 +53,6 @@ from app.langgraph_v2.output_assessments import (
     LoggingOutputAssessmentAudit,
     OutputAssessmentAudit,
 )
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.provider_adapters import (
     MissingModeration,
@@ -845,25 +844,6 @@ def create_tracer_router(
                 selected_graph = graph or tracer_graph
                 graph_config: RunnableConfig | None = None
                 if graph is None:
-                    phase_context = PhaseExecutionContext(
-                        repository=PhaseResultRepository(pool, live_events=wakeups),
-                        artifact_repository=ArtifactRepository(pool),
-                        message_repository=message_repository,
-                        request_context=request_context,
-                        history_token_budget=history_token_budget,
-                        current_turn_id=turn_id,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                        cancellation_check=_resolve_cancellation_check(
-                            http_request.app,
-                            tenant_id,
-                            run_id,
-                            cancellation_observer,
-                        ),
-                        output_assessment_audit=configured_output_assessment_audit,
-                    )
                     saver: FencedAsyncPostgresSaver | None = None
                     if configured_checkpointer is not None:
 
@@ -892,7 +872,20 @@ def create_tracer_router(
                         )
                     selected_graph = build_tracer_graph(
                         saver,
-                        phase_context=phase_context,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        current_turn_id=turn_id,
+                        artifact_repository=ArtifactRepository(pool),
+                        message_repository=message_repository,
+                        request_context=request_context,
+                        history_token_budget=history_token_budget,
+                        cancellation_check=_resolve_cancellation_check(
+                            http_request.app,
+                            tenant_id,
+                            run_id,
+                            cancellation_observer,
+                        ),
+                        output_assessment_audit=configured_output_assessment_audit,
                         refinement_actor=configured_refinement_actor,
                         retriever=configured_retriever,
                         ranker=configured_ranker,
@@ -1076,18 +1069,13 @@ def create_tracer_router(
         )
         checkpoint_graph = build_tracer_graph(
             configured_checkpointer,
-            phase_context=PhaseExecutionContext(
-                repository=PhaseResultRepository(pool, live_events=wakeups),
-                artifact_repository=ArtifactRepository(pool),
-                message_repository=message_repository,
-                request_context=request_context,
-                history_token_budget=history_token_budget,
-                tenant_id=tenant_id,
-                run_id=uuid.UUID(int=0),
-                owner_instance_id="",
-                execution_epoch=0,
-                output_assessment_audit=configured_output_assessment_audit,
-            ),
+            tenant_id=tenant_id,
+            run_id=uuid.UUID(int=0),
+            artifact_repository=ArtifactRepository(pool),
+            message_repository=message_repository,
+            request_context=request_context,
+            history_token_budget=history_token_budget,
+            output_assessment_audit=configured_output_assessment_audit,
             refinement_actor=configured_refinement_actor,
             retriever=configured_retriever,
             ranker=configured_ranker,
@@ -1173,25 +1161,20 @@ def create_tracer_router(
                         checkpoint_namespace="",
                         pointer_writer=write_checkpoint_pointer,
                     ),
-                    phase_context=PhaseExecutionContext(
-                        repository=PhaseResultRepository(pool, live_events=wakeups),
-                        artifact_repository=ArtifactRepository(pool),
-                        message_repository=message_repository,
-                        request_context=request_context,
-                        history_token_budget=history_token_budget,
-                        current_turn_id=target.turn.turn_id,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                        cancellation_check=_resolve_cancellation_check(
-                            http_request.app,
-                            tenant_id,
-                            run_id,
-                            cancellation_observer,
-                        ),
-                        output_assessment_audit=configured_output_assessment_audit,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    current_turn_id=target.turn.turn_id,
+                    artifact_repository=ArtifactRepository(pool),
+                    message_repository=message_repository,
+                    request_context=request_context,
+                    history_token_budget=history_token_budget,
+                    cancellation_check=_resolve_cancellation_check(
+                        http_request.app,
+                        tenant_id,
+                        run_id,
+                        cancellation_observer,
                     ),
+                    output_assessment_audit=configured_output_assessment_audit,
                     refinement_actor=configured_refinement_actor,
                     retriever=configured_retriever,
                     ranker=configured_ranker,

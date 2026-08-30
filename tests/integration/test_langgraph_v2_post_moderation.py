@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -14,7 +13,6 @@ from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
@@ -115,16 +113,10 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             idempotency_key=f"run:{run.run_id}:user",
         )
         moderation = _SafeModeration()
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             moderation_provider=moderation,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -201,23 +193,14 @@ async def test_flagged_answer_remains_canonical_through_finalization(
             content="hello",
             idempotency_key=f"run:{run.run_id}:user",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
         turn_id = uuid4()
         audit = MockOutputAssessmentAudit()
-        context = replace(
-            context,
+        graph = build_tracer_graph(
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             output_assessment_audit=audit,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
             moderation_provider=_FlaggingModeration(),
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -286,16 +269,10 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             moderation_provider=_FailingPostModeration(),
             retriever=_Retriever(),
             ranker=_Ranker(),

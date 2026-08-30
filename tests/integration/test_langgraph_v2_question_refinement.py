@@ -11,7 +11,6 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
     PydanticAIQuestionRefinementActor,
@@ -47,13 +46,8 @@ async def test_safe_query_gets_structured_refinement_and_events(
             owner_instance_id="instance-a",
         )
         graph = build_tracer_graph(
-            phase_context=PhaseExecutionContext(
-                repository=PhaseResultRepository(pool),
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            ),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
             refinement_actor=MockQuestionRefinementActor(),
         )
 
@@ -96,13 +90,8 @@ async def test_refinement_failure_halts_before_later_phases(
             owner_instance_id="instance-a",
         )
         graph = build_tracer_graph(
-            phase_context=PhaseExecutionContext(
-                repository=PhaseResultRepository(pool),
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            ),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
             refinement_actor=FailingActor(),
         )
 
@@ -112,16 +101,11 @@ async def test_refinement_failure_halts_before_later_phases(
         assert result["halted"] is True
         assert result["events"][-1]["type"] == "error"
         assert all(event.get("step") != "finalization" for event in result["events"])
-        phases = PhaseResultRepository(pool)
-        assert (
-            await phases.get_completed("tenant-a", run.run_id, "question_refinement")
-            is None
-        )
         assert await runs.list_events("tenant-a", run.run_id) == []
 
 
 @pytest.mark.asyncio
-async def test_refinement_reexecution_reinvokes_actor_without_journal_events(
+async def test_refinement_reexecution_reinvokes_actor(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class CountingActor:
@@ -150,13 +134,8 @@ async def test_refinement_reexecution_reinvokes_actor_without_journal_events(
         )
         actor = CountingActor()
         graph = build_tracer_graph(
-            phase_context=PhaseExecutionContext(
-                repository=PhaseResultRepository(pool),
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            ),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
             refinement_actor=actor,
         )
 
@@ -164,8 +143,6 @@ async def test_refinement_reexecution_reinvokes_actor_without_journal_events(
         await graph.ainvoke(_state())
 
         assert actor.calls == 2
-        events = await runs.list_events("tenant-a", run.run_id)
-        assert events == []
 
 
 @pytest.mark.asyncio

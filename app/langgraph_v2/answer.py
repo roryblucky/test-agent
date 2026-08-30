@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol
 from uuid import UUID
@@ -14,7 +14,6 @@ from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
-from app.langgraph_v2.phase_results import PhaseExecutionContext
 from app.langgraph_v2.run_events import CancellationObserved, EventInput
 from app.models.domain import Document
 from app.models.workflow import CitationReference
@@ -228,7 +227,8 @@ def build_answer_actor(
 async def run_answer(
     state: Mapping[str, Any],
     *,
-    context: PhaseExecutionContext,
+    tenant_id: str,
+    cancellation_check: Callable[[], Awaitable[bool]] | None,
     artifacts: ArtifactStore,
     actor: AnswerActor,
     stream_writer: Any | None = None,
@@ -244,7 +244,7 @@ async def run_answer(
                 }
             )
 
-    if context.cancellation_check is not None and await context.cancellation_check():
+    if cancellation_check is not None and await cancellation_check():
         raise AnswerCancelled("answer generation cancelled before publication")
     try:
         refs = [
@@ -256,7 +256,7 @@ async def run_answer(
             Document.model_validate(
                 (
                     await artifacts.get(
-                        tenant_id=context.tenant_id,
+                        tenant_id=tenant_id,
                         artifact_id=UUID(ref["artifact_id"]),
                     )
                 ).payload
@@ -286,8 +286,8 @@ async def run_answer(
                 if not chunk.delta:
                     continue
                 if (
-                    context.cancellation_check is not None
-                    and await context.cancellation_check()
+                    cancellation_check is not None
+                    and await cancellation_check()
                 ):
                     raise AnswerCancelled(
                         "answer generation cancelled before publication"
@@ -338,8 +338,8 @@ async def run_answer(
         events.append(event)
         write_event(event)
         if (
-            context.cancellation_check is not None
-            and await context.cancellation_check()
+            cancellation_check is not None
+            and await cancellation_check()
         ):
             raise AnswerCancelled("answer generation cancelled before publication")
         return (

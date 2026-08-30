@@ -10,7 +10,6 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from pydantic import BaseModel, Field
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactWriter
-from app.langgraph_v2.phase_results import PhaseExecutionContext
 from app.langgraph_v2.run_events import EventInput
 from app.models.domain import Document
 
@@ -46,7 +45,9 @@ class MockRetriever:
 async def run_retrieval(
     state: Mapping[str, Any],
     *,
-    context: PhaseExecutionContext,
+    tenant_id: str,
+    run_id: UUID,
+    current_turn_id: UUID | None,
     artifacts: ArtifactWriter,
     retriever: Retriever,
 ) -> tuple[list[EventInput], list[ArtifactRef], list[Document], bool, str | None]:
@@ -57,12 +58,14 @@ async def run_retrieval(
         for document in result.documents:
             payload = document.model_dump(mode="json", exclude_none=True)
             artifact = await artifacts.create(
-                tenant_id=context.tenant_id,
+                tenant_id=tenant_id,
                 artifact_type="document",
                 payload=payload,
                 artifact_id=_artifact_id(
                     state=state,
-                    context=context,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    current_turn_id=current_turn_id,
                     artifact_type="document",
                     payload=payload,
                 ),
@@ -74,12 +77,14 @@ async def run_retrieval(
                 }
             )
         raw = await artifacts.create(
-            tenant_id=context.tenant_id,
+            tenant_id=tenant_id,
             artifact_type="retrieval_raw",
             payload=result.raw_payload,
             artifact_id=_artifact_id(
                 state=state,
-                context=context,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                current_turn_id=current_turn_id,
                 artifact_type="retrieval_raw",
                 payload=result.raw_payload,
             ),
@@ -136,14 +141,16 @@ async def run_retrieval(
 def _artifact_id(
     *,
     state: Mapping[str, Any],
-    context: PhaseExecutionContext,
+    tenant_id: str,
+    run_id: UUID,
+    current_turn_id: UUID | None,
     artifact_type: str,
     payload: Any,
 ) -> UUID:
     """Address immutable retrieval data consistently across Resume Runs."""
-    raw_turn_id = context.current_turn_id or state.get("turn_id")
+    raw_turn_id = current_turn_id or state.get("turn_id")
     scope_kind = "turn" if raw_turn_id is not None else "run"
-    scope_id = str(raw_turn_id or context.run_id)
+    scope_id = str(raw_turn_id or run_id)
     canonical_payload = json.dumps(
         payload,
         ensure_ascii=False,
@@ -155,7 +162,7 @@ def _artifact_id(
         ":".join(
             (
                 "langgraph-v2",
-                context.tenant_id,
+                tenant_id,
                 str(state.get("conversation_id", "")),
                 scope_kind,
                 scope_id,

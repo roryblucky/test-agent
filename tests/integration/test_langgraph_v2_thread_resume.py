@@ -31,7 +31,6 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.post_moderation import ModerationDecision
 from app.langgraph_v2.question_refinement import (
     QuestionRefinementResult,
@@ -302,21 +301,15 @@ async def _seed_pre_answer_checkpoint(
             content="resume me",
             idempotency_key=f"turn:{turn_id}:user",
         )
-        phase_context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
+        graph = build_tracer_graph(
+            checkpointer,
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            current_turn_id=turn_id,
             artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
             request_context=context,
             history_token_budget=4096,
-            current_turn_id=turn_id,
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            checkpointer,
-            phase_context=phase_context,
             answer_actor=_AnswerActor(),
             groundedness_actor=_AssertingGroundednessActor("recovered answer"),
         )
@@ -451,21 +444,15 @@ async def _advance_same_turn_checkpoint(
             content="resume me",
             idempotency_key=f"turn:{turn_id}:user",
         )
-        phase_context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
+        graph = build_tracer_graph(
+            checkpointer,
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            current_turn_id=turn_id,
             artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
             request_context=context,
             history_token_budget=4096,
-            current_turn_id=turn_id,
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            checkpointer,
-            phase_context=phase_context,
             answer_actor=_AnswerActor(),
         )
         await graph.ainvoke(

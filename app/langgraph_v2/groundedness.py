@@ -12,10 +12,10 @@ from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.output_assessments import (
+    OutputAssessmentAudit,
     build_output_assessment_scope,
     record_output_assessment,
 )
-from app.langgraph_v2.phase_results import PhaseExecutionContext
 from app.langgraph_v2.run_events import EventInput
 from app.models.domain import Document, GroundednessResult
 
@@ -101,19 +101,21 @@ def build_groundedness_actor(
 async def run_groundedness(
     state: Mapping[str, Any],
     *,
-    context: PhaseExecutionContext,
+    tenant_id: str,
+    current_turn_id: UUID | None,
+    output_assessment_audit: OutputAssessmentAudit | None,
     artifacts: ArtifactStore,
     actor: GroundednessActor,
 ) -> tuple[list[EventInput], GroundednessResult | None, dict[str, Any], str | None]:
     """Evaluate the canonical Answer and record the advisory audit result."""
     assessment_scope = build_output_assessment_scope(
-        tenant_id=context.tenant_id,
+        tenant_id=tenant_id,
         conversation_id=(
             state.get("conversation_id")
             if isinstance(state.get("conversation_id"), str)
             else None
         ),
-        turn_id=context.current_turn_id or state.get("turn_id"),
+        turn_id=current_turn_id or state.get("turn_id"),
     )
 
     try:
@@ -134,7 +136,7 @@ async def run_groundedness(
             Document.model_validate(
                 (
                     await artifacts.get(
-                        tenant_id=context.tenant_id,
+                        tenant_id=tenant_id,
                         artifact_id=UUID(ref["artifact_id"]),
                     )
                 ).payload
@@ -150,7 +152,7 @@ async def run_groundedness(
             "usage": raw_result.get("usage", {}),
         }
         await record_output_assessment(
-            context.output_assessment_audit,
+            output_assessment_audit,
             scope=assessment_scope,
             assessment_type="groundedness",
             result=normalized_result,
@@ -177,7 +179,7 @@ async def run_groundedness(
         message = str(exc) or "Groundedness evaluation failed."
         failed_result = {"failed": True, "error": message}
         await record_output_assessment(
-            context.output_assessment_audit,
+            output_assessment_audit,
             scope=assessment_scope,
             assessment_type="groundedness",
             result=failed_result,

@@ -19,7 +19,6 @@ from app.langgraph_v2.answer import (
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
@@ -194,7 +193,7 @@ class _MalformedCitationAnswer:
 
 
 @pytest.mark.asyncio
-async def test_answer_receives_ranked_documents_without_phase_journal(
+async def test_answer_receives_ranked_documents_on_each_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -208,16 +207,10 @@ async def test_answer_receives_ranked_documents_without_phase_journal(
             owner_instance_id="i1",
         )
         actor = _AnswerActor()
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -231,12 +224,8 @@ async def test_answer_receives_ranked_documents_without_phase_journal(
 
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
-        answer_phase = await context.repository.get_completed(
-            "tenant-a", run.run_id, "answer"
-        )
 
     assert actor.calls == 2
-    assert answer_phase is None
     assert "answer" in first
     assert first["answer"] == "One. Two\nThree; four"
     assert "answer" in first
@@ -271,17 +260,11 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
         graph = build_tracer_graph(
             checkpointer=MemorySaver(),
-            phase_context=context,
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            artifact_repository=ArtifactRepository(pool),
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_StreamingAnswerActor(),
@@ -380,16 +363,10 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
             owner_instance_id="i1",
         )
         actor = _CitingAnswer()
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -439,16 +416,10 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
             owner_instance_id="i1",
         )
         actor = _InlineCitationAnswer()
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -554,17 +525,10 @@ async def test_inline_citation_uses_reranked_artifact_position(
             owner_instance_id="i1",
         )
         actor = _RankedInlineAnswer()
-        repository = PhaseResultRepository(pool)
-        context = PhaseExecutionContext(
-            repository=repository,
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             retriever=TwoRetriever(),
             ranker=ReverseRanker(),
             answer_actor=actor,
@@ -599,16 +563,10 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
             owner_instance_id="i1",
         )
         actor = _MalformedCitationAnswer()
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,

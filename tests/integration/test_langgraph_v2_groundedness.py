@@ -19,7 +19,6 @@ from app.langgraph_v2.groundedness import (
 )
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
@@ -103,7 +102,7 @@ class _FailingAssessmentAudit:
 
 
 @pytest.mark.asyncio
-async def test_low_groundedness_is_advisory_without_phase_journal(
+async def test_low_groundedness_is_advisory_on_each_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -119,18 +118,12 @@ async def test_low_groundedness_is_advisory_without_phase_journal(
         evaluator = _Groundedness()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
+            artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             output_assessment_audit=audit,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_Answer(),
@@ -145,9 +138,6 @@ async def test_low_groundedness_is_advisory_without_phase_journal(
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
-        phase = await context.repository.get_completed(
-            "tenant-a", run.run_id, "groundedness"
-        )
 
     assert evaluator.calls == 2
     assert "answer" in first
@@ -171,7 +161,6 @@ async def test_low_groundedness_is_advisory_without_phase_journal(
     assert groundedness_audit.assessment_id == (
         f"turn:{turn_id}:assessment:groundedness"
     )
-    assert phase is None
     assert any(event.get("step") == "groundedness" for event in first["events"])
 
 
@@ -201,18 +190,12 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         evaluator = Failing()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
+            artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             output_assessment_audit=audit,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_Answer(),
@@ -278,16 +261,10 @@ async def test_groundedness_uses_only_cited_documents(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_UncitedAnswer(),
@@ -327,16 +304,10 @@ async def test_groundedness_rejects_out_of_range_scores(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
+            artifact_repository=ArtifactRepository(pool),
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_Answer(),
@@ -431,18 +402,12 @@ async def test_assessment_audit_failure_does_not_gate_answer(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        context = PhaseExecutionContext(
-            repository=PhaseResultRepository(pool),
-            artifact_repository=ArtifactRepository(pool),
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
+            artifact_repository=ArtifactRepository(pool),
             current_turn_id=uuid4(),
             output_assessment_audit=_FailingAssessmentAudit(),
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_Answer(),

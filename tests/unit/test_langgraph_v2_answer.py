@@ -1,7 +1,5 @@
 import asyncio
-from types import SimpleNamespace
 from typing import Any, Self, cast
-from uuid import uuid4
 
 import pytest
 from pydantic_ai.usage import RunUsage
@@ -17,7 +15,6 @@ from app.langgraph_v2.answer import (
 )
 from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.history import ConversationTurn
-from app.langgraph_v2.phase_results import PhaseExecutionContext
 from app.models.domain import Document
 
 
@@ -72,21 +69,6 @@ class _FakeStructuredAgent:
         self.prompt = prompt
         self.kwargs = kwargs
         return self.stream
-
-
-class _FakePhaseRepository:
-    def __init__(self) -> None:
-        self.committed = False
-        self.candidate: object | None = None
-
-    async def get_or_invoke(self, **kwargs: Any) -> object:
-        phase = await kwargs["invoke"]()  # type: ignore[index]
-        self.candidate = phase
-        self.committed = True
-        return SimpleNamespace(
-            normalized_result=phase.normalized_result,  # type: ignore[attr-defined]
-            events=[],
-        )
 
 
 @pytest.mark.asyncio
@@ -154,19 +136,12 @@ async def test_run_answer_writes_real_deltas_and_returns_same_complete_answer() 
         final,
     )
     actor = PydanticAIAnswerActor(_FakeStructuredAgent(stream))  # type: ignore[arg-type]
-    repository = _FakePhaseRepository()
-    context = PhaseExecutionContext(
-        repository=repository,  # type: ignore[arg-type]
-        tenant_id="tenant-a",
-        run_id=uuid4(),
-        owner_instance_id="instance-a",
-        execution_epoch=1,
-    )
     public_events: list[dict[str, object]] = []
 
     _, result, halted, error = await run_answer(
         {"query": "question"},
-        context=context,
+        tenant_id="tenant-a",
+        cancellation_check=None,
         artifacts=object(),  # type: ignore[arg-type]
         actor=actor,
         stream_writer=public_events.append,
@@ -186,7 +161,6 @@ async def test_run_answer_writes_real_deltas_and_returns_same_complete_answer() 
         )
         == result.answer
     )
-    assert repository.committed is False
 
 
 @pytest.mark.asyncio
@@ -199,7 +173,6 @@ async def test_run_answer_cancellation_after_delta_does_not_commit_partial_resul
         final,
     )
     actor = PydanticAIAnswerActor(_FakeStructuredAgent(stream))  # type: ignore[arg-type]
-    repository = _FakePhaseRepository()
     checks = 0
 
     async def cancellation_check() -> bool:
@@ -207,26 +180,17 @@ async def test_run_answer_cancellation_after_delta_does_not_commit_partial_resul
         checks += 1
         return checks > 2
 
-    context = PhaseExecutionContext(
-        repository=repository,  # type: ignore[arg-type]
-        tenant_id="tenant-a",
-        run_id=uuid4(),
-        owner_instance_id="instance-a",
-        execution_epoch=1,
-        cancellation_check=cancellation_check,
-    )
-
     public_events: list[dict[str, object]] = []
     with pytest.raises(AnswerCancelled):
         await run_answer(
             {"query": "question"},
-            context=context,
+            tenant_id="tenant-a",
+            cancellation_check=cancellation_check,
             artifacts=object(),  # type: ignore[arg-type]
             actor=actor,
             stream_writer=public_events.append,
         )
 
-    assert repository.committed is False
     assert stream.exited is True
     assert stream.cleanup_completed is True
     assert [event["data"] for event in public_events if event["type"] == "token"] == [
@@ -253,23 +217,11 @@ def test_build_answer_actor_uses_registry_model_and_output_type() -> None:
 
 @pytest.mark.asyncio
 async def test_answer_checks_cancellation_before_publication() -> None:
-    class Repository:
-        async def get_or_invoke(self, **kwargs: Any) -> object:
-            raise AssertionError("cancelled answer must not invoke the repository")
-
-    context = PhaseExecutionContext(
-        repository=Repository(),  # type: ignore[arg-type]
-        tenant_id="tenant-a",
-        run_id=uuid4(),
-        owner_instance_id="instance-a",
-        execution_epoch=1,
-        cancellation_check=lambda: asyncio.sleep(0, result=True),
-    )
-
     with pytest.raises(AnswerCancelled):
         await run_answer(
             {"query": "hello"},
-            context=context,
+            tenant_id="tenant-a",
+            cancellation_check=lambda: asyncio.sleep(0, result=True),
             artifacts=cast(ArtifactStore, object()),
             actor=object(),  # type: ignore[arg-type]
         )

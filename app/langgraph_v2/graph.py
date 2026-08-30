@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import AsyncIterator, Hashable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Iterable
 from typing import Any, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
@@ -18,7 +18,7 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.types import StateSnapshot
 
 from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
-from app.langgraph_v2.artifacts import ArtifactRef
+from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import (
     GraphEventJournalPolicy,
@@ -26,10 +26,15 @@ from app.langgraph_v2.contracts import (
     TracerQueryResponse,
     TracerStreamEvent,
 )
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
-from app.langgraph_v2.history import ConversationTurn, select_sliding_window_history
-from app.langgraph_v2.phase_results import PhaseExecutionContext
+from app.langgraph_v2.history import (
+    DEFAULT_HISTORY_TOKEN_BUDGET,
+    ConversationTurn,
+    select_sliding_window_history,
+)
+from app.langgraph_v2.output_assessments import OutputAssessmentAudit
 from app.langgraph_v2.post_moderation import run_post_moderation
 from app.langgraph_v2.pre_moderation import (
     MockModerationProvider,
@@ -137,21 +142,24 @@ class TracerGraph(Protocol):
 async def _query(
     state: TracerState,
     *,
-    phase_context: PhaseExecutionContext | None = None,
+    message_repository: ConversationMessageRepository | None = None,
+    request_context: TrustedRequestContext | None = None,
+    history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
+    current_turn_id: UUID | None = None,
 ) -> TracerStateUpdate:
     query = state["query"]
     canonical = canonical_query(query)
 
     history: list[ConversationTurn] = []
-    if phase_context is not None and phase_context.message_repository is not None:
-        messages = await phase_context.message_repository.list_messages(
-            context=cast(TrustedRequestContext, phase_context.request_context),
+    if message_repository is not None and request_context is not None:
+        messages = await message_repository.list_messages(
+            context=request_context,
             conversation_id=state["conversation_id"],
         )
         history = select_sliding_window_history(
             messages,
-            token_budget=phase_context.history_token_budget,
-            current_turn_id=phase_context.current_turn_id
+            token_budget=history_token_budget,
+            current_turn_id=current_turn_id
             or (
                 UUID(turn_id) if (turn_id := state.get("turn_id")) is not None else None
             ),
@@ -222,12 +230,12 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     return cast(TracerStateUpdate, finalize_in_memory(state))
 
 
-async def _check_cancellation(context: PhaseExecutionContext | None) -> None:
+async def _check_cancellation(
+    cancellation_check: Callable[[], Awaitable[bool]] | None,
+) -> None:
     """Stop before entering the next persistent graph node."""
     if (
-        context is not None
-        and context.cancellation_check is not None
-        and await context.cancellation_check()
+        cancellation_check is not None and await cancellation_check()
     ):
         raise CancellationObserved("cancellation observed at graph boundary")
 
@@ -247,7 +255,16 @@ def _next_after_retrieval(state: TracerState) -> str:
 
 def build_tracer_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
-    phase_context: PhaseExecutionContext | None = None,
+    *,
+    tenant_id: str | None = None,
+    run_id: UUID | None = None,
+    current_turn_id: UUID | None = None,
+    artifact_repository: ArtifactStore | None = None,
+    message_repository: ConversationMessageRepository | None = None,
+    request_context: TrustedRequestContext | None = None,
+    history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
+    cancellation_check: Callable[[], Awaitable[bool]] | None = None,
+    output_assessment_audit: OutputAssessmentAudit | None = None,
     moderation_provider: ModerationProvider | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
@@ -256,25 +273,38 @@ def build_tracer_graph(
     groundedness_actor: GroundednessActor | None = None,
 ) -> TracerGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
+    if message_repository is not None and request_context is None:
+        raise ValueError("request_context is required with message_repository")
+    if (
+        tenant_id is not None
+        and request_context is not None
+        and request_context.tenant_id != tenant_id
+    ):
+        raise ValueError("request_context tenant_id must match tenant_id")
+
     builder: StateGraph[TracerState, None, TracerState, TracerState] = StateGraph(
         TracerState
     )
 
     async def query_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(phase_context)
-        return await _query(state, phase_context=phase_context)
+        await _check_cancellation(cancellation_check)
+        return await _query(
+            state,
+            message_repository=message_repository,
+            request_context=request_context,
+            history_token_budget=history_token_budget,
+            current_turn_id=current_turn_id,
+        )
 
     builder.add_node("query", query_node)  # pyright: ignore[reportUnknownMemberType]
     selected_moderation_provider = moderation_provider or MockModerationProvider()
     selected_refinement_actor = refinement_actor or MockQuestionRefinementActor()
     selected_retriever = retriever or MockRetriever()
     selected_ranker = ranker or MockRanker()
-    selected_artifact_repository = (
-        phase_context.artifact_repository if phase_context is not None else None
-    )
+    selected_artifact_repository = artifact_repository
 
     async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(phase_context)
+        await _check_cancellation(cancellation_check)
         events, halted, decision = await run_pre_moderation(
             state, provider=selected_moderation_provider
         )
@@ -289,7 +319,7 @@ def build_tracer_graph(
     )
 
     async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(phase_context)
+        await _check_cancellation(cancellation_check)
         events, halted, result, error = await run_question_refinement(
             state, actor=selected_refinement_actor
         )
@@ -310,12 +340,14 @@ def build_tracer_graph(
     )
 
     async def retrieval_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(phase_context)
-        if phase_context is None or selected_artifact_repository is None:
+        await _check_cancellation(cancellation_check)
+        if tenant_id is None or run_id is None or selected_artifact_repository is None:
             return {"artifact_refs": []}
         events, refs, _, halted, error = await run_retrieval(
             state,
-            context=phase_context,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            current_turn_id=current_turn_id,
             artifacts=selected_artifact_repository,
             retriever=selected_retriever,
         )
@@ -333,12 +365,12 @@ def build_tracer_graph(
     )
 
     async def reranking_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(phase_context)
-        if phase_context is None or selected_artifact_repository is None:
+        await _check_cancellation(cancellation_check)
+        if tenant_id is None or selected_artifact_repository is None:
             return {"ranked_refs": state.get("artifact_refs", [])}
         events, refs, halted, error = await run_reranking(
             state,
-            context=phase_context,
+            tenant_id=tenant_id,
             artifacts=selected_artifact_repository,
             ranker=selected_ranker,
         )
@@ -355,14 +387,22 @@ def build_tracer_graph(
         "reranking", reranking_node
     )
 
-    if answer_actor is not None and selected_artifact_repository is not None:
+    answer_enabled = (
+        answer_actor is not None
+        and selected_artifact_repository is not None
+        and tenant_id is not None
+    )
+    if answer_enabled:
 
         async def answer_node(state: TracerState) -> TracerStateUpdate:
-            assert phase_context is not None
-            await _check_cancellation(phase_context)
+            assert tenant_id is not None
+            assert selected_artifact_repository is not None
+            assert answer_actor is not None
+            await _check_cancellation(cancellation_check)
             events, result, halted, error = await run_answer(
                 state,
-                context=phase_context,
+                tenant_id=tenant_id,
+                cancellation_check=cancellation_check,
                 artifacts=selected_artifact_repository,
                 actor=answer_actor,
                 stream_writer=get_stream_writer(),
@@ -379,8 +419,8 @@ def build_tracer_graph(
                 update["answer_error"] = error
             if (
                 not halted
-                and phase_context.cancellation_check is not None
-                and await phase_context.cancellation_check()
+                and cancellation_check is not None
+                and await cancellation_check()
             ):
                 raise AnswerCancelled("answer publication cancelled at graph boundary")
             return update
@@ -392,11 +432,14 @@ def build_tracer_graph(
         if groundedness_actor is not None:
 
             async def groundedness_node(state: TracerState) -> TracerStateUpdate:
-                assert phase_context is not None
-                await _check_cancellation(phase_context)
+                assert tenant_id is not None
+                assert selected_artifact_repository is not None
+                await _check_cancellation(cancellation_check)
                 events, result, usage, error = await run_groundedness(
                     state,
-                    context=phase_context,
+                    tenant_id=tenant_id,
+                    current_turn_id=current_turn_id,
+                    output_assessment_audit=output_assessment_audit,
                     artifacts=selected_artifact_repository,
                     actor=groundedness_actor,
                 )
@@ -416,11 +459,13 @@ def build_tracer_graph(
             )
 
         async def post_moderation_node(state: TracerState) -> TracerStateUpdate:
-            assert phase_context is not None
-            await _check_cancellation(phase_context)
+            assert tenant_id is not None
+            await _check_cancellation(cancellation_check)
             events, decision, error = await run_post_moderation(
                 state,
-                context=phase_context,
+                tenant_id=tenant_id,
+                current_turn_id=current_turn_id,
+                output_assessment_audit=output_assessment_audit,
                 provider=selected_moderation_provider,
             )
             update: TracerStateUpdate = {
@@ -437,12 +482,12 @@ def build_tracer_graph(
         )
 
     async def finalization_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(phase_context)
-        if phase_context is None or selected_artifact_repository is None:
+        await _check_cancellation(cancellation_check)
+        if tenant_id is None or selected_artifact_repository is None:
             return await _finalize(state)
         events, response = await run_finalization(
             state,
-            context=phase_context,
+            tenant_id=tenant_id,
             artifacts=selected_artifact_repository,
         )
         done_event = TracerStreamEvent(
@@ -486,13 +531,13 @@ def build_tracer_graph(
         "finalization": "finalization",
         "end": END,
     }
-    if answer_actor is not None and selected_artifact_repository is not None:
+    if answer_enabled:
         reranking_routes["answer"] = "answer"
 
     def next_after_reranking(state: TracerState) -> str:
         if state.get("halted", False):
             return "end"
-        if answer_actor is not None and selected_artifact_repository is not None:
+        if answer_enabled:
             return "answer"
         return "finalization"
 
@@ -501,7 +546,7 @@ def build_tracer_graph(
         next_after_reranking,
         reranking_routes,
     )
-    if answer_actor is not None and selected_artifact_repository is not None:
+    if answer_enabled:
         answer_routes: dict[Hashable, str] = {
             "finalization": "finalization",
             "end": END,

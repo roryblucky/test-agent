@@ -25,7 +25,6 @@ from app.langgraph_v2.artifacts import (
 )
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
@@ -77,14 +76,9 @@ async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
         )
         retriever = CountingRetriever()
         graph = build_tracer_graph(
-            phase_context=PhaseExecutionContext(
-                repository=PhaseResultRepository(pool),
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                owner_instance_id="i1",
-                execution_epoch=run.execution_epoch,
-                artifact_repository=ArtifactRepository(pool),
-            ),
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            artifact_repository=ArtifactRepository(pool),
             retriever=retriever,
         )
         state: TracerState = {
@@ -253,23 +247,16 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        repository = PhaseResultRepository(pool)
         artifacts = InterruptAfterArtifacts(ArtifactRepository(pool))
         retriever = CountingRetriever()
         turn_id = uuid4()
-        first_context = PhaseExecutionContext(
-            repository=repository,
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id="i1",
-            execution_epoch=run.execution_epoch,
-            current_turn_id=turn_id,
-            artifact_repository=artifacts,
-        )
         checkpointer = MemorySaver()
         first_graph = build_tracer_graph(
             checkpointer=checkpointer,
-            phase_context=first_context,
+            tenant_id="tenant-a",
+            run_id=run.run_id,
+            current_turn_id=turn_id,
+            artifact_repository=artifacts,
             retriever=retriever,
             ranker=IdentityRanker(),
             answer_actor=CitingAnswer(),
@@ -295,15 +282,10 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
         )
         resume_graph = build_tracer_graph(
             checkpointer=checkpointer,
-            phase_context=PhaseExecutionContext(
-                repository=PhaseResultRepository(pool),
-                tenant_id="tenant-a",
-                run_id=resume_run.run_id,
-                owner_instance_id="i2",
-                execution_epoch=resume_run.execution_epoch,
-                current_turn_id=turn_id,
-                artifact_repository=artifacts,
-            ),
+            tenant_id="tenant-a",
+            run_id=resume_run.run_id,
+            current_turn_id=turn_id,
+            artifact_repository=artifacts,
             retriever=retriever,
             ranker=IdentityRanker(),
             answer_actor=CitingAnswer(),
