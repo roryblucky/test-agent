@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Iterable
+from collections.abc import AsyncIterator, Hashable, Iterable
 from typing import Any, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
@@ -17,12 +17,7 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 )
 from langgraph.types import StateSnapshot
 
-from app.langgraph_v2.answer import (
-    AnswerActor,
-    AnswerCancelled,
-    CancellationObserved,
-    run_answer,
-)
+from app.langgraph_v2.answer import AnswerActor, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import LiveStreamEvent, TracerQueryResponse
@@ -206,14 +201,6 @@ async def _finalize(state: TracerState) -> TracerStateUpdate:
     return {"final_response": response}
 
 
-async def _check_cancellation(
-    cancellation_check: Callable[[], Awaitable[bool]] | None,
-) -> None:
-    """Stop before entering the next persistent graph node."""
-    if cancellation_check is not None and await cancellation_check():
-        raise CancellationObserved("cancellation observed at graph boundary")
-
-
 def _next_after_pre_moderation(state: TracerState) -> str:
     """Stop the graph on a flagged query before any later phase."""
     return "end" if state.get("halted", False) else "question_refinement"
@@ -236,7 +223,6 @@ def build_tracer_graph(
     message_repository: ConversationMessageRepository | None = None,
     request_context: TrustedRequestContext | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
-    cancellation_check: Callable[[], Awaitable[bool]] | None = None,
     output_assessment_audit: OutputAssessmentAudit | None = None,
     moderation_provider: ModerationProvider | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
@@ -260,7 +246,6 @@ def build_tracer_graph(
     )
 
     async def query_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(cancellation_check)
         return await _query(
             state,
             message_repository=message_repository,
@@ -293,7 +278,6 @@ def build_tracer_graph(
         )
 
     async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(cancellation_check)
         events, halted, decision = await run_pre_moderation(
             state, provider=selected_moderation_provider
         )
@@ -308,7 +292,6 @@ def build_tracer_graph(
     )
 
     async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(cancellation_check)
         events, halted, result, error = await run_question_refinement(
             state, actor=selected_refinement_actor
         )
@@ -329,7 +312,6 @@ def build_tracer_graph(
     )
 
     async def retrieval_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(cancellation_check)
         scope = artifact_scope(state)
         if scope is None or selected_artifact_repository is None:
             return {"artifact_refs": []}
@@ -353,7 +335,6 @@ def build_tracer_graph(
     )
 
     async def reranking_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(cancellation_check)
         scope = artifact_scope(state)
         if scope is None or selected_artifact_repository is None:
             return {"ranked_refs": state.get("artifact_refs", [])}
@@ -389,11 +370,9 @@ def build_tracer_graph(
             assert answer_actor is not None
             scope = artifact_scope(state)
             assert scope is not None
-            await _check_cancellation(cancellation_check)
             _, result, halted, error = await run_answer(
                 state,
                 scope=scope,
-                cancellation_check=cancellation_check,
                 artifacts=selected_artifact_repository,
                 actor=answer_actor,
                 stream_writer=get_stream_writer(),
@@ -407,12 +386,6 @@ def build_tracer_graph(
                 update["citations"] = result.citations
             if error is not None:
                 update["answer_error"] = error
-            if (
-                not halted
-                and cancellation_check is not None
-                and await cancellation_check()
-            ):
-                raise AnswerCancelled("answer publication cancelled at graph boundary")
             return update
 
         builder.add_node(  # pyright: ignore[reportUnknownMemberType]
@@ -426,7 +399,6 @@ def build_tracer_graph(
                 assert selected_artifact_repository is not None
                 scope = artifact_scope(state)
                 assert scope is not None
-                await _check_cancellation(cancellation_check)
                 events, result, usage, error = await run_groundedness(
                     state,
                     scope=scope,
@@ -451,7 +423,6 @@ def build_tracer_graph(
 
         async def post_moderation_node(state: TracerState) -> TracerStateUpdate:
             assert tenant_id is not None
-            await _check_cancellation(cancellation_check)
             events, decision, error = await run_post_moderation(
                 state,
                 tenant_id=tenant_id,
@@ -472,7 +443,6 @@ def build_tracer_graph(
         )
 
     async def finalization_node(state: TracerState) -> TracerStateUpdate:
-        await _check_cancellation(cancellation_check)
         scope = artifact_scope(state)
         if scope is None or selected_artifact_repository is None:
             return await _finalize(state)

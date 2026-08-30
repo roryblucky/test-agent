@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol
 from uuid import UUID
@@ -140,14 +140,6 @@ class AnswerActor(Protocol):
         ...
 
 
-class CancellationObserved(RuntimeError):
-    """Request-owned execution observed cooperative cancellation."""
-
-
-class AnswerCancelled(CancellationObserved):
-    """Raised when cancellation is observed before answer publication."""
-
-
 class PydanticAIAnswerActor:
     """Adapt a PydanticAI Agent with structured answer output."""
 
@@ -232,7 +224,6 @@ async def run_answer(
     state: Mapping[str, Any],
     *,
     scope: ArtifactScope,
-    cancellation_check: Callable[[], Awaitable[bool]] | None,
     artifacts: ArtifactStore,
     actor: AnswerActor,
     stream_writer: Any | None = None,
@@ -243,8 +234,6 @@ async def run_answer(
         if stream_writer is not None:
             stream_writer(event.to_stream_payload())
 
-    if cancellation_check is not None and await cancellation_check():
-        raise AnswerCancelled("answer generation cancelled before publication")
     answer_started = False
     try:
         refs = [
@@ -283,10 +272,6 @@ async def run_answer(
                     streamed_result = chunk.result
                 if not chunk.delta:
                     continue
-                if cancellation_check is not None and await cancellation_check():
-                    raise AnswerCancelled(
-                        "answer generation cancelled before publication"
-                    )
                 if not answer_started:
                     answer_started = True
                     write_event(events[0])
@@ -329,8 +314,6 @@ async def run_answer(
         )
         events.append(event)
         write_event(event)
-        if cancellation_check is not None and await cancellation_check():
-            raise AnswerCancelled("answer generation cancelled before publication")
         return (
             events,
             BoundAnswerResult(
@@ -341,8 +324,6 @@ async def run_answer(
             False,
             None,
         )
-    except AnswerCancelled:
-        raise
     except Exception as exc:
         message = str(exc) or "Answer generation failed."
         start_event = LiveStreamEvent(
