@@ -185,25 +185,3 @@ class CancellationRepository:
                     if cursor.rowcount != 1:
                         raise ClaimFenced(str(run_id))
         return True
-
-
-class CancellationObserver:
-    """Read authoritative cancellation intent at Graph boundaries."""
-
-    def __init__(
-        self,
-        repository: CancellationRepository,
-        *,
-        tenant_id: str,
-        run_id: UUID,
-    ) -> None:
-        self._repository = repository
-        self._tenant_id = tenant_id
-        self._run_id = run_id
-
-    async def is_requested(self) -> bool:
-        """Check PostgreSQL at a boundary unless a prior read confirmed intent."""
-        return await self._repository.is_requested(
-            tenant_id=self._tenant_id,
-            run_id=self._run_id,
-        )

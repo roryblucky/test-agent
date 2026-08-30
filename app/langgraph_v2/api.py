@@ -7,7 +7,7 @@ import logging
 import os
 import socket
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
@@ -25,7 +25,7 @@ from app.langgraph_v2.authorization import (
     TrustedRequestContext,
     get_trusted_request_context,
 )
-from app.langgraph_v2.cancellation import CancellationObserver, CancellationRepository
+from app.langgraph_v2.cancellation import CancellationRepository
 from app.langgraph_v2.checkpointing import (
     FencedAsyncPostgresSaver,
     exact_checkpoint_config,
@@ -139,15 +139,18 @@ def _resolve_cancellation_check(
     app: FastAPI,
     tenant_id: str,
     run_id: uuid.UUID,
-    observer: CancellationObserver,
-) -> Any:
-    """Combine the authoritative observer with an optional test seam."""
+    repository: CancellationRepository,
+) -> Callable[[], Awaitable[bool]]:
+    """Combine the authoritative PostgreSQL check with an optional test seam."""
+    async def authoritative_check() -> bool:
+        return await repository.is_requested(tenant_id=tenant_id, run_id=run_id)
+
     checker = getattr(app.state, "langgraph_v2_cancellation_check", None)
     if checker is None:
-        return observer.is_requested
+        return authoritative_check
 
     async def check() -> bool:
-        return bool(await checker(tenant_id, run_id)) or await observer.is_requested()
+        return bool(await checker(tenant_id, run_id)) or await authoritative_check()
 
     return check
 
@@ -584,11 +587,6 @@ def create_tracer_router(
         pool = cast(AsyncConnectionPool[Any], configured_pool)
         repository = RunRepository(pool)
         cancellation_repository = CancellationRepository(pool)
-        cancellation_observer = CancellationObserver(
-            cancellation_repository,
-            tenant_id=tenant_id,
-            run_id=run_id,
-        )
         message_repository = _message_repository(http_request.app, pool)
         try:
             if payload.conversation_id is None:
@@ -715,7 +713,7 @@ def create_tracer_router(
                             http_request.app,
                             tenant_id,
                             run_id,
-                            cancellation_observer,
+                            cancellation_repository,
                         ),
                         output_assessment_audit=configured_output_assessment_audit,
                         refinement_actor=configured_refinement_actor,
@@ -913,12 +911,6 @@ def create_tracer_router(
             ) from error
 
         run_id = uuid.uuid4()
-        cancellation_observer = CancellationObserver(
-            cancellation_repository,
-            tenant_id=tenant_id,
-            run_id=run_id,
-        )
-
         async def event_generator() -> AsyncIterator[str]:
             claim = None
             graph_stream: AsyncGenerator[str] | None = None
@@ -980,7 +972,7 @@ def create_tracer_router(
                         http_request.app,
                         tenant_id,
                         run_id,
-                        cancellation_observer,
+                        cancellation_repository,
                     ),
                     output_assessment_audit=configured_output_assessment_audit,
                     refinement_actor=configured_refinement_actor,

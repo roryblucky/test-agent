@@ -18,6 +18,7 @@ _STREAM_MODES = ["updates", "custom"]
 _EVENT_TYPES = {
     "step_start",
     "step_completed",
+    "progress",
     "token",
     "citations",
     "error",
@@ -166,6 +167,8 @@ def _stream_part(part: object) -> tuple[str | None, object]:
 
 
 def _as_mapping(value: object) -> Mapping[str, Any] | None:
+    if isinstance(value, LiveStreamEvent):
+        return value.to_stream_payload()
     if isinstance(value, Mapping):
         return cast(Mapping[str, Any], value)
     if isinstance(value, BaseModel):

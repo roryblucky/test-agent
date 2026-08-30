@@ -13,6 +13,7 @@ from app.models.workflow import CitationReference
 TracerEventType = Literal[
     "step_start",
     "step_completed",
+    "progress",
     "token",
     "citations",
     "error",

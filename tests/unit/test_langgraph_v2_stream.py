@@ -60,6 +60,43 @@ def test_checkpoint_terminal_marker_is_internal_to_the_custom_stream() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_graph_preserves_terminal_marker_from_event_model() -> None:
+    terminal_events: list[LiveStreamEvent] = []
+    graph = _FakeGraph(
+        _FakeGraphStream(
+            [
+                (
+                    "custom",
+                    LiveStreamEvent(
+                        type="done",
+                        data={"answer": "complete"},
+                        checkpoint_terminal=True,
+                    ),
+                ),
+                ("updates", {"finalization": {"final_response": {}}}),
+            ]
+        )
+    )
+
+    async def terminal_sink(event: LiveStreamEvent) -> None:
+        terminal_events.append(event)
+
+    frames = [
+        frame
+        async for frame in stream_graph(
+            graph,
+            {"query": "hello"},
+            terminal_sink=terminal_sink,
+        )
+    ]
+
+    assert [event.type for event in terminal_events] == ["done"]
+    assert [_payload(frame) for frame in frames] == [
+        {"type": "done", "data": {"answer": "complete"}}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() -> None:
     stream = _FakeGraphStream(
         [
@@ -84,6 +121,14 @@ async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() 
                     "event_key": "phase:answer:token:1",
                     "type": "token",
                     "data": "hello",
+                },
+            ),
+            (
+                "custom",
+                {
+                    "type": "progress",
+                    "step": "retriever",
+                    "data": {"completed": 1, "total": 3},
                 },
             ),
             ("custom", "unknown custom text"),
@@ -114,6 +159,11 @@ async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() 
 
     assert [_payload(frame) for frame in frames] == [
         {"type": "token", "data": "hello"},
+        {
+            "type": "progress",
+            "step": "retriever",
+            "data": {"completed": 1, "total": 3},
+        },
     ]
     assert graph.inputs == [{"query": "hello"}]
     assert graph.options == [
