@@ -8,26 +8,49 @@ uv run pytest tests
 
 ## LangGraph v2 UAT functional gate
 
-Before deploying the default-off v2 routes to UAT, run the functional gate
-against the disposable PostgreSQL database:
+Run one functional gate against an empty disposable PostgreSQL database before
+deploying the v2 routes to UAT:
 
 ```shell
 LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms_test_42' \
-  PYTHONPATH=. uv run pytest \
-  tests/integration/test_langgraph_v2_tracer.py \
-  tests/integration/test_langgraph_v2_history_stream.py \
-  tests/integration/test_langgraph_v2_thread_resume.py \
-  tests/integration/test_langgraph_v2_live_follow.py \
-  tests/integration/test_langgraph_v2_cancellation.py \
-  tests/integration/test_langgraph_v2_finalization.py \
-  tests/integration/test_langgraph_v2_provider_adapter_integration.py
+  PYTHONPATH=. uv run pytest tests/unit/test_langgraph_v2_*.py \
+  tests/integration/test_langgraph_v2_*.py
 ```
 
-This gate covers the assembled route flag, Tenant isolation,
-persist-before-deliver, the Linear phases, history, and the public query and
-thread resume streams with deterministic dependencies. It is a functional gate
-only; admission, `429` capacity behavior, load, and production default
-enablement remain outside this UAT scope.
+This is the single functional UAT gate. It covers clean and incremental
+migrations, schema preservation, the released request/SSE contract, real
+PostgreSQL checkpoint recovery across independent application instances, a
+real Uvicorn TCP disconnect, Tenant and Subject isolation, Turn-owned Message
+publication, advisory output assessments, and the public query and Resume
+streams. The TCP test binds only to loopback and closes its client socket and
+server under bounded timeouts.
+
+Resume rejection is expected to remain indistinguishable across authorization
+boundaries while retaining the public lifecycle statuses:
+
+| Resume condition | Expected status |
+| --- | ---: |
+| latest incomplete Turn before `resume_deadline` | `200` |
+| completed Turn or wrong/superseded Turn | `409` |
+| expired Turn | `410` |
+| missing Turn, wrong Conversation, Tenant, or Subject | `404` |
+
+## Opt-in warmed concurrency profile
+
+After the functional gate passes, run the non-default profile explicitly:
+
+```shell
+LANGGRAPH_V2_WARMED_PROFILE=1 \
+LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms_test_42' \
+  PYTHONPATH=. uv run pytest -q \
+  tests/integration/test_langgraph_v2_concurrency_profile.py
+```
+
+The profile warms the route once, then starts 50 simultaneous query streams.
+All 50 must reach a Graph-entry barrier before any completes, demonstrating
+that the application does not serialize admission through an in-process queue.
+It is skipped unless `LANGGRAPH_V2_WARMED_PROFILE=1`; it is a bounded UAT
+profile, not a production capacity benchmark.
 
 ## Disposable PostgreSQL fixture
 

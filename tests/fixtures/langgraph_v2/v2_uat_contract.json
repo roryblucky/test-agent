@@ -1,0 +1,60 @@
+{
+  "request": {
+    "query": "hello",
+    "sessionId": "contract-conversation",
+    "clientRequestId": "contract-request-1"
+  },
+  "query_request_fields": {
+    "query": "string",
+    "sessionId": "string|null",
+    "clientRequestId": "string|null"
+  },
+  "resume_request_fields": {
+    "thread_id": "string:path",
+    "expectedTurnId": "uuid:query"
+  },
+  "query_response_headers": [
+    "x-run-id",
+    "x-conversation-id",
+    "x-turn-id",
+    "x-thread-id"
+  ],
+  "resume_response_headers": [
+    "x-conversation-id",
+    "x-turn-id",
+    "x-thread-id"
+  ],
+  "event_names": [
+    "step_start",
+    "step_completed",
+    "progress",
+    "token",
+    "citations",
+    "error",
+    "done",
+    "stopped"
+  ],
+  "payload_types": {
+    "step_start": "none",
+    "step_completed": "object",
+    "progress": "object",
+    "token": "string",
+    "citations": "array",
+    "error": "string",
+    "done": "object",
+    "stopped": "object"
+  },
+  "done_fields": [
+    "query",
+    "refined_query",
+    "intent",
+    "answer",
+    "documents",
+    "moderation",
+    "groundedness",
+    "clarification",
+    "session_id",
+    "metadata",
+    "citations"
+  ]
+}

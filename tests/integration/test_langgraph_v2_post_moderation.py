@@ -20,6 +20,7 @@ from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import (
+    parse_sse,
     persistent_tracer_app,
     seed_subject_conversation,
     stream_request,
@@ -115,7 +116,7 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
             stream_request(app),
             request_context=context,
         )
-        _ = [frame async for frame in response.body_iterator]
+        frames = [frame async for frame in response.body_iterator]
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
@@ -124,6 +125,13 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
             )
 
     assert moderation.calls == 2
+    events = parse_sse("".join(frames))
+    token_text = "".join(
+        event["data"] for event in events if event["type"] == "token"
+    )
+    assert token_text == "generated answer"
+    assert events[-1]["type"] == "done"
+    assert events[-1]["data"]["answer"] == token_text
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
         ("assistant", "generated answer"),

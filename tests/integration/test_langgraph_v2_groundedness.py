@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -11,6 +12,8 @@ from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerCitation, AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.groundedness import (
     GroundednessAssessment,
@@ -23,7 +26,11 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
-from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
+from tests.integration.test_langgraph_v2_tracer import (
+    parse_sse,
+    persistent_tracer_app,
+    seed_subject_conversation,
+)
 
 
 class _Retriever:
@@ -154,6 +161,52 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     assert groundedness_audit.assessment_id == (
         f"turn:{turn_id}:assessment:groundedness"
     )
+
+
+def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    conversation_id = "low-groundedness-http"
+    context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+    asyncio.run(
+        seed_subject_conversation(
+            langgraph_v2_migrated_database_url,
+            conversation_id,
+        )
+    )
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+    )
+    app.state.langgraph_v2_groundedness_actor = _Groundedness()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": conversation_id},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+
+    async def read_assistant_message() -> str:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            messages = await ConversationMessageRepository(pool).list_messages(
+                context=context,
+                conversation_id=conversation_id,
+            )
+            return messages[-1].content
+
+    events = parse_sse(response.text)
+    token_text = "".join(
+        event["data"] for event in events if event["type"] == "token"
+    )
+    assert token_text == "answer [1]"
+    assert events[-1]["type"] == "done"
+    assert events[-1]["data"]["answer"] == token_text
+    assert asyncio.run(read_assistant_message()) == token_text
 
 
 @pytest.mark.asyncio

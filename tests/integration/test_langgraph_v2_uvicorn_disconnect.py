@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import socket
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any, Self
+
+import pytest
+import uvicorn
+from fastapi import FastAPI
+from pydantic_ai.usage import RunUsage
+
+from app.langgraph_v2.answer import AnswerOutput, PydanticAIAnswerActor
+from app.langgraph_v2.api import TracerGraph, register_v2_routes
+from app.langgraph_v2.artifacts import ArtifactRepository
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.checkpointing import initial_checkpoint_config, thread_id_for
+from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
+from app.langgraph_v2.reranking import RerankingResult
+from app.langgraph_v2.retrieval import RetrievalResult
+from app.models.domain import Document
+from tests.integration.test_langgraph_v2_tracer import seed_subject_conversation
+
+
+class _Retriever:
+    async def retrieve(self, query: str) -> RetrievalResult:
+        return RetrievalResult(documents=[Document(id="d1", content=query)])
+
+
+class _Ranker:
+    async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
+        return RerankingResult(documents=documents)
+
+
+class _BlockingPydanticStream:
+    def __init__(self) -> None:
+        self.entered = False
+        self.exited = asyncio.Event()
+        self.allow_cleanup = asyncio.Event()
+        self.cleanup_completed = asyncio.Event()
+
+    async def __aenter__(self) -> Self:
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        self.exited.set()
+        await self.allow_cleanup.wait()
+        self.cleanup_completed.set()
+
+    async def stream_output(
+        self, *, debounce_by: float | None
+    ) -> AsyncIterator[AnswerOutput]:
+        assert debounce_by is None
+        yield AnswerOutput(answer="partial")
+        await asyncio.Event().wait()
+
+    async def get_output(self) -> AnswerOutput:
+        raise AssertionError("disconnect must prevent complete model output")
+
+    def usage(self) -> RunUsage:
+        return RunUsage()
+
+
+class _PydanticAgent:
+    def __init__(self, stream: _BlockingPydanticStream) -> None:
+        self.stream = stream
+
+    def run_stream(self, prompt: str, **kwargs: Any) -> _BlockingPydanticStream:
+        del prompt, kwargs
+        return self.stream
+
+
+class _TrackedGraph:
+    def __init__(self, *, thread_id: str) -> None:
+        self.target: TracerGraph | None = None
+        self.config = initial_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
+        self.cancelled = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    def astream(self, state: object | None, **options: Any) -> AsyncIterator[object]:
+        async def iterate() -> AsyncIterator[object]:
+            assert self.target is not None
+            if options.get("config") is None:
+                options["config"] = self.config
+            target_stream = self.target.astream(state, **options)
+            try:
+                async for item in target_stream:
+                    yield item
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            finally:
+                close = getattr(target_stream, "aclose", None)
+                if close is not None:
+                    await close()
+                self.closed.set()
+
+        return iterate()
+
+
+@asynccontextmanager
+async def _serve_uvicorn(app: FastAPI) -> AsyncGenerator[int]:
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(("127.0.0.1", 0))
+    server_socket.listen(128)
+    port = int(server_socket.getsockname()[1])
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="error",
+            timeout_graceful_shutdown=1,
+        )
+    )
+    server_task = asyncio.create_task(server.serve(sockets=[server_socket]))
+    try:
+        async with asyncio.timeout(5):
+            while not server.started:
+                await asyncio.sleep(0.01)
+        yield port
+    finally:
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(server_task, timeout=5)
+        finally:
+            server_socket.close()
+
+
+@pytest.mark.asyncio
+async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    conversation_id = "uvicorn-disconnect"
+    context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+    await seed_subject_conversation(
+        langgraph_v2_migrated_database_url,
+        conversation_id,
+    )
+    model_stream = _BlockingPydanticStream()
+    answer_actor = PydanticAIAnswerActor(
+        _PydanticAgent(model_stream)  # type: ignore[arg-type]
+    )
+    tracked_graph = _TrackedGraph(
+        thread_id=thread_id_for(context.tenant_id, conversation_id)
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        async with postgres_lifespan(
+            app,
+            config=V2PostgresConfig(database_url=langgraph_v2_migrated_database_url),
+        ):
+            pool = app.state.langgraph_v2_postgres_pool
+            tracked_graph.target = build_tracer_graph(
+                app.state.langgraph_v2_checkpointer,
+                tenant_id="tenant-a",
+                artifact_repository=ArtifactRepository(pool),
+                request_context=context,
+                retriever=_Retriever(),
+                ranker=_Ranker(),
+                answer_actor=answer_actor,
+            )
+            yield
+
+    app = FastAPI(lifespan=lifespan)
+    register_v2_routes(app, enabled=True, graph=tracked_graph)
+
+    async with _serve_uvicorn(app) as port:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        body = json.dumps(
+            {"query": "hello", "sessionId": conversation_id},
+            separators=(",", ":"),
+        ).encode()
+        request = (
+            b"POST /v2/query/stream HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{port}\r\n".encode()
+            + b"Content-Type: application/json\r\n"
+            + b"X-Application-Id: tenant-a\r\n"
+            + b"X-Subject-Id: subject-a\r\n"
+            + b"Connection: close\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        writer.write(request)
+        await writer.drain()
+        received = b""
+        try:
+            async with asyncio.timeout(5):
+                while b'"data": "partial"' not in received:
+                    chunk = await reader.read(4096)
+                    assert chunk
+                    received += chunk
+        except TimeoutError as error:
+            raise AssertionError(received.decode(errors="replace")) from error
+        writer.transport.abort()
+        try:
+            await asyncio.wait_for(model_stream.exited.wait(), timeout=5)
+            assert not tracked_graph.closed.is_set()
+        finally:
+            model_stream.allow_cleanup.set()
+        await writer.wait_closed()
+        await asyncio.wait_for(tracked_graph.closed.wait(), timeout=5)
+        await asyncio.wait_for(model_stream.cleanup_completed.wait(), timeout=5)
+
+    assert tracked_graph.cancelled.is_set()
+    assert tracked_graph.closed.is_set()
+    assert model_stream.entered is True
+    assert model_stream.exited.is_set()
+    assert model_stream.cleanup_completed.is_set()

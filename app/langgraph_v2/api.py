@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import StateSnapshot
 from psycopg_pool import AsyncConnectionPool
+from starlette.types import Receive, Scope, Send
 
 from app.langgraph_v2.answer import AnswerActor, build_answer_actor
 from app.langgraph_v2.artifacts import (
@@ -73,6 +74,38 @@ from app.langgraph_v2.stream import (
 from app.services.exceptions import TenantNotFoundError
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class _RequestOwnedStreamingResponse(StreamingResponse):
+    """Cancel and await stream work as soon as the HTTP client disconnects."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        stream_task = asyncio.create_task(self.stream_response(send))
+        disconnect_task = asyncio.create_task(self.listen_for_disconnect(receive))
+        try:
+            done, _ = await asyncio.wait(
+                {stream_task, disconnect_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stream_task in done:
+                await stream_task
+            else:
+                stream_task.cancel()
+                try:
+                    await stream_task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            for task in (stream_task, disconnect_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                stream_task,
+                disconnect_task,
+                return_exceptions=True,
+            )
+        if self.background is not None:
+            await self.background()
 
 
 class CheckpointGraph(Protocol):
@@ -598,7 +631,7 @@ def create_tracer_router(
                     primary_error=primary_error,
                 )
 
-        return StreamingResponse(
+        return _RequestOwnedStreamingResponse(
             event_generator(),
             media_type="text/event-stream",
             headers={
@@ -765,7 +798,7 @@ def create_tracer_router(
                     primary_error=primary_error,
                 )
 
-        return StreamingResponse(
+        return _RequestOwnedStreamingResponse(
             event_generator(),
             media_type="text/event-stream",
             headers={

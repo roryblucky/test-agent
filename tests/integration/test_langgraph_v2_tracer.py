@@ -18,6 +18,7 @@ from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import AnswerActor
 from app.langgraph_v2.api import TracerGraph, register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
 )
@@ -32,6 +33,29 @@ from app.services.events import EventEmitter
 FIXTURE_PATH = (
     Path(__file__).parents[1] / "fixtures" / "langgraph_v2" / "v1_minimal_wire.json"
 )
+UAT_CONTRACT_PATH = (
+    Path(__file__).parents[1] / "fixtures" / "langgraph_v2" / "v2_uat_contract.json"
+)
+
+
+def _wire_fixture(name: str) -> dict[str, Any]:
+    fixture: object = json.loads((FIXTURE_PATH.parent / name).read_text())
+    if not isinstance(fixture, dict):
+        raise TypeError(f"{name} must contain a JSON object")
+    return cast(dict[str, Any], fixture)
+
+
+def _event_payload_type(event: dict[str, Any]) -> str:
+    if "data" not in event:
+        return "none"
+    data = event["data"]
+    if isinstance(data, str):
+        return "string"
+    if isinstance(data, list):
+        return "array"
+    if isinstance(data, dict):
+        return "object"
+    raise TypeError(f"unsupported captured event payload: {data!r}")
 
 
 def parse_sse(response_text: str) -> list[dict[str, Any]]:
@@ -283,6 +307,80 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
             },
         },
     ]
+
+
+def test_released_uat_contract_fixture_matches_public_http_shapes(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    fixture = _wire_fixture(UAT_CONTRACT_PATH.name)
+    minimal = _wire_fixture("v1_minimal_wire.json")
+    answer = _wire_fixture("v1_answer_wire.json")
+    captured_events = [
+        *minimal["events"],
+        *answer["token_events"],
+        answer["error_event"],
+        _wire_fixture("v1_citations_wire.json")["event"],
+        *_wire_fixture("v1_stopped_wire.json")["events"],
+        *_wire_fixture("v1_progress_wire.json")["events"],
+    ]
+    samples_by_name = {
+        event["type"]: cast(dict[str, Any], event) for event in captured_events
+    }
+    assert set(samples_by_name) == set(fixture["event_names"])
+    for event_name, sample in samples_by_name.items():
+        assert _event_payload_type(sample) == fixture["payload_types"][event_name]
+    done_data = samples_by_name["done"]["data"]
+    assert isinstance(done_data, dict)
+    assert set(cast(dict[str, Any], done_data)) == set(fixture["done_fields"])
+
+    request = V2QueryRequest.model_validate(fixture["request"])
+    assert set(fixture["request"]) == set(fixture["query_request_fields"])
+    assert isinstance(request.query, str)
+    assert isinstance(request.conversation_id, str)
+    assert isinstance(request.client_request_id, str)
+
+    asyncio.run(
+        seed_subject_conversation(
+            langgraph_v2_migrated_database_url,
+            "contract-conversation",
+        )
+    )
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
+    with TestClient(app) as client:
+        success = client.post(
+            "/v2/query/stream",
+            json={**fixture["request"], "sessionId": "contract-conversation"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+        error = client.post(
+            "/v2/query/stream",
+            json={"query": "blocked", "sessionId": "contract-conversation"},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+
+    for header in fixture["query_response_headers"]:
+        assert header in success.headers
+    assert fixture["resume_request_fields"] == {
+        "thread_id": "string:path",
+        "expectedTurnId": "uuid:query",
+    }
+    assert fixture["resume_response_headers"] == [
+        "x-conversation-id",
+        "x-turn-id",
+        "x-thread-id",
+    ]
+    success_events = parse_sse(success.text)
+    error_events = parse_sse(error.text)
+    assert set(event["type"] for event in success_events) <= set(
+        fixture["event_names"]
+    )
+    assert set(event["type"] for event in error_events) <= set(
+        fixture["event_names"]
+    )
+    assert set(success_events[-1]["data"]) == set(fixture["done_fields"])
+    assert isinstance(success_events[-1]["data"], dict)
+    assert error_events[-1]["type"] == "error"
+    assert isinstance(error_events[-1]["data"], str)
 
 
 def test_request_header_and_generated_conversation_variants(

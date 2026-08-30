@@ -195,7 +195,7 @@ class _SuccessfulRefinementActor:
 
 async def _interrupt_query_after_answer_token(
     database_url: str,
-) -> tuple[str, UUID, datetime]:
+) -> tuple[str, UUID, datetime, object]:
     await seed_subject_conversation(database_url, "conversation-1")
     answer_actor = _StreamingAnswerActor(
         answer="partial answer [1]",
@@ -225,12 +225,13 @@ async def _interrupt_query_after_answer_token(
             (
                 await _read_turn(database_url, UUID(response.headers["x-turn-id"]))
             ).resume_deadline,
+            app.state.langgraph_v2_postgres_pool,
         )
 
 
 async def _interrupt_query_during_refinement(
     database_url: str,
-) -> tuple[str, UUID, _BlockingRefinementActor]:
+) -> tuple[str, UUID, _BlockingRefinementActor, object]:
     conversation_id = "conversation-task41-refinement-resume"
     await seed_subject_conversation(database_url, conversation_id)
     actor = _BlockingRefinementActor()
@@ -258,6 +259,7 @@ async def _interrupt_query_during_refinement(
             response.headers["x-thread-id"],
             UUID(response.headers["x-turn-id"]),
             actor,
+            app.state.langgraph_v2_postgres_pool,
         )
 
 
@@ -561,7 +563,7 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
 def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, interrupted_actor = asyncio.run(
+    thread_id, turn_id, interrupted_actor, interrupted_pool = asyncio.run(
         _interrupt_query_during_refinement(langgraph_v2_migrated_database_url)
     )
     resumed_actor = _SuccessfulRefinementActor()
@@ -577,6 +579,7 @@ def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
     )
 
     with TestClient(app) as client:
+        assert app.state.langgraph_v2_postgres_pool is not interrupted_pool
         response = client.post(
             f"/v2/threads/{thread_id}/resume/stream",
             headers={
@@ -883,7 +886,7 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
 def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_advisory_inputs(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, resume_deadline = asyncio.run(
+    thread_id, turn_id, resume_deadline, interrupted_pool = asyncio.run(
         _interrupt_query_after_answer_token(
             langgraph_v2_migrated_database_url,
         )
@@ -914,6 +917,7 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
     app.state.langgraph_v2_output_assessment_audit = audit
 
     with TestClient(app) as client:
+        assert app.state.langgraph_v2_postgres_pool is not interrupted_pool
         response = client.post(
             f"/v2/threads/{thread_id}/resume/stream",
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
@@ -954,7 +958,7 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
 def test_second_interruption_can_resume_before_original_deadline(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, resume_deadline = asyncio.run(
+    thread_id, turn_id, resume_deadline, _ = asyncio.run(
         _interrupt_query_after_answer_token(
             langgraph_v2_migrated_database_url,
         )
@@ -1031,7 +1035,7 @@ def test_second_interruption_can_resume_before_original_deadline(
 def test_second_interruption_returns_410_after_original_deadline_expires(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, _ = asyncio.run(
+    thread_id, turn_id, _, _ = asyncio.run(
         _interrupt_query_after_answer_token(
             langgraph_v2_migrated_database_url,
         )

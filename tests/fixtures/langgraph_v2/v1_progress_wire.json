@@ -1,0 +1,9 @@
+{
+  "events": [
+    {
+      "type": "progress",
+      "step": "retriever",
+      "data": {"completed": 1, "total": 3}
+    }
+  ]
+}
