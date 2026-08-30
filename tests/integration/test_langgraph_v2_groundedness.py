@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-from typing import Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -104,7 +103,7 @@ class _FailingAssessmentAudit:
 
 
 @pytest.mark.asyncio
-async def test_low_groundedness_is_advisory_and_replayed(
+async def test_low_groundedness_is_advisory_without_phase_journal(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -150,7 +149,7 @@ async def test_low_groundedness_is_advisory_and_replayed(
             "tenant-a", run.run_id, "groundedness"
         )
 
-    assert evaluator.calls == 1
+    assert evaluator.calls == 2
     assert "answer" in first
     assert "answer" in second
     assert first["answer"] == second["answer"] == "answer [1]"
@@ -161,23 +160,23 @@ async def test_low_groundedness_is_advisory_and_replayed(
     assert first["groundedness"].score == 0.2
     assert first["events"][-1]["type"] == "done"
     assert first["events"][-1]["data"]["answer"] == "answer [1]"
-    assert len(audit.records) == 2
-    groundedness_audit = next(
+    groundedness_records = [
         record for record in audit.records if record.assessment_type == "groundedness"
-    )
+    ]
+    assert len(groundedness_records) == 2
+    groundedness_audit = groundedness_records[0]
     assert groundedness_audit.tenant_id == "tenant-a"
     assert groundedness_audit.conversation_id == "c1"
     assert groundedness_audit.turn_id == turn_id
     assert groundedness_audit.assessment_id == (
         f"turn:{turn_id}:assessment:groundedness"
     )
-    assert phase is not None
-    assert phase.normalized_result["usage"] == {}
+    assert phase is None
     assert any(event.get("step") == "groundedness" for event in first["events"])
 
 
 @pytest.mark.asyncio
-async def test_groundedness_failure_is_explicit_and_replayed(
+async def test_groundedness_failure_is_explicit_on_each_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class Failing:
@@ -229,7 +228,7 @@ async def test_groundedness_failure_is_explicit_and_replayed(
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
 
-    assert evaluator.calls == 1
+    assert evaluator.calls == 2
     assert "groundedness_error" in first
     assert "groundedness_error" in second
     assert (
@@ -239,10 +238,11 @@ async def test_groundedness_failure_is_explicit_and_replayed(
     )
     assert first["events"][-1]["type"] == "done"
     assert first["events"][-1]["data"]["answer"] == "answer [1]"
-    assert len(audit.records) == 2
-    groundedness_audit = next(
+    groundedness_records = [
         record for record in audit.records if record.assessment_type == "groundedness"
-    )
+    ]
+    assert len(groundedness_records) == 2
+    groundedness_audit = groundedness_records[0]
     assert groundedness_audit.result == {
         "failed": True,
         "error": "evaluator unavailable",
@@ -259,6 +259,7 @@ async def test_groundedness_failure_is_explicit_and_replayed(
             "step": "groundedness",
             "data": {"failed": True, "error": "evaluator unavailable"},
             "sequence": failure_events[0]["sequence"],
+            "journal_policy": "checkpoint_only",
         }
     ]
 
@@ -303,69 +304,6 @@ async def test_groundedness_uses_only_cited_documents(
 
     assert "groundedness" in result
     assert result["groundedness"].score == 0.0
-
-
-@pytest.mark.asyncio
-async def test_groundedness_reuses_atomic_commit_after_crash_window(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    class CrashAfterGroundednessCommit(PhaseResultRepository):
-        crashed = False
-
-        async def commit(self, **kwargs: Any):  # type: ignore[no-untyped-def]
-            result = await super().commit(**kwargs)
-            if kwargs["phase"].phase_name == "groundedness" and not self.crashed:
-                self.crashed = True
-                raise RuntimeError("crash after groundedness commit")
-            return result
-
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunEventRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
-        evaluator = _Groundedness()
-        context = PhaseExecutionContext(
-            repository=CrashAfterGroundednessCommit(pool),
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-            groundedness_actor=evaluator,
-        )
-        state: TracerState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "client_request_id": None,
-            "events": [],
-        }
-        with pytest.raises(RuntimeError, match="crash after groundedness commit"):
-            await graph.ainvoke(state)
-        recovered = await graph.ainvoke(state)
-        events = await runs.list_events("tenant-a", run.run_id)
-
-    assert evaluator.calls == 1
-    assert "groundedness" in recovered
-    assert recovered["groundedness"].score == 0.2
-    assert len({event.event_key for event in events}) == len(events)
-    assert (
-        sum(
-            event.event_key == "phase:groundedness:step_completed:1" for event in events
-        )
-        == 1
-    )
 
 
 @pytest.mark.asyncio

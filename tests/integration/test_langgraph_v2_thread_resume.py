@@ -892,6 +892,14 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
             langgraph_v2_migrated_database_url,
         )
     )
+    messages_before_resume = asyncio.run(
+        _read_messages(langgraph_v2_migrated_database_url)
+    )
+    assert [
+        (message.role, message.content)
+        for message in messages_before_resume
+        if message.turn_id == turn_id
+    ] == [("user", "hello")]
     answer_text = "replacement answer [1]"
     answer_actor = _StreamingAnswerActor(
         answer=answer_text,
@@ -944,6 +952,9 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
     assistant_run = asyncio.run(
         _read_run(langgraph_v2_migrated_database_url, assistant_run_id)
     )
+    assistant_run_events = asyncio.run(
+        _read_run_events(langgraph_v2_migrated_database_url, assistant_run_id)
+    )
 
     assert turn_after_resume.resume_deadline == resume_deadline
     assert original_run.status == "interrupted"
@@ -954,6 +965,18 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
         for message in messages
         if message.turn_id == turn_id
     ] == [("user", "hello"), ("assistant", answer_text)]
+    assert not any(
+        event.event_key.startswith(
+            (
+                "phase:answer:",
+                "phase:groundedness:",
+                "phase:post_moderation:",
+                "phase:finalization:",
+                "lifecycle:completed:",
+            )
+        )
+        for event in assistant_run_events
+    )
     assert {record.assessment_type for record in audit.records} == {
         "groundedness",
         "post_moderation",

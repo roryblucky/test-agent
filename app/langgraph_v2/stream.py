@@ -80,6 +80,7 @@ async def stream_graph(
     *,
     config: RunnableConfig | None = None,
     event_sink: Callable[[TracerStreamEvent], Awaitable[None]] | None = None,
+    terminal_sink: Callable[[TracerStreamEvent], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[str]:
     """Yield one legacy-compatible SSE frame for each public graph update.
 
@@ -119,6 +120,18 @@ async def stream_graph(
                 seen_event_keys.add(event.event_key)
                 if event_sink is not None and journal_policy == "transport_journal":
                     await event_sink(event)
+                if (
+                    terminal_sink is not None
+                    and journal_policy == "checkpoint_only"
+                    and (
+                        event.type == "done"
+                        or (
+                            event.type == "error"
+                            and event.event_key.startswith("phase:answer:")
+                        )
+                    )
+                ):
+                    await terminal_sink(event)
                 yield event.to_sse()
     except BaseException as error:
         primary_error = error

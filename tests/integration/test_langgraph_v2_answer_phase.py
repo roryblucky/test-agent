@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -195,7 +194,7 @@ class _MalformedCitationAnswer:
 
 
 @pytest.mark.asyncio
-async def test_answer_receives_ranked_documents_and_replays_without_model_call(
+async def test_answer_receives_ranked_documents_without_phase_journal(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -232,8 +231,12 @@ async def test_answer_receives_ranked_documents_and_replays_without_model_call(
 
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
+        answer_phase = await context.repository.get_completed(
+            "tenant-a", run.run_id, "answer"
+        )
 
-    assert actor.calls == 1
+    assert actor.calls == 2
+    assert answer_phase is None
     assert "answer" in first
     assert first["answer"] == "One. Two\nThree; four"
     assert "answer" in first
@@ -301,80 +304,6 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
     assert not any(event.get("data") == "private reasoning" for event in events)
 
 
-@pytest.mark.asyncio
-async def test_answer_reuses_atomic_commit_after_crash_window(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    class CrashAfterAnswerCommit(PhaseResultRepository):
-        crashed = False
-
-        async def commit(self, **kwargs: Any):  # type: ignore[no-untyped-def]
-            result = await super().commit(**kwargs)
-            if kwargs["phase"].phase_name == "answer" and not self.crashed:
-                self.crashed = True
-                raise RuntimeError("crash after answer commit")
-            return result
-
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunEventRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
-        actor = _InlineCitationAnswer()
-        context = PhaseExecutionContext(
-            repository=CrashAfterAnswerCommit(pool),
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
-        )
-        state: TracerState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "client_request_id": None,
-            "events": [],
-        }
-        with pytest.raises(RuntimeError, match="crash after answer commit"):
-            await graph.ainvoke(state)
-        recovered = await graph.ainvoke(state)
-        retrieval = await context.repository.get_completed(
-            "tenant-a", run.run_id, "retrieval"
-        )
-        answer = await context.repository.get_completed("tenant-a", run.run_id, "answer")
-
-    assert actor.calls == 1
-    assert retrieval is None
-    assert answer is not None
-    assert "answer" in recovered
-    assert (
-        recovered["answer"]
-        == "Supported claim [1]. Malformed [x] [0] []. Unknown claim [99]."
-    )
-    assert "citations" in recovered
-    assert [citation.index for citation in recovered["citations"]] == [1]
-    assert "citations" in recovered
-    assert "ranked_refs" in recovered
-    assert (
-        recovered["citations"][0].evidence_id
-        == recovered["ranked_refs"][0]["artifact_id"]
-    )
-    assert len({event["event_key"] for event in recovered["events"]}) == len(
-        recovered["events"]
-    )
-
-
 def test_answer_model_failure_fails_the_public_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -437,7 +366,7 @@ def test_answer_chunks_are_streamed_before_finalization(
 
 
 @pytest.mark.asyncio
-async def test_answer_citation_subresult_is_bound_and_replayed(
+async def test_answer_citation_subresult_is_bound_on_each_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -474,7 +403,7 @@ async def test_answer_citation_subresult_is_bound_and_replayed(
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
 
-    assert actor.calls == 1
+    assert actor.calls == 2
     assert "citations" in first
     assert "citations" in second
     assert first["citations"] == second["citations"]
@@ -652,10 +581,7 @@ async def test_inline_citation_uses_reranked_artifact_position(
     assert actor.calls == 1
     assert "ranked_refs" in result
     assert "citations" in result
-    assert (
-        result["citations"][0].evidence_id
-        == result["ranked_refs"][0]["artifact_id"]
-    )
+    assert result["citations"][0].evidence_id == result["ranked_refs"][0]["artifact_id"]
 
 
 @pytest.mark.asyncio

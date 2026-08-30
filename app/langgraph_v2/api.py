@@ -848,11 +848,34 @@ def create_tracer_router(
                     if event.type in {"done", "error"}:
                         terminal = True
 
+                async def terminalize_checkpoint_event(
+                    event: TracerStreamEvent,
+                ) -> None:
+                    nonlocal terminal
+                    if event.type == "done":
+                        await repository.complete_run_without_event(
+                            tenant_id=x_application_id,
+                            run_id=run_id,
+                            owner_instance_id=claim.owner_instance_id,
+                            execution_epoch=claim.execution_epoch,
+                            outcome=event.data,
+                        )
+                    else:
+                        await repository.fail_run_without_event(
+                            tenant_id=x_application_id,
+                            run_id=run_id,
+                            owner_instance_id=claim.owner_instance_id,
+                            execution_epoch=claim.execution_epoch,
+                            error=event.data,
+                        )
+                    terminal = True
+
                 graph_stream = stream_graph(
                     cast(RequestOwnedGraph, selected_graph),
                     state,
                     config=graph_config,
                     event_sink=persist_event,
+                    terminal_sink=terminalize_checkpoint_event,
                 )
                 async for frame in graph_stream:
                     yield frame
@@ -1121,11 +1144,34 @@ def create_tracer_router(
                     if event.type in {"done", "error"}:
                         terminal = True
 
+                async def terminalize_checkpoint_event(
+                    event: TracerStreamEvent,
+                ) -> None:
+                    nonlocal terminal
+                    if event.type == "done":
+                        await repository.complete_run_without_event(
+                            tenant_id=x_application_id,
+                            run_id=run_id,
+                            owner_instance_id=claim.owner_instance_id,
+                            execution_epoch=claim.execution_epoch,
+                            outcome=event.data,
+                        )
+                    else:
+                        await repository.fail_run_without_event(
+                            tenant_id=x_application_id,
+                            run_id=run_id,
+                            owner_instance_id=claim.owner_instance_id,
+                            execution_epoch=claim.execution_epoch,
+                            error=event.data,
+                        )
+                    terminal = True
+
                 graph_stream = stream_graph(
                     cast(RequestOwnedGraph, selected_graph),
                     None,
                     config=target.config,
                     event_sink=persist_event,
+                    terminal_sink=terminalize_checkpoint_event,
                 )
                 async for frame in graph_stream:
                     yield frame

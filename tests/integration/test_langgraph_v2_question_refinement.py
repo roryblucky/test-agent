@@ -262,4 +262,4 @@ def test_http_query_uses_injected_refinement_actor(
         )
         for event_key in event_keys
     )
-    assert "phase:finalization:step_completed:1" in event_keys
+    assert event_keys == []

@@ -14,8 +14,8 @@ from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
-from app.langgraph_v2.run_events import CancellationObserved, EventInput, EventRecord
+from app.langgraph_v2.phase_results import PhaseExecutionContext
+from app.langgraph_v2.run_events import CancellationObserved, EventInput
 from app.models.domain import Document
 from app.models.workflow import CitationReference
 
@@ -232,167 +232,148 @@ async def run_answer(
     artifacts: ArtifactStore,
     actor: AnswerActor,
     stream_writer: Any | None = None,
-) -> tuple[list[EventRecord], BoundAnswerResult | None, bool, str | None]:
-    """Hydrate ranked evidence, stream deltas, and journal the final result."""
+) -> tuple[list[EventInput], BoundAnswerResult | None, bool, str | None]:
+    """Hydrate ranked evidence and stream one checkpoint-owned Answer result."""
 
-    async def invoke() -> PhaseResultInput:
-        try:
-            refs = [
-                ref
-                for ref in state.get("ranked_refs", state.get("artifact_refs", []))
-                if ref.get("artifact_type") == "document"
-            ]
-            documents = [
-                Document.model_validate(
-                    (
-                        await artifacts.get(
-                            tenant_id=context.tenant_id,
-                            artifact_id=UUID(ref["artifact_id"]),
-                        )
-                    ).payload
-                )
-                for ref in refs
-            ]
-            history = [
-                ConversationTurn.model_validate(turn)
-                for turn in state.get("history", [])
-            ]
-            answer_query = state.get("refined_query", state["query"])
-            events: list[EventInput] = [
-                EventInput(
-                    event_key="phase:answer:step_start:1",
-                    type="step_start",
-                    step="llm:answer",
-                )
-            ]
+    def write_event(event: EventInput) -> None:
+        if stream_writer is not None:
+            stream_writer(
+                {
+                    **event.model_dump(exclude_none=True),
+                    "journal_policy": "checkpoint_only",
+                }
+            )
 
-            chunks: list[str] = []
-            streamed_result: AnswerResult | None = None
-            answer_started = False
-            answer_iterator = actor.answer_stream(answer_query, documents, history)
-            try:
-                async for chunk in answer_iterator:
-                    if chunk.result is not None:
-                        streamed_result = chunk.result
-                    if not chunk.delta:
-                        continue
-                    if (
-                        context.cancellation_check is not None
-                        and await context.cancellation_check()
-                    ):
-                        raise AnswerCancelled(
-                            "answer generation cancelled before publication"
-                        )
-                    if not answer_started:
-                        answer_started = True
-                        if stream_writer is not None:
-                            stream_writer(events[0].model_dump(exclude_none=True))
-                    chunks.append(chunk.delta)
-                    event = EventInput(
-                        event_key=f"phase:answer:token:{len(chunks) - 1}",
-                        type="token",
-                        data=chunk.delta,
+    if context.cancellation_check is not None and await context.cancellation_check():
+        raise AnswerCancelled("answer generation cancelled before publication")
+    try:
+        refs = [
+            ref
+            for ref in state.get("ranked_refs", state.get("artifact_refs", []))
+            if ref.get("artifact_type") == "document"
+        ]
+        documents = [
+            Document.model_validate(
+                (
+                    await artifacts.get(
+                        tenant_id=context.tenant_id,
+                        artifact_id=UUID(ref["artifact_id"]),
                     )
-                    events.append(event)
-                    if stream_writer is not None:
-                        stream_writer(event.model_dump(exclude_none=True))
-            finally:
-                close = getattr(answer_iterator, "aclose", None)
-                if close is not None:
-                    close_task = asyncio.ensure_future(close())
-                    try:
-                        await asyncio.shield(close_task)
-                    except asyncio.CancelledError:
-                        await asyncio.shield(close_task)
-                        raise
-            if streamed_result is None:
-                raise ValueError("answer stream did not return a final result")
-            validated = AnswerResult.model_validate(streamed_result)
-            normalized_answer = validated.answer
-            if "".join(chunks) != normalized_answer:
-                raise ValueError("streamed Answer deltas do not match final Answer")
-            citations = await build_inline_citations(normalized_answer, refs, documents)
-            if "[" not in normalized_answer and "]" not in normalized_answer:
-                citations = bind_answer_citations(validated.citations, refs, documents)
-            if citations:
+                ).payload
+            )
+            for ref in refs
+        ]
+        history = [
+            ConversationTurn.model_validate(turn) for turn in state.get("history", [])
+        ]
+        answer_query = state.get("refined_query", state["query"])
+        events: list[EventInput] = [
+            EventInput(
+                event_key="phase:answer:step_start:1",
+                type="step_start",
+                step="llm:answer",
+            )
+        ]
+
+        chunks: list[str] = []
+        streamed_result: AnswerResult | None = None
+        answer_started = False
+        answer_iterator = actor.answer_stream(answer_query, documents, history)
+        try:
+            async for chunk in answer_iterator:
+                if chunk.result is not None:
+                    streamed_result = chunk.result
+                if not chunk.delta:
+                    continue
+                if (
+                    context.cancellation_check is not None
+                    and await context.cancellation_check()
+                ):
+                    raise AnswerCancelled(
+                        "answer generation cancelled before publication"
+                    )
+                if not answer_started:
+                    answer_started = True
+                    write_event(events[0])
+                chunks.append(chunk.delta)
                 event = EventInput(
-                    event_key="phase:answer:citations:1",
-                    type="citations",
-                    data=[citation.model_dump(mode="json") for citation in citations],
+                    event_key=f"phase:answer:token:{len(chunks) - 1}",
+                    type="token",
+                    data=chunk.delta,
                 )
                 events.append(event)
-                if stream_writer is not None:
-                    stream_writer(event.model_dump(exclude_none=True))
+                write_event(event)
+        finally:
+            close = getattr(answer_iterator, "aclose", None)
+            if close is not None:
+                close_task = asyncio.ensure_future(close())
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    await asyncio.shield(close_task)
+                    raise
+        if streamed_result is None:
+            raise ValueError("answer stream did not return a final result")
+        validated = AnswerResult.model_validate(streamed_result)
+        normalized_answer = validated.answer
+        if "".join(chunks) != normalized_answer:
+            raise ValueError("streamed Answer deltas do not match final Answer")
+        citations = await build_inline_citations(normalized_answer, refs, documents)
+        if "[" not in normalized_answer and "]" not in normalized_answer:
+            citations = bind_answer_citations(validated.citations, refs, documents)
+        if citations:
             event = EventInput(
-                event_key="phase:answer:step_completed:1",
-                type="step_completed",
-                step="llm:answer",
-                data={"chunk_count": len(chunks)},
+                event_key="phase:answer:citations:1",
+                type="citations",
+                data=[citation.model_dump(mode="json") for citation in citations],
             )
             events.append(event)
-            if stream_writer is not None:
-                stream_writer(event.model_dump(exclude_none=True))
-            return PhaseResultInput(
-                phase_name="answer",
-                normalized_result={
-                    "answer": normalized_answer,
-                    "usage": validated.usage,
-                    "citations": [
-                        citation.model_dump(mode="json") for citation in citations
-                    ],
-                },
-                events=tuple(events),
-                terminal_status=None,
-            )
-        except AnswerCancelled:
-            raise
-        except Exception as exc:
-            message = str(exc) or "Answer generation failed."
-            error_event = EventInput(
-                event_key="phase:answer:error:1",
-                type="error",
-                data=message,
-            )
-            if stream_writer is not None:
-                stream_writer(error_event.model_dump(exclude_none=True))
-            return PhaseResultInput(
-                phase_name="answer",
-                normalized_result={"failed": True, "error": message},
-                events=(
-                    EventInput(
-                        event_key="phase:answer:step_start:1",
-                        type="step_start",
-                        step="llm:answer",
-                    ),
-                    error_event,
-                ),
-                terminal_status="failed",
-            )
-
-    async def check_before_commit() -> None:
+            write_event(event)
+        event = EventInput(
+            event_key="phase:answer:step_completed:1",
+            type="step_completed",
+            step="llm:answer",
+            data={"chunk_count": len(chunks)},
+        )
+        events.append(event)
+        write_event(event)
         if (
             context.cancellation_check is not None
             and await context.cancellation_check()
         ):
             raise AnswerCancelled("answer generation cancelled before publication")
-
-    if context.cancellation_check is not None and await context.cancellation_check():
-        raise AnswerCancelled("answer generation cancelled before publication")
-    result = await context.repository.get_or_invoke(
-        tenant_id=context.tenant_id,
-        run_id=context.run_id,
-        owner_instance_id=context.owner_instance_id,
-        execution_epoch=context.execution_epoch,
-        phase_name="answer",
-        invoke=invoke,
-        before_commit=check_before_commit,
-        reject_cancellation=True,
-    )
-    if result.normalized_result.get("failed") is True:
-        return list(result.events), None, True, str(result.normalized_result["error"])
-    return (
-        list(result.events),
-        BoundAnswerResult.model_validate(result.normalized_result),
-        False,
-        None,
-    )
+        return (
+            events,
+            BoundAnswerResult(
+                answer=normalized_answer,
+                usage=validated.usage,
+                citations=citations,
+            ),
+            False,
+            None,
+        )
+    except AnswerCancelled:
+        raise
+    except Exception as exc:
+        message = str(exc) or "Answer generation failed."
+        start_event = EventInput(
+            event_key="phase:answer:step_start:1",
+            type="step_start",
+            step="llm:answer",
+        )
+        error_event = EventInput(
+            event_key="phase:answer:error:1",
+            type="error",
+            data=message,
+        )
+        write_event(start_event)
+        write_event(error_event)
+        return (
+            [
+                start_event,
+                error_event,
+            ],
+            None,
+            True,
+            message,
+        )

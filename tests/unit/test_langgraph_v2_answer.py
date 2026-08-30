@@ -186,7 +186,7 @@ async def test_run_answer_writes_real_deltas_and_returns_same_complete_answer() 
         )
         == result.answer
     )
-    assert repository.committed is True
+    assert repository.committed is False
 
 
 @pytest.mark.asyncio

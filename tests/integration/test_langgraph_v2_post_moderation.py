@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
-from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -272,64 +271,6 @@ async def test_flagged_answer_remains_canonical_through_finalization(
     assert audit.records[0].conversation_id == "c1"
     assert audit.records[0].turn_id == turn_id
     assert audit.records[0].assessment_type == "post_moderation"
-
-
-@pytest.mark.asyncio
-async def test_post_moderation_replays_after_commit_window_crash(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    class CrashAfterPostModerationCommit(PhaseResultRepository):
-        crashed = False
-
-        async def commit(self, **kwargs: Any):  # type: ignore[no-untyped-def]
-            result = await super().commit(**kwargs)
-            if kwargs["phase"].phase_name == "post_moderation" and not self.crashed:
-                self.crashed = True
-                raise RuntimeError("crash after post moderation commit")
-            return result
-
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunEventRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="c1",
-            owner_instance_id="i1",
-        )
-        moderation = _FlaggingModeration()
-        context = PhaseExecutionContext(
-            repository=CrashAfterPostModerationCommit(pool),
-            artifact_repository=ArtifactRepository(pool),
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        graph = build_tracer_graph(
-            phase_context=context,
-            moderation_provider=moderation,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-        )
-        with pytest.raises(RuntimeError, match="crash after post moderation commit"):
-            await graph.ainvoke(_state())
-        recovered = await graph.ainvoke(_state())
-        events = await runs.list_events("tenant-a", run.run_id)
-
-    assert moderation.calls == 3
-    assert "answer" in recovered
-    assert recovered["answer"] == "generated answer"
-    assert len({event.event_key for event in events}) == len(events)
-    assert (
-        sum(
-            event.event_key == "phase:post_moderation:step_completed:1"
-            for event in events
-        )
-        == 1
-    )
 
 
 @pytest.mark.asyncio

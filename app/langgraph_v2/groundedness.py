@@ -15,8 +15,8 @@ from app.langgraph_v2.output_assessments import (
     build_output_assessment_scope,
     record_output_assessment,
 )
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
-from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.langgraph_v2.phase_results import PhaseExecutionContext
+from app.langgraph_v2.run_events import EventInput
 from app.models.domain import Document, GroundednessResult
 
 
@@ -68,7 +68,9 @@ class PydanticAIGroundednessActor:
     def __init__(self, agent: Agent[Any, GroundednessOutput]) -> None:
         self._agent = agent
 
-    async def evaluate(self, answer: str, documents: list[Document]) -> GroundednessAssessment:
+    async def evaluate(
+        self, answer: str, documents: list[Document]
+    ) -> GroundednessAssessment:
         """Evaluate the answer against the supplied evidence text."""
         evidence = "\n\n".join(document.content for document in documents)
         result = await self._agent.run(f"Answer:\n{answer}\n\nEvidence:\n{evidence}")
@@ -90,7 +92,8 @@ def build_groundedness_actor(
     agent = registry.create_agent(
         model_name,
         output_type=GroundednessOutput,
-        instructions=instructions or "Assess whether the answer is supported by the evidence.",
+        instructions=instructions
+        or "Assess whether the answer is supported by the evidence.",
     )
     return PydanticAIGroundednessActor(agent)
 
@@ -101,8 +104,8 @@ async def run_groundedness(
     context: PhaseExecutionContext,
     artifacts: ArtifactStore,
     actor: GroundednessActor,
-) -> tuple[list[EventRecord], GroundednessResult | None, str | None]:
-    """Evaluate an answer once and journal the advisory result atomically."""
+) -> tuple[list[EventInput], GroundednessResult | None, dict[str, Any], str | None]:
+    """Evaluate the canonical Answer and record the advisory audit result."""
     assessment_scope = build_output_assessment_scope(
         tenant_id=context.tenant_id,
         conversation_id=(
@@ -113,102 +116,87 @@ async def run_groundedness(
         turn_id=context.current_turn_id or state.get("turn_id"),
     )
 
-    async def invoke() -> PhaseResultInput:
-        try:
-            citations = state.get("citations", [])
-            cited_ids = {
-                citation.evidence_id
-                if hasattr(citation, "evidence_id")
-                else citation.get("evidence_id")
-                for citation in citations
-            }
-            refs = [
-                ref
-                for ref in state.get("ranked_refs", state.get("artifact_refs", []))
-                if ref.get("artifact_type") == "document"
-                and ref.get("artifact_id") in cited_ids
-            ]
-            documents = [
-                Document.model_validate(
-                    (
-                        await artifacts.get(
-                            tenant_id=context.tenant_id,
-                            artifact_id=UUID(ref["artifact_id"]),
-                        )
-                    ).payload
-                )
-                for ref in refs
-            ]
-            actor_result = await actor.evaluate(state.get("answer", ""), documents)
-            raw_result = actor_result.model_dump()
-            output = GroundednessOutput.model_validate(raw_result)
-            result = GroundednessResult.model_validate(output.model_dump())
-            normalized_result = {
-                **result.model_dump(),
-                "usage": raw_result.get("usage", {}),
-            }
-            await record_output_assessment(
-                context.output_assessment_audit,
-                scope=assessment_scope,
-                assessment_type="groundedness",
-                result=normalized_result,
+    try:
+        citations = state.get("citations", [])
+        cited_ids = {
+            citation.evidence_id
+            if hasattr(citation, "evidence_id")
+            else citation.get("evidence_id")
+            for citation in citations
+        }
+        refs = [
+            ref
+            for ref in state.get("ranked_refs", state.get("artifact_refs", []))
+            if ref.get("artifact_type") == "document"
+            and ref.get("artifact_id") in cited_ids
+        ]
+        documents = [
+            Document.model_validate(
+                (
+                    await artifacts.get(
+                        tenant_id=context.tenant_id,
+                        artifact_id=UUID(ref["artifact_id"]),
+                    )
+                ).payload
             )
-            return PhaseResultInput(
-                phase_name="groundedness",
-                normalized_result=normalized_result,
-                events=(
-                    EventInput(
-                        event_key="phase:groundedness:step_start:1",
-                        type="step_start",
-                        step="groundedness",
-                    ),
-                    EventInput(
-                        event_key="phase:groundedness:step_completed:1",
-                        type="step_completed",
-                        step="groundedness",
-                        data=result.model_dump(),
-                    ),
+            for ref in refs
+        ]
+        actor_result = await actor.evaluate(state.get("answer", ""), documents)
+        raw_result = actor_result.model_dump()
+        output = GroundednessOutput.model_validate(raw_result)
+        result = GroundednessResult.model_validate(output.model_dump())
+        normalized_result = {
+            **result.model_dump(),
+            "usage": raw_result.get("usage", {}),
+        }
+        await record_output_assessment(
+            context.output_assessment_audit,
+            scope=assessment_scope,
+            assessment_type="groundedness",
+            result=normalized_result,
+        )
+        return (
+            [
+                EventInput(
+                    event_key="phase:groundedness:step_start:1",
+                    type="step_start",
+                    step="groundedness",
                 ),
-            )
-        except Exception as exc:
-            message = str(exc) or "Groundedness evaluation failed."
-            failed_result = {"failed": True, "error": message}
-            await record_output_assessment(
-                context.output_assessment_audit,
-                scope=assessment_scope,
-                assessment_type="groundedness",
-                result=failed_result,
-            )
-            return PhaseResultInput(
-                phase_name="groundedness",
-                normalized_result=failed_result,
-                events=(
-                    EventInput(
-                        event_key="phase:groundedness:step_start:1",
-                        type="step_start",
-                        step="groundedness",
-                    ),
-                    EventInput(
-                        event_key="phase:groundedness:error:1",
-                        type="step_completed",
-                        step="groundedness",
-                        data=failed_result,
-                    ),
+                EventInput(
+                    event_key="phase:groundedness:step_completed:1",
+                    type="step_completed",
+                    step="groundedness",
+                    data=result.model_dump(),
                 ),
-            )
-
-    result = await context.repository.get_or_invoke(
-        tenant_id=context.tenant_id,
-        run_id=context.run_id,
-        owner_instance_id=context.owner_instance_id,
-        execution_epoch=context.execution_epoch,
-        phase_name="groundedness",
-        invoke=invoke,
-    )
-    if result.normalized_result.get("failed") is True:
-        return list(result.events), None, str(result.normalized_result["error"])
-    return (
-        list(result.events),
-        GroundednessResult.model_validate(result.normalized_result),
-        None,
-    )
+            ],
+            result,
+            actor_result.usage,
+            None,
+        )
+    except Exception as exc:
+        message = str(exc) or "Groundedness evaluation failed."
+        failed_result = {"failed": True, "error": message}
+        await record_output_assessment(
+            context.output_assessment_audit,
+            scope=assessment_scope,
+            assessment_type="groundedness",
+            result=failed_result,
+        )
+        return (
+            [
+                EventInput(
+                    event_key="phase:groundedness:step_start:1",
+                    type="step_start",
+                    step="groundedness",
+                ),
+                EventInput(
+                    event_key="phase:groundedness:error:1",
+                    type="step_completed",
+                    step="groundedness",
+                    data=failed_result,
+                ),
+            ],
+            None,
+            {},
+            message,
+        )

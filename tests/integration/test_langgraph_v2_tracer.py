@@ -806,7 +806,7 @@ def test_removed_run_control_routes_are_404(method: str, path: str) -> None:
     assert response.status_code == 404
 
 
-def test_completed_tracer_persists_only_later_phase_and_terminal_events(
+def test_completed_tracer_uses_checkpoint_events_without_transport_journal(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = "conversation-completed-tracer"
@@ -850,15 +850,7 @@ def test_completed_tracer_persists_only_later_phase_and_terminal_events(
 
     assert run.status == "completed"
     assert run.terminal_outcome == delivered[-1]["data"]
-    assert [event.sequence for event in persisted] == list(range(1, 4))
-    assert [event.event_key for event in persisted] == [
-        "phase:finalization:step_start:1",
-        "phase:finalization:step_completed:1",
-        "lifecycle:completed:0",
-    ]
-    assert [event.type for event in persisted] == [
-        event["type"] for event in delivered[-3:]
-    ]
+    assert persisted == []
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
     ]
@@ -921,7 +913,7 @@ def test_long_running_request_refreshes_its_claim(
     assert run.heartbeat_at > run.created_at
 
 
-def test_persistence_failure_emits_no_unpersisted_event(
+def test_transport_event_table_is_not_used_by_completed_graph(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
@@ -946,23 +938,21 @@ def test_persistence_failure_emits_no_unpersisted_event(
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
     try:
         with TestClient(app) as client:
-            with pytest.raises(
-                psycopg.errors.RaiseException,
-                match="forced event persistence failure",
-            ):
-                client.post(
-                    "/v2/query/stream",
-                    json={"query": "hello"},
-                    headers={
-                        "X-Application-Id": "tenant-a",
-                        "X-Subject-Id": "subject-a",
-                    },
-                )
+            response = client.post(
+                "/v2/query/stream",
+                json={"query": "hello"},
+                headers={
+                    "X-Application-Id": "tenant-a",
+                    "X-Subject-Id": "subject-a",
+                },
+            )
 
         with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
             event_count = connection.execute(
                 "SELECT count(*) FROM langgraph_v2.events"
             ).fetchone()
+        assert response.status_code == 200
+        assert parse_sse(response.text)[-1]["type"] == "done"
         assert event_count == (0,)
     finally:
         with psycopg.connect(langgraph_v2_migrated_database_url) as connection:

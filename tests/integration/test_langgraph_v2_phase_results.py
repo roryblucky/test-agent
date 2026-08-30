@@ -215,12 +215,9 @@ async def test_input_and_evidence_nodes_bypass_phase_and_event_journals(
 
         result = await graph.ainvoke(state)
 
-        assert phases.phase_reads == ["finalization"]
+        assert phases.phase_reads == []
         events = await runs.list_events("tenant-a", run.run_id)
-        assert [event.event_key for event in events] == [
-            "phase:finalization:step_start:1",
-            "phase:finalization:step_completed:1",
-        ]
+        assert events == []
         evidence_events = [
             event
             for event in result["events"]

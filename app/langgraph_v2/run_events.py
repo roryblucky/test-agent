@@ -612,6 +612,75 @@ class RunEventRepository:
             completes_run=True,
         )
 
+    async def complete_run_without_event(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+        outcome: object,
+    ) -> RunRecord:
+        """Complete a transitional Run without persisting a transport Event."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await self._lock_and_validate_claim(
+                        cursor,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        owner_instance_id=owner_instance_id,
+                        execution_epoch=execution_epoch,
+                    )
+                    await cursor.execute(
+                        """
+                        SELECT 1 FROM langgraph_v2.cancellation_intents
+                        WHERE tenant_id = %s AND run_id = %s
+                        """,
+                        (tenant_id, run_id),
+                    )
+                    if await cursor.fetchone() is not None:
+                        raise CancellationObserved(str(run_id))
+                await _set_terminal_status_in_transaction(
+                    connection,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    status="completed",
+                    outcome=outcome,
+                )
+        await self._publish_wakeup(tenant_id, run_id)
+        return await self.get_run(tenant_id, run_id)
+
+    async def fail_run_without_event(
+        self,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+        error: object,
+    ) -> RunRecord:
+        """Fail a transitional Run without persisting a transport Event."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await self._lock_and_validate_claim(
+                        cursor,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        owner_instance_id=owner_instance_id,
+                        execution_epoch=execution_epoch,
+                    )
+                await _set_terminal_status_in_transaction(
+                    connection,
+                    tenant_id=tenant_id,
+                    run_id=run_id,
+                    status="failed",
+                    outcome={"error": error},
+                )
+        await self._publish_wakeup(tenant_id, run_id)
+        return await self.get_run(tenant_id, run_id)
+
     async def complete_run_in_transaction(
         self,
         connection: Any,

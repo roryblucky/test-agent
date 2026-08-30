@@ -8,8 +8,8 @@ from uuid import UUID
 
 from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
-from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.langgraph_v2.phase_results import PhaseExecutionContext
+from app.langgraph_v2.run_events import EventInput
 from app.models.domain import Document
 
 
@@ -91,88 +91,76 @@ async def run_finalization(
     *,
     context: PhaseExecutionContext,
     artifacts: ArtifactStore,
-) -> tuple[list[EventRecord], TracerQueryResponse]:
-    """Assemble and journal the deterministic publication payload once."""
-
-    async def invoke() -> PhaseResultInput:
-        documents = []
-        if "answer" in state:
-            documents = [
-                Document.model_validate(
-                    (
-                        await artifacts.get(
-                            tenant_id=context.tenant_id,
-                            artifact_id=UUID(ref["artifact_id"]),
-                        )
-                    ).payload
-                )
-                for ref in state.get("ranked_refs", state.get("artifact_refs", []))
-                if ref.get("artifact_type") == "document"
-            ]
-        response = TracerQueryResponse(
-            query=state["query"],
-            conversation_id=state["conversation_id"],
-            metadata={"steps_executed": _steps(state)},
-            refined_query=state.get("refined_query"),
-            answer=state.get("answer"),
-            documents=[document.model_dump(mode="json") for document in documents],
-            moderation=(
-                _legacy_moderation(state.get("moderation"))
-                if "answer" in state
-                else None
-            ),
-            groundedness=state.get("groundedness"),
-            citations=state.get("citations", []),
-        )
-        events = (
-            EventInput(
-                event_key="phase:finalization:step_start:1",
-                type="step_start",
-                step="finalization",
-            ),
-            EventInput(
-                event_key="phase:finalization:step_completed:1",
-                type="step_completed",
-                step="finalization",
-                data={"status": "completed"},
-            ),
-        )
-        normalized = response.model_dump(mode="json")
-        usages: list[Mapping[str, Any]] = [
-            state.get("answer_usage", {}),
-            state.get("refinement_usage", {}),
+) -> tuple[list[EventInput], TracerQueryResponse]:
+    """Assemble the publication payload and persist its complete Answer once."""
+    documents = []
+    if "answer" in state:
+        documents = [
+            Document.model_validate(
+                (
+                    await artifacts.get(
+                        tenant_id=context.tenant_id,
+                        artifact_id=UUID(ref["artifact_id"]),
+                    )
+                ).payload
+            )
+            for ref in state.get("ranked_refs", state.get("artifact_refs", []))
+            if ref.get("artifact_type") == "document"
         ]
-        groundedness = await context.repository.get_completed(
-            context.tenant_id, context.run_id, "groundedness"
-        )
-        raw_groundedness_result: object = (
-            groundedness.normalized_result if groundedness is not None else None
-        )
-        if isinstance(raw_groundedness_result, Mapping):
-            groundedness_result = cast(Mapping[str, Any], raw_groundedness_result)
-            usage_value = groundedness_result.get("usage", {})
-            if isinstance(usage_value, Mapping):
-                usages.append(cast(Mapping[str, Any], usage_value))
-        usage = _combine_usage(usages)
-        if usage is not None:
-            normalized["metadata"]["usage"] = usage
-        return PhaseResultInput(
-            phase_name="finalization",
-            normalized_result=normalized,
-            events=events,
-        )
-
-    result = await context.repository.get_or_invoke(
-        tenant_id=context.tenant_id,
-        run_id=context.run_id,
-        owner_instance_id=context.owner_instance_id,
-        execution_epoch=context.execution_epoch,
-        phase_name="finalization",
-        invoke=invoke,
+    response = TracerQueryResponse(
+        query=state["query"],
+        conversation_id=state["conversation_id"],
+        metadata={"steps_executed": _steps(state)},
+        refined_query=state.get("refined_query"),
+        answer=state.get("answer"),
+        documents=[document.model_dump(mode="json") for document in documents],
+        moderation=(
+            _legacy_moderation(state.get("moderation")) if "answer" in state else None
+        ),
+        groundedness=state.get("groundedness"),
+        citations=state.get("citations", []),
     )
-    return list(result.events), TracerQueryResponse.model_validate(
-        result.normalized_result
-    )
+    events = [
+        EventInput(
+            event_key="phase:finalization:step_start:1",
+            type="step_start",
+            step="finalization",
+        ),
+        EventInput(
+            event_key="phase:finalization:step_completed:1",
+            type="step_completed",
+            step="finalization",
+            data={"status": "completed"},
+        ),
+    ]
+    normalized = response.model_dump(mode="json")
+    usages: list[Mapping[str, Any]] = [
+        state.get("answer_usage", {}),
+        state.get("refinement_usage", {}),
+    ]
+    groundedness_usage = state.get("groundedness_usage", {})
+    if isinstance(groundedness_usage, Mapping):
+        usages.append(cast(Mapping[str, Any], groundedness_usage))
+    usage = _combine_usage(usages)
+    if usage is not None:
+        normalized["metadata"]["usage"] = usage
+    response = TracerQueryResponse.model_validate(normalized)
+    answer = response.answer
+    turn_id = context.current_turn_id
+    if (
+        answer is not None
+        and turn_id is not None
+        and context.message_repository is not None
+        and context.request_context is not None
+    ):
+        await context.message_repository.persist_assistant_message_for_turn(
+            context=context.request_context,
+            conversation_id=response.conversation_id,
+            run_id=context.run_id,
+            turn_id=turn_id,
+            content=answer,
+        )
+    return events, response
 
 
 def finalize_in_memory(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -197,24 +185,33 @@ def finalize_in_memory(state: Mapping[str, Any]) -> dict[str, Any]:
     if usage is not None:
         done_data["metadata"]["usage"] = usage
     events = [
-        TracerStreamEvent(
-            event_key="phase:finalization:step_start:1",
-            type="step_start",
-            step="finalization",
-            sequence=len(state["events"]) + 1,
-        ).model_dump(exclude_none=True),
-        TracerStreamEvent(
-            event_key="phase:finalization:step_completed:1",
-            type="step_completed",
-            step="finalization",
-            data={"status": "completed"},
-            sequence=len(state["events"]) + 2,
-        ).model_dump(exclude_none=True),
-        TracerStreamEvent(
-            event_key="lifecycle:completed:0",
-            type="done",
-            data=done_data,
-            sequence=len(state["events"]) + 3,
-        ).model_dump(exclude_none=True),
+        {
+            **TracerStreamEvent(
+                event_key="phase:finalization:step_start:1",
+                type="step_start",
+                step="finalization",
+                sequence=len(state["events"]) + 1,
+            ).model_dump(exclude_none=True),
+            "journal_policy": "checkpoint_only",
+        },
+        {
+            **TracerStreamEvent(
+                event_key="phase:finalization:step_completed:1",
+                type="step_completed",
+                step="finalization",
+                data={"status": "completed"},
+                sequence=len(state["events"]) + 2,
+            ).model_dump(exclude_none=True),
+            "journal_policy": "checkpoint_only",
+        },
+        {
+            **TracerStreamEvent(
+                event_key="lifecycle:completed:0",
+                type="done",
+                data=done_data,
+                sequence=len(state["events"]) + 3,
+            ).model_dump(exclude_none=True),
+            "journal_policy": "checkpoint_only",
+        },
     ]
     return {"events": [*state["events"], *events]}

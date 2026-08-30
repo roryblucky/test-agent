@@ -71,6 +71,7 @@ class TracerState(TypedDict):
     citations: NotRequired[list[CitationReference]]
     answer_error: NotRequired[str]
     groundedness: NotRequired[GroundednessResult]
+    groundedness_usage: NotRequired[dict[str, Any]]
     groundedness_error: NotRequired[str]
     post_moderation: NotRequired[dict[str, Any]]
     post_moderation_error: NotRequired[str]
@@ -96,6 +97,7 @@ class TracerStateUpdate(TypedDict, total=False):
     citations: list[CitationReference]
     answer_error: str
     groundedness: GroundednessResult
+    groundedness_usage: dict[str, Any]
     groundedness_error: str
     post_moderation: dict[str, Any]
     post_moderation_error: str
@@ -395,7 +397,14 @@ def build_tracer_graph(
             update: TracerStateUpdate = {
                 "events": [
                     *state["events"],
-                    *[_event_state(event, event.sequence) for event in events],
+                    *[
+                        _event_state(
+                            event,
+                            len(state["events"]) + index,
+                            journal_policy="checkpoint_only",
+                        )
+                        for index, event in enumerate(events, 1)
+                    ],
                 ],
                 "halted": halted,
             }
@@ -422,7 +431,7 @@ def build_tracer_graph(
             async def groundedness_node(state: TracerState) -> TracerStateUpdate:
                 assert phase_context is not None
                 await _check_cancellation(phase_context)
-                events, result, error = await run_groundedness(
+                events, result, usage, error = await run_groundedness(
                     state,
                     context=phase_context,
                     artifacts=selected_artifact_repository,
@@ -431,11 +440,20 @@ def build_tracer_graph(
                 update: TracerStateUpdate = {
                     "events": [
                         *state["events"],
-                        *[_event_state(event, event.sequence) for event in events],
+                        *[
+                            _event_state(
+                                event,
+                                len(state["events"]) + index,
+                                journal_policy="checkpoint_only",
+                            )
+                            for index, event in enumerate(events, 1)
+                        ],
                     ],
                 }
                 if result is not None:
                     update["groundedness"] = result
+                if usage:
+                    update["groundedness_usage"] = usage
                 if error is not None:
                     update["groundedness_error"] = error
                 return update
@@ -455,7 +473,14 @@ def build_tracer_graph(
             update: TracerStateUpdate = {
                 "events": [
                     *state["events"],
-                    *[_event_state(event, event.sequence) for event in events],
+                    *[
+                        _event_state(
+                            event,
+                            len(state["events"]) + index,
+                            journal_policy="checkpoint_only",
+                        )
+                        for index, event in enumerate(events, 1)
+                    ],
                 ],
             }
             if decision is not None:
@@ -486,8 +511,18 @@ def build_tracer_graph(
         return {
             "events": [
                 *state["events"],
-                *[_event_state(event, event.sequence) for event in events],
-                done_event.model_dump(exclude_none=True),
+                *[
+                    _event_state(
+                        event,
+                        len(state["events"]) + index,
+                        journal_policy="checkpoint_only",
+                    )
+                    for index, event in enumerate(events, 1)
+                ],
+                {
+                    **done_event.model_dump(exclude_none=True),
+                    "journal_policy": "checkpoint_only",
+                },
             ],
             "final_response": response,
         }
