@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -53,12 +54,18 @@ async def run_retrieval(
     try:
         result = await retriever.retrieve(state.get("refined_query", state["query"]))
         refs: list[ArtifactRef] = []
-        for index, document in enumerate(result.documents):
+        for document in result.documents:
+            payload = document.model_dump(mode="json", exclude_none=True)
             artifact = await artifacts.create(
                 tenant_id=context.tenant_id,
                 artifact_type="document",
-                payload=document.model_dump(exclude_none=True),
-                artifact_id=_artifact_id(context, "document", index),
+                payload=payload,
+                artifact_id=_artifact_id(
+                    state=state,
+                    context=context,
+                    artifact_type="document",
+                    payload=payload,
+                ),
             )
             refs.append(
                 {
@@ -70,7 +77,12 @@ async def run_retrieval(
             tenant_id=context.tenant_id,
             artifact_type="retrieval_raw",
             payload=result.raw_payload,
-            artifact_id=_artifact_id(context, "retrieval_raw", 0),
+            artifact_id=_artifact_id(
+                state=state,
+                context=context,
+                artifact_type="retrieval_raw",
+                payload=result.raw_payload,
+            ),
         )
         refs.append(
             {"artifact_id": str(raw.artifact_id), "artifact_type": "retrieval_raw"}
@@ -122,10 +134,34 @@ async def run_retrieval(
 
 
 def _artifact_id(
-    context: PhaseExecutionContext, artifact_type: str, index: int
+    *,
+    state: Mapping[str, Any],
+    context: PhaseExecutionContext,
+    artifact_type: str,
+    payload: Any,
 ) -> UUID:
-    """Derive a stable id so a retry after a checkpoint gap is idempotent."""
+    """Address immutable retrieval data consistently across Resume Runs."""
+    raw_turn_id = context.current_turn_id or state.get("turn_id")
+    scope_kind = "turn" if raw_turn_id is not None else "run"
+    scope_id = str(raw_turn_id or context.run_id)
+    canonical_payload = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     return uuid5(
         NAMESPACE_URL,
-        f"langgraph-v2:{context.tenant_id}:{context.run_id}:retrieval:{artifact_type}:{index}",
+        ":".join(
+            (
+                "langgraph-v2",
+                context.tenant_id,
+                str(state.get("conversation_id", "")),
+                scope_kind,
+                scope_id,
+                "retrieval",
+                artifact_type,
+                canonical_payload,
+            )
+        ),
     )
