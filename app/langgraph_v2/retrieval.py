@@ -9,8 +9,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from pydantic import BaseModel, Field
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactWriter
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
-from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.langgraph_v2.phase_results import PhaseExecutionContext
+from app.langgraph_v2.run_events import EventInput
 from app.models.domain import Document
 
 
@@ -48,38 +48,35 @@ async def run_retrieval(
     context: PhaseExecutionContext,
     artifacts: ArtifactWriter,
     retriever: Retriever,
-) -> tuple[list[EventRecord], list[ArtifactRef], list[Document], bool, str | None]:
-    """Journal retrieval output and persist referenced Artifacts."""
-
-    async def invoke() -> PhaseResultInput:
-        try:
-            result = await retriever.retrieve(
-                state.get("refined_query", state["query"])
-            )
-            refs: list[ArtifactRef] = []
-            for index, document in enumerate(result.documents):
-                artifact = await artifacts.create(
-                    tenant_id=context.tenant_id,
-                    artifact_type="document",
-                    payload=document.model_dump(exclude_none=True),
-                    artifact_id=_artifact_id(context, "document", index),
-                )
-                refs.append(
-                    {
-                        "artifact_id": str(artifact.artifact_id),
-                        "artifact_type": "document",
-                    }
-                )
-            raw = await artifacts.create(
+) -> tuple[list[EventInput], list[ArtifactRef], list[Document], bool, str | None]:
+    """Persist retrieved Artifacts and return checkpoint-owned State data."""
+    try:
+        result = await retriever.retrieve(state.get("refined_query", state["query"]))
+        refs: list[ArtifactRef] = []
+        for index, document in enumerate(result.documents):
+            artifact = await artifacts.create(
                 tenant_id=context.tenant_id,
-                artifact_type="retrieval_raw",
-                payload=result.raw_payload,
-                artifact_id=_artifact_id(context, "retrieval_raw", 0),
+                artifact_type="document",
+                payload=document.model_dump(exclude_none=True),
+                artifact_id=_artifact_id(context, "document", index),
             )
             refs.append(
-                {"artifact_id": str(raw.artifact_id), "artifact_type": "retrieval_raw"}
+                {
+                    "artifact_id": str(artifact.artifact_id),
+                    "artifact_type": "document",
+                }
             )
-            events = (
+        raw = await artifacts.create(
+            tenant_id=context.tenant_id,
+            artifact_type="retrieval_raw",
+            payload=result.raw_payload,
+            artifact_id=_artifact_id(context, "retrieval_raw", 0),
+        )
+        refs.append(
+            {"artifact_id": str(raw.artifact_id), "artifact_type": "retrieval_raw"}
+        )
+        return (
+            [
                 EventInput(
                     event_key="phase:retrieval:step_start:1",
                     type="step_start",
@@ -98,44 +95,30 @@ async def run_retrieval(
                         "artifact_ids": [ref["artifact_id"] for ref in refs],
                     },
                 ),
-            )
-            return PhaseResultInput(
-                phase_name="retrieval",
-                normalized_result={
-                    "document_ids": [document.id for document in result.documents]
-                },
-                artifact_refs=refs,
-                events=events,
-            )
-        except Exception as exc:
-            message = str(exc) or "Retrieval failed."
-            return PhaseResultInput(
-                phase_name="retrieval",
-                normalized_result={"failed": True, "error": message},
-                events=(
-                    EventInput(
-                        event_key="phase:retrieval:step_start:1",
-                        type="step_start",
-                        step="retriever",
-                    ),
-                    EventInput(
-                        event_key="phase:retrieval:error:1", type="error", data=message
-                    ),
+            ],
+            refs,
+            result.documents,
+            False,
+            None,
+        )
+    except Exception as exc:
+        message = str(exc) or "Retrieval failed."
+        return (
+            [
+                EventInput(
+                    event_key="phase:retrieval:step_start:1",
+                    type="step_start",
+                    step="retriever",
                 ),
-                terminal_status="failed",
-            )
-
-    result = await context.repository.get_or_invoke(
-        tenant_id=context.tenant_id,
-        run_id=context.run_id,
-        owner_instance_id=context.owner_instance_id,
-        execution_epoch=context.execution_epoch,
-        phase_name="retrieval",
-        invoke=invoke,
-    )
-    if result.normalized_result.get("failed") is True:
-        return list(result.events), [], [], True, str(result.normalized_result["error"])
-    return list(result.events), list(result.artifact_refs), [], False, None
+                EventInput(
+                    event_key="phase:retrieval:error:1", type="error", data=message
+                ),
+            ],
+            [],
+            [],
+            True,
+            message,
+        )
 
 
 def _artifact_id(

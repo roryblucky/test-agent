@@ -648,12 +648,14 @@ def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
     }
     assert all(
         not event.event_key.startswith(
-            ("phase:query:", "phase:pre_moderation:", "phase:question_refinement:")
+            (
+                "phase:query:",
+                "phase:pre_moderation:",
+                "phase:question_refinement:",
+                "phase:retrieval:",
+                "phase:reranking:",
+            )
         )
-        for event in continuation_events
-    )
-    assert any(
-        event.event_key == "phase:retrieval:step_completed:1"
         for event in continuation_events
     )
     assert [

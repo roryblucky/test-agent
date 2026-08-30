@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
+import asyncio
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import MemorySaver
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.artifacts import ArtifactRepository
@@ -226,7 +228,7 @@ def test_failed_ranker_terminates_public_stream(
 
 
 @pytest.mark.asyncio
-async def test_reranking_replays_after_commit_window_crash(
+async def test_interrupted_reranking_repeats_provider_with_stable_artifact_refs(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class CountingRanker:
@@ -235,17 +237,9 @@ async def test_reranking_replays_after_commit_window_crash(
         async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
             self.calls += 1
             del query
+            if self.calls == 1:
+                raise asyncio.CancelledError
             return RerankingResult(documents=list(reversed(documents)))
-
-    class CrashAfterRerankingCommit(PhaseResultRepository):
-        crashed = False
-
-        async def commit(self, **kwargs: Any):  # type: ignore[no-untyped-def]
-            result = await super().commit(**kwargs)
-            if kwargs["phase"].phase_name == "reranking" and not self.crashed:
-                self.crashed = True
-                raise RuntimeError("crash after reranking commit")
-            return result
 
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
@@ -256,7 +250,7 @@ async def test_reranking_replays_after_commit_window_crash(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        repository = CrashAfterRerankingCommit(pool)
+        repository = PhaseResultRepository(pool)
         ranker = CountingRanker()
         context = PhaseExecutionContext(
             repository=repository,
@@ -266,19 +260,24 @@ async def test_reranking_replays_after_commit_window_crash(
             execution_epoch=run.execution_epoch,
             artifact_repository=ArtifactRepository(pool),
         )
-        graph = build_tracer_graph(phase_context=context, ranker=ranker)
+        graph = build_tracer_graph(
+            checkpointer=MemorySaver(), phase_context=context, ranker=ranker
+        )
         state: TracerState = {
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
             "events": [],
         }
-        with pytest.raises(RuntimeError, match="crash after reranking commit"):
-            await graph.ainvoke(state)
-        recovered = await graph.ainvoke(state)
+        config: RunnableConfig = {"configurable": {"thread_id": "reranking-recovery"}}
+        with pytest.raises(asyncio.CancelledError):
+            await graph.ainvoke(state, config)
+        checkpoint = await graph.aget_state(config)
+        assert checkpoint.next == ("reranking",)
+        recovered = await graph.ainvoke(None, config)
 
-        assert ranker.calls == 1
+        assert ranker.calls == 2
+        assert "artifact_refs" in recovered
         assert "ranked_refs" in recovered
         assert len(recovered["ranked_refs"]) == 1
-        events = await RunEventRepository(pool).list_events("tenant-a", run.run_id)
-        assert len({event.event_key for event in events}) == len(events)
+        assert recovered["ranked_refs"] == [recovered["artifact_refs"][0]]

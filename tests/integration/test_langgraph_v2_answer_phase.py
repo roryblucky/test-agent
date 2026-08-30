@@ -352,9 +352,11 @@ async def test_answer_reuses_atomic_commit_after_crash_window(
         retrieval = await context.repository.get_completed(
             "tenant-a", run.run_id, "retrieval"
         )
+        answer = await context.repository.get_completed("tenant-a", run.run_id, "answer")
 
     assert actor.calls == 1
-    assert retrieval is not None
+    assert retrieval is None
+    assert answer is not None
     assert "answer" in recovered
     assert (
         recovered["answer"]
@@ -363,9 +365,10 @@ async def test_answer_reuses_atomic_commit_after_crash_window(
     assert "citations" in recovered
     assert [citation.index for citation in recovered["citations"]] == [1]
     assert "citations" in recovered
+    assert "ranked_refs" in recovered
     assert (
         recovered["citations"][0].evidence_id
-        == retrieval.artifact_refs[0]["artifact_id"]
+        == recovered["ranked_refs"][0]["artifact_id"]
     )
     assert len({event["event_key"] for event in recovered["events"]}) == len(
         recovered["events"]
@@ -645,13 +648,13 @@ async def test_inline_citation_uses_reranked_artifact_position(
                 "events": [],
             }
         )
-        reranking = await repository.get_completed("tenant-a", run.run_id, "reranking")
 
     assert actor.calls == 1
-    assert reranking is not None
+    assert "ranked_refs" in result
     assert "citations" in result
     assert (
-        result["citations"][0].evidence_id == reranking.artifact_refs[0]["artifact_id"]
+        result["citations"][0].evidence_id
+        == result["ranked_refs"][0]["artifact_id"]
     )
 
 

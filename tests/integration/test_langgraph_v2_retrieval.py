@@ -1,16 +1,30 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 from uuid import uuid4
 
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import MemorySaver
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
+from app.langgraph_v2.answer import (
+    AnswerCitation,
+    AnswerResult,
+    AnswerStreamChunk,
+)
+from app.langgraph_v2.artifacts import (
+    ArtifactNotFound,
+    ArtifactRecord,
+    ArtifactRepository,
+)
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import RunEventRepository
@@ -37,7 +51,7 @@ async def test_artifact_repository_is_tenant_scoped(
 
 
 @pytest.mark.asyncio
-async def test_retrieval_persists_artifacts_and_replays_without_second_call(
+async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class CountingRetriever:
@@ -80,7 +94,7 @@ async def test_retrieval_persists_artifacts_and_replays_without_second_call(
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
-        assert retriever.calls == 1
+        assert retriever.calls == 2
         assert "artifact_refs" in first
         assert "artifact_refs" in second
         assert first["artifact_refs"] == second["artifact_refs"]
@@ -161,7 +175,7 @@ def test_failed_retrieval_is_error_without_finalization_on_public_stream(
 
 
 @pytest.mark.asyncio
-async def test_retrieval_replays_after_commit_window_crash(
+async def test_interrupted_retrieval_repeats_provider_without_duplicate_artifacts_or_citations(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class CountingRetriever:
@@ -174,15 +188,44 @@ async def test_retrieval_replays_after_commit_window_crash(
                 raw_payload={"query": query},
             )
 
-    class CrashAfterRetrievalCommit(PhaseResultRepository):
-        crashed = False
+    class InterruptAfterArtifacts:
+        def __init__(self, repository: ArtifactRepository) -> None:
+            self.repository = repository
+            self.interrupted = False
+            self.first_document_id: str | None = None
 
-        async def commit(self, **kwargs: Any):  # type: ignore[no-untyped-def]
-            result = await super().commit(**kwargs)
-            if kwargs["phase"].phase_name == "retrieval" and not self.crashed:
-                self.crashed = True
-                raise RuntimeError("crash after retrieval commit")
-            return result
+        async def create(self, **kwargs: Any) -> ArtifactRecord:
+            artifact = await self.repository.create(**kwargs)
+            if kwargs["artifact_type"] == "document" and self.first_document_id is None:
+                self.first_document_id = str(artifact.artifact_id)
+            if kwargs["artifact_type"] == "retrieval_raw" and not self.interrupted:
+                self.interrupted = True
+                raise asyncio.CancelledError
+            return artifact
+
+        async def get(self, **kwargs: Any) -> ArtifactRecord:
+            return await self.repository.get(**kwargs)
+
+    class CitingAnswer:
+        def answer_stream(
+            self,
+            query: str,
+            documents: list[Document],
+            history: Sequence[ConversationTurn],
+        ) -> AsyncIterator[AnswerStreamChunk]:
+            del query, history
+
+            async def stream() -> AsyncIterator[AnswerStreamChunk]:
+                assert [document.id for document in documents] == ["d1"]
+                yield AnswerStreamChunk(delta="supported")
+                yield AnswerStreamChunk(
+                    result=AnswerResult(
+                        answer="supported",
+                        citations=[AnswerCitation(index=1)],
+                    )
+                )
+
+            return stream()
 
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
@@ -193,7 +236,8 @@ async def test_retrieval_replays_after_commit_window_crash(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        repository = CrashAfterRetrievalCommit(pool)
+        repository = PhaseResultRepository(pool)
+        artifacts = InterruptAfterArtifacts(ArtifactRepository(pool))
         retriever = CountingRetriever()
         context = PhaseExecutionContext(
             repository=repository,
@@ -201,23 +245,41 @@ async def test_retrieval_replays_after_commit_window_crash(
             run_id=run.run_id,
             owner_instance_id="i1",
             execution_epoch=run.execution_epoch,
-            artifact_repository=ArtifactRepository(pool),
+            artifact_repository=artifacts,
         )
-        graph = build_tracer_graph(phase_context=context, retriever=retriever)
+        graph = build_tracer_graph(
+            checkpointer=MemorySaver(),
+            phase_context=context,
+            retriever=retriever,
+            answer_actor=CitingAnswer(),
+        )
         state: TracerState = {
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
             "events": [],
         }
-        with pytest.raises(RuntimeError, match="crash after retrieval commit"):
-            await graph.ainvoke(state)
-        recovered = await graph.ainvoke(state)
-        assert retriever.calls == 1
+        config: RunnableConfig = {
+            "configurable": {"thread_id": "retrieval-recovery"}
+        }
+        with pytest.raises(asyncio.CancelledError):
+            await graph.ainvoke(state, config)
+        recovered = await graph.ainvoke(None, config)
+
+        assert retriever.calls == 2
         assert "artifact_refs" in recovered
         assert len(recovered["artifact_refs"]) == 2
-        events = await RunEventRepository(pool).list_events("tenant-a", run.run_id)
-        assert len({event.event_key for event in events}) == len(events)
+        document_ref = recovered["artifact_refs"][0]
+        assert document_ref == {
+            "artifact_id": artifacts.first_document_id,
+            "artifact_type": "document",
+        }
+        assert "citations" in recovered
+        citation = recovered["citations"][0]
+        assert citation.evidence_id == artifacts.first_document_id
+        assert citation.metadata == {
+            "artifact_id": artifacts.first_document_id
+        }
         async with pool.connection() as connection:
             async with connection.cursor() as cursor:
                 await cursor.execute(

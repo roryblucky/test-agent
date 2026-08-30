@@ -174,7 +174,7 @@ async def test_phase_replay_reuses_result_without_invocation(
 
 
 @pytest.mark.asyncio
-async def test_input_nodes_bypass_phase_and_event_journals_while_retrieval_uses_them(
+async def test_input_and_evidence_nodes_bypass_phase_and_event_journals(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class Retriever:
@@ -213,18 +213,23 @@ async def test_input_nodes_bypass_phase_and_event_journals_while_retrieval_uses_
             "events": [],
         }
 
-        await graph.ainvoke(state)
+        result = await graph.ainvoke(state)
 
-        assert phases.phase_reads == ["retrieval", "reranking", "finalization"]
+        assert phases.phase_reads == ["finalization"]
         events = await runs.list_events("tenant-a", run.run_id)
         assert [event.event_key for event in events] == [
-            "phase:retrieval:step_start:1",
-            "phase:retrieval:step_completed:1",
-            "phase:reranking:step_start:1",
-            "phase:reranking:step_completed:1",
             "phase:finalization:step_start:1",
             "phase:finalization:step_completed:1",
         ]
+        evidence_events = [
+            event
+            for event in result["events"]
+            if event.get("step") in {"retriever", "reranker"}
+        ]
+        assert len(evidence_events) == 4
+        assert {event.get("journal_policy") for event in evidence_events} == {
+            "checkpoint_only"
+        }
 
 
 @pytest.mark.asyncio

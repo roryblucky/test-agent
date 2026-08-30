@@ -327,7 +327,14 @@ def build_tracer_graph(
         update: TracerStateUpdate = {
             "events": [
                 *state["events"],
-                *[_event_state(event, event.sequence) for event in events],
+                *[
+                    _event_state(
+                        event,
+                        len(state["events"]) + index,
+                        journal_policy="checkpoint_only",
+                    )
+                    for index, event in enumerate(events, 1)
+                ],
             ],
             "halted": halted,
             "artifact_refs": refs,
@@ -353,7 +360,14 @@ def build_tracer_graph(
         update: TracerStateUpdate = {
             "events": [
                 *state["events"],
-                *[_event_state(event, event.sequence) for event in events],
+                *[
+                    _event_state(
+                        event,
+                        len(state["events"]) + index,
+                        journal_policy="checkpoint_only",
+                    )
+                    for index, event in enumerate(events, 1)
+                ],
             ],
             "halted": halted,
             "ranked_refs": refs,

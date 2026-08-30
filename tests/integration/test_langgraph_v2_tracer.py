@@ -850,18 +850,14 @@ def test_completed_tracer_persists_only_later_phase_and_terminal_events(
 
     assert run.status == "completed"
     assert run.terminal_outcome == delivered[-1]["data"]
-    assert [event.sequence for event in persisted] == list(range(1, 8))
+    assert [event.sequence for event in persisted] == list(range(1, 4))
     assert [event.event_key for event in persisted] == [
-        "phase:retrieval:step_start:1",
-        "phase:retrieval:step_completed:1",
-        "phase:reranking:step_start:1",
-        "phase:reranking:step_completed:1",
         "phase:finalization:step_start:1",
         "phase:finalization:step_completed:1",
         "lifecycle:completed:0",
     ]
     assert [event.type for event in persisted] == [
-        event["type"] for event in delivered[6:]
+        event["type"] for event in delivered[-3:]
     ]
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),

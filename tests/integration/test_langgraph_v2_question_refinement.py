@@ -252,9 +252,14 @@ def test_http_query_uses_injected_refinement_actor(
     event_keys = asyncio.run(read_event_keys())
     assert all(
         not event_key.startswith(
-            ("phase:query:", "phase:pre_moderation:", "phase:question_refinement:")
+            (
+                "phase:query:",
+                "phase:pre_moderation:",
+                "phase:question_refinement:",
+                "phase:retrieval:",
+                "phase:reranking:",
+            )
         )
         for event_key in event_keys
     )
-    assert "phase:retrieval:step_completed:1" in event_keys
     assert "phase:finalization:step_completed:1" in event_keys
