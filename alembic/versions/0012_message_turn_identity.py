@@ -30,7 +30,26 @@ def downgrade() -> None:
     op.execute(
         """
         UPDATE langgraph_v2.messages
-        SET run_id = turn_id
+        SET run_id = COALESCE(
+            (
+                SELECT runs.run_id
+                FROM langgraph_v2.runs AS runs
+                WHERE runs.tenant_id = messages.tenant_id
+                  AND runs.conversation_id = messages.conversation_id
+                  AND runs.turn_id = messages.turn_id
+                ORDER BY
+                    CASE
+                        WHEN messages.role = 'assistant'
+                             AND runs.status = 'completed' THEN 0
+                        WHEN messages.role = 'assistant' THEN 1
+                        ELSE 0
+                    END,
+                    runs.created_at,
+                    runs.run_id
+                LIMIT 1
+            ),
+            turn_id
+        )
         """
     )
     op.execute(

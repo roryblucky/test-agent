@@ -12,30 +12,29 @@ from app.langgraph_v2.history import (
 
 
 def _message(
-    run_number: int,
+    turn_number: int,
     role: Literal["user", "assistant"],
     content: str,
     order: int,
-    turn_number: int | None = None,
 ) -> MessageRecord:
     return MessageRecord(
         tenant_id="tenant-a",
         message_id=UUID(int=order),
         conversation_id="conversation-1",
-        turn_id=UUID(int=turn_number or run_number),
+        turn_id=UUID(int=turn_number),
         role=role,
         content=content,
-        idempotency_key=f"{run_number}:{role}",
+        idempotency_key=f"{turn_number}:{role}",
         created_at=datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=order),
     )
 
 
 def _turn(
-    run_number: int, user: str, assistant: str, order: int
+    turn_number: int, user: str, assistant: str, order: int
 ) -> list[MessageRecord]:
     return [
-        _message(run_number, "user", user, order),
-        _message(run_number, "assistant", assistant, order + 1),
+        _message(turn_number, "user", user, order),
+        _message(turn_number, "assistant", assistant, order + 1),
     ]
 
 
@@ -94,10 +93,10 @@ def test_current_and_incomplete_turns_never_enter_history() -> None:
     ]
 
 
-def test_history_groups_retried_messages_by_turn_not_run() -> None:
+def test_history_groups_user_and_assistant_messages_by_turn() -> None:
     messages = [
-        _message(1, "user", "question", 1, turn_number=9),
-        _message(2, "assistant", "answer", 2, turn_number=9),
+        _message(9, "user", "question", 1),
+        _message(9, "assistant", "answer", 2),
     ]
 
     selected = select_sliding_window_history(messages, token_budget=100)

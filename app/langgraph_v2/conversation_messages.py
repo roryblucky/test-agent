@@ -385,7 +385,7 @@ class ConversationMessageRepository:
     async def persist_assistant_message(
         self,
         *,
-        tenant_id: str,
+        context: TrustedRequestContext,
         conversation_id: str,
         content: str,
         idempotency_key: str,
@@ -394,15 +394,20 @@ class ConversationMessageRepository:
         """Persist exactly one assistant Message for an existing Turn."""
         async with self._pool.connection() as connection:
             async with connection.transaction():
+                await self._resolve_conversation_in_transaction(
+                    connection,
+                    context=context,
+                    conversation_id=conversation_id,
+                )
                 await self._require_user_turn_in_transaction(
                     connection,
-                    tenant_id=tenant_id,
+                    tenant_id=context.tenant_id,
                     conversation_id=conversation_id,
                     turn_id=turn_id,
                 )
                 return await self._persist_message_in_transaction(
                     connection,
-                    tenant_id=tenant_id,
+                    tenant_id=context.tenant_id,
                     conversation_id=conversation_id,
                     turn_id=turn_id,
                     role="assistant",

@@ -169,6 +169,90 @@ def test_application_base_revision_upgrades_and_downgrades(
     assert exists_after_downgrade == (False,)
 
 
+def test_message_turn_migration_restores_transitional_run_identity_on_downgrade(
+    langgraph_v2_test_database_url: str,
+) -> None:
+    config = build_alembic_config(langgraph_v2_test_database_url)
+    command.upgrade(config, "0011_run_turn_association")
+    tenant_id = "tenant-a"
+    conversation_id = "conversation-rollback"
+    turn_id = uuid4()
+    user_run_id = uuid4()
+    assistant_run_id = uuid4()
+    user_message_id = uuid4()
+    assistant_message_id = uuid4()
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO langgraph_v2.conversations (
+                tenant_id, conversation_id, owner_subject_id, thread_id
+            ) VALUES (%s, %s, 'subject-a', %s)
+            """,
+            (tenant_id, conversation_id, str(uuid4())),
+        )
+        connection.execute(
+            """
+            INSERT INTO langgraph_v2.runs (
+                tenant_id, run_id, conversation_id, status, turn_id, created_at
+            ) VALUES
+                (%s, %s, %s, 'interrupted', %s, %s),
+                (%s, %s, %s, 'completed', %s, %s)
+            """,
+            (
+                tenant_id,
+                user_run_id,
+                conversation_id,
+                turn_id,
+                datetime(2026, 1, 1, tzinfo=UTC),
+                tenant_id,
+                assistant_run_id,
+                conversation_id,
+                turn_id,
+                datetime(2026, 1, 2, tzinfo=UTC),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO langgraph_v2.messages (
+                tenant_id, message_id, conversation_id, run_id, turn_id, role,
+                content, idempotency_key, resume_deadline
+            ) VALUES
+                (%s, %s, %s, %s, %s, 'user', 'question', 'rollback:user', %s),
+                (%s, %s, %s, %s, %s, 'assistant', 'answer',
+                 'rollback:assistant', NULL)
+            """,
+            (
+                tenant_id,
+                user_message_id,
+                conversation_id,
+                user_run_id,
+                turn_id,
+                datetime(2026, 2, 1, tzinfo=UTC),
+                tenant_id,
+                assistant_message_id,
+                conversation_id,
+                assistant_run_id,
+                turn_id,
+            ),
+        )
+
+    command.upgrade(config, "head")
+    command.downgrade(config, "0011_run_turn_association")
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        rows = connection.execute(
+            """
+            SELECT role, run_id
+            FROM langgraph_v2.messages
+            ORDER BY role
+            """
+        ).fetchall()
+    assert rows == [
+        ("assistant", assistant_run_id),
+        ("user", user_run_id),
+    ]
+    command.downgrade(config, "base")
+
+
 def test_conversation_authorization_migrates_existing_conversations_forward(
     langgraph_v2_test_database_url: str,
 ) -> None:

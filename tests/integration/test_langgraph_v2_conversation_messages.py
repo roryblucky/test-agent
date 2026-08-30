@@ -322,14 +322,14 @@ async def test_turn_messages_are_idempotent_without_a_run(
             idempotency_key=f"turn:{turn_id}:user",
         )
         first = await repository.persist_assistant_message(
-            tenant_id="tenant-a",
+            context=context,
             conversation_id="session-1",
             turn_id=turn_id,
             content="answer",
             idempotency_key=f"turn:{turn_id}:assistant",
         )
         repeated = await repository.persist_assistant_message(
-            tenant_id="tenant-a",
+            context=context,
             conversation_id="session-1",
             turn_id=turn_id,
             content="answer",
@@ -347,7 +347,7 @@ async def test_turn_messages_are_idempotent_without_a_run(
         ]
         with pytest.raises(MessageInvariantConflict):
             await repository.persist_assistant_message(
-                tenant_id="tenant-a",
+                context=context,
                 conversation_id="session-1",
                 turn_id=turn_id,
                 content="changed",
@@ -385,16 +385,26 @@ async def test_assistant_message_requires_an_existing_user_turn(
             idempotency_key=f"turn:{turn_id}:user",
         )
         assistant = await messages.persist_assistant_message(
-            tenant_id="tenant-a",
+            context=context,
             conversation_id="session-1",
             turn_id=turn_id,
             content="safe answer",
             idempotency_key=f"turn:{turn_id}:assistant",
         )
         assert assistant.turn_id == turn_id
+        with pytest.raises(ConversationNotFound):
+            await messages.persist_assistant_message(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-b"
+                ),
+                conversation_id="session-1",
+                turn_id=turn_id,
+                content="unauthorized",
+                idempotency_key="unauthorized:assistant",
+            )
         with pytest.raises(TurnNotFound):
             await messages.persist_assistant_message(
-                tenant_id="tenant-a",
+                context=context,
                 conversation_id="session-1",
                 turn_id=uuid4(),
                 content="orphan",
