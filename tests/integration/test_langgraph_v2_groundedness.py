@@ -21,7 +21,7 @@ from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
@@ -108,7 +108,7 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -134,7 +134,6 @@ async def test_low_groundedness_is_advisory_on_each_execution(
             "conversation_id": "c1",
             "turn_id": str(turn_id),
             "client_request_id": None,
-            "events": [],
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
@@ -148,8 +147,8 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     assert first["groundedness"] == second["groundedness"]
     assert "groundedness" in first
     assert first["groundedness"].score == 0.2
-    assert first["events"][-1]["type"] == "done"
-    assert first["events"][-1]["data"]["answer"] == "answer [1]"
+    assert "final_response" in first
+    assert first["final_response"].answer == "answer [1]"
     groundedness_records = [
         record for record in audit.records if record.assessment_type == "groundedness"
     ]
@@ -161,7 +160,6 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     assert groundedness_audit.assessment_id == (
         f"turn:{turn_id}:assessment:groundedness"
     )
-    assert any(event.get("step") == "groundedness" for event in first["events"])
 
 
 @pytest.mark.asyncio
@@ -180,7 +178,7 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -206,7 +204,6 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
             "conversation_id": "c1",
             "turn_id": str(turn_id),
             "client_request_id": None,
-            "events": [],
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
@@ -219,8 +216,8 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         == second["groundedness_error"]
         == "evaluator unavailable"
     )
-    assert first["events"][-1]["type"] == "done"
-    assert first["events"][-1]["data"]["answer"] == "answer [1]"
+    assert "final_response" in first
+    assert first["final_response"].answer == "answer [1]"
     groundedness_records = [
         record for record in audit.records if record.assessment_type == "groundedness"
     ]
@@ -230,21 +227,6 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         "failed": True,
         "error": "evaluator unavailable",
     }
-    failure_events = [
-        event
-        for event in first["events"]
-        if event["event_key"] == "phase:groundedness:error:1"
-    ]
-    assert failure_events == [
-        {
-            "event_key": "phase:groundedness:error:1",
-            "type": "step_completed",
-            "step": "groundedness",
-            "data": {"failed": True, "error": "evaluator unavailable"},
-            "sequence": failure_events[0]["sequence"],
-            "journal_policy": "checkpoint_only",
-        }
-    ]
 
 
 @pytest.mark.asyncio
@@ -254,7 +236,7 @@ async def test_groundedness_uses_only_cited_documents(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -275,7 +257,6 @@ async def test_groundedness_uses_only_cited_documents(
                 "query": "hello",
                 "conversation_id": "c1",
                 "client_request_id": None,
-                "events": [],
             }
         )
 
@@ -297,7 +278,7 @@ async def test_groundedness_rejects_out_of_range_scores(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -318,7 +299,6 @@ async def test_groundedness_rejects_out_of_range_scores(
                 "query": "hello",
                 "conversation_id": "c1",
                 "client_request_id": None,
-                "events": [],
             }
         )
 
@@ -372,7 +352,7 @@ async def test_groundedness_actor_setup_failure_is_advisory(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).get_run(
+        run = await RunRepository(pool).get_run(
             "tenant-a", UUID(response.headers["x-run-id"])
         )
     assert run.status == "completed"
@@ -395,7 +375,7 @@ async def test_assessment_audit_failure_does_not_gate_answer(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -419,13 +399,13 @@ async def test_assessment_audit_failure_does_not_gate_answer(
                 query="hello",
                 conversation_id="c1",
                 client_request_id=None,
-                events=[],
             )
         )
 
     assert "answer" in result
     assert result["answer"] == "answer [1]"
-    assert result["events"][-1]["type"] == "done"
+    assert "final_response" in result
+    assert result["final_response"].answer == "answer [1]"
 
 
 @pytest.mark.asyncio

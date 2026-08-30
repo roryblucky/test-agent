@@ -10,7 +10,6 @@
     "data": "answer model unavailable"
   },
   "documented_v2_differences": [
-    "sequence and event_key metadata are additive",
     "answer text is chunked at sentence boundaries and hard-split at 240 Unicode code points"
   ]
 }

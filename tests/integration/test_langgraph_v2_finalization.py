@@ -42,7 +42,7 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document, GroundednessResult, ModerationResult
 from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
@@ -218,7 +218,6 @@ def _state() -> TracerState:
         "query": "hello",
         "conversation_id": "c1",
         "client_request_id": None,
-        "events": [],
     }
 
 
@@ -229,7 +228,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
@@ -249,12 +248,8 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
             groundedness_actor=_Groundedness(),
         )
         result = await graph.ainvoke(_state())
-        transport_events = await RunEventRepository(pool).list_events(
-            "tenant-a", run.run_id
-        )
-
-    done = result["events"][-1]["data"]
-    assert transport_events == []
+    assert "final_response" in result
+    done = result["final_response"].model_dump(by_alias=True)
     assert done["session_id"] == "c1"
     assert done["answer"] == "grounded answer [1]"
     assert done["documents"][0]["id"] == "d1"
@@ -308,6 +303,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     stable_done["citations"][0]["metadata"]["artifact_id"] = "__artifact_id__"
     assert stable_done == expected["event"]["data"]
     assert "final_response" in result
+    assert "final_response" in result
     assert result["final_response"].model_dump(by_alias=True) == done
     assert answer.calls == 1
     assert moderation.calls == 2
@@ -324,7 +320,7 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
@@ -452,12 +448,11 @@ def test_public_v2_sse_matches_final_output_golden(
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.headers["x-run-id"]
     assert response.headers["x-conversation-id"] == "c1"
-    assert "sequence" in v2_fixture["intentional_additive_fields"]
-    assert all("sequence" in event for event in events), events
+    assert v2_fixture["intentional_additive_fields"] == []
+    assert all("sequence" not in event for event in events), events
     assert set(events[-1]["data"]) == set(v2_fixture["done_data_fields"])
     for header in v2_fixture["required_response_headers"]:
         assert header in response.headers
-    stable_done.pop("sequence", None)
     assert stable_done == fixture["event"]
     assert asyncio.run(read_messages()) == [
         ("user", "hello"),
@@ -591,7 +586,7 @@ def test_terminal_checkpoint_failure_does_not_publish_done_or_assistant_message(
                 ),
                 conversation_id="terminal-checkpoint-failure",
             )
-            run = await RunEventRepository(pool).get_run("tenant-a", run_id)
+            run = await RunRepository(pool).get_run("tenant-a", run_id)
             return [message.role for message in messages], run.status
 
     delivered = parse_sse(response.text)

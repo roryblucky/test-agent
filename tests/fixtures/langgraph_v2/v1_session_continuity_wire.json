@@ -41,7 +41,5 @@
       "citations": []
     }
   },
-  "documented_v2_differences": [
-    "sequence and event_key metadata are additive and excluded from this legacy wire comparison"
-  ]
+  "documented_v2_differences": []
 }

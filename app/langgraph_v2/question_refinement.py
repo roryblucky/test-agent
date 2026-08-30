@@ -9,8 +9,8 @@ from typing import Any, Protocol
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
+from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
-from app.langgraph_v2.run_events import EventInput
 from app.models.workflow import ResolvedQuery
 
 REFINEMENT_ERROR_MESSAGE = "Question refinement failed."
@@ -102,28 +102,26 @@ def refinement_events(
     result: ResolvedQuery | None = None,
     *,
     error: str | None = None,
-) -> tuple[EventInput, ...]:
+) -> tuple[LiveStreamEvent, ...]:
     """Build stable Events for a successful or failed refinement."""
     events = [
-        EventInput(
-            event_key="phase:question_refinement:step_start:1",
+        LiveStreamEvent(
             type="step_start",
             step="llm:refine_question",
         )
     ]
     if error is not None:
         events.append(
-            EventInput(
-                event_key="phase:question_refinement:error:1",
+            LiveStreamEvent(
                 type="error",
                 data=error,
+                checkpoint_terminal=True,
             )
         )
     else:
         assert result is not None
         events.append(
-            EventInput(
-                event_key="phase:question_refinement:step_completed:1",
+            LiveStreamEvent(
                 type="step_completed",
                 step="llm:refine_question",
                 data={"refined_query": result.standalone_query},
@@ -136,7 +134,9 @@ async def run_question_refinement(
     state: Mapping[str, Any],
     *,
     actor: QuestionRefinementActor,
-) -> tuple[tuple[EventInput, ...], bool, QuestionRefinementResult | None, str | None]:
+) -> tuple[
+    tuple[LiveStreamEvent, ...], bool, QuestionRefinementResult | None, str | None
+]:
     """Return refinement State without reading or writing an application journal."""
     try:
         history = [

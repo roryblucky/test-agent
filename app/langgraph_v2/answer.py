@@ -13,8 +13,9 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
+from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
-from app.langgraph_v2.run_events import CancellationObserved, EventInput
+from app.langgraph_v2.runs import CancellationObserved
 from app.models.domain import Document
 from app.models.workflow import CitationReference
 
@@ -232,20 +233,16 @@ async def run_answer(
     artifacts: ArtifactStore,
     actor: AnswerActor,
     stream_writer: Any | None = None,
-) -> tuple[list[EventInput], BoundAnswerResult | None, bool, str | None]:
+) -> tuple[list[LiveStreamEvent], BoundAnswerResult | None, bool, str | None]:
     """Hydrate ranked evidence and stream one checkpoint-owned Answer result."""
 
-    def write_event(event: EventInput) -> None:
+    def write_event(event: LiveStreamEvent) -> None:
         if stream_writer is not None:
-            stream_writer(
-                {
-                    **event.model_dump(exclude_none=True),
-                    "journal_policy": "checkpoint_only",
-                }
-            )
+            stream_writer(event.to_stream_payload())
 
     if cancellation_check is not None and await cancellation_check():
         raise AnswerCancelled("answer generation cancelled before publication")
+    answer_started = False
     try:
         refs = [
             ref
@@ -267,9 +264,8 @@ async def run_answer(
             ConversationTurn.model_validate(turn) for turn in state.get("history", [])
         ]
         answer_query = state.get("refined_query", state["query"])
-        events: list[EventInput] = [
-            EventInput(
-                event_key="phase:answer:step_start:1",
+        events: list[LiveStreamEvent] = [
+            LiveStreamEvent(
                 type="step_start",
                 step="llm:answer",
             )
@@ -277,7 +273,6 @@ async def run_answer(
 
         chunks: list[str] = []
         streamed_result: AnswerResult | None = None
-        answer_started = False
         answer_iterator = actor.answer_stream(answer_query, documents, history)
         try:
             async for chunk in answer_iterator:
@@ -285,10 +280,7 @@ async def run_answer(
                     streamed_result = chunk.result
                 if not chunk.delta:
                     continue
-                if (
-                    cancellation_check is not None
-                    and await cancellation_check()
-                ):
+                if cancellation_check is not None and await cancellation_check():
                     raise AnswerCancelled(
                         "answer generation cancelled before publication"
                     )
@@ -296,8 +288,7 @@ async def run_answer(
                     answer_started = True
                     write_event(events[0])
                 chunks.append(chunk.delta)
-                event = EventInput(
-                    event_key=f"phase:answer:token:{len(chunks) - 1}",
+                event = LiveStreamEvent(
                     type="token",
                     data=chunk.delta,
                 )
@@ -322,25 +313,20 @@ async def run_answer(
         if "[" not in normalized_answer and "]" not in normalized_answer:
             citations = bind_answer_citations(validated.citations, refs, documents)
         if citations:
-            event = EventInput(
-                event_key="phase:answer:citations:1",
+            event = LiveStreamEvent(
                 type="citations",
                 data=[citation.model_dump(mode="json") for citation in citations],
             )
             events.append(event)
             write_event(event)
-        event = EventInput(
-            event_key="phase:answer:step_completed:1",
+        event = LiveStreamEvent(
             type="step_completed",
             step="llm:answer",
             data={"chunk_count": len(chunks)},
         )
         events.append(event)
         write_event(event)
-        if (
-            cancellation_check is not None
-            and await cancellation_check()
-        ):
+        if cancellation_check is not None and await cancellation_check():
             raise AnswerCancelled("answer generation cancelled before publication")
         return (
             events,
@@ -356,17 +342,17 @@ async def run_answer(
         raise
     except Exception as exc:
         message = str(exc) or "Answer generation failed."
-        start_event = EventInput(
-            event_key="phase:answer:step_start:1",
+        start_event = LiveStreamEvent(
             type="step_start",
             step="llm:answer",
         )
-        error_event = EventInput(
-            event_key="phase:answer:error:1",
+        error_event = LiveStreamEvent(
             type="error",
             data=message,
+            checkpoint_terminal=True,
         )
-        write_event(start_event)
+        if not answer_started:
+            write_event(start_event)
         write_event(error_event)
         return (
             [

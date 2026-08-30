@@ -6,13 +6,13 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import UUID
 
+from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.output_assessments import (
     OutputAssessmentAudit,
     build_output_assessment_scope,
     record_output_assessment,
 )
 from app.langgraph_v2.pre_moderation import ModerationDecision, ModerationProvider
-from app.langgraph_v2.run_events import EventInput
 
 
 async def run_post_moderation(
@@ -22,7 +22,7 @@ async def run_post_moderation(
     current_turn_id: UUID | None,
     output_assessment_audit: OutputAssessmentAudit | None,
     provider: ModerationProvider,
-) -> tuple[list[EventInput], ModerationDecision | None, str | None]:
+) -> tuple[list[LiveStreamEvent], ModerationDecision | None, str | None]:
     """Assess the generated answer without changing its publication state."""
     assessment_scope = build_output_assessment_scope(
         tenant_id=tenant_id,
@@ -46,13 +46,11 @@ async def run_post_moderation(
         )
         return (
             [
-                EventInput(
-                    event_key="phase:post_moderation:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="moderation:post",
                 ),
-                EventInput(
-                    event_key="phase:post_moderation:error:1",
+                LiveStreamEvent(
                     type="step_completed",
                     step="moderation:post",
                     data=failed_result,
@@ -74,13 +72,11 @@ async def run_post_moderation(
         )
         return (
             [
-                EventInput(
-                    event_key="phase:post_moderation:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="moderation:post",
                 ),
-                EventInput(
-                    event_key="phase:post_moderation:error:1",
+                LiveStreamEvent(
                     type="step_completed",
                     step="moderation:post",
                     data=failed_result,
@@ -97,13 +93,11 @@ async def run_post_moderation(
     )
     return (
         [
-            EventInput(
-                event_key="phase:post_moderation:step_start:1",
+            LiveStreamEvent(
                 type="step_start",
                 step="moderation:post",
             ),
-            EventInput(
-                event_key="phase:post_moderation:step_completed:1",
+            LiveStreamEvent(
                 type="step_completed",
                 step="moderation:post",
                 data={"is_flagged": decision.is_flagged, "mode": "post"},

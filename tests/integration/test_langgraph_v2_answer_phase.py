@@ -21,7 +21,7 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.langgraph_v2.stream import stream_graph
 from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence
@@ -199,7 +199,7 @@ async def test_answer_receives_ranked_documents_on_each_execution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -219,7 +219,6 @@ async def test_answer_receives_ranked_documents_on_each_execution(
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
-            "events": [],
         }
 
         first = await graph.ainvoke(state)
@@ -231,19 +230,6 @@ async def test_answer_receives_ranked_documents_on_each_execution(
     assert "answer" in first
     assert "answer" in second
     assert second["answer"] == first["answer"]
-    answer_events = [
-        event
-        for event in first["events"]
-        if event["event_key"].startswith("phase:answer:")
-    ]
-    assert [event["type"] for event in answer_events] == [
-        "step_start",
-        "token",
-        "step_completed",
-    ]
-    assert [event["data"] for event in answer_events if event["type"] == "token"] == [
-        "One. Two\nThree; four"
-    ]
 
 
 @pytest.mark.asyncio
@@ -253,7 +239,7 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -273,7 +259,6 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
-            "events": [],
         }
 
         config: RunnableConfig = {"configurable": {"thread_id": "ticket34-stream"}}
@@ -355,7 +340,7 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -375,7 +360,6 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
-            "events": [],
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
@@ -388,17 +372,6 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
     assert first["citations"][0].evidence_id
     assert "citations" in first
     assert first["citations"][0].quoted_text == "hello"
-    answer_events = [
-        event
-        for event in first["events"]
-        if event["event_key"].startswith("phase:answer:")
-    ]
-    assert [event["type"] for event in answer_events] == [
-        "step_start",
-        "token",
-        "citations",
-        "step_completed",
-    ]
 
 
 @pytest.mark.asyncio
@@ -408,7 +381,7 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -428,7 +401,6 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
-            "events": [],
         }
         result = await graph.ainvoke(state)
 
@@ -437,15 +409,6 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     assert [citation.index for citation in result["citations"]] == [1]
     assert "citations" in result
     assert result["citations"][0].evidence_id
-    answer_events = [
-        event
-        for event in result["events"]
-        if event["event_key"].startswith("phase:answer:")
-    ]
-    assert answer_events[0]["type"] == "step_start"
-    assert answer_events[-1]["type"] == "step_completed"
-    assert all(event["type"] == "token" for event in answer_events[1:-2])
-    assert answer_events[-2]["type"] == "citations"
     citation_fixture = json.loads(
         (
             Path(__file__).parents[1]
@@ -454,10 +417,7 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
             / "v1_citations_wire.json"
         ).read_text()
     )
-    citation_event = answer_events[-2]
-    assert citation_event["type"] == citation_fixture["event"]["type"]
-    assert set(citation_fixture["event"]["data"][0]) <= set(citation_event["data"][0])
-
+    citation_data = result["citations"][0].model_dump(mode="json")
     legacy_citations, _ = await build_citations(
         "Supported claim [1].",
         [
@@ -486,13 +446,10 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
     assert legacy_wire["data"] == [
         citation.model_dump(mode="json") for citation in legacy_citations
     ]
-    assert citation_event["data"][0]["index"] == legacy_wire["data"][0]["index"]
-    assert citation_event["data"][0]["source"] == legacy_wire["data"][0]["source"]
-    assert (
-        citation_event["data"][0]["evidence_id"]
-        != legacy_wire["data"][0]["evidence_id"]
-    )
-    assert "highlight_spans" in citation_event["data"][0]
+    assert citation_data["index"] == legacy_wire["data"][0]["index"]
+    assert citation_data["source"] == legacy_wire["data"][0]["source"]
+    assert citation_data["evidence_id"] != legacy_wire["data"][0]["evidence_id"]
+    assert "highlight_spans" in citation_data
 
 
 @pytest.mark.asyncio
@@ -517,7 +474,7 @@ async def test_inline_citation_uses_reranked_artifact_position(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -538,7 +495,6 @@ async def test_inline_citation_uses_reranked_artifact_position(
                 "query": "hello",
                 "conversation_id": "c1",
                 "client_request_id": None,
-                "events": [],
             }
         )
 
@@ -555,7 +511,7 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -576,7 +532,6 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
                 "query": "hello",
                 "conversation_id": "c1",
                 "client_request_id": None,
-                "events": [],
             }
         )
 

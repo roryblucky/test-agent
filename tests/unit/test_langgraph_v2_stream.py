@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.stream import stream_graph
 
 
@@ -45,6 +46,17 @@ class _FakeGraph:
         self.inputs.append(graph_input)
         self.options.append(options)
         return self.stream
+
+
+def test_checkpoint_terminal_marker_is_internal_to_the_custom_stream() -> None:
+    event = LiveStreamEvent(
+        type="done",
+        data={"answer": "complete"},
+        checkpoint_terminal=True,
+    )
+
+    assert event.to_stream_payload()["checkpoint_terminal"] is True
+    assert "checkpoint_terminal" not in _payload(event.to_sse())
 
 
 @pytest.mark.asyncio
@@ -101,8 +113,7 @@ async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() 
     frames = [frame async for frame in stream_graph(graph, {"query": "hello"})]
 
     assert [_payload(frame) for frame in frames] == [
-        {"type": "step_start", "sequence": 1, "step": "answer"},
-        {"type": "token", "sequence": 2, "data": "hello"},
+        {"type": "token", "data": "hello"},
     ]
     assert graph.inputs == [{"query": "hello"}]
     assert graph.options == [
@@ -118,23 +129,14 @@ async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() 
 
 @pytest.mark.asyncio
 async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
-    persisted_events: list[Any] = []
-
-    async def persist_event(event: Any) -> None:
-        persisted_events.append(event)
-
     graph = _FakeGraph(
         _FakeGraphStream(
             [
                 (
-                    "updates",
+                    "custom",
                     {
-                        "query": {
-                            "event_key": "phase:query:step_completed:1",
-                            "type": "step_completed",
-                            "data": {"query": "continued"},
-                            "journal_policy": "checkpoint_only",
-                        }
+                        "type": "step_completed",
+                        "data": {"query": "continued"},
                     },
                 )
             ]
@@ -147,17 +149,14 @@ async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
             graph,
             None,
             config={"configurable": {"thread_id": "thread-1"}},
-            event_sink=persist_event,
         )
     ]
 
     assert _payload(frames[0]) == {
         "type": "step_completed",
-        "sequence": 1,
         "data": {"query": "continued"},
     }
     assert graph.inputs == [None]
-    assert persisted_events == []
     assert graph.options == [
         {
             "config": {"configurable": {"thread_id": "thread-1"}},
@@ -171,15 +170,14 @@ async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
 async def test_answer_error_update_does_not_confirm_a_failing_checkpoint() -> None:
     terminal_events: list[Any] = []
     answer_error = {
-        "event_key": "phase:answer:error:1",
         "type": "error",
         "data": "answer failed",
-        "journal_policy": "checkpoint_only",
+        "checkpoint_terminal": True,
     }
 
     async def failing_checkpoint_stream() -> AsyncIterator[Any]:
         yield ("custom", answer_error)
-        yield ("updates", {"answer": {"events": [answer_error]}})
+        yield ("updates", {"answer": {"answer_error": "answer failed"}})
         raise RuntimeError("sync checkpoint failed")
 
     async def terminal_sink(event: Any) -> None:

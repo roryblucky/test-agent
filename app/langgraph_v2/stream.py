@@ -10,7 +10,7 @@ from typing import Any, Protocol, cast
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
 
-from app.langgraph_v2.contracts import GraphEventJournalPolicy, TracerStreamEvent
+from app.langgraph_v2.contracts import LiveStreamEvent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,8 +79,7 @@ async def stream_graph(
     graph_input: Any | None,
     *,
     config: RunnableConfig | None = None,
-    event_sink: Callable[[TracerStreamEvent], Awaitable[None]] | None = None,
-    terminal_sink: Callable[[TracerStreamEvent], Awaitable[None]] | None = None,
+    terminal_sink: Callable[[LiveStreamEvent], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[str]:
     """Yield one legacy-compatible SSE frame for each public graph update.
 
@@ -96,9 +95,7 @@ async def stream_graph(
         stream_mode=_STREAM_MODES,
         durability="sync",
     )
-    seen_event_keys: set[str] = set()
-    next_sequence = 0
-    pending_terminal: TracerStreamEvent | None = None
+    pending_terminal: LiveStreamEvent | None = None
     pending_terminal_update_seen = False
     deferred_frames: list[str] = []
 
@@ -109,39 +106,15 @@ async def stream_graph(
             if mode not in _STREAM_MODES:
                 continue
 
-            candidates = _event_mappings(data)
-
-            for candidate in candidates:
-                event_key = candidate.get("event_key")
-                if (
-                    pending_terminal is not None
-                    and mode == "updates"
-                    and event_key == pending_terminal.event_key
-                ):
+            if mode == "updates":
+                if pending_terminal is not None:
                     pending_terminal_update_seen = True
-                    continue
-                if isinstance(event_key, str) and event_key in seen_event_keys:
-                    continue
-                event, next_sequence, journal_policy = _event_from_mapping(
-                    candidate,
-                    next_sequence=next_sequence,
-                    mode=mode,
-                )
-                seen_event_keys.add(event.event_key)
-                if event_sink is not None and journal_policy == "transport_journal":
-                    await event_sink(event)
-                if (
-                    journal_policy == "checkpoint_only"
-                    and (
-                        event.type == "done"
-                        or (
-                            event.type == "error"
-                            and event.event_key.startswith("phase:answer:")
-                        )
-                    )
-                ):
+                continue
+
+            for candidate in _event_mappings(data):
+                event = LiveStreamEvent.model_validate(candidate)
+                if event.checkpoint_terminal:
                     pending_terminal = event
-                    pending_terminal_update_seen = mode == "updates"
                     deferred_frames.append(event.to_sse())
                     continue
                 frame = event.to_sse()
@@ -204,8 +177,6 @@ def _event_mappings(value: object) -> list[Mapping[str, Any]]:
     """Extract event-shaped values without exposing arbitrary graph state."""
     mapping = _as_mapping(value)
     if mapping is not None:
-        if isinstance(mapping.get("events"), (list, tuple)):
-            return _event_mappings(mapping["events"])
         nested_event = mapping.get("event")
         if nested_event is not None:
             return _event_mappings(nested_event)
@@ -220,29 +191,3 @@ def _event_mappings(value: object) -> list[Mapping[str, Any]]:
             events.extend(_event_mappings(item))
         return events
     return []
-
-
-def _event_from_mapping(
-    mapping: Mapping[str, Any],
-    *,
-    next_sequence: int,
-    mode: str,
-) -> tuple[TracerStreamEvent, int, GraphEventJournalPolicy]:
-    # Graph state updates may carry node-local journal sequences (and repeated
-    # snapshots), so the SSE projection owns one contiguous public sequence.
-    sequence = next_sequence + 1
-
-    event_key = mapping.get("event_key")
-    if not isinstance(event_key, str) or not event_key:
-        event_key = f"stream:{mode}:{sequence}"
-    event = TracerStreamEvent(
-        event_key=event_key,
-        type=mapping["type"],
-        sequence=sequence,
-        step=mapping.get("step"),
-        data=mapping.get("data"),
-    )
-    journal_policy = mapping.get("journal_policy", "transport_journal")
-    if journal_policy not in {"checkpoint_only", "transport_journal"}:
-        raise ValueError(f"unknown Graph event journal policy: {journal_policy!r}")
-    return event, sequence, cast(GraphEventJournalPolicy, journal_policy)

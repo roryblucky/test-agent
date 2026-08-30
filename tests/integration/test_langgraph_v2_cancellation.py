@@ -8,7 +8,6 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from uuid import UUID, uuid4
 
-import psycopg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -25,7 +24,7 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.run_events import ClaimFenced, EventInput, RunEventRepository
+from app.langgraph_v2.runs import ClaimFenced, RunRepository
 from app.models.domain import Document
 from app.services.events import EventEmitter
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
@@ -101,7 +100,7 @@ async def test_owner_atomically_applies_cancellation_once_and_fences_stale_epoch
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         cancellations = CancellationRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
@@ -124,13 +123,7 @@ async def test_owner_atomically_applies_cancellation_once_and_fences_stale_epoch
             execution_epoch=run.execution_epoch,
         )
         persisted_run = await runs.get_run("tenant-a", run.run_id)
-        events = await runs.list_events("tenant-a", run.run_id)
-
-        assert stopped == repeated == events[-1]
-        assert stopped is not None
-        assert stopped.event_key == "lifecycle:cancelled:1"
-        assert stopped.type == "stopped"
-        assert stopped.data == {"partial": None}
+        assert stopped is repeated is True
         assert persisted_run.status == "cancelled"
         assert persisted_run.owner_instance_id == ""
         assert persisted_run.completed_at is None
@@ -142,173 +135,6 @@ async def test_owner_atomically_applies_cancellation_once_and_fences_stale_epoch
                 owner_instance_id="stale-owner",
                 execution_epoch=0,
             )
-
-
-@pytest.mark.asyncio
-async def test_failed_run_rejects_later_cancellation_transition(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunEventRepository(pool)
-        cancellations = CancellationRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="owner-a",
-        )
-        failed = await runs.fail_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            event=EventInput(
-                event_key="lifecycle:failed:1",
-                type="error",
-                data="provider failed",
-            ),
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-
-        request = await cancellations.request(tenant_id="tenant-a", run_id=run.run_id)
-        with pytest.raises(ClaimFenced):
-            await cancellations.apply_if_requested(
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            )
-
-        persisted = await runs.get_run("tenant-a", run.run_id)
-        assert request.accepted is False
-        assert persisted.status == "failed"
-        assert await runs.list_events("tenant-a", run.run_id) == [failed]
-
-
-@pytest.mark.asyncio
-async def test_interrupted_run_with_pending_intent_cancels_after_explicit_resume(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunEventRepository(pool)
-        cancellations = CancellationRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="owner-a",
-        )
-        await runs.update_checkpoint_pointer(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-            checkpoint_id="checkpoint-1",
-            checkpoint_ns="namespace-1",
-        )
-        await runs.interrupt_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        request = await cancellations.request(tenant_id="tenant-a", run_id=run.run_id)
-
-        resumed = await runs.resume_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id="owner-b",
-        )
-        stopped = await cancellations.apply_if_requested(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=resumed.owner_instance_id,
-            execution_epoch=resumed.execution_epoch,
-        )
-
-        assert request.accepted is True
-        assert stopped is not None
-        assert stopped.event_key == "lifecycle:cancelled:2"
-        assert (await runs.get_run("tenant-a", run.run_id)).status == "cancelled"
-        with pytest.raises(ClaimFenced):
-            await cancellations.apply_if_requested(
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            )
-
-
-@pytest.mark.asyncio
-async def test_expired_owner_cannot_apply_pending_intent_after_resume_epoch(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        runs = RunEventRepository(pool)
-        cancellations = CancellationRepository(pool)
-        run = await runs.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="owner-a",
-        )
-        await runs.update_checkpoint_pointer(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-            checkpoint_id="checkpoint-1",
-            checkpoint_ns="namespace-1",
-        )
-        with psycopg.connect(
-            langgraph_v2_migrated_database_url, autocommit=True
-        ) as connection:
-            connection.execute(
-                """
-                UPDATE langgraph_v2.runs
-                SET expires_at = clock_timestamp() - interval '1 second'
-                WHERE tenant_id = %s AND run_id = %s
-                """,
-                ("tenant-a", run.run_id),
-            )
-        await cancellations.request(tenant_id="tenant-a", run_id=run.run_id)
-        interrupted = await runs.interrupt_expired_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            observed_execution_epoch=run.execution_epoch,
-        )
-        resumed = await runs.resume_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id="owner-b",
-        )
-
-        with pytest.raises(ClaimFenced):
-            await cancellations.apply_if_requested(
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            )
-        stopped = await cancellations.apply_if_requested(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            owner_instance_id=resumed.owner_instance_id,
-            execution_epoch=resumed.execution_epoch,
-        )
-
-        assert interrupted is not None
-        assert interrupted.event_key == "lifecycle:interrupted:1"
-        assert stopped is not None
-        assert stopped.event_key == "lifecycle:cancelled:3"
-        assert [
-            event.event_key for event in await runs.list_events("tenant-a", run.run_id)
-        ] == ["lifecycle:interrupted:1", "lifecycle:cancelled:3"]
 
 
 class _Retriever:
@@ -428,10 +254,7 @@ def test_public_executor_observes_cancellation_before_answer_batch(
     events = parse_sse(response.text)
     assert events[-1]["type"] == "stopped"
     assert events[-1]["data"] == {"partial": None}
-    public_stopped = {
-        key: value for key, value in events[-1].items() if key != "sequence"
-    }
-    assert public_stopped == json.loads(STOPPED_FIXTURE_PATH.read_text())["events"][0]
+    assert events[-1] == json.loads(STOPPED_FIXTURE_PATH.read_text())["events"][0]
     assert not any(
         event.get("step") == "llm:answer" or event["type"] == "token"
         for event in events
@@ -446,7 +269,7 @@ def test_public_executor_observes_cancellation_before_answer_batch(
     )
     assert run["status"] == "cancelled"
     assert run["owner_instance_id"] == ""
-    assert persisted_events[-1]["event_key"] == "lifecycle:cancelled:1"
+    assert persisted_events == []
 
 
 def test_public_executor_checks_cancellation_at_next_graph_boundary(

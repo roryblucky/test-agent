@@ -6,7 +6,6 @@ import pytest
 from fastapi import FastAPI
 from pydantic import ValidationError
 
-import app.langgraph_v2.postgres as postgres_module
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 
 
@@ -89,26 +88,16 @@ async def test_postgres_lifespan_opens_and_closes_the_configured_pool() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["pool_open", "checkpointer_setup"])
 async def test_postgres_startup_failure_closes_all_started_resources(
-    failure: str, monkeypatch: pytest.MonkeyPatch
+    failure: str,
 ) -> None:
     app = FastAPI()
     pool = FailingAsyncPool(fail_open=failure == "pool_open")
-    wakeups = FakeWakeups()
-
-    def wakeups_factory(*, redis_url: str | None, instance_id: str) -> FakeWakeups:
-        return wakeups
 
     def pool_factory(**kwargs: Any) -> FailingAsyncPool:
         return pool
 
     def checkpointer_factory(pool: Any) -> FailingCheckpointer:
         return FailingCheckpointer(fail_setup=failure == "checkpointer_setup")
-
-    monkeypatch.setattr(
-        postgres_module,
-        "LiveEventWakeups",
-        wakeups_factory,
-    )
 
     with pytest.raises(RuntimeError, match="startup failed"):
         async with postgres_lifespan(
@@ -119,8 +108,6 @@ async def test_postgres_startup_failure_closes_all_started_resources(
         ):
             pass
 
-    assert wakeups.started is True
-    assert wakeups.closed is True
     assert pool.closed is True
     assert app.state.langgraph_v2_postgres_pool is None
     assert app.state.langgraph_v2_checkpointer is None
@@ -173,15 +160,3 @@ class FailingCheckpointer(FakeCheckpointer):
         await super().setup()
         if self._fail_setup:
             raise RuntimeError("startup failed")
-
-
-class FakeWakeups:
-    def __init__(self) -> None:
-        self.started = False
-        self.closed = False
-
-    async def start(self) -> None:
-        self.started = True
-
-    async def close(self) -> None:
-        self.closed = True

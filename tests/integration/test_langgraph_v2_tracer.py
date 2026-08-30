@@ -1,12 +1,12 @@
 import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Generator
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import timedelta
 from importlib import reload
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import psycopg
 import pytest
@@ -22,22 +22,14 @@ from app.langgraph_v2.api import TracerGraph, register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
-    MessageRecord,
 )
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import TracerState
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
-from app.langgraph_v2.run_events import (
-    ClaimFenced,
-    EventInput,
-    EventInvariantConflict,
-    EventRecord,
-    RunEventRepository,
-    RunRecord,
-)
+from app.langgraph_v2.runs import RunRepository
 from app.services.events import EventEmitter
 
 FIXTURE_PATH = (
@@ -53,6 +45,39 @@ def parse_sse(response_text: str) -> list[dict[str, Any]]:
             raise TypeError("SSE payload must be a JSON object")
         events.append(cast(dict[str, Any], payload))
     return events
+
+
+@contextmanager
+def reject_transport_event_inserts(database_url: str) -> Generator[None]:
+    """Fail a public request if it attempts to persist a transport Event."""
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            CREATE FUNCTION langgraph_v2.reject_event_insert()
+            RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'forced event persistence failure';
+            END;
+            $$ LANGUAGE plpgsql
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER reject_event_insert
+            BEFORE INSERT ON langgraph_v2.events
+            FOR EACH ROW EXECUTE FUNCTION langgraph_v2.reject_event_insert()
+            """
+        )
+    try:
+        yield
+    finally:
+        with psycopg.connect(database_url) as connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reject_event_insert ON langgraph_v2.events"
+            )
+            connection.execute(
+                "DROP FUNCTION IF EXISTS langgraph_v2.reject_event_insert()"
+            )
 
 
 def persistent_tracer_app(
@@ -191,20 +216,6 @@ async def test_captured_legacy_moderation_error_fixture() -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_in_memory_graph_sequences_events_additively() -> None:
-    result = await build_tracer_graph().ainvoke(
-        {
-            "query": "hello",
-            "conversation_id": "conversation-1",
-            "client_request_id": None,
-            "events": [],
-        }
-    )
-
-    assert [event["sequence"] for event in result["events"]] == list(range(1, 10))
-
-
 def test_enabled_tracer_preserves_the_minimal_stream_contract(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -233,7 +244,6 @@ def test_enabled_tracer_preserves_the_minimal_stream_contract(
     assert response.headers["x-conversation-id"] == "conversation-123"
     assert response.text.endswith("\n\n")
     actual_events = parse_sse(response.text)
-    assert [event.pop("sequence") for event in actual_events] == list(range(1, 14))
     assert actual_events == [
         {
             "type": "step_start",
@@ -363,177 +373,6 @@ def test_request_header_and_generated_conversation_variants(
     assert invalid_client_id.status_code == 422
 
 
-@pytest.mark.asyncio
-async def test_done_answer_finalization_is_atomic_on_turn_validation(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        await seed_subject_conversation(pool)
-        repository = RunEventRepository(pool)
-        message_repository = ConversationMessageRepository(pool)
-
-        async def persist_done(
-            run_id: UUID,
-            result_turn_id: UUID,
-            expected_turn_id: UUID | None = None,
-        ) -> None:
-            result = {
-                "turn_id": str(result_turn_id),
-                "events": [
-                    {
-                        "event_key": "lifecycle:completed:0",
-                        "type": "done",
-                        "data": {"answer": "answer"},
-                        "sequence": 1,
-                    }
-                ],
-            }
-            frames = api_module.persist_result_events(
-                repository,
-                message_repository,
-                tenant_id="tenant-a",
-                run_id=run_id,
-                conversation_id="conversation-1",
-                result=result,
-                expected_turn_id=expected_turn_id,
-                owner_instance_id="instance-a",
-                execution_epoch=1,
-            )
-            async for _ in frames:
-                pass
-
-        missing_run = await repository.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        missing_turn = uuid4()
-        with pytest.raises(ClaimFenced):
-            await persist_done(missing_run.run_id, missing_turn)
-        assert (await repository.get_run("tenant-a", missing_run.run_id)).status == (
-            "running"
-        )
-        assert await repository.list_events("tenant-a", missing_run.run_id) == []
-
-        wrong_run = await repository.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        actual_turn = uuid4()
-        await message_repository.persist_user_message(
-            tenant_id="tenant-a",
-            conversation_id="conversation-1",
-            run_id=wrong_run.run_id,
-            turn_id=actual_turn,
-            content="question",
-            idempotency_key=f"turn:{actual_turn}:user",
-        )
-        unrelated_turn = uuid4()
-        await message_repository.persist_user_message(
-            tenant_id="tenant-a",
-            conversation_id="conversation-1",
-            run_id=uuid4(),
-            turn_id=unrelated_turn,
-            content="another question",
-            idempotency_key=f"turn:{unrelated_turn}:user",
-        )
-        with pytest.raises(ValueError, match="does not match Run"):
-            await persist_done(wrong_run.run_id, unrelated_turn, actual_turn)
-        assert (await repository.get_run("tenant-a", wrong_run.run_id)).status == (
-            "running"
-        )
-        assert await repository.list_events("tenant-a", wrong_run.run_id) == []
-
-        valid_run = await repository.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        valid_turn = uuid4()
-        await message_repository.persist_user_message(
-            tenant_id="tenant-a",
-            conversation_id="conversation-1",
-            run_id=valid_run.run_id,
-            turn_id=valid_turn,
-            content="question",
-            idempotency_key=f"turn:{valid_turn}:user",
-        )
-        await persist_done(valid_run.run_id, valid_turn)
-
-        assert (await repository.get_run("tenant-a", valid_run.run_id)).status == (
-            "completed"
-        )
-        events = await repository.list_events("tenant-a", valid_run.run_id)
-        assert [(event.event_key, event.type) for event in events] == [
-            ("lifecycle:completed:0", "done")
-        ]
-        messages = await message_repository.list_messages(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="conversation-1",
-        )
-        assert [
-            message.role for message in messages if message.turn_id == valid_turn
-        ] == [
-            "user",
-            "assistant",
-        ]
-
-        conflict_run = await repository.create_run(
-            tenant_id="tenant-a",
-            run_id=uuid4(),
-            conversation_id="conversation-1",
-            owner_instance_id="instance-a",
-        )
-        conflict_turn = uuid4()
-        await message_repository.persist_user_message(
-            tenant_id="tenant-a",
-            conversation_id="conversation-1",
-            run_id=conflict_run.run_id,
-            turn_id=conflict_turn,
-            content="question",
-            idempotency_key=f"turn:{conflict_turn}:user",
-        )
-        await repository.append_event(
-            tenant_id="tenant-a",
-            run_id=conflict_run.run_id,
-            owner_instance_id="instance-a",
-            execution_epoch=1,
-            event=EventInput(
-                event_key="lifecycle:completed:0",
-                type="done",
-                data={"answer": "previous answer"},
-            ),
-        )
-        with pytest.raises(EventInvariantConflict):
-            await persist_done(conflict_run.run_id, conflict_turn, conflict_turn)
-        failed_conflict_run = await repository.get_run("tenant-a", conflict_run.run_id)
-        assert failed_conflict_run.status == "failed"
-        assert failed_conflict_run.terminal_outcome == {
-            "error": "event_invariant_conflict",
-            "event_key": "lifecycle:completed:0",
-        }
-        assert [
-            event.event_key
-            for event in await repository.list_events("tenant-a", conflict_run.run_id)
-        ] == ["lifecycle:completed:0"]
-        assert [
-            message
-            for message in await message_repository.list_messages(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="conversation-1",
-            )
-            if message.turn_id == conflict_turn and message.role == "assistant"
-        ] == []
-
-
 def test_query_authorizes_existing_conversation_before_streaming(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -612,59 +451,15 @@ def test_flagged_query_emits_error_before_finalization(
 
     run_id = UUID(response.headers["x-run-id"])
 
-    async def read_run() -> tuple[str, list[EventRecord]]:
+    async def read_run() -> str:
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
-            repository = RunEventRepository(pool)
-            return (
-                (await repository.get_run("tenant-a", run_id)).status,
-                await repository.list_events("tenant-a", run_id),
-            )
+            repository = RunRepository(pool)
+            return (await repository.get_run("tenant-a", run_id)).status
 
-    status, persisted = asyncio.run(read_run())
-    assert status == "interrupted"
-    assert persisted == []
-
-
-def test_failed_moderation_error_retry_is_idempotent(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    async def exercise() -> None:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            repository = RunEventRepository(pool)
-            run = await repository.create_run(
-                tenant_id="tenant-a",
-                run_id=uuid4(),
-                conversation_id="conversation-1",
-                owner_instance_id="instance-a",
-            )
-            event = EventInput(
-                event_key="phase:pre_moderation:error:1",
-                type="error",
-                data="Content flagged by moderation: query contains blocked term: blocked",
-            )
-            first = await repository.fail_run(
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                event=event,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            )
-            repeated = await repository.fail_run(
-                tenant_id="tenant-a",
-                run_id=run.run_id,
-                event=event,
-                owner_instance_id=run.owner_instance_id,
-                execution_epoch=run.execution_epoch,
-            )
-            assert repeated == first
-            assert (await repository.get_run("tenant-a", run.run_id)).status == "failed"
-            assert await repository.list_events("tenant-a", run.run_id) == [first]
-
-    asyncio.run(exercise())
+    status = asyncio.run(read_run())
+    assert status == "failed"
 
 
 @pytest.mark.asyncio
@@ -689,24 +484,21 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
 
             async def stream() -> AsyncIterator[object]:
                 yield (
-                    "updates",
+                    "custom",
                     {
-                        "fake": {
-                            "events": [
-                                {
-                                    "event_key": "phase:fake:step_start:1",
-                                    "type": "step_start",
-                                    "step": "fake",
-                                },
-                                {
-                                    "event_key": "lifecycle:completed:0",
-                                    "type": "done",
-                                    "data": {"source": "fake"},
-                                },
-                            ]
-                        }
+                        "type": "step_start",
+                        "step": "fake",
                     },
                 )
+                yield (
+                    "custom",
+                    {
+                        "type": "done",
+                        "data": {"source": "fake"},
+                        "checkpoint_terminal": True,
+                    },
+                )
+                yield ("updates", {"fake": {"final_response": {}}})
 
             return stream()
 
@@ -731,7 +523,6 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
         "conversation_id": "conversation-1",
         "turn_id": turn_id,
         "client_request_id": None,
-        "events": [],
     }
 
 
@@ -841,56 +632,6 @@ def test_removed_replay_cursor_is_rejected(
     }
 
 
-def test_completed_tracer_uses_checkpoint_events_without_transport_journal(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    conversation_id = "conversation-completed-tracer"
-    asyncio.run(
-        seed_subject_conversation(langgraph_v2_migrated_database_url, conversation_id)
-    )
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/v2/query/stream",
-            json={"query": "hello", "sessionId": conversation_id},
-            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
-        )
-
-    delivered = parse_sse(response.text)
-    run_id = UUID(response.headers["x-run-id"])
-
-    async def load_persisted_result() -> tuple[
-        RunRecord, list[EventRecord], list[MessageRecord]
-    ]:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url,
-            min_size=1,
-            max_size=2,
-        ) as pool:
-            repository = RunEventRepository(pool)
-            messages = ConversationMessageRepository(pool)
-            return (
-                await repository.get_run("tenant-a", run_id),
-                await repository.list_events("tenant-a", run_id),
-                await messages.list_messages(
-                    context=TrustedRequestContext(
-                        tenant_id="tenant-a", subject_id="subject-a"
-                    ),
-                    conversation_id=conversation_id,
-                ),
-            )
-
-    run, persisted, messages = asyncio.run(load_persisted_result())
-
-    assert run.status == "completed"
-    assert run.terminal_outcome == delivered[-1]["data"]
-    assert persisted == []
-    assert [(message.role, message.content) for message in messages] == [
-        ("user", "hello"),
-    ]
-
-
 def test_long_running_request_refreshes_its_claim(
     langgraph_v2_migrated_database_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -909,20 +650,14 @@ def test_long_running_request_refreshes_its_claim(
             async def stream() -> AsyncIterator[object]:
                 await asyncio.sleep(0.05)
                 yield (
-                    "updates",
+                    "custom",
                     {
-                        "slow": {
-                            "events": [
-                                {
-                                    "event_key": "lifecycle:completed:0",
-                                    "type": "done",
-                                    "data": {"source": "slow"},
-                                    "sequence": 1,
-                                }
-                            ]
-                        }
+                        "type": "done",
+                        "data": {"source": "slow"},
+                        "checkpoint_terminal": True,
                     },
                 )
+                yield ("updates", {"slow": {"final_response": {}}})
 
             return stream()
 
@@ -942,7 +677,7 @@ def test_long_running_request_refreshes_its_claim(
             min_size=1,
             max_size=2,
         ) as pool:
-            return await RunEventRepository(pool).get_run("tenant-a", run_id)
+            return await RunRepository(pool).get_run("tenant-a", run_id)
 
     run = asyncio.run(load_run())
     assert run.heartbeat_at > run.created_at
@@ -951,27 +686,8 @@ def test_long_running_request_refreshes_its_claim(
 def test_transport_event_table_is_not_used_by_completed_graph(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
-        connection.execute(
-            """
-            CREATE FUNCTION langgraph_v2.reject_event_insert()
-            RETURNS trigger AS $$
-            BEGIN
-                RAISE EXCEPTION 'forced event persistence failure';
-            END;
-            $$ LANGUAGE plpgsql
-            """
-        )
-        connection.execute(
-            """
-            CREATE TRIGGER reject_event_insert
-            BEFORE INSERT ON langgraph_v2.events
-            FOR EACH ROW EXECUTE FUNCTION langgraph_v2.reject_event_insert()
-            """
-        )
-
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
-    try:
+    with reject_transport_event_inserts(langgraph_v2_migrated_database_url):
         with TestClient(app) as client:
             response = client.post(
                 "/v2/query/stream",
@@ -989,11 +705,3 @@ def test_transport_event_table_is_not_used_by_completed_graph(
         assert response.status_code == 200
         assert parse_sse(response.text)[-1]["type"] == "done"
         assert event_count == (0,)
-    finally:
-        with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
-            connection.execute(
-                "DROP TRIGGER IF EXISTS reject_event_insert ON langgraph_v2.events"
-            )
-            connection.execute(
-                "DROP FUNCTION IF EXISTS langgraph_v2.reject_event_insert()"
-            )

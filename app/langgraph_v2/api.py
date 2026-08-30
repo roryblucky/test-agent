@@ -31,7 +31,7 @@ from app.langgraph_v2.checkpointing import (
     exact_checkpoint_config,
     initial_checkpoint_config,
 )
-from app.langgraph_v2.contracts import TracerStreamEvent, V2QueryRequest
+from app.langgraph_v2.contracts import LiveStreamEvent, V2QueryRequest
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
@@ -48,7 +48,6 @@ from app.langgraph_v2.groundedness import (
     build_groundedness_actor,
 )
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
-from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.output_assessments import (
     LoggingOutputAssessmentAudit,
     OutputAssessmentAudit,
@@ -67,16 +66,13 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import Ranker
 from app.langgraph_v2.retrieval import Retriever
-from app.langgraph_v2.run_events import (
+from app.langgraph_v2.runs import (
     CLAIM_HEARTBEAT_INTERVAL_SECONDS,
     CancellationObserved,
     ClaimFenced,
-    EventInput,
-    EventInvariantConflict,
-    EventRecord,
-    RunEventRepository,
     RunNotFound,
     RunRecord,
+    RunRepository,
 )
 from app.langgraph_v2.stream import (
     GraphStreamCleanupError,
@@ -241,7 +237,7 @@ def _resolve_phase_providers(
 
 
 async def _refresh_claim(
-    repository: RunEventRepository,
+    repository: RunRepository,
     tenant_id: str,
     run_id: uuid.UUID,
     owner_instance_id: str,
@@ -261,107 +257,10 @@ async def _refresh_claim(
             return
 
 
-async def _persist_event_record(
-    repository: RunEventRepository,
-    message_repository: ConversationMessageRepository,
-    event: TracerStreamEvent,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    conversation_id: str,
-    turn_id: uuid.UUID | str | None = None,
-    owner_instance_id: str,
-    execution_epoch: int,
-) -> EventRecord:
-    """Persist one graph Event, atomically publishing an assistant answer."""
-    event_input = EventInput(
-        event_key=event.event_key,
-        type=event.type,
-        step=event.step,
-        data=event.data,
-    )
-    raw_event_data: object = event.data
-    event_data = (
-        cast(dict[str, Any], raw_event_data)
-        if isinstance(raw_event_data, dict)
-        else None
-    )
-    answer = event_data.get("answer") if event_data is not None else None
-    if event.type == "done" and isinstance(answer, str):
-        try:
-            resolved_turn_id = uuid.UUID(str(turn_id))
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "completed Graph state is missing a valid turn_id"
-            ) from error
-        conflict: EventInvariantConflict | None = None
-        persisted: EventRecord | None = None
-        async with repository.transaction() as connection:
-            try:
-                async with connection.transaction():
-                    await message_repository.persist_assistant_message_in_terminal_transaction(
-                        connection,
-                        tenant_id=tenant_id,
-                        conversation_id=conversation_id,
-                        run_id=run_id,
-                        owner_instance_id=owner_instance_id,
-                        execution_epoch=execution_epoch,
-                        turn_id=resolved_turn_id,
-                        content=answer,
-                        idempotency_key=f"turn:{resolved_turn_id}:assistant",
-                    )
-                    persisted = await repository.complete_run_in_transaction(
-                        connection,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        event=event_input,
-                        owner_instance_id=owner_instance_id,
-                        execution_epoch=execution_epoch,
-                    )
-            except EventInvariantConflict as error:
-                await repository.mark_event_conflict_in_transaction(
-                    connection,
-                    tenant_id=tenant_id,
-                    run_id=run_id,
-                    event_key=event.event_key,
-                )
-                conflict = error
-        if conflict is not None:
-            raise conflict
-        if persisted is None:
-            raise RuntimeError("terminal event transaction produced no event record")
-        await repository.publish_wakeup(tenant_id, run_id)
-        return persisted
-
-    if event.type == "done":
-        return await repository.complete_run(
-            tenant_id=tenant_id,
-            run_id=run_id,
-            event=event_input,
-            owner_instance_id=owner_instance_id,
-            execution_epoch=execution_epoch,
-        )
-    if event.type == "error":
-        return await repository.fail_run(
-            tenant_id=tenant_id,
-            run_id=run_id,
-            event=event_input,
-            owner_instance_id=owner_instance_id,
-            execution_epoch=execution_epoch,
-        )
-    return await repository.append_event(
-        tenant_id=tenant_id,
-        run_id=run_id,
-        event=event_input,
-        owner_instance_id=owner_instance_id,
-        execution_epoch=execution_epoch,
-    )
-
-
 async def _terminalize_checkpoint_event(
-    repository: RunEventRepository,
+    repository: RunRepository,
     message_repository: ConversationMessageRepository,
-    event: TracerStreamEvent,
+    event: LiveStreamEvent,
     *,
     tenant_id: str,
     run_id: uuid.UUID,
@@ -370,9 +269,9 @@ async def _terminalize_checkpoint_event(
     owner_instance_id: str,
     execution_epoch: int,
 ) -> None:
-    """Publish a checkpoint-owned terminal outcome without an Event journal."""
+    """Publish a checkpoint-owned terminal outcome."""
     if event.type == "error":
-        await repository.fail_run_without_event(
+        await repository.fail_run(
             tenant_id=tenant_id,
             run_id=run_id,
             owner_instance_id=owner_instance_id,
@@ -399,7 +298,7 @@ async def _terminalize_checkpoint_event(
                 content=answer,
                 idempotency_key=f"turn:{turn_id}:assistant",
             )
-        await repository.complete_run_without_event_in_transaction(
+        await repository.complete_run_in_transaction(
             connection,
             tenant_id=tenant_id,
             run_id=run_id,
@@ -407,14 +306,12 @@ async def _terminalize_checkpoint_event(
             execution_epoch=execution_epoch,
             outcome=event.data,
         )
-    await repository.publish_wakeup(tenant_id, run_id)
 
 
 async def _cleanup_request_execution(
     graph_stream: AsyncGenerator[str] | None,
-    cancellation_observer: CancellationObserver,
     heartbeat_task: asyncio.Task[None] | None,
-    repository: RunEventRepository,
+    repository: RunRepository,
     *,
     claim: RunRecord | None,
     terminal: bool,
@@ -429,11 +326,6 @@ async def _cleanup_request_execution(
     if graph_stream is not None:
         cancelled, error = await _await_cleanup_operation(graph_stream.aclose())
         cleanup_cancelled |= cancelled
-        cleanup_error = error
-
-    cancelled, error = await _await_cleanup_operation(cancellation_observer.close())
-    cleanup_cancelled |= cancelled
-    if cleanup_error is None:
         cleanup_error = error
 
     if heartbeat_task is not None:
@@ -500,50 +392,8 @@ async def _await_cleanup_operation(
     return await _await_cleanup_task(asyncio.ensure_future(operation))
 
 
-async def persist_result_events(  # pyright: ignore[reportUnusedFunction] -- test seam
-    repository: RunEventRepository,
-    message_repository: ConversationMessageRepository,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    conversation_id: str,
-    result: dict[str, Any],
-    expected_turn_id: uuid.UUID | None = None,
-    owner_instance_id: str,
-    execution_epoch: int,
-    suppress_sse_for_event_keys: set[str] | None = None,
-) -> AsyncIterator[str]:
-    """Persist graph Events and serialize newly published SSE frames."""
-    prior_keys = suppress_sse_for_event_keys or set()
-    for raw_event in result["events"]:
-        event = TracerStreamEvent.model_validate(raw_event)
-        result_turn_id = result.get("turn_id", expected_turn_id)
-        if expected_turn_id is not None and result_turn_id is not None:
-            try:
-                resolved_result_turn_id = uuid.UUID(str(result_turn_id))
-            except (TypeError, ValueError) as error:
-                raise ValueError(
-                    "completed Graph state is missing a valid turn_id"
-                ) from error
-            if resolved_result_turn_id != expected_turn_id:
-                raise ValueError("completed Graph state turn_id does not match Run")
-        persisted = await _persist_event_record(
-            repository,
-            message_repository,
-            event,
-            tenant_id=tenant_id,
-            run_id=run_id,
-            conversation_id=conversation_id,
-            turn_id=result_turn_id,
-            owner_instance_id=owner_instance_id,
-            execution_epoch=execution_epoch,
-        )
-        if event.event_key not in prior_keys:
-            yield event.model_copy(update={"sequence": persisted.sequence}).to_sse()
-
-
 async def _persist_setup_failure(
-    repository: RunEventRepository,
+    repository: RunRepository,
     *,
     tenant_id: str,
     run_id: uuid.UUID,
@@ -552,22 +402,16 @@ async def _persist_setup_failure(
     message: str,
 ) -> str:
     """Terminalize a Run when role actor construction fails before graph start."""
-    event = await repository.fail_run(
+    await repository.fail_run(
         tenant_id=tenant_id,
         run_id=run_id,
-        event=EventInput(
-            event_key="lifecycle:groundedness_setup:error:0",
-            type="error",
-            data=message,
-        ),
         owner_instance_id=owner_instance_id,
         execution_epoch=execution_epoch,
+        error=message,
     )
-    return TracerStreamEvent(
-        event_key=event.event_key,
+    return LiveStreamEvent(
         type="error",
         data=message,
-        sequence=event.sequence,
     ).to_sse()
 
 
@@ -612,15 +456,6 @@ class ThreadResumeTarget:
     conversation: ConversationRecord
     turn: TurnRecord
     config: RunnableConfig
-
-
-def _live_events(app: FastAPI) -> LiveEventWakeups:
-    """Return the app-local wakeup relay used by durable Event followers."""
-    wakeups = getattr(app.state, "langgraph_v2_live_events", None)
-    if wakeups is None:
-        wakeups = LiveEventWakeups(instance_id=_INSTANCE_ID)
-        app.state.langgraph_v2_live_events = wakeups
-    return cast(LiveEventWakeups, wakeups)
 
 
 def _message_repository(
@@ -747,12 +582,10 @@ def create_tracer_router(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
         pool = cast(AsyncConnectionPool[Any], configured_pool)
-        wakeups = _live_events(http_request.app)
-        repository = RunEventRepository(pool, live_events=wakeups)
-        cancellation_repository = CancellationRepository(pool, wakeups=wakeups)
+        repository = RunRepository(pool)
+        cancellation_repository = CancellationRepository(pool)
         cancellation_observer = CancellationObserver(
             cancellation_repository,
-            wakeups,
             tenant_id=tenant_id,
             run_id=run_id,
         )
@@ -801,7 +634,6 @@ def create_tracer_router(
                     content=payload.query,
                     idempotency_key=user_idempotency_key,
                 )
-                await cancellation_observer.start()
                 heartbeat_task = asyncio.create_task(
                     _refresh_claim(
                         repository,
@@ -898,27 +730,10 @@ def create_tracer_router(
                     "conversation_id": conversation_id,
                     "turn_id": str(turn_id),
                     "client_request_id": payload.client_request_id,
-                    "events": [],
                 }
 
-                async def persist_event(event: TracerStreamEvent) -> None:
-                    nonlocal terminal
-                    await _persist_event_record(
-                        repository,
-                        message_repository,
-                        event,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        conversation_id=conversation_id,
-                        turn_id=turn_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                    )
-                    if event.type in {"done", "error"}:
-                        terminal = True
-
                 async def terminalize_checkpoint_event(
-                    event: TracerStreamEvent,
+                    event: LiveStreamEvent,
                 ) -> None:
                     nonlocal terminal
                     await _terminalize_checkpoint_event(
@@ -938,7 +753,6 @@ def create_tracer_router(
                     cast(RequestOwnedGraph, selected_graph),
                     state,
                     config=graph_config,
-                    event_sink=persist_event,
                     terminal_sink=terminalize_checkpoint_event,
                 )
                 async for frame in graph_stream:
@@ -951,13 +765,11 @@ def create_tracer_router(
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
                     )
-                    if stopped is not None:
+                    if stopped:
                         terminal = True
-                        yield TracerStreamEvent(
-                            event_key=stopped.event_key,
+                        yield LiveStreamEvent(
                             type="stopped",
-                            sequence=stopped.sequence,
-                            data=stopped.data,
+                            data={"partial": None},
                         ).to_sse()
             except asyncio.CancelledError as error:
                 primary_error = error
@@ -983,7 +795,6 @@ def create_tracer_router(
             finally:
                 await _cleanup_request_execution(
                     graph_stream,
-                    cancellation_observer,
                     heartbeat_task,
                     repository,
                     claim=claim,
@@ -1038,9 +849,8 @@ def create_tracer_router(
                 status_code=500, detail="LangGraph v2 checkpointer is not configured"
             )
         pool = cast(AsyncConnectionPool[Any], configured_pool)
-        wakeups = _live_events(http_request.app)
-        repository = RunEventRepository(pool, live_events=wakeups)
-        cancellation_repository = CancellationRepository(pool, wakeups=wakeups)
+        repository = RunRepository(pool)
+        cancellation_repository = CancellationRepository(pool)
         message_repository = _message_repository(http_request.app, pool)
         configured_refinement_actor = _resolve_refinement_actor(
             http_request.app,
@@ -1105,7 +915,6 @@ def create_tracer_router(
         run_id = uuid.uuid4()
         cancellation_observer = CancellationObserver(
             cancellation_repository,
-            wakeups,
             tenant_id=tenant_id,
             run_id=run_id,
         )
@@ -1131,7 +940,6 @@ def create_tracer_router(
                     execution_epoch=claim.execution_epoch,
                     turn_id=target.turn.turn_id,
                 )
-                await cancellation_observer.start()
                 heartbeat_task = asyncio.create_task(
                     _refresh_claim(
                         repository,
@@ -1183,24 +991,8 @@ def create_tracer_router(
                     groundedness_actor=configured_groundedness_actor,
                 )
 
-                async def persist_event(event: TracerStreamEvent) -> None:
-                    nonlocal terminal
-                    await _persist_event_record(
-                        repository,
-                        message_repository,
-                        event,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        conversation_id=target.conversation.conversation_id,
-                        turn_id=target.turn.turn_id,
-                        owner_instance_id=claim.owner_instance_id,
-                        execution_epoch=claim.execution_epoch,
-                    )
-                    if event.type in {"done", "error"}:
-                        terminal = True
-
                 async def terminalize_checkpoint_event(
-                    event: TracerStreamEvent,
+                    event: LiveStreamEvent,
                 ) -> None:
                     nonlocal terminal
                     await _terminalize_checkpoint_event(
@@ -1220,7 +1012,6 @@ def create_tracer_router(
                     cast(RequestOwnedGraph, selected_graph),
                     None,
                     config=target.config,
-                    event_sink=persist_event,
                     terminal_sink=terminalize_checkpoint_event,
                 )
                 async for frame in graph_stream:
@@ -1233,13 +1024,11 @@ def create_tracer_router(
                         owner_instance_id=claim.owner_instance_id,
                         execution_epoch=claim.execution_epoch,
                     )
-                    if stopped is not None:
+                    if stopped:
                         terminal = True
-                        yield TracerStreamEvent(
-                            event_key=stopped.event_key,
+                        yield LiveStreamEvent(
                             type="stopped",
-                            sequence=stopped.sequence,
-                            data=stopped.data,
+                            data={"partial": None},
                         ).to_sse()
             except asyncio.CancelledError as error:
                 primary_error = error
@@ -1265,7 +1054,6 @@ def create_tracer_router(
             finally:
                 await _cleanup_request_execution(
                     graph_stream,
-                    cancellation_observer,
                     heartbeat_task,
                     repository,
                     claim=claim,

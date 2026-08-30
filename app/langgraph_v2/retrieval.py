@@ -10,7 +10,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from pydantic import BaseModel, Field
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactWriter
-from app.langgraph_v2.run_events import EventInput
+from app.langgraph_v2.contracts import LiveStreamEvent
 from app.models.domain import Document
 
 
@@ -50,7 +50,7 @@ async def run_retrieval(
     current_turn_id: UUID | None,
     artifacts: ArtifactWriter,
     retriever: Retriever,
-) -> tuple[list[EventInput], list[ArtifactRef], list[Document], bool, str | None]:
+) -> tuple[list[LiveStreamEvent], list[ArtifactRef], list[Document], bool, str | None]:
     """Persist retrieved Artifacts and return checkpoint-owned State data."""
     try:
         result = await retriever.retrieve(state.get("refined_query", state["query"]))
@@ -94,13 +94,11 @@ async def run_retrieval(
         )
         return (
             [
-                EventInput(
-                    event_key="phase:retrieval:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="retriever",
                 ),
-                EventInput(
-                    event_key="phase:retrieval:step_completed:1",
+                LiveStreamEvent(
                     type="step_completed",
                     step="retriever",
                     data={
@@ -122,13 +120,14 @@ async def run_retrieval(
         message = str(exc) or "Retrieval failed."
         return (
             [
-                EventInput(
-                    event_key="phase:retrieval:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="retriever",
                 ),
-                EventInput(
-                    event_key="phase:retrieval:error:1", type="error", data=message
+                LiveStreamEvent(
+                    type="error",
+                    data=message,
+                    checkpoint_terminal=True,
                 ),
             ],
             [],

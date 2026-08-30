@@ -11,7 +11,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
-from app.langgraph_v2.run_events import EventInput
+from app.langgraph_v2.contracts import LiveStreamEvent
 from app.models.domain import Document
 
 
@@ -44,7 +44,7 @@ async def run_reranking(
     tenant_id: str,
     artifacts: ArtifactStore,
     ranker: Ranker,
-) -> tuple[list[EventInput], list[ArtifactRef], bool, str | None]:
+) -> tuple[list[LiveStreamEvent], list[ArtifactRef], bool, str | None]:
     """Hydrate retrieved Documents and return checkpoint-owned ranked refs."""
     try:
         refs = [
@@ -77,13 +77,11 @@ async def run_reranking(
         ordered_refs = [refs_by_key[key].pop(0) for key in output_keys]
         return (
             [
-                EventInput(
-                    event_key="phase:reranking:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="reranker",
                 ),
-                EventInput(
-                    event_key="phase:reranking:step_completed:1",
+                LiveStreamEvent(
                     type="step_completed",
                     step="reranker",
                     data={
@@ -100,15 +98,14 @@ async def run_reranking(
         message = str(exc) or "Reranking failed."
         return (
             [
-                EventInput(
-                    event_key="phase:reranking:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="reranker",
                 ),
-                EventInput(
-                    event_key="phase:reranking:error:1",
+                LiveStreamEvent(
                     type="error",
                     data=message,
+                    checkpoint_terminal=True,
                 ),
             ],
             [],

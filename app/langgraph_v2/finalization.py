@@ -7,8 +7,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from app.langgraph_v2.artifacts import ArtifactStore
-from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
-from app.langgraph_v2.run_events import EventInput
+from app.langgraph_v2.contracts import LiveStreamEvent, TracerQueryResponse
 from app.models.domain import Document
 
 
@@ -90,7 +89,7 @@ async def run_finalization(
     *,
     tenant_id: str,
     artifacts: ArtifactStore,
-) -> tuple[list[EventInput], TracerQueryResponse]:
+) -> tuple[list[LiveStreamEvent], TracerQueryResponse]:
     """Assemble the response and its checkpoint-owned finalization events."""
     documents = []
     if "answer" in state:
@@ -120,13 +119,11 @@ async def run_finalization(
         citations=state.get("citations", []),
     )
     events = [
-        EventInput(
-            event_key="phase:finalization:step_start:1",
+        LiveStreamEvent(
             type="step_start",
             step="finalization",
         ),
-        EventInput(
-            event_key="phase:finalization:step_completed:1",
+        LiveStreamEvent(
             type="step_completed",
             step="finalization",
             data={"status": "completed"},
@@ -147,7 +144,9 @@ async def run_finalization(
     return events, response
 
 
-def finalize_in_memory(state: Mapping[str, Any]) -> dict[str, Any]:
+def finalize_in_memory(
+    state: Mapping[str, Any],
+) -> tuple[list[LiveStreamEvent], TracerQueryResponse]:
     """Assemble the same response shape for a non-persistent graph."""
     response = TracerQueryResponse(
         query=state["query"],
@@ -162,40 +161,18 @@ def finalize_in_memory(state: Mapping[str, Any]) -> dict[str, Any]:
         citations=state.get("citations", []),
         documents=[],
     )
-    done_data = response.model_dump(by_alias=True)
+    normalized = response.model_dump(mode="json")
     usage = _combine_usage(
         [state.get("answer_usage", {}), state.get("refinement_usage", {})]
     )
     if usage is not None:
-        done_data["metadata"]["usage"] = usage
-    events = [
-        {
-            **TracerStreamEvent(
-                event_key="phase:finalization:step_start:1",
-                type="step_start",
-                step="finalization",
-                sequence=len(state["events"]) + 1,
-            ).model_dump(exclude_none=True),
-            "journal_policy": "checkpoint_only",
-        },
-        {
-            **TracerStreamEvent(
-                event_key="phase:finalization:step_completed:1",
-                type="step_completed",
-                step="finalization",
-                data={"status": "completed"},
-                sequence=len(state["events"]) + 2,
-            ).model_dump(exclude_none=True),
-            "journal_policy": "checkpoint_only",
-        },
-        {
-            **TracerStreamEvent(
-                event_key="lifecycle:completed:0",
-                type="done",
-                data=done_data,
-                sequence=len(state["events"]) + 3,
-            ).model_dump(exclude_none=True),
-            "journal_policy": "checkpoint_only",
-        },
-    ]
-    return {"events": [*state["events"], *events]}
+        normalized["metadata"]["usage"] = usage
+    response = TracerQueryResponse.model_validate(normalized)
+    return [
+        LiveStreamEvent(type="step_start", step="finalization"),
+        LiveStreamEvent(
+            type="step_completed",
+            step="finalization",
+            data={"status": "completed"},
+        ),
+    ], response

@@ -11,12 +11,12 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.output_assessments import (
     OutputAssessmentAudit,
     build_output_assessment_scope,
     record_output_assessment,
 )
-from app.langgraph_v2.run_events import EventInput
 from app.models.domain import Document, GroundednessResult
 
 
@@ -106,7 +106,9 @@ async def run_groundedness(
     output_assessment_audit: OutputAssessmentAudit | None,
     artifacts: ArtifactStore,
     actor: GroundednessActor,
-) -> tuple[list[EventInput], GroundednessResult | None, dict[str, Any], str | None]:
+) -> tuple[
+    list[LiveStreamEvent], GroundednessResult | None, dict[str, Any], str | None
+]:
     """Evaluate the canonical Answer and record the advisory audit result."""
     assessment_scope = build_output_assessment_scope(
         tenant_id=tenant_id,
@@ -159,13 +161,11 @@ async def run_groundedness(
         )
         return (
             [
-                EventInput(
-                    event_key="phase:groundedness:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="groundedness",
                 ),
-                EventInput(
-                    event_key="phase:groundedness:step_completed:1",
+                LiveStreamEvent(
                     type="step_completed",
                     step="groundedness",
                     data=result.model_dump(),
@@ -186,13 +186,11 @@ async def run_groundedness(
         )
         return (
             [
-                EventInput(
-                    event_key="phase:groundedness:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="groundedness",
                 ),
-                EventInput(
-                    event_key="phase:groundedness:error:1",
+                LiveStreamEvent(
                     type="step_completed",
                     step="groundedness",
                     data=failed_result,

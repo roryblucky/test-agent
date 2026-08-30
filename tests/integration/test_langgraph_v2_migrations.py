@@ -107,7 +107,11 @@ def test_application_base_revision_upgrades_and_downgrades(
             "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s)",
             ("langgraph_v2",),
         ).fetchone()
+        event_table_exists = connection.execute(
+            "SELECT to_regclass('langgraph_v2.events') IS NOT NULL"
+        ).fetchone()
     assert exists_after_upgrade == (True,)
+    assert event_table_exists == (True,)
 
     command.downgrade(config, "base")
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
@@ -150,7 +154,6 @@ def test_conversation_authorization_migrates_existing_conversations_forward(
                     "query": "migration checkpoint",
                     "conversation_id": conversation_id,
                     "client_request_id": None,
-                    "events": [],
                 },
                 config=initial_checkpoint_config(
                     thread_id=expected_thread_id,

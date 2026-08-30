@@ -16,7 +16,7 @@ from app.langgraph_v2.checkpointing import (
     thread_id_for,
 )
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
-from app.langgraph_v2.run_events import ClaimFenced, RunEventRepository
+from app.langgraph_v2.runs import ClaimFenced, RunRepository
 
 
 async def _setup_saver(pool: Any) -> AsyncPostgresSaver:
@@ -30,7 +30,6 @@ def _state(query: str, conversation_id: str, turn_id: str | None = None) -> Trac
         "query": query,
         "conversation_id": conversation_id,
         "client_request_id": None,
-        "events": [],
     }
     if turn_id is not None:
         state["turn_id"] = turn_id
@@ -58,7 +57,7 @@ async def test_committed_checkpoint_is_read_by_a_fresh_saver(
         max_size=3,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     ) as pool:
-        repository = RunEventRepository(pool)
+        repository = RunRepository(pool)
         run_id = uuid4()
         run = await repository.create_run(
             tenant_id="tenant-a",
@@ -123,7 +122,7 @@ async def test_resume_graph_reads_exact_prior_namespace_before_writing_new_epoch
         max_size=3,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     ) as pool:
-        repository = RunEventRepository(pool)
+        repository = RunRepository(pool)
         run_id = uuid4()
         run = await repository.create_run(
             tenant_id="tenant-a",
@@ -209,7 +208,7 @@ async def test_checkpoint_namespace_prevents_cross_tenant_lookup(
         max_size=3,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     ) as pool:
-        repository = RunEventRepository(pool)
+        repository = RunRepository(pool)
         run_id = uuid4()
         run = await repository.create_run(
             tenant_id="tenant-a",
@@ -274,7 +273,7 @@ async def test_stale_saver_checkpoint_is_orphaned_and_cannot_move_run_pointer(
         max_size=3,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     ) as pool:
-        repository = RunEventRepository(pool)
+        repository = RunRepository(pool)
         run_id = uuid4()
         run = await repository.create_run(
             tenant_id="tenant-a",
@@ -396,7 +395,7 @@ async def test_pointer_failure_leaves_committed_checkpoint_without_advancing_run
         max_size=3,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     ) as pool:
-        repository = RunEventRepository(pool)
+        repository = RunRepository(pool)
         run_id = uuid4()
         run = await repository.create_run(
             tenant_id="tenant-a",

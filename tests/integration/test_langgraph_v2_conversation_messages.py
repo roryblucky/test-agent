@@ -17,11 +17,10 @@ from app.langgraph_v2.conversation_messages import (
     ResumeExpired,
     TurnSuperseded,
 )
-from app.langgraph_v2.run_events import (
+from app.langgraph_v2.runs import (
     ClaimFenced,
-    EventInput,
-    RunEventRepository,
     RunRecord,
+    RunRepository,
 )
 
 
@@ -61,7 +60,7 @@ class _PausingAdmissionRepository(ConversationMessageRepository):
 
 async def _seed_admission_case(
     messages: ConversationMessageRepository,
-    runs: RunEventRepository,
+    runs: RunRepository,
     context: TrustedRequestContext,
 ) -> tuple[UUID, RunRecord, RunRecord]:
     await messages.resolve_conversation(context=context, conversation_id="session-1")
@@ -105,7 +104,7 @@ async def test_query_admission_blocks_resume_then_supersedes_it(
         context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
         messages = ConversationMessageRepository(pool)
         original_turn_id, resume_run, query_run = await _seed_admission_case(
-            messages, RunEventRepository(pool), context
+            messages, RunRepository(pool), context
         )
         lock_acquired = asyncio.Event()
         release_lock = asyncio.Event()
@@ -155,7 +154,7 @@ async def test_resume_admission_blocks_query_until_resume_is_bound(
         context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
         messages = ConversationMessageRepository(pool)
         original_turn_id, resume_run, query_run = await _seed_admission_case(
-            messages, RunEventRepository(pool), context
+            messages, RunRepository(pool), context
         )
         lock_acquired = asyncio.Event()
         release_lock = asyncio.Event()
@@ -378,7 +377,7 @@ async def test_assistant_message_requires_successful_run_completion(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         messages = ConversationMessageRepository(pool)
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         await messages.resolve_conversation(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
             conversation_id="session-1",
@@ -416,34 +415,26 @@ async def test_assistant_message_requires_successful_run_completion(
             content="question",
             idempotency_key=f"run:{completed.run_id}:user",
         )
-        await runs.complete_run(
-            tenant_id="tenant-a",
-            run_id=completed.run_id,
-            event=EventInput(event_key="done", type="done", data={}),
-            owner_instance_id=completed.owner_instance_id,
-            execution_epoch=completed.execution_epoch,
-        )
-        await runs.fail_run(
-            tenant_id="tenant-a",
-            run_id=failed.run_id,
-            event=EventInput(event_key="error", type="error", data={}),
-            owner_instance_id=failed.owner_instance_id,
-            execution_epoch=failed.execution_epoch,
-        )
         async with pool.connection() as connection:
             async with connection.transaction():
                 await connection.execute(
                     """
                     UPDATE langgraph_v2.runs
                     SET status = CASE
+                        WHEN run_id = %s THEN 'completed'
+                        WHEN run_id = %s THEN 'failed'
                         WHEN run_id = %s THEN 'cancelled'
                         ELSE 'interrupted'
                     END
-                    WHERE tenant_id = %s AND run_id IN (%s, %s)
+                    WHERE tenant_id = %s AND run_id IN (%s, %s, %s, %s)
                     """,
                     (
+                        completed.run_id,
+                        failed.run_id,
                         cancelled.run_id,
                         "tenant-a",
+                        completed.run_id,
+                        failed.run_id,
                         cancelled.run_id,
                         interrupted.run_id,
                     ),
@@ -516,7 +507,7 @@ async def test_resume_retry_reuses_the_user_message(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         messages = ConversationMessageRepository(pool)
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         await messages.resolve_conversation(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
             conversation_id="session-1",

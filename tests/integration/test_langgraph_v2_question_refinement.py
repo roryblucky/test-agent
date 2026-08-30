@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -17,7 +17,7 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementResult,
     V2ResolvedQuery,
 )
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.models.workflow import ResolvedQuery
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
@@ -27,18 +27,17 @@ def _state() -> TracerState:
         "query": "compare gold and FX",
         "conversation_id": "conversation-1",
         "client_request_id": None,
-        "events": [],
     }
 
 
 @pytest.mark.asyncio
-async def test_safe_query_gets_structured_refinement_and_events(
+async def test_safe_query_gets_structured_refinement(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -55,17 +54,6 @@ async def test_safe_query_gets_structured_refinement_and_events(
 
         assert "refined_query" in result
         assert result["refined_query"] == "compare gold and FX"
-        assert [event.get("step") for event in result["events"]] == [
-            "query",
-            "query",
-            "moderation:pre",
-            "moderation:pre",
-            "llm:refine_question",
-            "llm:refine_question",
-            "finalization",
-            "finalization",
-            None,
-        ]
 
 
 @pytest.mark.asyncio
@@ -82,7 +70,7 @@ async def test_refinement_failure_halts_before_later_phases(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -99,9 +87,6 @@ async def test_refinement_failure_halts_before_later_phases(
 
         assert "halted" in result
         assert result["halted"] is True
-        assert result["events"][-1]["type"] == "error"
-        assert all(event.get("step") != "finalization" for event in result["events"])
-        assert await runs.list_events("tenant-a", run.run_id) == []
 
 
 @pytest.mark.asyncio
@@ -125,7 +110,7 @@ async def test_refinement_reexecution_reinvokes_actor(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -216,27 +201,3 @@ def test_http_query_uses_injected_refinement_actor(
     assert actor.calls == 1
     delivered = parse_sse(response.text)
     assert delivered[-1]["data"]["refined_query"] == "http-refined"
-
-    async def read_event_keys() -> list[str]:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            events = await RunEventRepository(pool).list_events(
-                "tenant-a", UUID(response.headers["x-run-id"])
-            )
-            return [event.event_key for event in events]
-
-    event_keys = asyncio.run(read_event_keys())
-    assert all(
-        not event_key.startswith(
-            (
-                "phase:query:",
-                "phase:pre_moderation:",
-                "phase:question_refinement:",
-                "phase:retrieval:",
-                "phase:reranking:",
-            )
-        )
-        for event_key in event_keys
-    )
-    assert event_keys == []

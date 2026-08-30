@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import thread_id_for
-from app.langgraph_v2.run_events import ClaimFenced, RepositoryNotFound
+from app.langgraph_v2.runs import ClaimFenced, RepositoryNotFound
 
 
 class ConversationNotFound(RepositoryNotFound):

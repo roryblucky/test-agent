@@ -10,7 +10,6 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
-GraphEventJournalPolicy = Literal["checkpoint_only", "transport_journal"]
 TracerEventType = Literal[
     "step_start",
     "step_completed",
@@ -63,27 +62,22 @@ class TracerQueryResponse(BaseModel):
     citations: list[CitationReference] = Field(default_factory=list[CitationReference])
 
 
-class TracerStreamEvent(BaseModel):
-    """One additive-sequence SSE event produced by the v2 tracer."""
+class LiveStreamEvent(BaseModel):
+    """One public event emitted by the live request-owned Graph stream."""
 
-    event_key: str = Field(min_length=1)
     type: TracerEventType
-    sequence: int = Field(ge=1)
     step: str | None = None
     data: Any = None
+    checkpoint_terminal: bool = Field(default=False, exclude=True)
+
+    def to_stream_payload(self) -> dict[str, Any]:
+        """Include private delivery metadata for LangGraph's custom channel."""
+        payload = self.model_dump(exclude_none=True)
+        if self.checkpoint_terminal:
+            payload["checkpoint_terminal"] = True
+        return payload
 
     def to_sse(self) -> str:
         r"""Serialize the event using the established ``data: JSON\n\n`` frame."""
-        payload = self.model_dump(exclude={"event_key"}, exclude_none=True)
+        payload = self.model_dump(exclude_none=True)
         return f"data: {json.dumps(payload, default=str)}\n\n"
-
-
-class TracerGraphEvent(BaseModel):
-    """Internal event carried through Graph State."""
-
-    event_key: str = Field(min_length=1)
-    type: TracerEventType
-    sequence: int = Field(ge=1)
-    step: str | None = None
-    data: Any = None
-    journal_policy: GraphEventJournalPolicy = "transport_journal"

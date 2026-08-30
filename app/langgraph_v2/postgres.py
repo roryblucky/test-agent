@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import socket
 from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager
 from typing import Any, Protocol, Self
@@ -12,10 +11,6 @@ from fastapi import FastAPI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
-
-from app.langgraph_v2.live_events import LiveEventWakeups
-
-_INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
 
 
 class V2PostgresConfig(BaseModel):
@@ -90,14 +85,8 @@ async def postgres_lifespan(
     app.state.langgraph_v2_resume_ttl_seconds = (
         resolved_config.resume_ttl_seconds if resolved_config is not None else 3600
     )
-    app.state.langgraph_v2_live_events = LiveEventWakeups(
-        redis_url=os.environ.get("LANGGRAPH_V2_REDIS_URL"),
-        instance_id=_INSTANCE_ID,
-    )
-    wakeups = app.state.langgraph_v2_live_events
     pool: Any | None = None
     try:
-        await wakeups.start()
         if resolved_config is None:
             yield
             return
@@ -125,4 +114,3 @@ async def postgres_lifespan(
             app.state.langgraph_v2_postgres_pool = None
             app.state.langgraph_v2_checkpointer = None
             app.state.langgraph_v2_resume_ttl_seconds = None
-            await wakeups.close()

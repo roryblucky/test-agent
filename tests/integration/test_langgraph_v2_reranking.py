@@ -13,7 +13,7 @@ from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
@@ -43,7 +43,7 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
@@ -61,7 +61,6 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
                 "query": "hello",
                 "conversation_id": "c1",
                 "client_request_id": None,
-                "events": [],
             }
         )
 
@@ -72,15 +71,6 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
             result["artifact_refs"][1]["artifact_id"],
             result["artifact_refs"][0]["artifact_id"],
         ]
-        completed = next(
-            event
-            for event in result["events"]
-            if event.get("step") == "reranker" and event["type"] == "step_completed"
-        )
-        assert completed["data"] == {
-            "document_count": 2,
-            "selected_ids": ["d2", "d1"],
-        }
 
 
 @pytest.mark.asyncio
@@ -105,7 +95,7 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
@@ -122,7 +112,6 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
                 "query": "hello",
                 "conversation_id": "c1",
                 "client_request_id": None,
-                "events": [],
             }
         )
 
@@ -154,7 +143,7 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
@@ -171,7 +160,6 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
                 "query": "hello",
                 "conversation_id": "c1",
                 "client_request_id": None,
-                "events": [],
             }
         )
 
@@ -227,7 +215,7 @@ async def test_interrupted_reranking_repeats_provider_with_stable_artifact_refs(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
@@ -245,7 +233,6 @@ async def test_interrupted_reranking_repeats_provider_with_stable_artifact_refs(
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
-            "events": [],
         }
         config: RunnableConfig = {"configurable": {"thread_id": "reranking-recovery"}}
         with pytest.raises(asyncio.CancelledError):

@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
-from app.langgraph_v2.run_events import EventInput
+from app.langgraph_v2.contracts import LiveStreamEvent
 
 
 class ModerationDecision(BaseModel):
@@ -24,19 +24,17 @@ def moderation_error_message(decision: ModerationDecision) -> str:
     return f"Content flagged by moderation: {detail}"
 
 
-def pre_moderation_events(decision: ModerationDecision) -> tuple[EventInput, ...]:
+def pre_moderation_events(decision: ModerationDecision) -> tuple[LiveStreamEvent, ...]:
     """Build the stable stream Events for one moderation decision."""
     events = [
-        EventInput(
-            event_key="phase:pre_moderation:step_start:1",
+        LiveStreamEvent(
             type="step_start",
             step="moderation:pre",
         )
     ]
     if not decision.is_flagged:
         events.append(
-            EventInput(
-                event_key="phase:pre_moderation:step_completed:1",
+            LiveStreamEvent(
                 type="step_completed",
                 step="moderation:pre",
                 data={"is_flagged": False, "mode": "pre"},
@@ -44,10 +42,10 @@ def pre_moderation_events(decision: ModerationDecision) -> tuple[EventInput, ...
         )
     else:
         events.append(
-            EventInput(
-                event_key="phase:pre_moderation:error:1",
+            LiveStreamEvent(
                 type="error",
                 data=moderation_error_message(decision),
+                checkpoint_terminal=True,
             )
         )
     return tuple(events)
@@ -87,7 +85,7 @@ async def run_pre_moderation(
     state: Mapping[str, Any],
     *,
     provider: ModerationProvider,
-) -> tuple[tuple[EventInput, ...], bool, ModerationDecision]:
+) -> tuple[tuple[LiveStreamEvent, ...], bool, ModerationDecision]:
     """Return the pre-moderation State update without an application journal."""
     try:
         decision = await provider.check(state["query"])
@@ -96,15 +94,14 @@ async def run_pre_moderation(
         decision = ModerationDecision(is_flagged=True, reason=message)
         return (
             (
-                EventInput(
-                    event_key="phase:pre_moderation:step_start:1",
+                LiveStreamEvent(
                     type="step_start",
                     step="moderation:pre",
                 ),
-                EventInput(
-                    event_key="phase:pre_moderation:error:1",
+                LiveStreamEvent(
                     type="error",
                     data=message,
+                    checkpoint_terminal=True,
                 ),
             ),
             True,

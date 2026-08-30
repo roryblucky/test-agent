@@ -20,12 +20,7 @@ from langgraph.types import StateSnapshot
 from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.contracts import (
-    GraphEventJournalPolicy,
-    TracerGraphEvent,
-    TracerQueryResponse,
-    TracerStreamEvent,
-)
+from app.langgraph_v2.contracts import LiveStreamEvent, TracerQueryResponse
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
@@ -48,7 +43,7 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import MockRanker, Ranker, run_reranking
 from app.langgraph_v2.retrieval import MockRetriever, Retriever, run_retrieval
-from app.langgraph_v2.run_events import CancellationObserved, EventInput, EventRecord
+from app.langgraph_v2.runs import CancellationObserved
 from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
@@ -60,7 +55,6 @@ class TracerState(TypedDict):
     conversation_id: str
     turn_id: NotRequired[str]
     client_request_id: str | None
-    events: list[dict[str, Any]]
     history: NotRequired[list[ConversationTurn]]
     halted: NotRequired[bool]
     moderation: NotRequired[dict[str, Any]]
@@ -86,7 +80,6 @@ class TracerState(TypedDict):
 class TracerStateUpdate(TypedDict, total=False):
     """Partial state update returned by one tracer node."""
 
-    events: list[dict[str, Any]]
     history: list[ConversationTurn]
     halted: bool
     moderation: dict[str, Any]
@@ -164,61 +157,29 @@ async def _query(
                 UUID(turn_id) if (turn_id := state.get("turn_id")) is not None else None
             ),
         )
-    events = (
-        EventInput(
-            event_key="phase:query:step_start:1",
-            type="step_start",
-            step="query",
-        ),
-        EventInput(
-            event_key="phase:query:step_completed:1",
-            type="step_completed",
-            step="query",
-            data={"query": canonical},
-        ),
+    _emit_events(
+        (
+            LiveStreamEvent(
+                type="step_start",
+                step="query",
+            ),
+            LiveStreamEvent(
+                type="step_completed",
+                step="query",
+                data={"query": canonical},
+            ),
+        )
     )
     return {
-        "events": _with_checkpoint_events(state, events),
         "history": history,
     }
 
 
-def _event_state(
-    event: EventInput | EventRecord,
-    sequence: int,
-    *,
-    journal_policy: GraphEventJournalPolicy = "transport_journal",
-) -> dict[str, Any]:
-    """Convert journal or in-memory event data into graph state."""
-    state_event = TracerGraphEvent(
-        event_key=event.event_key,
-        type=cast(Any, event.type),
-        step=event.step,
-        data=event.data,
-        sequence=sequence,
-        journal_policy=journal_policy,
-    )
-    return state_event.model_dump(
-        exclude_none=True,
-        exclude={"journal_policy"} if journal_policy == "transport_journal" else None,
-    )
-
-
-def _with_checkpoint_events(
-    state: TracerState,
-    events: Iterable[EventInput | EventRecord],
-) -> list[dict[str, Any]]:
-    """Return existing events followed by checkpoint-owned node events."""
-    sequence_start = len(state["events"])
-    checkpoint_events = [
-        _event_state(
-            event,
-            sequence_start + index,
-            journal_policy="checkpoint_only",
-        )
-        for index, event in enumerate(events, 1)
-    ]
-    return [*state["events"], *checkpoint_events]
+def _emit_events(events: Iterable[LiveStreamEvent]) -> None:
+    """Write public envelopes directly to LangGraph's live custom stream."""
+    writer = get_stream_writer()
+    for event in events:
+        writer(event.to_stream_payload())
 
 
 def canonical_query(query: str) -> str:
@@ -227,16 +188,25 @@ def canonical_query(query: str) -> str:
 
 
 async def _finalize(state: TracerState) -> TracerStateUpdate:
-    return cast(TracerStateUpdate, finalize_in_memory(state))
+    events, response = finalize_in_memory(state)
+    _emit_events(events)
+    _emit_events(
+        (
+            LiveStreamEvent(
+                type="done",
+                data=response.model_dump(by_alias=True),
+                checkpoint_terminal=True,
+            ),
+        )
+    )
+    return {"final_response": response}
 
 
 async def _check_cancellation(
     cancellation_check: Callable[[], Awaitable[bool]] | None,
 ) -> None:
     """Stop before entering the next persistent graph node."""
-    if (
-        cancellation_check is not None and await cancellation_check()
-    ):
+    if cancellation_check is not None and await cancellation_check():
         raise CancellationObserved("cancellation observed at graph boundary")
 
 
@@ -308,8 +278,8 @@ def build_tracer_graph(
         events, halted, decision = await run_pre_moderation(
             state, provider=selected_moderation_provider
         )
+        _emit_events(events)
         return {
-            "events": _with_checkpoint_events(state, events),
             "halted": halted,
             "moderation": decision.model_dump(exclude_none=True),
         }
@@ -323,8 +293,8 @@ def build_tracer_graph(
         events, halted, result, error = await run_question_refinement(
             state, actor=selected_refinement_actor
         )
+        _emit_events(events)
         update: TracerStateUpdate = {
-            "events": _with_checkpoint_events(state, events),
             "halted": halted,
         }
         if result is not None:
@@ -351,8 +321,8 @@ def build_tracer_graph(
             artifacts=selected_artifact_repository,
             retriever=selected_retriever,
         )
+        _emit_events(events)
         update: TracerStateUpdate = {
-            "events": _with_checkpoint_events(state, events),
             "halted": halted,
             "artifact_refs": refs,
         }
@@ -374,8 +344,8 @@ def build_tracer_graph(
             artifacts=selected_artifact_repository,
             ranker=selected_ranker,
         )
+        _emit_events(events)
         update: TracerStateUpdate = {
-            "events": _with_checkpoint_events(state, events),
             "halted": halted,
             "ranked_refs": refs,
         }
@@ -399,7 +369,7 @@ def build_tracer_graph(
             assert selected_artifact_repository is not None
             assert answer_actor is not None
             await _check_cancellation(cancellation_check)
-            events, result, halted, error = await run_answer(
+            _, result, halted, error = await run_answer(
                 state,
                 tenant_id=tenant_id,
                 cancellation_check=cancellation_check,
@@ -408,7 +378,6 @@ def build_tracer_graph(
                 stream_writer=get_stream_writer(),
             )
             update: TracerStateUpdate = {
-                "events": _with_checkpoint_events(state, events),
                 "halted": halted,
             }
             if result is not None:
@@ -443,9 +412,8 @@ def build_tracer_graph(
                     artifacts=selected_artifact_repository,
                     actor=groundedness_actor,
                 )
-                update: TracerStateUpdate = {
-                    "events": _with_checkpoint_events(state, events),
-                }
+                _emit_events(events)
+                update: TracerStateUpdate = {}
                 if result is not None:
                     update["groundedness"] = result
                 if usage:
@@ -468,9 +436,8 @@ def build_tracer_graph(
                 output_assessment_audit=output_assessment_audit,
                 provider=selected_moderation_provider,
             )
-            update: TracerStateUpdate = {
-                "events": _with_checkpoint_events(state, events),
-            }
+            _emit_events(events)
+            update: TracerStateUpdate = {}
             if decision is not None:
                 update["post_moderation"] = decision.model_dump(exclude_none=True)
             if error is not None:
@@ -490,20 +457,17 @@ def build_tracer_graph(
             tenant_id=tenant_id,
             artifacts=selected_artifact_repository,
         )
-        done_event = TracerStreamEvent(
-            event_key="lifecycle:completed:0",
-            type="done",
-            data=response.model_dump(by_alias=True),
-            sequence=len(state["events"]) + len(events) + 1,
+        _emit_events(events)
+        _emit_events(
+            (
+                LiveStreamEvent(
+                    type="done",
+                    data=response.model_dump(by_alias=True),
+                    checkpoint_terminal=True,
+                ),
+            )
         )
         return {
-            "events": [
-                *_with_checkpoint_events(state, events),
-                {
-                    **done_event.model_dump(exclude_none=True),
-                    "journal_policy": "checkpoint_only",
-                },
-            ],
             "final_response": response,
         }
 

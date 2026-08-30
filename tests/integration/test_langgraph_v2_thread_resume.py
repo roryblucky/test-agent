@@ -36,12 +36,13 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementResult,
     V2ResolvedQuery,
 )
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
     parse_sse,
     persistent_tracer_app,
+    reject_transport_event_inserts,
     seed_subject_conversation,
     stream_request,
     v2_stream_endpoint,
@@ -285,7 +286,7 @@ async def _seed_pre_answer_checkpoint(
             context=context,
             conversation_id=conversation_id,
         )
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -318,7 +319,6 @@ async def _seed_pre_answer_checkpoint(
             "conversation_id": conversation.conversation_id,
             "turn_id": str(checkpoint_turn_id or turn_id),
             "client_request_id": None,
-            "events": [],
         }
         config = initial_checkpoint_config(
             thread_id=conversation.thread_id,
@@ -356,12 +356,7 @@ async def _read_turn(database_url: str, turn_id: UUID) -> TurnRecord:
 
 async def _read_run(database_url: str, run_id: UUID):
     async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
-        return await RunEventRepository(pool).get_run("tenant-a", run_id)
-
-
-async def _read_run_events(database_url: str, run_id: UUID):
-    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
-        return await RunEventRepository(pool).list_events("tenant-a", run_id)
+        return await RunRepository(pool).get_run("tenant-a", run_id)
 
 
 async def _read_messages(
@@ -393,7 +388,7 @@ async def _expire_turn(database_url: str, turn_id: UUID) -> None:
 async def _create_superseding_turn(database_url: str) -> None:
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="conversation-1",
@@ -429,7 +424,7 @@ async def _advance_same_turn_checkpoint(
             context=context,
             conversation_id="conversation-1",
         )
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -461,7 +456,6 @@ async def _advance_same_turn_checkpoint(
                 "conversation_id": conversation.conversation_id,
                 "turn_id": str(turn_id),
                 "client_request_id": None,
-                "events": [],
             },
             config=initial_checkpoint_config(
                 thread_id=conversation.thread_id,
@@ -517,7 +511,14 @@ class _BlockingResumeGraph:
         async def iterator() -> AsyncIterator[object]:
             self.started.set()
             await asyncio.to_thread(self.release.wait)
-            yield ("updates", {"events": self.events})
+            for event in self.events:
+                live_event = {
+                    key: value for key, value in event.items() if key != "event_key"
+                }
+                if live_event.get("type") == "done":
+                    live_event["checkpoint_terminal"] = True
+                yield ("custom", live_event)
+            yield ("updates", {"finalization": {"final_response": {}}})
 
         return iterator()
 
@@ -574,10 +575,12 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
         if interrupt_before in {"groundedness", "post_moderation", "finalization"}
         else 1
     )
-    assert [event["type"] for event in delivered if event["type"] == "token"] == [
-        "token",
-        "token",
-    ]
+    expected_token_count = (
+        0
+        if interrupt_before in {"groundedness", "post_moderation", "finalization"}
+        else 2
+    )
+    assert sum(event["type"] == "token" for event in delivered) == expected_token_count
     assert delivered[-1]["type"] == "done"
     assert delivered[-1]["data"]["answer"] == "recovered answer"
 
@@ -593,6 +596,36 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
     ] == [("user", "resume me"), ("assistant", "recovered answer")]
     turn_messages = [message for message in messages if message.turn_id == turn_id]
     assert turn_messages[0].run_id != turn_messages[1].run_id
+
+
+def test_thread_resume_does_not_insert_transport_events(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    thread_id, turn_id, _ = asyncio.run(
+        _seed_pre_answer_checkpoint(
+            langgraph_v2_migrated_database_url,
+            drop_origin_run_mapping=True,
+        )
+    )
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        thread_resume_enabled=True,
+        answer_actor=_AnswerActor(),
+    )
+
+    with reject_transport_event_inserts(langgraph_v2_migrated_database_url):
+        with TestClient(app) as client:
+            response = client.post(
+                f"/v2/threads/{thread_id}/resume/stream",
+                headers={
+                    "X-Application-Id": "tenant-a",
+                    "X-Subject-Id": "subject-a",
+                },
+                params={"expectedTurnId": str(turn_id)},
+            )
+
+    assert response.status_code == 200
+    assert parse_sse(response.text)[-1]["type"] == "done"
 
 
 def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
@@ -630,14 +663,6 @@ def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
             conversation_id="conversation-task41-refinement-resume",
         )
     )
-    assistant_run_id = next(
-        message.run_id
-        for message in messages
-        if message.turn_id == turn_id and message.role == "assistant"
-    )
-    continuation_events = asyncio.run(
-        _read_run_events(langgraph_v2_migrated_database_url, assistant_run_id)
-    )
     assert response.status_code == 200
     assert interrupted_actor.calls == resumed_actor.calls == 1
     assert answer_actor.calls == 1
@@ -647,23 +672,7 @@ def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
     ]
     assert sum(event["type"] == "done" for event in delivered) == 1
     assert delivered[-1]["data"]["answer"] == "recovered answer"
-    assert {event.get("step") for event in delivered} >= {
-        "query",
-        "moderation:pre",
-        "llm:refine_question",
-    }
-    assert all(
-        not event.event_key.startswith(
-            (
-                "phase:query:",
-                "phase:pre_moderation:",
-                "phase:question_refinement:",
-                "phase:retrieval:",
-                "phase:reranking:",
-            )
-        )
-        for event in continuation_events
-    )
+    assert "llm:refine_question" in {event.get("step") for event in delivered}
     assert [
         (message.role, message.content)
         for message in messages
@@ -1003,9 +1012,6 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
     assistant_run = asyncio.run(
         _read_run(langgraph_v2_migrated_database_url, assistant_run_id)
     )
-    assistant_run_events = asyncio.run(
-        _read_run_events(langgraph_v2_migrated_database_url, assistant_run_id)
-    )
 
     assert turn_after_resume.resume_deadline == resume_deadline
     assert original_run.status == "interrupted"
@@ -1016,18 +1022,6 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
         for message in messages
         if message.turn_id == turn_id
     ] == [("user", "hello"), ("assistant", answer_text)]
-    assert not any(
-        event.event_key.startswith(
-            (
-                "phase:answer:",
-                "phase:groundedness:",
-                "phase:post_moderation:",
-                "phase:finalization:",
-                "lifecycle:completed:",
-            )
-        )
-        for event in assistant_run_events
-    )
     assert {record.assessment_type for record in audit.records} == {
         "groundedness",
         "post_moderation",

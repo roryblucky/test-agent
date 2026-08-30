@@ -14,7 +14,7 @@ from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.langgraph_v2.stream import GraphStreamCleanupError
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
@@ -31,17 +31,21 @@ def _event_frame(frame: str) -> dict[str, Any]:
 
 class _CompletedStream:
     async def __anext__(self) -> Any:
-        if hasattr(self, "done"):
+        index = getattr(self, "index", 0)
+        self.index = index + 1
+        if index == 0:
+            return (
+                "custom",
+                {
+                    "type": "done",
+                    "data": {"answer": "canonical answer"},
+                    "checkpoint_terminal": True,
+                },
+            )
+        if index == 1:
+            return ("updates", {"finalization": {"final_response": {}}})
+        else:
             raise StopAsyncIteration
-        self.done = True
-        return (
-            "custom",
-            {
-                "event_key": "lifecycle:completed:0",
-                "type": "done",
-                "data": {"answer": "canonical answer"},
-            },
-        )
 
     def __aiter__(self) -> AsyncIterator[Any]:
         return self
@@ -85,20 +89,20 @@ class _RealtimeStream:
             )
         await self.release.wait()
         if self.release.is_set():
+            if not hasattr(self, "terminal_sent"):
+                self.terminal_sent = True
+                return (
+                    "custom",
+                    {
+                        "type": "done",
+                        "data": {"answer": "partial complete"},
+                        "checkpoint_terminal": True,
+                    },
+                )
             self.completed = True
             return (
                 "updates",
-                {
-                    "finalization": {
-                        "events": [
-                            {
-                                "event_key": "lifecycle:completed:0",
-                                "type": "done",
-                                "data": {"answer": "partial complete"},
-                            }
-                        ]
-                    }
-                },
+                {"finalization": {"final_response": {}}},
             )
         raise StopAsyncIteration
 
@@ -180,14 +184,13 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
                 conversation_id="conversation-1",
             )
 
-            run = await RunEventRepository(pool).get_run(
+            run = await RunRepository(pool).get_run(
                 "tenant-a", UUID(response.headers["x-run-id"])
             )
 
     assert graph.astream_called is True
     assert _event_frame(frames[0]) == {
         "type": "done",
-        "sequence": 1,
         "data": {"answer": "canonical answer"},
     }
     assert response.headers["x-thread-id"]
@@ -250,7 +253,7 @@ async def test_closing_query_sse_closes_graph_and_interrupts_run(
             await pending_read
         await subscriber.aclose()
 
-        run = await RunEventRepository(app.state.langgraph_v2_postgres_pool).get_run(
+        run = await RunRepository(app.state.langgraph_v2_postgres_pool).get_run(
             "tenant-a", UUID(response.headers["x-run-id"])
         )
 
@@ -338,7 +341,7 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
                 ),
                 conversation_id="conversation-1",
             )
-            run = await RunEventRepository(pool).get_run(
+            run = await RunRepository(pool).get_run(
                 "tenant-a", UUID(response.headers["x-run-id"])
             )
 
@@ -398,7 +401,7 @@ async def test_graph_close_failure_is_reported_after_request_cleanup(
         with pytest.raises(asyncio.CancelledError):
             await pending_read
         await response.body_iterator.aclose()
-        run = await RunEventRepository(app.state.langgraph_v2_postgres_pool).get_run(
+        run = await RunRepository(app.state.langgraph_v2_postgres_pool).get_run(
             "tenant-a", UUID(response.headers["x-run-id"])
         )
 
@@ -441,7 +444,7 @@ async def test_graph_close_failure_without_primary_error_is_reported(
         )
         with pytest.raises(GraphStreamCleanupError, match="normal close failed"):
             await anext(response.body_iterator)
-        run = await RunEventRepository(app.state.langgraph_v2_postgres_pool).get_run(
+        run = await RunRepository(app.state.langgraph_v2_postgres_pool).get_run(
             "tenant-a", UUID(response.headers["x-run-id"])
         )
 

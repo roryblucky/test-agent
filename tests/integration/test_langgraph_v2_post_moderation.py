@@ -16,7 +16,7 @@ from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.run_events import EventInput, RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 
 
@@ -82,7 +82,6 @@ def _state() -> TracerState:
         "query": "hello",
         "conversation_id": "c1",
         "client_request_id": None,
-        "events": [],
     }
 
 
@@ -93,7 +92,7 @@ async def test_safe_answer_passes_post_moderation_unchanged(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -123,48 +122,14 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             answer_actor=_Answer(),
         )
         result = await graph.ainvoke(_state())
-        done = result["events"][-1]
-        await runs.complete_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            event=EventInput(
-                event_key=done["event_key"],
-                type=done["type"],
-                data=done["data"],
-            ),
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        assert "answer" in result
-        await messages.persist_assistant_message_after_completion(
-            tenant_id="tenant-a",
-            conversation_id="c1",
-            run_id=run.run_id,
-            turn_id=run.run_id,
-            content=result["answer"],
-            idempotency_key=f"run:{run.run_id}:assistant",
-        )
-        persisted_messages = await messages.list_messages(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="c1",
-        )
 
     assert moderation.calls == 2
     assert "answer" in result
     assert result["answer"] == "generated answer"
     assert "post_moderation" in result
     assert result["post_moderation"]["is_flagged"] is False
-    assert [
-        event["step"]
-        for event in result["events"]
-        if event.get("step") == "moderation:post"
-    ] == ["moderation:post", "moderation:post"]
-    assert result["events"][-1]["type"] == "done"
-    assert result["events"][-1]["data"]["answer"] == "generated answer"
-    assert [message.content for message in persisted_messages] == [
-        "hello",
-        "generated answer",
-    ]
+    assert "final_response" in result
+    assert result["final_response"].answer == "generated answer"
 
 
 @pytest.mark.asyncio
@@ -174,7 +139,7 @@ async def test_flagged_answer_remains_canonical_through_finalization(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -209,27 +174,6 @@ async def test_flagged_answer_remains_canonical_through_finalization(
         state = _state()
         state["turn_id"] = str(turn_id)
         result = await graph.ainvoke(state)
-        done = result["events"][-1]
-        await runs.complete_run(
-            tenant_id="tenant-a",
-            run_id=run.run_id,
-            event=EventInput(
-                event_key=done["event_key"],
-                type=done["type"],
-                data=done["data"],
-            ),
-            owner_instance_id=run.owner_instance_id,
-            execution_epoch=run.execution_epoch,
-        )
-        assert "answer" in result
-        await messages.persist_assistant_message_after_completion(
-            tenant_id="tenant-a",
-            conversation_id="c1",
-            run_id=run.run_id,
-            turn_id=run.run_id,
-            content=result["answer"],
-            idempotency_key=f"run:{run.run_id}:assistant",
-        )
         persisted_messages = await messages.list_messages(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
             conversation_id="c1",
@@ -237,16 +181,9 @@ async def test_flagged_answer_remains_canonical_through_finalization(
 
     assert "answer" in result
     assert result["answer"] == "generated answer"
-    assert any(
-        event["type"] == "token" and event["data"] == "generated answer"
-        for event in result["events"]
-    )
-    assert result["events"][-1]["type"] == "done"
-    assert result["events"][-1]["data"]["answer"] == "generated answer"
-    assert [message.content for message in persisted_messages] == [
-        "hello",
-        "generated answer",
-    ]
+    assert "final_response" in result
+    assert result["final_response"].answer == "generated answer"
+    assert [message.content for message in persisted_messages] == ["hello"]
     assert "post_moderation" in result
     assert result["post_moderation"]["is_flagged"] is True
     assert len(audit.records) == 1
@@ -263,7 +200,7 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
@@ -285,15 +222,5 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
     assert result["answer"] == "generated answer"
     assert "post_moderation_error" in result
     assert result["post_moderation_error"] == "post evaluator unavailable"
-    failure_event = next(
-        event
-        for event in result["events"]
-        if event["event_key"] == "phase:post_moderation:error:1"
-    )
-    assert failure_event["data"] == {
-        "failed": True,
-        "error": "post evaluator unavailable",
-    }
-    assert failure_event["type"] == "step_completed"
-    assert result["events"][-1]["type"] == "done"
-    assert result["events"][-1]["data"]["answer"] == "generated answer"
+    assert "final_response" in result
+    assert result["final_response"].answer == "generated answer"

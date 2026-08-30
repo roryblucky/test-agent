@@ -27,7 +27,7 @@ from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
-from app.langgraph_v2.run_events import RunEventRepository
+from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
@@ -67,7 +67,7 @@ async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        runs = RunEventRepository(pool)
+        runs = RunRepository(pool)
         run = await runs.create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
@@ -85,7 +85,6 @@ async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
             "query": "hello",
             "conversation_id": "c1",
             "client_request_id": None,
-            "events": [],
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
@@ -211,9 +210,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
             return await self.repository.get(**kwargs)
 
     class IdentityRanker:
-        async def rank(
-            self, query: str, documents: list[Document]
-        ) -> RerankingResult:
+        async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
             del query
             return RerankingResult(documents=documents)
 
@@ -241,7 +238,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        run = await RunEventRepository(pool).create_run(
+        run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
@@ -266,15 +263,12 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
             "conversation_id": "c1",
             "turn_id": str(turn_id),
             "client_request_id": None,
-            "events": [],
         }
-        config: RunnableConfig = {
-            "configurable": {"thread_id": "retrieval-recovery"}
-        }
+        config: RunnableConfig = {"configurable": {"thread_id": "retrieval-recovery"}}
         with pytest.raises(asyncio.CancelledError):
             await first_graph.ainvoke(state, config)
 
-        resume_run = await RunEventRepository(pool).create_run(
+        resume_run = await RunRepository(pool).create_run(
             tenant_id="tenant-a",
             run_id=uuid4(),
             conversation_id="c1",
