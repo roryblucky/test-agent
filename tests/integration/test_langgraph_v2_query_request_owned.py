@@ -16,7 +16,6 @@ from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.stream import GraphStreamCleanupError
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
-    count_run_rows,
     persistent_tracer_app,
     seed_subject_conversation,
     stream_request,
@@ -188,9 +187,6 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
                 ),
                 conversation_id="conversation-1",
             )
-        persisted_run_count = await count_run_rows(
-            langgraph_v2_migrated_database_url
-        )
 
     assert graph.astream_called is True
     assert _event_frame(frames[0]) == {
@@ -198,7 +194,6 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
         "data": {"answer": "canonical answer"},
     }
     assert response.headers["x-thread-id"]
-    assert persisted_run_count == 0
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
         ("assistant", "canonical answer"),
@@ -299,7 +294,6 @@ async def test_closing_query_sse_closes_graph_without_persisting_a_run(
 
     assert graph.stream.closed is True
     assert graph.stream.close_completed is True
-    assert await count_run_rows(langgraph_v2_migrated_database_url) == 0
 
 
 @pytest.mark.asyncio
@@ -383,7 +377,6 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
 
     assert answer_actor.calls == 1
     assert answer_actor.close_completed.is_set() is True
-    assert await count_run_rows(langgraph_v2_migrated_database_url) == 0
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
     ]
@@ -439,7 +432,6 @@ async def test_graph_close_failure_is_reported_after_request_cleanup(
         await response.body_iterator.aclose()
 
     assert graph.stream.close_calls == 1
-    assert await count_run_rows(langgraph_v2_migrated_database_url) == 0
 
 
 @pytest.mark.asyncio
@@ -477,7 +469,6 @@ async def test_graph_close_failure_without_primary_error_is_reported(
         with pytest.raises(GraphStreamCleanupError, match="normal close failed"):
             await anext(response.body_iterator)
 
-    assert await count_run_rows(langgraph_v2_migrated_database_url) == 0
 
 
 @pytest.mark.asyncio

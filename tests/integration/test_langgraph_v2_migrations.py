@@ -69,7 +69,7 @@ def test_turn_migration_backfills_user_deadline_from_authoritative_message(
             ),
         )
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0013_artifact_turn_provenance")
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
         rows = connection.execute(
             """
@@ -106,6 +106,8 @@ def test_turn_migration_backfills_user_deadline_from_authoritative_message(
             """,
             (tenant_id, conversation_id),
         )
+
+    command.upgrade(config, "head")
 
     async def read_migrated_messages() -> list[tuple[str, str]]:
         async with AsyncConnectionPool(
@@ -156,11 +158,17 @@ def test_application_base_revision_upgrades_and_downgrades(
             "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s)",
             ("langgraph_v2",),
         ).fetchone()
-        event_table_exists = connection.execute(
-            "SELECT to_regclass('langgraph_v2.events') IS NOT NULL"
-        ).fetchone()
+        journal_tables = connection.execute(
+            """SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'langgraph_v2'
+              AND table_name IN (
+                  'runs', 'events', 'phase_results', 'cancellation_intents'
+              )
+            ORDER BY table_name"""
+        ).fetchall()
     assert exists_after_upgrade == (True,)
-    assert event_table_exists == (True,)
+    assert journal_tables == []
 
     command.downgrade(config, "base")
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
@@ -169,6 +177,215 @@ def test_application_base_revision_upgrades_and_downgrades(
             ("langgraph_v2",),
         ).fetchone()
     assert exists_after_downgrade == (False,)
+
+
+def test_upgrade_from_0013_preserves_product_and_checkpoint_data(
+    langgraph_v2_test_database_url: str,
+) -> None:
+    config = build_alembic_config(langgraph_v2_test_database_url)
+    command.upgrade(config, "0013_artifact_turn_provenance")
+    tenant_id = "tenant-a"
+    conversation_id = "conversation-preserved"
+    thread_id = thread_id_for(tenant_id, conversation_id)
+    turn_id = uuid4()
+    artifact_id = uuid4()
+    legacy_run_id = uuid4()
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        connection.execute(
+            """INSERT INTO langgraph_v2.conversations
+            (tenant_id, conversation_id, owner_subject_id, thread_id)
+            VALUES (%s, %s, 'subject-a', %s)""",
+            (tenant_id, conversation_id, thread_id),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.messages
+            (tenant_id, message_id, conversation_id, turn_id, role, content,
+             idempotency_key, resume_deadline)
+            VALUES (%s, %s, %s, %s, 'user', 'preserved question',
+                    'preserved:user', now() + interval '1 hour')""",
+            (tenant_id, uuid4(), conversation_id, turn_id),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.artifacts
+            (tenant_id, artifact_id, artifact_type, payload,
+             conversation_id, turn_id)
+            VALUES (%s, %s, 'document', %s, %s, %s)""",
+            (
+                tenant_id,
+                artifact_id,
+                Jsonb({"id": "preserved-evidence"}),
+                conversation_id,
+                turn_id,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.runs
+            (tenant_id, run_id, conversation_id, status, turn_id)
+            VALUES (%s, %s, %s, 'running', %s)""",
+            (tenant_id, legacy_run_id, conversation_id, turn_id),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.events
+            (tenant_id, run_id, sequence, event_key, type, canonical_envelope)
+            VALUES (%s, %s, 1, 'legacy:event', 'token', '{}')""",
+            (tenant_id, legacy_run_id),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.phase_results
+            (tenant_id, run_id, phase_name, execution_epoch,
+             normalized_result, canonical_result)
+            VALUES (%s, %s, 'query', 1, '{}'::jsonb, '{}')""",
+            (tenant_id, legacy_run_id),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.cancellation_intents
+            (tenant_id, run_id) VALUES (%s, %s)""",
+            (tenant_id, legacy_run_id),
+        )
+
+    async def write_checkpoint() -> None:
+        async with AsyncConnectionPool(
+            langgraph_v2_test_database_url,
+            min_size=1,
+            max_size=2,
+            kwargs={"autocommit": True, "prepare_threshold": 0},
+        ) as pool:
+            saver = AsyncPostgresSaver(cast(Any, pool))
+            await saver.setup()
+            graph = build_tracer_graph(checkpointer=saver)
+            await graph.ainvoke(
+                {
+                    "query": "preserved checkpoint",
+                    "conversation_id": conversation_id,
+                    "client_request_id": None,
+                },
+                config=initial_checkpoint_config(
+                    thread_id=thread_id,
+                    checkpoint_ns="",
+                ),
+                durability="sync",
+            )
+
+    asyncio.run(write_checkpoint())
+    command.upgrade(config, "head")
+
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        assert connection.execute(
+            """SELECT owner_subject_id, thread_id
+            FROM langgraph_v2.conversations
+            WHERE tenant_id = %s AND conversation_id = %s""",
+            (tenant_id, conversation_id),
+        ).fetchone() == ("subject-a", thread_id)
+        assert connection.execute(
+            """SELECT role, content, turn_id
+            FROM langgraph_v2.messages
+            WHERE tenant_id = %s AND conversation_id = %s""",
+            (tenant_id, conversation_id),
+        ).fetchone() == ("user", "preserved question", turn_id)
+        assert connection.execute(
+            """SELECT payload, conversation_id, turn_id
+            FROM langgraph_v2.artifacts
+            WHERE tenant_id = %s AND artifact_id = %s""",
+            (tenant_id, artifact_id),
+        ).fetchone() == (
+            {"id": "preserved-evidence"},
+            conversation_id,
+            turn_id,
+        )
+        assert connection.execute(
+            """SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'langgraph_v2'
+              AND table_name IN
+                  ('runs', 'events', 'phase_results', 'cancellation_intents')"""
+        ).fetchall() == []
+
+    async def read_checkpoint() -> None:
+        async with AsyncConnectionPool(
+            langgraph_v2_test_database_url,
+            min_size=1,
+            max_size=2,
+            kwargs={"autocommit": True, "prepare_threshold": 0},
+        ) as pool:
+            saver = AsyncPostgresSaver(cast(Any, pool))
+            checkpoint = await saver.aget_tuple(
+                initial_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
+            )
+            assert checkpoint is not None
+            assert checkpoint.checkpoint["channel_values"]["query"] == (
+                "preserved checkpoint"
+            )
+
+    asyncio.run(read_checkpoint())
+
+
+def test_downgrade_to_0013_recreates_empty_compatible_journal_tables(
+    langgraph_v2_test_database_url: str,
+) -> None:
+    config = build_alembic_config(langgraph_v2_test_database_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "0013_artifact_turn_provenance")
+
+    run_id = uuid4()
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        table_counts = connection.execute(
+            """SELECT
+                (SELECT count(*) FROM langgraph_v2.runs),
+                (SELECT count(*) FROM langgraph_v2.events),
+                (SELECT count(*) FROM langgraph_v2.phase_results),
+                (SELECT count(*) FROM langgraph_v2.cancellation_intents)"""
+        ).fetchall()
+        assert table_counts == [(0, 0, 0, 0)]
+        run_columns = {
+            row[0]
+            for row in connection.execute(
+                """SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'langgraph_v2' AND table_name = 'runs'"""
+            ).fetchall()
+        }
+        assert run_columns == {
+            "tenant_id",
+            "run_id",
+            "conversation_id",
+            "status",
+            "next_event_sequence",
+            "terminal_outcome",
+            "created_at",
+            "completed_at",
+            "owner_instance_id",
+            "execution_epoch",
+            "heartbeat_at",
+            "expires_at",
+            "checkpoint_id",
+            "checkpoint_ns",
+            "turn_id",
+        }
+        connection.execute(
+            """INSERT INTO langgraph_v2.runs
+            (tenant_id, run_id, conversation_id, status)
+            VALUES ('tenant-a', %s, 'conversation-1', 'running')""",
+            (run_id,),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.events
+            (tenant_id, run_id, sequence, event_key, type, canonical_envelope)
+            VALUES ('tenant-a', %s, 1, 'event-1', 'token', '{}')""",
+            (run_id,),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.phase_results
+            (tenant_id, run_id, phase_name, execution_epoch,
+             normalized_result, canonical_result)
+            VALUES ('tenant-a', %s, 'query', 1, '{}'::jsonb, '{}')""",
+            (run_id,),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.cancellation_intents
+            (tenant_id, run_id) VALUES ('tenant-a', %s)""",
+            (run_id,),
+        )
+
+    command.downgrade(config, "base")
 
 
 def test_artifact_migration_backfills_turn_provenance_and_downgrades(
@@ -381,7 +598,7 @@ def test_message_turn_migration_restores_transitional_run_identity_on_downgrade(
             ),
         )
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0013_artifact_turn_provenance")
     command.downgrade(config, "0011_run_turn_association")
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
         rows = connection.execute(

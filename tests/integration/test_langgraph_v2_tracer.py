@@ -1,14 +1,13 @@
 import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Generator
-from contextlib import asynccontextmanager, contextmanager, suppress
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from importlib import reload
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
-import psycopg
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.routing import APIRoute
@@ -43,39 +42,6 @@ def parse_sse(response_text: str) -> list[dict[str, Any]]:
             raise TypeError("SSE payload must be a JSON object")
         events.append(cast(dict[str, Any], payload))
     return events
-
-
-@contextmanager
-def reject_transport_event_inserts(database_url: str) -> Generator[None]:
-    """Fail a public request if it attempts to persist a transport Event."""
-    with psycopg.connect(database_url) as connection:
-        connection.execute(
-            """
-            CREATE FUNCTION langgraph_v2.reject_event_insert()
-            RETURNS trigger AS $$
-            BEGIN
-                RAISE EXCEPTION 'forced event persistence failure';
-            END;
-            $$ LANGUAGE plpgsql
-            """
-        )
-        connection.execute(
-            """
-            CREATE TRIGGER reject_event_insert
-            BEFORE INSERT ON langgraph_v2.events
-            FOR EACH ROW EXECUTE FUNCTION langgraph_v2.reject_event_insert()
-            """
-        )
-    try:
-        yield
-    finally:
-        with psycopg.connect(database_url) as connection:
-            connection.execute(
-                "DROP TRIGGER IF EXISTS reject_event_insert ON langgraph_v2.events"
-            )
-            connection.execute(
-                "DROP FUNCTION IF EXISTS langgraph_v2.reject_event_insert()"
-            )
 
 
 def persistent_tracer_app(
@@ -169,19 +135,6 @@ async def seed_subject_conversation(
         context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
         conversation_id=conversation_id,
     )
-
-
-async def count_run_rows(database_url: str) -> int:
-    """Count transitional Run rows while task49 still owns their schema removal."""
-    async with AsyncConnectionPool(database_url, min_size=1, max_size=2) as pool:
-        async with pool.connection() as connection:
-            row = await (
-                await connection.execute("SELECT count(*) FROM langgraph_v2.runs")
-            ).fetchone()
-    assert row is not None
-    value: object = row[0]
-    assert isinstance(value, int)
-    return value
 
 
 @pytest.mark.asyncio
@@ -628,27 +581,3 @@ def test_removed_replay_cursor_is_rejected(
     assert response.json() == {
         "detail": "Replay query parameter is no longer supported: afterSequence"
     }
-
-
-def test_transport_event_table_is_not_used_by_completed_graph(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    app = persistent_tracer_app(langgraph_v2_migrated_database_url)
-    with reject_transport_event_inserts(langgraph_v2_migrated_database_url):
-        with TestClient(app) as client:
-            response = client.post(
-                "/v2/query/stream",
-                json={"query": "hello"},
-                headers={
-                    "X-Application-Id": "tenant-a",
-                    "X-Subject-Id": "subject-a",
-                },
-            )
-
-        with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
-            event_count = connection.execute(
-                "SELECT count(*) FROM langgraph_v2.events"
-            ).fetchone()
-        assert response.status_code == 200
-        assert parse_sse(response.text)[-1]["type"] == "done"
-        assert event_count == (0,)

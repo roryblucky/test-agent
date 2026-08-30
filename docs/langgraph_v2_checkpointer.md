@@ -10,24 +10,33 @@ index migrations.
 Application identifiers are encoded as URL-safe base64 JSON tuples:
 
 - `thread_id` is `("thread", tenant_id, conversation_id)`.
-- `checkpoint_ns` is `("checkpoint", tenant_id, run_id, execution_epoch)`.
+- `checkpoint_ns` is the empty string used by the root LangGraph graph.
 
-The root LangGraph graph reserves its runtime namespace as `""`; the fenced
-saver translates that root persistence operation to the Run's encoded
-namespace without changing LangGraph's execution rules. The Run stores the
-exact checkpoint ID and namespace returned by the committed saver.
+Query and Resume pass the shared official saver directly to LangGraph. Resume
+authorizes the Tenant, Subject, Conversation, and Turn before reading the
+latest checkpoint, then pins the exact authorized checkpoint ID when execution
+starts. PostgreSQL checkpoint state is authoritative; there is no application
+checkpoint pointer, fenced saver, claim, lease, heartbeat, or execution epoch.
 
-Checkpoint ordering is deliberately one-way: `AsyncPostgresSaver.aput()`
-commits first, then the epoch-fenced Run pointer transaction executes. If the
-second transaction fails, the committed checkpoint remains an unreachable
-orphan and the node may run again; a Run pointer is never advanced to an
-uncommitted checkpoint. Reads and resumes must use
-`exact_checkpoint_config()` with the stored checkpoint ID and namespace; no
-namespace-latest lookup is authoritative.
+Reads and resumes use `exact_checkpoint_config()` with the checkpoint ID and
+empty namespace returned by the official saver. Completed finalization writes
+the assistant Message idempotently by Turn.
 
 Checkpoint rows are internal journal state. They do not create application
 Events and are not emitted in the query SSE stream.
 
-The fenced saver emits only operation-level OpenTelemetry spans for checkpoint
-read, write, and intermediate-write operations. Span attributes contain no
-tenant, conversation, query, or checkpoint identifiers.
+## Deployment compatibility boundary
+
+Migration `0014_drop_run_lifecycle` removes the superseded application `runs`,
+`events`, `phase_results`, and `cancellation_intents` tables. Deploy it in two
+ordered stages across every application instance:
+
+1. Fully deploy the task48 runtime, which no longer reads or writes those
+   tables, and confirm every old instance has stopped.
+2. Upgrade the database through `0014_drop_run_lifecycle`.
+
+Do not run pre-task48 application instances against the 0014 schema, and do not
+mix old and new schema expectations during a rolling deployment. Downgrading
+0014 recreates an empty 0013-compatible journal schema; deleted lifecycle rows
+are intentionally not restored. Conversation, Message, Artifact, and official
+LangGraph checkpoint data are unaffected by this migration.

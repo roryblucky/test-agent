@@ -39,10 +39,8 @@ from app.langgraph_v2.question_refinement import (
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
-    count_run_rows,
     parse_sse,
     persistent_tracer_app,
-    reject_transport_event_inserts,
     seed_subject_conversation,
     stream_request,
     v2_stream_endpoint,
@@ -547,7 +545,6 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
     assert sum(event["type"] == "token" for event in delivered) == expected_token_count
     assert delivered[-1]["type"] == "done"
     assert delivered[-1]["data"]["answer"] == "recovered answer"
-    assert asyncio.run(count_run_rows(langgraph_v2_migrated_database_url)) == 0
 
     turn_after_resume = asyncio.run(
         _read_turn(langgraph_v2_migrated_database_url, turn_id)
@@ -559,35 +556,6 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
         for message in messages
         if message.turn_id == turn_id
     ] == [("user", "resume me"), ("assistant", "recovered answer")]
-
-
-def test_thread_resume_does_not_insert_transport_events(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    thread_id, turn_id, _ = asyncio.run(
-        _seed_pre_answer_checkpoint(
-            langgraph_v2_migrated_database_url,
-        )
-    )
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url,
-        thread_resume_enabled=True,
-        answer_actor=_AnswerActor(),
-    )
-
-    with reject_transport_event_inserts(langgraph_v2_migrated_database_url):
-        with TestClient(app) as client:
-            response = client.post(
-                f"/v2/threads/{thread_id}/resume/stream",
-                headers={
-                    "X-Application-Id": "tenant-a",
-                    "X-Subject-Id": "subject-a",
-                },
-                params={"expectedTurnId": str(turn_id)},
-            )
-
-    assert response.status_code == 200
-    assert parse_sse(response.text)[-1]["type"] == "done"
 
 
 def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
@@ -844,7 +812,6 @@ def test_thread_resume_rechecks_supersession_when_execution_starts(
     assert delivered[-1]["type"] == "error"
     assert "has been superseded" in delivered[-1]["data"]
     assert answer_actor.calls == 0
-    assert asyncio.run(count_run_rows(langgraph_v2_migrated_database_url)) == 0
 
 
 def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
@@ -1020,7 +987,6 @@ def test_second_interruption_can_resume_before_original_deadline(
             assert token_frame["data"] == "replacement "
 
     asyncio.run(interrupt_resumed_stream())
-    assert asyncio.run(count_run_rows(langgraph_v2_migrated_database_url)) == 0
 
     turn_after_second_interrupt = asyncio.run(
         _read_turn(langgraph_v2_migrated_database_url, turn_id)

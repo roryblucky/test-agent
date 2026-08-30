@@ -46,7 +46,6 @@ from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
 from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import (
-    count_run_rows,
     parse_sse,
     seed_subject_conversation,
 )
@@ -502,4 +501,3 @@ def test_terminal_checkpoint_failure_publishes_error_without_assistant_or_run(
     assert delivered[-1]["type"] == "error"
     assert "forced terminal checkpoint failure" in delivered[-1]["data"]
     assert asyncio.run(read_roles()) == ["user"]
-    assert asyncio.run(count_run_rows(langgraph_v2_migrated_database_url)) == 0
