@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import AsyncIterator, Hashable
+from collections.abc import AsyncIterator, Hashable, Iterable
 from typing import Any, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
@@ -170,10 +170,7 @@ async def _query(
         ),
     )
     return {
-        "events": [
-            _event_state(event, index, journal_policy="checkpoint_only")
-            for index, event in enumerate(events, 1)
-        ],
+        "events": _with_checkpoint_events(state, events),
         "history": history,
     }
 
@@ -197,6 +194,23 @@ def _event_state(
         exclude_none=True,
         exclude={"journal_policy"} if journal_policy == "transport_journal" else None,
     )
+
+
+def _with_checkpoint_events(
+    state: TracerState,
+    events: Iterable[EventInput | EventRecord],
+) -> list[dict[str, Any]]:
+    """Return existing events followed by checkpoint-owned node events."""
+    sequence_start = len(state["events"])
+    checkpoint_events = [
+        _event_state(
+            event,
+            sequence_start + index,
+            journal_policy="checkpoint_only",
+        )
+        for index, event in enumerate(events, 1)
+    ]
+    return [*state["events"], *checkpoint_events]
 
 
 def canonical_query(query: str) -> str:
@@ -264,19 +278,8 @@ def build_tracer_graph(
         events, halted, decision = await run_pre_moderation(
             state, provider=selected_moderation_provider
         )
-        sequence_start = len(state["events"])
         return {
-            "events": [
-                *state["events"],
-                *[
-                    _event_state(
-                        event,
-                        sequence_start + index,
-                        journal_policy="checkpoint_only",
-                    )
-                    for index, event in enumerate(events, 1)
-                ],
-            ],
+            "events": _with_checkpoint_events(state, events),
             "halted": halted,
             "moderation": decision.model_dump(exclude_none=True),
         }
@@ -291,17 +294,7 @@ def build_tracer_graph(
             state, actor=selected_refinement_actor
         )
         update: TracerStateUpdate = {
-            "events": [
-                *state["events"],
-                *[
-                    _event_state(
-                        event,
-                        len(state["events"]) + index,
-                        journal_policy="checkpoint_only",
-                    )
-                    for index, event in enumerate(events, 1)
-                ],
-            ],
+            "events": _with_checkpoint_events(state, events),
             "halted": halted,
         }
         if result is not None:
@@ -327,17 +320,7 @@ def build_tracer_graph(
             retriever=selected_retriever,
         )
         update: TracerStateUpdate = {
-            "events": [
-                *state["events"],
-                *[
-                    _event_state(
-                        event,
-                        len(state["events"]) + index,
-                        journal_policy="checkpoint_only",
-                    )
-                    for index, event in enumerate(events, 1)
-                ],
-            ],
+            "events": _with_checkpoint_events(state, events),
             "halted": halted,
             "artifact_refs": refs,
         }
@@ -360,17 +343,7 @@ def build_tracer_graph(
             ranker=selected_ranker,
         )
         update: TracerStateUpdate = {
-            "events": [
-                *state["events"],
-                *[
-                    _event_state(
-                        event,
-                        len(state["events"]) + index,
-                        journal_policy="checkpoint_only",
-                    )
-                    for index, event in enumerate(events, 1)
-                ],
-            ],
+            "events": _with_checkpoint_events(state, events),
             "halted": halted,
             "ranked_refs": refs,
         }
@@ -395,17 +368,7 @@ def build_tracer_graph(
                 stream_writer=get_stream_writer(),
             )
             update: TracerStateUpdate = {
-                "events": [
-                    *state["events"],
-                    *[
-                        _event_state(
-                            event,
-                            len(state["events"]) + index,
-                            journal_policy="checkpoint_only",
-                        )
-                        for index, event in enumerate(events, 1)
-                    ],
-                ],
+                "events": _with_checkpoint_events(state, events),
                 "halted": halted,
             }
             if result is not None:
@@ -438,17 +401,7 @@ def build_tracer_graph(
                     actor=groundedness_actor,
                 )
                 update: TracerStateUpdate = {
-                    "events": [
-                        *state["events"],
-                        *[
-                            _event_state(
-                                event,
-                                len(state["events"]) + index,
-                                journal_policy="checkpoint_only",
-                            )
-                            for index, event in enumerate(events, 1)
-                        ],
-                    ],
+                    "events": _with_checkpoint_events(state, events),
                 }
                 if result is not None:
                     update["groundedness"] = result
@@ -471,17 +424,7 @@ def build_tracer_graph(
                 provider=selected_moderation_provider,
             )
             update: TracerStateUpdate = {
-                "events": [
-                    *state["events"],
-                    *[
-                        _event_state(
-                            event,
-                            len(state["events"]) + index,
-                            journal_policy="checkpoint_only",
-                        )
-                        for index, event in enumerate(events, 1)
-                    ],
-                ],
+                "events": _with_checkpoint_events(state, events),
             }
             if decision is not None:
                 update["post_moderation"] = decision.model_dump(exclude_none=True)
@@ -510,15 +453,7 @@ def build_tracer_graph(
         )
         return {
             "events": [
-                *state["events"],
-                *[
-                    _event_state(
-                        event,
-                        len(state["events"]) + index,
-                        journal_policy="checkpoint_only",
-                    )
-                    for index, event in enumerate(events, 1)
-                ],
+                *_with_checkpoint_events(state, events),
                 {
                     **done_event.model_dump(exclude_none=True),
                     "journal_policy": "checkpoint_only",

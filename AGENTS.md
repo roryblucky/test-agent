@@ -58,6 +58,17 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+## 5. Clean Code and Review Closure
+
+**Every review comment reaches an explicit resolution. Priority does not make a finding optional.**
+
+- Keep the task's code cohesive, readable, and free of duplication introduced or expanded by the change.
+- Prefer straightforward local code over abstraction. Extract only repeated, stable behavior, and keep helpers shallow, specifically named, and close to their callers so a human can follow the flow without chasing layers.
+- Resolve each review finding with code, tests, or documentation before declaring the task complete.
+- Dismiss a finding only when evidence shows it is a false positive or a named follow-up ticket explicitly owns the work. Record that disposition and evidence in the issue's `Comments` section.
+- Completion requires zero unresolved review comments, recorded dispositions for dismissed or deferred findings, and verification after the final change.
+- Report the unresolved review-comment count in the final handoff.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
