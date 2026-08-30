@@ -64,6 +64,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 - Keep the task's code cohesive, readable, and free of duplication introduced or expanded by the change.
 - Prefer straightforward local code over abstraction. Extract only repeated, stable behavior, and keep helpers shallow, specifically named, and close to their callers so a human can follow the flow without chasing layers.
+- Optimize for the next human reader: use direct control flow and domain names, and do not introduce generic frameworks or layers that make the implementation harder to understand.
 - Resolve each review finding with code, tests, or documentation before declaring the task complete.
 - Dismiss a finding only when evidence shows it is a false positive or a named follow-up ticket explicitly owns the work. Record that disposition and evidence in the issue's `Comments` section.
 - Completion requires zero unresolved review comments, recorded dispositions for dismissed or deferred findings, and verification after the final change.

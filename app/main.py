@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -87,6 +87,7 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Application lifespan — initialise and tear down shared resources."""
     # Startup
+    from app.api.router import get_session_store
     from app.config.config_reloader import ConfigReloader
     from app.core.audit import AuditLogger, AuditSink, BigQueryAuditSink, FileAuditSink
     from app.core.rate_limiter import create_rate_limiter
@@ -96,57 +97,49 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         LoggingOutputAssessmentAudit,
     )
 
-    # Initialize OpenTelemetry
-    TelemetryService("agent-kms-api")
+    async with AsyncExitStack() as cleanup:
+        # Initialize OpenTelemetry
+        TelemetryService("agent-kms-api")
 
-    http_pool = HttpClientPool()
-    configs = load_config("config.json")
-    app.state.tenant_manager = TenantManager(configs, http_pool)
-    app.state.http_pool = http_pool
+        http_pool = HttpClientPool()
+        cleanup.push_async_callback(http_pool.close_all)
+        configs = load_config("config.json")
+        app.state.tenant_manager = TenantManager(configs, http_pool)
+        app.state.http_pool = http_pool
 
-    # Rate limiter (Redis in production, InMemory for dev)
-    redis_url = os.environ.get("RATE_LIMIT_REDIS_URL")
-    app.state.rate_limiter = create_rate_limiter(redis_url)
+        # Rate limiter (Redis in production, InMemory for dev)
+        redis_url = os.environ.get("RATE_LIMIT_REDIS_URL")
+        app.state.rate_limiter = create_rate_limiter(redis_url)
+        cleanup.push_async_callback(app.state.rate_limiter.close)
 
-    # Audit logger with configured sinks
-    audit_sinks: list[AuditSink] = [FileAuditSink()]  # Always available for dev/debug
-    gcp_project = os.environ.get("GCP_PROJECT_ID")
-    bigquery_assessment_audit: BigQueryOutputAssessmentAudit | None = None
-    if gcp_project:
-        try:
-            audit_sinks.append(BigQueryAuditSink(project_id=gcp_project))
-            bigquery_assessment_audit = BigQueryOutputAssessmentAudit(
-                project_id=gcp_project
-            )
-        except Exception:
-            logger.warning("BigQuery audit sink not available, using file only")
-    app.state.audit_logger = AuditLogger(sinks=audit_sinks)
-    app.state.langgraph_v2_output_assessment_audit = (
-        bigquery_assessment_audit or LoggingOutputAssessmentAudit()
-    )
+        # Audit logger with configured sinks
+        audit_sinks: list[AuditSink] = [FileAuditSink()]
+        gcp_project = os.environ.get("GCP_PROJECT_ID")
+        bigquery_assessment_audit: BigQueryOutputAssessmentAudit | None = None
+        if gcp_project:
+            try:
+                audit_sinks.append(BigQueryAuditSink(project_id=gcp_project))
+                bigquery_assessment_audit = BigQueryOutputAssessmentAudit(
+                    project_id=gcp_project
+                )
+            except Exception:
+                logger.warning("BigQuery audit sink not available, using file only")
+        app.state.audit_logger = AuditLogger(sinks=audit_sinks)
+        cleanup.push_async_callback(app.state.audit_logger.close)
+        app.state.langgraph_v2_output_assessment_audit = (
+            bigquery_assessment_audit or LoggingOutputAssessmentAudit()
+        )
+        if bigquery_assessment_audit is not None:
+            cleanup.push_async_callback(bigquery_assessment_audit.close)
 
-    # Config hot-reloader
-    app.state.config_reloader = ConfigReloader(app, http_pool)
+        # Config hot-reloader
+        app.state.config_reloader = ConfigReloader(app, http_pool)
 
-    logger.info("KMS started — tenants: %s", app.state.tenant_manager.tenant_ids)
+        logger.info("KMS started — tenants: %s", app.state.tenant_manager.tenant_ids)
 
-    async with postgres_lifespan(app):
+        cleanup.push_async_callback(get_session_store().close)
+        await cleanup.enter_async_context(postgres_lifespan(app))
         yield
-
-    # Shutdown — close Redis session store if active
-    from app.api.router import get_session_store
-
-    await get_session_store().close()
-
-    # Close audit logger
-    await app.state.audit_logger.close()
-    if bigquery_assessment_audit is not None:
-        await bigquery_assessment_audit.close()
-
-    # Close rate limiter if Redis-backed
-    await app.state.rate_limiter.close()
-
-    await http_pool.close_all()
     logger.info("KMS shutdown complete")
 
 

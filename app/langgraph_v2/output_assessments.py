@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -71,13 +73,25 @@ class BigQueryOutputAssessmentAudit:
         self._table = table
         self._table_ref = f"{project_id}.{dataset}.{table}"
         self._client = client
+        self._client_lock = threading.Lock()
 
     def _ensure_client(self) -> Any:
         if self._client is None:
-            bigquery: Any = importlib.import_module("google.cloud.bigquery")
-            client: Any = bigquery.Client(project=self._project_id)
-            self._ensure_table(bigquery, client)
-            self._client = client
+            with self._client_lock:
+                if self._client is None:
+                    bigquery: Any = importlib.import_module("google.cloud.bigquery")
+                    client: Any = bigquery.Client(project=self._project_id)
+                    try:
+                        self._ensure_table(bigquery, client)
+                    except Exception:
+                        try:
+                            client.close()
+                        except Exception:
+                            logger.exception(
+                                "Failed to close BigQuery client after setup failure"
+                            )
+                        raise
+                    self._client = client
         return self._client
 
     def _ensure_table(self, bigquery: Any, client: Any) -> None:
@@ -99,6 +113,10 @@ class BigQueryOutputAssessmentAudit:
 
     async def record(self, assessment: OutputAssessmentAuditRecord) -> None:
         """Insert one assessment using its stable identity for retry deduplication."""
+        await asyncio.to_thread(self._record_sync, assessment)
+
+    def _record_sync(self, assessment: OutputAssessmentAuditRecord) -> None:
+        """Run the blocking BigQuery insert outside the application event loop."""
         row = {
             "recorded_at": datetime.now(UTC).isoformat(),
             **assessment.model_dump(mode="json"),
@@ -113,9 +131,14 @@ class BigQueryOutputAssessmentAudit:
 
     async def close(self) -> None:
         """Close the lazily-created client during application shutdown."""
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        await asyncio.to_thread(self._close_sync)
+
+    def _close_sync(self) -> None:
+        """Close the blocking client outside the application event loop."""
+        with self._client_lock:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
 
 
 class MockOutputAssessmentAudit:
