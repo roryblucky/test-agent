@@ -64,7 +64,7 @@ class AzureContentSafetyModerator(BaseModerationProvider):
                 categories={},
             )
 
-        categories = {}
+        categories: dict[str, float] = {}
         is_flagged = False
 
         # response.categories_analysis is expected to be a list

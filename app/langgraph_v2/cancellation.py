@@ -19,7 +19,7 @@ from app.langgraph_v2.run_events import (
     EventInput,
     EventRecord,
     RunNotFound,
-    _canonical_envelope,
+    _canonical_envelope,  # pyright: ignore[reportPrivateUsage] -- shared journal primitive
 )
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
@@ -245,7 +245,7 @@ class CancellationRepository:
                     )
                     if cursor.rowcount != 1:
                         raise ClaimFenced(str(run_id))
-        if persisted is not None and self._wakeups is not None:
+        if self._wakeups is not None:
             await self._wakeups.publish(tenant_id, run_id)
         return persisted
 

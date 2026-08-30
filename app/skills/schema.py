@@ -17,7 +17,7 @@ K8s/enterprise adaptation:
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator
 
@@ -60,31 +60,59 @@ class SkillMetadata(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
     description: str = Field(..., min_length=1, max_length=1024)
     license: str | None = None
-    compatibility: str | None = Field(None, max_length=500)
+    compatibility: Annotated[str | None, Field(max_length=500)] = None
     # Official spec uses ``metadata`` as a dict of arbitrary kv pairs
-    skill_metadata: dict[str, Any] = Field(default_factory=dict, alias="metadata")
+    skill_metadata: Annotated[
+        dict[str, Any],
+        Field(
+            validation_alias=AliasChoices("skill_metadata", "metadata"),
+            serialization_alias="metadata",
+        ),
+    ] = Field(default_factory=dict)
 
     # Official spec: space-separated string or list accepted
-    allowed_tools: list[str] = Field(default_factory=list, alias="allowed-tools")
+    allowed_tools: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("allowed_tools", "allowed-tools"),
+            serialization_alias="allowed-tools",
+        ),
+    ] = Field(default_factory=list)
 
     # ---- Enterprise extension fields ----
-    risk_level: SkillRiskLevel = Field(
-        SkillRiskLevel.LOW,
-        validation_alias=AliasChoices("risk_level", "risk-level"),
-        serialization_alias="risk_level",
-    )
-    required_tools: list[str] = Field(
-        default_factory=list, alias="required-tools"
-    )
-    tool_constraints: dict[str, dict[str, Any]] = Field(
-        default_factory=dict, alias="tool-constraints"
-    )
+    risk_level: Annotated[
+        SkillRiskLevel,
+        Field(
+            validation_alias=AliasChoices("risk_level", "risk-level"),
+            serialization_alias="risk_level",
+        ),
+    ] = SkillRiskLevel.LOW
+    required_tools: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("required_tools", "required-tools"),
+            serialization_alias="required-tools",
+        ),
+    ] = Field(default_factory=list)
+    tool_constraints: Annotated[
+        dict[str, dict[str, Any]],
+        Field(
+            validation_alias=AliasChoices("tool_constraints", "tool-constraints"),
+            serialization_alias="tool-constraints",
+        ),
+    ] = Field(default_factory=dict)
     # If True, ToolOutput is used to return results directly (redirect=True)
     redirect: bool = False
     # Maps to a Pydantic model class in OUTPUT_MODEL_REGISTRY
-    redirect_output_schema: str | None = Field(
-        None, alias="redirect-output-schema"
-    )
+    redirect_output_schema: Annotated[
+        str | None,
+        Field(
+            validation_alias=AliasChoices(
+                "redirect_output_schema", "redirect-output-schema"
+            ),
+            serialization_alias="redirect-output-schema",
+        ),
+    ] = None
 
     model_config = {"populate_by_name": True}
 
@@ -99,6 +127,7 @@ class SkillMetadata(BaseModel):
         """
         import logging
         import re
+
         _log = logging.getLogger(__name__)
         if len(v) > 64:
             _log.warning(
@@ -164,12 +193,12 @@ class SkillDefinition(BaseModel):
     """
 
     metadata: SkillMetadata
-    instructions: str           # Markdown body from SKILL.md
+    instructions: str  # Markdown body from SKILL.md
     tenant_id: str
-    source_path: str            # gs://bucket/path or local path
+    source_path: str  # gs://bucket/path or local path
 
     # Tier 3: populated lazily by the registry on demand
-    references: list[ReferenceDocument] = Field(default_factory=list)
+    references: list[ReferenceDocument] = Field(default_factory=list[ReferenceDocument])
 
     def to_summary(self) -> SkillSummary:
         """Downgrade to a Tier 1 summary for discovery."""

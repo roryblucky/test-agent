@@ -1,7 +1,8 @@
 """Unit tests for aggregation handler."""
 
+import unittest.mock
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -25,7 +26,7 @@ def _tool_result(
     source: str = "search_documents",
     metadata: dict[str, Any] | None = None,
     published_at: datetime | None = None,
-    item_type: str = "document_chunk",
+    item_type: Literal["document_chunk", "structured_record"] = "document_chunk",
     structured_facts: dict[str, Any] | None = None,
 ) -> ToolResultRecord:
     return ToolResultRecord(
@@ -48,7 +49,7 @@ def _tool_result(
 
 @pytest.mark.asyncio
 async def test_aggregation_builds_bundle_from_tool_results(
-    mock_emitter,
+    mock_emitter: unittest.mock.AsyncMock,
 ) -> None:
     """Aggregation selects evidence from normalized tool results."""
     ctx = FlowContext(query="original query", emitter=mock_emitter)
@@ -85,8 +86,7 @@ async def test_aggregation_builds_bundle_from_tool_results(
         "First evidence",
     ]
     assert all(
-        item.evidence_id.startswith("evidence:")
-        for item in bundle.selected_evidence
+        item.evidence_id.startswith("evidence:") for item in bundle.selected_evidence
     )
     assert list(result.evidence_store) == [
         item.evidence_id for item in bundle.selected_evidence
@@ -349,9 +349,7 @@ async def test_aggregation_freshness_contract_excludes_stale_metadata_date() -> 
             None,
             "watchlist",
             metadata={
-                "as_of_date": (
-                    datetime.now(UTC) - timedelta(days=5)
-                ).isoformat(),
+                "as_of_date": (datetime.now(UTC) - timedelta(days=5)).isoformat(),
                 "freshness_policy": {
                     "date_field": "as_of_date",
                     "max_age_days": 1,
@@ -374,9 +372,7 @@ async def test_aggregation_freshness_contract_excludes_stale_metadata_date() -> 
     assert bundle is not None
     assert bundle.selected_evidence == []
     assert [item.reason for item in bundle.excluded_evidence] == ["stale"]
-    assert "as_of_date older than 1 day" in (
-        bundle.excluded_evidence[0].detail or ""
-    )
+    assert "as_of_date older than 1 day" in (bundle.excluded_evidence[0].detail or "")
 
 
 @pytest.mark.asyncio

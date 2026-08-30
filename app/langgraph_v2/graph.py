@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import unicodedata
-from typing import Any, NotRequired, TypedDict, cast
+from collections.abc import AsyncIterator, Hashable
+from typing import Any, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.config import get_stream_writer
-from langgraph.graph import END, START, StateGraph
-from langgraph.graph.state import CompiledStateGraph
+from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
+    END,
+    START,
+    StateGraph,
+)
+from langgraph.types import StateSnapshot
 
 from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef
@@ -96,6 +102,36 @@ class TracerStateUpdate(TypedDict, total=False):
     final_response: TracerQueryResponse
 
 
+class TracerGraph(Protocol):
+    """Typed application boundary around LangGraph's partially typed API."""
+
+    async def ainvoke(
+        self,
+        graph_input: TracerState | None,
+        /,
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> TracerState:
+        """Invoke a new graph turn or resume one from its checkpoint."""
+        ...
+
+    async def aget_state(self, config: RunnableConfig) -> StateSnapshot:
+        """Read the current checkpoint state."""
+        ...
+
+    def astream(
+        self,
+        graph_input: Any | None,
+        /,
+        *,
+        config: RunnableConfig | None = None,
+        stream_mode: list[str] | str | None = None,
+        durability: str | None = None,
+    ) -> AsyncIterator[Any]:
+        """Stream graph output using the requested LangGraph mode."""
+        ...
+
+
 async def _query(
     state: TracerState,
     *,
@@ -114,7 +150,9 @@ async def _query(
             messages,
             token_budget=phase_context.history_token_budget,
             current_turn_id=phase_context.current_turn_id
-            or (UUID(state["turn_id"]) if state.get("turn_id") is not None else None),
+            or (
+                UUID(turn_id) if (turn_id := state.get("turn_id")) is not None else None
+            ),
         )
     events = (
         EventInput(
@@ -165,7 +203,7 @@ def canonical_query(query: str) -> str:
 
 
 async def _finalize(state: TracerState) -> TracerStateUpdate:
-    return finalize_in_memory(state)
+    return cast(TracerStateUpdate, finalize_in_memory(state))
 
 
 async def _check_cancellation(context: PhaseExecutionContext | None) -> None:
@@ -183,8 +221,16 @@ def _next_after_pre_moderation(state: TracerState) -> str:
     return "end" if state.get("halted", False) else "question_refinement"
 
 
+def _next_after_question_refinement(state: TracerState) -> str:
+    return "end" if state.get("halted", False) else "retrieval"
+
+
+def _next_after_retrieval(state: TracerState) -> str:
+    return "end" if state.get("halted", False) else "reranking"
+
+
 def build_tracer_graph(
-    checkpointer: BaseCheckpointSaver | None = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
     phase_context: PhaseExecutionContext | None = None,
     moderation_provider: ModerationProvider | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
@@ -192,15 +238,17 @@ def build_tracer_graph(
     ranker: Ranker | None = None,
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
-) -> CompiledStateGraph:
+) -> TracerGraph:
     """Compile the deterministic ingress-to-finalization LangGraph."""
-    builder = StateGraph(TracerState)
+    builder: StateGraph[TracerState, None, TracerState, TracerState] = StateGraph(
+        TracerState
+    )
 
     async def query_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
         return await _query(state, phase_context=phase_context)
 
-    builder.add_node("query", query_node)
+    builder.add_node("query", query_node)  # pyright: ignore[reportUnknownMemberType]
     selected_moderation_provider = moderation_provider or MockModerationProvider()
     selected_refinement_actor = refinement_actor or MockQuestionRefinementActor()
     selected_retriever = retriever or MockRetriever()
@@ -231,7 +279,9 @@ def build_tracer_graph(
             "moderation": decision.model_dump(exclude_none=True),
         }
 
-    builder.add_node("pre_moderation", pre_moderation_node)
+    builder.add_node(  # pyright: ignore[reportUnknownMemberType]
+        "pre_moderation", pre_moderation_node
+    )
 
     async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
@@ -260,7 +310,9 @@ def build_tracer_graph(
             update["refinement_error"] = error
         return update
 
-    builder.add_node("question_refinement", question_refinement_node)
+    builder.add_node(  # pyright: ignore[reportUnknownMemberType]
+        "question_refinement", question_refinement_node
+    )
 
     async def retrieval_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
@@ -284,7 +336,9 @@ def build_tracer_graph(
             update["retrieval_error"] = error
         return update
 
-    builder.add_node("retrieval", retrieval_node)
+    builder.add_node(  # pyright: ignore[reportUnknownMemberType]
+        "retrieval", retrieval_node
+    )
 
     async def reranking_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
@@ -308,11 +362,14 @@ def build_tracer_graph(
             update["reranking_error"] = error
         return update
 
-    builder.add_node("reranking", reranking_node)
+    builder.add_node(  # pyright: ignore[reportUnknownMemberType]
+        "reranking", reranking_node
+    )
 
     if answer_actor is not None and selected_artifact_repository is not None:
 
         async def answer_node(state: TracerState) -> TracerStateUpdate:
+            assert phase_context is not None
             await _check_cancellation(phase_context)
             events, result, halted, error = await run_answer(
                 state,
@@ -342,11 +399,14 @@ def build_tracer_graph(
                 raise AnswerCancelled("answer publication cancelled at graph boundary")
             return update
 
-        builder.add_node("answer", answer_node)
+        builder.add_node(  # pyright: ignore[reportUnknownMemberType]
+            "answer", answer_node
+        )
 
         if groundedness_actor is not None:
 
             async def groundedness_node(state: TracerState) -> TracerStateUpdate:
+                assert phase_context is not None
                 await _check_cancellation(phase_context)
                 events, result, error = await run_groundedness(
                     state,
@@ -366,9 +426,12 @@ def build_tracer_graph(
                     update["groundedness_error"] = error
                 return update
 
-            builder.add_node("groundedness", groundedness_node)
+            builder.add_node(  # pyright: ignore[reportUnknownMemberType]
+                "groundedness", groundedness_node
+            )
 
         async def post_moderation_node(state: TracerState) -> TracerStateUpdate:
+            assert phase_context is not None
             await _check_cancellation(phase_context)
             events, decision, error = await run_post_moderation(
                 state,
@@ -387,7 +450,9 @@ def build_tracer_graph(
                 update["post_moderation_error"] = error
             return update
 
-        builder.add_node("post_moderation", post_moderation_node)
+        builder.add_node(  # pyright: ignore[reportUnknownMemberType]
+            "post_moderation", post_moderation_node
+        )
 
     async def finalization_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
@@ -413,7 +478,9 @@ def build_tracer_graph(
             "final_response": response,
         }
 
-    builder.add_node("finalization", finalization_node)
+    builder.add_node(  # pyright: ignore[reportUnknownMemberType]
+        "finalization", finalization_node
+    )
     builder.add_edge(START, "query")
     builder.add_edge("query", "pre_moderation")
     builder.add_conditional_edges(
@@ -423,50 +490,65 @@ def build_tracer_graph(
     )
     builder.add_conditional_edges(
         "question_refinement",
-        lambda state: "end" if state.get("halted", False) else "retrieval",
+        _next_after_question_refinement,
         {"retrieval": "retrieval", "end": END},
     )
     builder.add_conditional_edges(
         "retrieval",
-        lambda state: "end" if state.get("halted", False) else "reranking",
+        _next_after_retrieval,
         {"reranking": "reranking", "end": END},
     )
-    reranking_routes = {"finalization": "finalization", "end": END}
+    reranking_routes: dict[Hashable, str] = {
+        "finalization": "finalization",
+        "end": END,
+    }
     if answer_actor is not None and selected_artifact_repository is not None:
         reranking_routes["answer"] = "answer"
+
+    def next_after_reranking(state: TracerState) -> str:
+        if state.get("halted", False):
+            return "end"
+        if answer_actor is not None and selected_artifact_repository is not None:
+            return "answer"
+        return "finalization"
+
     builder.add_conditional_edges(
         "reranking",
-        lambda state: (
-            "end"
-            if state.get("halted", False)
-            else "answer"
-            if answer_actor is not None and selected_artifact_repository is not None
-            else "finalization"
-        ),
+        next_after_reranking,
         reranking_routes,
     )
     if answer_actor is not None and selected_artifact_repository is not None:
-        answer_routes = {"finalization": "finalization", "end": END}
+        answer_routes: dict[Hashable, str] = {
+            "finalization": "finalization",
+            "end": END,
+        }
         if groundedness_actor is not None:
             answer_routes["groundedness"] = "groundedness"
         else:
             answer_routes["post_moderation"] = "post_moderation"
+
+        def next_after_answer(state: TracerState) -> str:
+            if state.get("halted", False):
+                return "end"
+            return (
+                "groundedness" if groundedness_actor is not None else "post_moderation"
+            )
+
         builder.add_conditional_edges(
             "answer",
-            lambda state: (
-                "end"
-                if state.get("halted", False)
-                else "groundedness"
-                if groundedness_actor is not None
-                else "post_moderation"
-            ),
+            next_after_answer,
             answer_routes,
         )
         if groundedness_actor is not None:
             builder.add_edge("groundedness", "post_moderation")
         builder.add_edge("post_moderation", "finalization")
     builder.add_edge("finalization", END)
-    return builder.compile(checkpointer=checkpointer)
+    return cast(
+        TracerGraph,
+        builder.compile(  # pyright: ignore[reportUnknownMemberType]
+            checkpointer=checkpointer
+        ),
+    )
 
 
 tracer_graph = build_tracer_graph()

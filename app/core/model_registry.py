@@ -9,7 +9,7 @@ appropriate ``system_prompt``, ``output_type``, and ``tools``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, TypeVar, cast, overload
 
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
@@ -17,6 +17,9 @@ from pydantic_ai.settings import ModelSettings
 
 from app.config.models import LLMConfig, ModelConfig
 from app.core.http_client_pool import HttpClientPool
+
+AgentDepsT = TypeVar("AgentDepsT")
+AgentOutputT = TypeVar("AgentOutputT")
 
 
 @dataclass(frozen=True)
@@ -73,16 +76,66 @@ class ModelRegistry:
             raise KeyError(f"Model '{name}' not found. Available: [{available}]")
         return self._models[name]
 
-    def create_agent(self, model_name: str, **agent_kwargs: Any) -> Agent:
+    @overload
+    def create_agent(
+        self,
+        model_name: str,
+        *,
+        deps_type: type[AgentDepsT],
+        output_type: type[AgentOutputT],
+        **agent_kwargs: Any,
+    ) -> Agent[AgentDepsT, AgentOutputT]: ...
+
+    @overload
+    def create_agent(
+        self,
+        model_name: str,
+        *,
+        output_type: type[AgentOutputT],
+        deps_type: None = None,
+        **agent_kwargs: Any,
+    ) -> Agent[None, AgentOutputT]: ...
+
+    @overload
+    def create_agent(
+        self,
+        model_name: str,
+        *,
+        deps_type: type[AgentDepsT],
+        output_type: type[str] = str,
+        **agent_kwargs: Any,
+    ) -> Agent[AgentDepsT, str]: ...
+
+    @overload
+    def create_agent(
+        self,
+        model_name: str,
+        *,
+        deps_type: None = None,
+        output_type: type[str] = str,
+        **agent_kwargs: Any,
+    ) -> Agent[None, str]: ...
+
+    def create_agent(
+        self,
+        model_name: str,
+        *,
+        deps_type: type[Any] | None = None,
+        output_type: type[Any] = str,
+        **agent_kwargs: Any,
+    ) -> Agent[Any, Any]:
         """Create a :class:`pydantic_ai.Agent` pre-configured with a named model.
 
         All extra *agent_kwargs* (``instructions``, ``output_type``,
         ``tools``, etc.) are forwarded directly to the Agent constructor.
         """
         registered = self.get_model(model_name)
+        if deps_type is not None:
+            agent_kwargs["deps_type"] = deps_type
         return Agent(
             registered.model,
             model_settings=registered.settings,
+            output_type=output_type,
             **agent_kwargs,
         )
 

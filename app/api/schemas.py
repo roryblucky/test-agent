@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.models.domain import (
     Document,
@@ -18,12 +18,14 @@ from app.services.flow_context import FlowContext
 
 class QuestionAnswerSelector(BaseModel):
     """Option selector for clarification requests."""
+
     question: str = Field(description="需要用户澄清的具体问题")
     options: list[str] = Field(description="提供给用户的可选快速回答列表")
 
 
 class ClarificationRequest(BaseModel):
     """Structured request to ask the user for clarification before proceeding."""
+
     response: str = Field(description="向用户解释为什么需要澄清的回复话术")
     quick_questions: list[QuestionAnswerSelector] | None = Field(
         None, description="结构化的追问列表"
@@ -36,11 +38,14 @@ class QueryRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     query: str = Field(..., min_length=1, description="The user's question")
-    session_id: str | None = Field(
-        None,
-        alias="sessionId",
-        description="Session ID for multi-turn conversation continuity",
-    )
+    session_id: Annotated[
+        str | None,
+        Field(
+            validation_alias=AliasChoices("session_id", "sessionId"),
+            serialization_alias="sessionId",
+            description="Session ID for multi-turn conversation continuity",
+        ),
+    ] = None
 
 
 class QueryResponse(BaseModel):
@@ -52,13 +57,19 @@ class QueryResponse(BaseModel):
     refined_query: str | None = None
     intent: IntentResult | None = None
     answer: str | None = None
-    documents: list[Document] = Field(default_factory=list)
+    documents: list[Document] = Field(default_factory=list[Document])
     moderation: ModerationResult | None = None
     groundedness: GroundednessResult | None = None
     clarification: ClarificationRequest | None = None
-    session_id: str | None = Field(None, alias="sessionId")
+    session_id: Annotated[
+        str | None,
+        Field(
+            validation_alias=AliasChoices("session_id", "sessionId"),
+            serialization_alias="sessionId",
+        ),
+    ] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    citations: list[CitationReference] = Field(default_factory=list)
+    citations: list[CitationReference] = Field(default_factory=list[CitationReference])
 
     @classmethod
     def from_flow_context(cls, ctx: FlowContext) -> QueryResponse:
@@ -80,7 +91,8 @@ class QueryResponse(BaseModel):
 
         citations_raw = final_meta.pop("citations", [])
         citations = [
-            c if isinstance(c, CitationReference)
+            c
+            if isinstance(c, CitationReference)
             else CitationReference.model_validate(c)
             for c in citations_raw
         ]

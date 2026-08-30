@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any
@@ -70,6 +70,11 @@ class LiveEventWakeups:
         self._pubsub: Any | None = None
         self._listener: asyncio.Task[None] | None = None
 
+    @property
+    def active_subscription_count(self) -> int:
+        """Return the number of active run-event subscription slots."""
+        return len(self._slots)
+
     async def start(self) -> None:
         """Begin receiving remote best-effort wakeups without blocking startup."""
         if self._redis_url is not None and self._listener is None:
@@ -94,7 +99,7 @@ class LiveEventWakeups:
     @asynccontextmanager
     async def subscribe(
         self, tenant_id: str, run_id: UUID
-    ) -> AsyncIterator[LiveEventSubscription]:
+    ) -> AsyncGenerator[LiveEventSubscription]:
         """Retain local state only while at least one follower is active."""
         async with self._subscribe(self._slots, tenant_id, run_id) as subscription:
             yield subscription
@@ -102,7 +107,7 @@ class LiveEventWakeups:
     @asynccontextmanager
     async def subscribe_cancellation(
         self, tenant_id: str, run_id: UUID
-    ) -> AsyncIterator[LiveEventSubscription]:
+    ) -> AsyncGenerator[LiveEventSubscription]:
         """Retain one owner-local cancellation signal subscription."""
         async with self._subscribe(
             self._cancellation_slots, tenant_id, run_id
@@ -115,7 +120,7 @@ class LiveEventWakeups:
         slots: dict[tuple[str, UUID], _WakeupSlot],
         tenant_id: str,
         run_id: UUID,
-    ) -> AsyncIterator[LiveEventSubscription]:
+    ) -> AsyncGenerator[LiveEventSubscription]:
         key = (tenant_id, run_id)
         async with self._slots_lock:
             slot = slots.setdefault(key, _WakeupSlot())
@@ -195,6 +200,8 @@ class LiveEventWakeups:
 
     def _redis_client(self) -> Any:
         if self._redis is None:
+            if self._redis_url is None:
+                raise RuntimeError("Redis wakeups are not configured")
             self._redis = aioredis.from_url(
                 self._redis_url,
                 decode_responses=True,
@@ -208,9 +215,10 @@ class LiveEventWakeups:
         while True:
             try:
                 redis = self._redis_client()
-                self._pubsub = redis.pubsub()
-                await self._pubsub.subscribe(_CHANNEL, _CANCELLATION_CHANNEL)
-                async for message in self._pubsub.listen():
+                pubsub = redis.pubsub()
+                self._pubsub = pubsub
+                await pubsub.subscribe(_CHANNEL, _CANCELLATION_CHANNEL)
+                async for message in pubsub.listen():
                     if message.get("type") != "message":
                         continue
                     payload = json.loads(message["data"])

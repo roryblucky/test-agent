@@ -11,6 +11,7 @@ Default sinks:
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -113,8 +114,7 @@ class BigQueryAuditSink(AuditSink):
         """Lazy-initialise the BigQuery client."""
         if self._client is None:
             try:
-                from google.cloud import bigquery
-
+                bigquery: Any = importlib.import_module("google.cloud.bigquery")
                 self._client = bigquery.Client(project=self._project_id)
                 self._ensure_table()
             except ImportError:
@@ -128,8 +128,8 @@ class BigQueryAuditSink(AuditSink):
     def _ensure_table(self) -> None:
         """Create dataset and table if they don't exist."""
         from google.api_core.exceptions import Conflict
-        from google.cloud import bigquery
 
+        bigquery: Any = importlib.import_module("google.cloud.bigquery")
         client = self._client
 
         # Create dataset if needed
@@ -142,7 +142,7 @@ class BigQueryAuditSink(AuditSink):
             pass
 
         # Define table schema
-        schema = [
+        schema: list[Any] = [
             bigquery.SchemaField("timestamp", "TIMESTAMP", mode="REQUIRED"),
             bigquery.SchemaField("trace_id", "STRING"),
             bigquery.SchemaField("app_id", "STRING", mode="REQUIRED"),

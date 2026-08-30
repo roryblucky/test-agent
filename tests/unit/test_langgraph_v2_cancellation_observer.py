@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -17,7 +18,7 @@ class _IntentRepository:
         self.requested_after = requested_after
         self.requested = asyncio.Event()
 
-    async def is_requested(self, **kwargs: object) -> bool:
+    async def is_requested(self, **kwargs: Any) -> bool:
         del kwargs
         self.calls += 1
         if self.calls >= self.requested_after:

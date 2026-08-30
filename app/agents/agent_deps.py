@@ -11,6 +11,7 @@ from app.services.tenant_manager import TenantProviders
 
 if TYPE_CHECKING:
     from app.services.flow_context import FlowContext
+    from app.skills.registry import TenantSkillRegistry
 
 
 @dataclass
@@ -28,11 +29,11 @@ class AgentDeps:
     emitter: EventEmitter | None = None
 
     # Skill system — injected so activate_skill / load_references tools work
-    skill_registry: object | None = None   # TenantSkillRegistry (avoid circular import)
+    skill_registry: TenantSkillRegistry | None = None
     tenant_id: str = ""
     # Tracks which skills have already been activated in the current run
-    activated_skill_names: list[str] = field(default_factory=list)
+    activated_skill_names: list[str] = field(default_factory=list[str])
     # Built-in tools available to this agent after tenant/runtime policy filtering
-    available_tool_names: list[str] = field(default_factory=list)
+    available_tool_names: list[str] = field(default_factory=list[str])
     # Optional workflow execution context for tools that write evidence/audit data
     flow_context: FlowContext | None = None

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any, Protocol, cast
 
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel
 
 from app.langgraph_v2.contracts import GraphEventJournalPolicy, TracerStreamEvent
 
@@ -31,6 +32,7 @@ class RequestOwnedGraph(Protocol):
     def astream(
         self,
         graph_input: Any | None,
+        /,
         *,
         config: RunnableConfig | None = None,
         stream_mode: list[str] | str | None = None,
@@ -78,7 +80,7 @@ async def stream_graph(
     *,
     config: RunnableConfig | None = None,
     event_sink: Callable[[TracerStreamEvent], Awaitable[None]] | None = None,
-) -> AsyncIterator[str]:
+) -> AsyncGenerator[str]:
     """Yield one legacy-compatible SSE frame for each public graph update.
 
     ``graph_input`` may be a new graph state or ``None`` when LangGraph should
@@ -141,24 +143,25 @@ async def stream_graph(
                 raise cleanup_error
 
 
-def _stream_part(part: Any) -> tuple[str | None, Any]:
+def _stream_part(part: object) -> tuple[str | None, object]:
     """Read LangGraph's pinned multiple-mode tuple shape."""
-    if isinstance(part, tuple) and len(part) == 2 and isinstance(part[0], str):
-        return part[0], part[1]
+    if isinstance(part, tuple):
+        tuple_part = cast(tuple[object, ...], part)
+        if len(tuple_part) == 2 and isinstance(tuple_part[0], str):
+            return tuple_part[0], tuple_part[1]
+        return None, tuple_part
     return None, part
 
 
-def _as_mapping(value: Any) -> Mapping[str, Any] | None:
+def _as_mapping(value: object) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
-        return value
-    dump = getattr(value, "model_dump", None)
-    if dump is None:
-        return None
-    dumped = dump()
-    return dumped if isinstance(dumped, Mapping) else None
+        return cast(Mapping[str, Any], value)
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    return None
 
 
-def _event_mappings(value: Any) -> list[Mapping[str, Any]]:
+def _event_mappings(value: object) -> list[Mapping[str, Any]]:
     """Extract event-shaped values without exposing arbitrary graph state."""
     mapping = _as_mapping(value)
     if mapping is not None:
@@ -174,7 +177,7 @@ def _event_mappings(value: Any) -> list[Mapping[str, Any]]:
         return []
     if isinstance(value, (list, tuple)):
         events: list[Mapping[str, Any]] = []
-        for item in value:
+        for item in cast(list[object] | tuple[object, ...], value):
             events.extend(_event_mappings(item))
         return events
     return []

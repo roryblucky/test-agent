@@ -1,6 +1,6 @@
 """Unit tests for FlowEngine."""
 
-from types import SimpleNamespace
+import unittest.mock
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,6 +13,12 @@ from app.config.models import (
     TenantConfig,
 )
 from app.models.domain import Document, ModerationResult
+from app.providers.base import (
+    BaseModerationProvider,
+    BaseRankerProvider,
+    BaseRetrieverProvider,
+)
+from app.services.flow_context import FlowContext
 from app.services.flow_engine import FlowEngine
 from app.services.handlers.base import StepHandler
 from app.services.handlers.moderation import ModerationHandler
@@ -21,28 +27,31 @@ from app.services.handlers.retriever import RetrieverHandler
 
 
 @pytest.fixture
-def mock_handlers():
+def mock_handlers() -> dict[FlowStepType, MagicMock]:
     """Mock StepHandlers."""
-    handlers = {}
+
+    async def return_context(ctx: FlowContext, _step: FlowStep) -> FlowContext:
+        return ctx
+
+    handlers: dict[FlowStepType, MagicMock] = {}
     for step_type in FlowStepType:
         mock_handler = MagicMock(spec=StepHandler)
-        mock_handler.handle = AsyncMock(side_effect=lambda ctx, step: ctx)
+        mock_handler.handle = AsyncMock(side_effect=return_context)
         handlers[step_type] = mock_handler
     return handlers
 
 
 @pytest.fixture
-def flow_engine(mock_handlers):
+def flow_engine(mock_handlers: dict[FlowStepType, MagicMock]) -> FlowEngine:
     """Create FlowEngine instance with mocks."""
     config = TenantConfig(
-        id="test-tenant",
-        kmsAppName="Test App",
-        applicationId="app-123",
-        adGroups=["group1"],
+        kms_app_name="Test App",
+        application_id="app-123",
+        ad_groups=["group1"],
         flow_config=FlowConfig(
             steps=[
                 FlowStep(type=FlowStepType.MODERATION, mode="pre"),
-                FlowStep(type=FlowStepType.RETRIEVER),
+                FlowStep(type=FlowStepType.RETRIEVER, settings={"top_k": 3}),
             ]
         ),
         llm_config=LLMConfig(models={}),
@@ -51,7 +60,11 @@ def flow_engine(mock_handlers):
 
 
 @pytest.mark.asyncio
-async def test_execute_pipeline(flow_engine, mock_handlers, mock_emitter):
+async def test_execute_pipeline(
+    flow_engine: FlowEngine,
+    mock_handlers: dict[FlowStepType, MagicMock],
+    mock_emitter: unittest.mock.AsyncMock,
+):
     """Test full pipeline execution."""
     ctx = await flow_engine.execute("test query", emitter=mock_emitter)
     assert ctx is not None
@@ -65,11 +78,10 @@ async def test_execute_pipeline(flow_engine, mock_handlers, mock_emitter):
     assert mock_emitter.emit_step_start.call_count == 2
 
 
-class FakeRetrieverProvider:
+class FakeRetrieverProvider(BaseRetrieverProvider):
     """Minimal retriever provider for legacy RAG regression coverage."""
 
     def __init__(self) -> None:
-        self.config = SimpleNamespace(top_k=3)
         self.calls: list[tuple[str, int]] = []
 
     async def retrieve(
@@ -82,7 +94,7 @@ class FakeRetrieverProvider:
         ]
 
 
-class FakeRankerProvider:
+class FakeRankerProvider(BaseRankerProvider):
     """Minimal ranker provider for legacy RAG regression coverage."""
 
     def __init__(self) -> None:
@@ -98,7 +110,7 @@ class FakeRankerProvider:
         ]
 
 
-class FakeModerationProvider:
+class FakeModerationProvider(BaseModerationProvider):
     """Minimal moderation provider for legacy RAG regression coverage."""
 
     def __init__(self) -> None:
@@ -112,7 +124,7 @@ class FakeModerationProvider:
 class FakeLLMHandler:
     """Small LLM handler double that preserves old mode semantics."""
 
-    async def handle(self, ctx, step):
+    async def handle(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         if step.mode == "refine_question":
             ctx.refined_query = "refined legacy query"
         elif step.mode == "answer":
@@ -126,17 +138,17 @@ class FakeLLMHandler:
 
 
 @pytest.mark.asyncio
-async def test_legacy_rag_flow_regression(mock_emitter):
+async def test_legacy_rag_flow_regression(mock_emitter: unittest.mock.AsyncMock):
     """Cover the existing moderation -> llm -> retriever -> ranking -> answer chain."""
     config = TenantConfig(
-        kmsAppName="Legacy RAG App",
-        applicationId="legacy-rag",
-        adGroups=["group1"],
+        kms_app_name="Legacy RAG App",
+        application_id="legacy-rag",
+        ad_groups=["group1"],
         flow_config=FlowConfig(
             steps=[
                 FlowStep(type=FlowStepType.MODERATION, mode="pre"),
                 FlowStep(type=FlowStepType.LLM, mode="refine_question"),
-                FlowStep(type=FlowStepType.RETRIEVER),
+                FlowStep(type=FlowStepType.RETRIEVER, settings={"top_k": 3}),
                 FlowStep(type=FlowStepType.RANKING),
                 FlowStep(type=FlowStepType.LLM, mode="answer"),
             ]

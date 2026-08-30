@@ -1,5 +1,4 @@
-"""
-银标准生成器 (Silver Standard Generator)
+"""银标准生成器 (Silver Standard Generator)
 ========================================
 解决"没有标准答案"的评测困境。
 使用大模型作为裁判，严格依据上下文生成"银标准"参考答案，
@@ -11,10 +10,11 @@
 
 import json
 import os
+from typing import Any, cast
 
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
@@ -32,19 +32,24 @@ SYSTEM_INSTRUCTION = """你是一个客观严格的金融知识打标员。
 如果参考文档中无法回答用户问题，请明确输出：\u201c无法根据提供文档回答\u201d。
 确保你的答案绝对没有任何主观臆测和外部知识的幻觉。"""
 
-system_prompt = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_INSTRUCTION),
-    ("human", "[用户问题(Query)]: {query}\n[参考文档(Context)]: {context_str}\n\n[标准答案]: "),
-])
+system_prompt = ChatPromptTemplate.from_messages(  # pyright: ignore[reportUnknownMemberType]
+    [
+        ("system", SYSTEM_INSTRUCTION),
+        (
+            "human",
+            "[用户问题(Query)]: {query}\n[参考文档(Context)]: {context_str}\n\n[标准答案]: ",
+        ),
+    ]
+)
 
-chain = system_prompt | llm
+chain: Any = system_prompt | llm  # pyright: ignore[reportUnknownVariableType] -- LangChain runnable input uses Unknown
 
 
-def generate_silver_standards(input_path: str, output_path: str):
+def generate_silver_standards(input_path: str, output_path: str) -> None:
     """读取日志数据，为每条记录生成银标准答案。"""
     print(f"📂 Loading data from {input_path}")
-    with open(input_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    with open(input_path, encoding="utf-8") as f:
+        data = cast(list[dict[str, Any]], json.load(f))
 
     for i, item in enumerate(data, 1):
         print(f"\n[{i}/{len(data)}] Processing query: {item['query']}")
@@ -54,7 +59,10 @@ def generate_silver_standards(input_path: str, output_path: str):
         response = chain.invoke({"query": item["query"], "context_str": context_str})
 
         # 将银标准存入 reference 字段
-        item["reference"] = response.content.strip()
+        content = response.content
+        if not isinstance(content, str):
+            raise TypeError("Silver-standard model must return text content")
+        item["reference"] = content.strip()
         print(f"  ✅ Silver Standard: {item['reference'][:80]}...")
 
     # 导出包含银标准的数据

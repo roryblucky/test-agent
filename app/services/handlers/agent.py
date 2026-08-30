@@ -147,6 +147,19 @@ class AgentHandler(StepHandler):
                     mode,
                 )
 
+    def set_agent_override(
+        self,
+        mode: str,
+        agent_config: AgentConfig,
+        agent: Agent[Any, Any],
+    ) -> None:
+        """Install an explicitly supplied agent for one configured mode."""
+        self._agent_cache[self._cache_key(mode, agent_config)] = agent
+
+    def has_cached_agent(self, mode: str, agent_config: AgentConfig) -> bool:
+        """Return whether an agent has been built for one configured mode."""
+        return self._cache_key(mode, agent_config) in self._agent_cache
+
     def _build_tenant_agent(
         self, agent_config: AgentConfig, mode: str
     ) -> Agent[Any, Any]:
@@ -194,7 +207,7 @@ class AgentHandler(StepHandler):
             agent_config,
             skill_defs=skill_defs,
         )
-        domain_toolset = FunctionToolset(tool_resolution.functions)
+        domain_toolset = FunctionToolset[AgentDeps](tool_resolution.functions)
 
         # --- 4. System prompt (5-layer: Identity + Guardrails + Tenant/Domain Contract + Context) ---
         # NOTE: Tier 1 skill discovery catalog is injected by SkillsCapability
@@ -221,9 +234,17 @@ class AgentHandler(StepHandler):
             for summary in self.skill_registry.get_summaries(self.app_id):
                 if summary.name not in (agent_config.skills or []):
                     continue
-                skill = self.skill_registry.get_activated_skill(self.app_id, summary.name)
-                if skill and skill.metadata.redirect and skill.metadata.redirect_output_schema:
-                    model_cls = OUTPUT_MODEL_REGISTRY.get(skill.metadata.redirect_output_schema)
+                skill = self.skill_registry.get_activated_skill(
+                    self.app_id, summary.name
+                )
+                if (
+                    skill
+                    and skill.metadata.redirect
+                    and skill.metadata.redirect_output_schema
+                ):
+                    model_cls = OUTPUT_MODEL_REGISTRY.get(
+                        skill.metadata.redirect_output_schema
+                    )
                     if model_cls:
                         output_types.append(
                             ToolOutput(
@@ -242,7 +263,8 @@ class AgentHandler(StepHandler):
         # --- 6. Assemble the Agent ---
         model = self.registry.get_model(agent_config.llm_type)
         return Agent(
-            model=model,
+            model=model.model,
+            model_settings=model.settings,
             deps_type=AgentDeps,
             output_type=output_type,
             instructions=system_prompt,
@@ -392,7 +414,7 @@ class AgentHandler(StepHandler):
         if self.skill_registry is None:
             return []
 
-        skills = []
+        skills: list[SkillDefinition] = []
         for skill_name in agent_config.skills:
             skill = self.skill_registry.get_activated_skill(self.app_id, skill_name)
             if skill is not None:
@@ -422,9 +444,7 @@ class AgentHandler(StepHandler):
         )
 
     @staticmethod
-    def _build_planner_runtime_prompt(
-        ctx: FlowContext, standalone_query: str
-    ) -> str:
+    def _build_planner_runtime_prompt(ctx: FlowContext, standalone_query: str) -> str:
         """Build the per-run planner prompt without full chat history.
 
         The resolver/refine step owns multi-turn disambiguation.  Planner gets

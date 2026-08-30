@@ -26,7 +26,7 @@ class MemoryEntry:
     """A single long-term memory item."""
 
     content: str
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict[str, Any])
     score: float = 1.0  # relevance score when retrieved
 
 

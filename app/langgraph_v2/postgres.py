@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import os
 import socket
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager
-from typing import Any, Self
+from typing import Any, Protocol, Self
 
 from fastapi import FastAPI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -62,7 +62,17 @@ class V2PostgresConfig(BaseModel):
 
 
 PoolFactory = Callable[..., Any]
-CheckpointerFactory = Callable[[Any], AsyncPostgresSaver]
+
+
+class Checkpointer(Protocol):
+    """Saver behavior required during application startup."""
+
+    async def setup(self) -> None:
+        """Create or validate checkpoint storage."""
+        ...
+
+
+CheckpointerFactory = Callable[[Any], Checkpointer]
 
 
 @asynccontextmanager
@@ -72,7 +82,7 @@ async def postgres_lifespan(
     config: V2PostgresConfig | None = None,
     pool_factory: PoolFactory = AsyncConnectionPool,
     checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
-) -> AsyncIterator[None]:
+) -> AsyncGenerator[None]:
     """Open the configured pool for the application lifespan and always close it."""
     resolved_config = config or V2PostgresConfig.from_environment()
     app.state.langgraph_v2_postgres_pool = None
@@ -99,6 +109,8 @@ async def postgres_lifespan(
             kwargs={"autocommit": True, "prepare_threshold": 0},
             open=False,
         )
+        if pool is None:
+            raise RuntimeError("PostgreSQL pool factory returned no pool")
         await pool.open(wait=True)
         app.state.langgraph_v2_postgres_pool = pool
         checkpointer = checkpointer_factory(pool)

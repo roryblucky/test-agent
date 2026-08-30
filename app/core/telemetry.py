@@ -7,10 +7,11 @@ functions with spans.
 from __future__ import annotations
 
 import functools
+import importlib
 import inspect
 import logging
 from collections.abc import Callable
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar, cast
 
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -18,8 +19,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import (
     ConsoleSpanExporter,
     SimpleSpanProcessor,
+    SpanExporter,
 )
-from opentelemetry.semconv.resource import ResourceAttributes
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -31,8 +32,8 @@ class TelemetryService:
     def __init__(self, service_name: str, version: str = "0.1.0") -> None:
         self.resource = Resource.create(
             {
-                ResourceAttributes.SERVICE_NAME: service_name,
-                ResourceAttributes.SERVICE_VERSION: version,
+                "service.name": service_name,
+                "service.version": version,
             }
         )
         self.provider = TracerProvider(resource=self.resource)
@@ -40,11 +41,12 @@ class TelemetryService:
         # Configure exporter based on environment
         # In a real app, check env vars (e.g., K_SERVICE) to detect GCP
         try:
-            from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
             # Use GCP Trace Exporter for production/GCP envs
-            exporter = CloudTraceSpanExporter()
+            cloud_trace = importlib.import_module("opentelemetry.exporter.cloud_trace")
+            exporter_type = cast(type[SpanExporter], cloud_trace.CloudTraceSpanExporter)
+            exporter = exporter_type()
             processor = BatchSpanProcessor(exporter)
         except ImportError:
             # Fallback to Console for local dev if GCP libs missing

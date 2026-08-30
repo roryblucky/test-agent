@@ -1,9 +1,10 @@
 """Unit tests for query resolver runtime prompt handling."""
 
-from typing import Any, Self
+from typing import Any, Self, cast
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -64,7 +65,9 @@ class FakeResolverAgent:
 
 def _handler(fake_agent: FakeResolverAgent) -> LLMHandler:
     handler = LLMHandler(MagicMock())
-    handler._agent_cache[("refine_question", "fast")] = fake_agent
+    handler.set_agent_override(
+        "refine_question", "fast", cast(Agent[Any, Any], fake_agent)
+    )
     return handler
 
 
@@ -97,7 +100,10 @@ async def test_query_resolver_uses_sanitized_history_runtime_prompt() -> None:
     assert fake_agent.last_message_history is None
     assert fake_agent.last_prompt is not None
     assert "<query_resolver_input>" in fake_agent.last_prompt
-    assert "<latest_user_query>\n那微软呢？\n</latest_user_query>" in fake_agent.last_prompt
+    assert (
+        "<latest_user_query>\n那微软呢？\n</latest_user_query>"
+        in fake_agent.last_prompt
+    )
     assert "[user]\n苹果最近怎么看？" in fake_agent.last_prompt
     assert "[assistant]\n苹果需要基于最新证据判断。" in fake_agent.last_prompt
 
@@ -149,20 +155,20 @@ async def test_flow_engine_honors_stop_flow_after_step() -> None:
     """FlowEngine does not run later steps after a handler sets stop_flow."""
 
     class StopHandler:
-        async def handle(self, ctx, step):
+        async def handle(self, ctx: FlowContext, step: FlowStep, /) -> FlowContext:
             ctx.metadata["stop_flow"] = True
             ctx.metadata["stop_reason"] = "test_stop"
             ctx.llm_response = "stop"
             return ctx
 
     class ShouldNotRunHandler:
-        async def handle(self, ctx, step):
+        async def handle(self, ctx: FlowContext, step: FlowStep, /) -> FlowContext:
             raise AssertionError("downstream step should not run")
 
     tenant = TenantConfig(
-        kmsAppName="Stop Flow App",
-        applicationId="stop-flow-app",
-        adGroups=[],
+        kms_app_name="Stop Flow App",
+        application_id="stop-flow-app",
+        ad_groups=[],
         llm_config=LLMConfig(models={}),
         flow_config=FlowConfig(
             steps=[

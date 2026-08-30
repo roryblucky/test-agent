@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from app.langgraph_v2.artifacts import ArtifactStore
@@ -145,10 +145,14 @@ async def run_finalization(
         groundedness = await context.repository.get_completed(
             context.tenant_id, context.run_id, "groundedness"
         )
-        if groundedness is not None and isinstance(
-            groundedness.normalized_result, Mapping
-        ):
-            usages.append(groundedness.normalized_result.get("usage", {}))
+        raw_groundedness_result: object = (
+            groundedness.normalized_result if groundedness is not None else None
+        )
+        if isinstance(raw_groundedness_result, Mapping):
+            groundedness_result = cast(Mapping[str, Any], raw_groundedness_result)
+            usage_value = groundedness_result.get("usage", {})
+            if isinstance(usage_value, Mapping):
+                usages.append(cast(Mapping[str, Any], usage_value))
         usage = _combine_usage(usages)
         if usage is not None:
             normalized["metadata"]["usage"] = usage

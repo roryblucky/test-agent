@@ -6,6 +6,8 @@ based on FlowContext field values after step execution.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from app.config.models import (
@@ -29,25 +31,28 @@ from app.services.flow_engine import FlowEngine
 def _make_tenant(steps: list[FlowStep]) -> TenantConfig:
     """Build a minimal TenantConfig with the given steps."""
     return TenantConfig(
-        kmsAppName="test",
-        applicationId="test-app",
-        adGroups=["test"],
-        llmConfig=LLMConfig(
-            models={"fast": ModelConfig(provider="azure", modelName="gpt-4o-mini")}
+        kms_app_name="test",
+        application_id="test-app",
+        ad_groups=["test"],
+        llm_config=LLMConfig(
+            models={"fast": ModelConfig(provider="azure", model_name="gpt-4o-mini")}
         ),
-        flowConfig=FlowConfig(steps=steps),
+        flow_config=FlowConfig(steps=steps),
     )
+
+
+type Mutator = Callable[[FlowContext, FlowStep], None]
 
 
 class RecordingHandler:
     """Stub handler that records calls and optionally mutates context."""
 
-    def __init__(self, name: str, mutator=None):
-        self.name = name
+    def __init__(self, name: str, mutator: Mutator | None = None) -> None:
+        self.intent = name
         self.calls: list[str] = []
         self._mutator = mutator
 
-    async def handle(self, ctx: FlowContext, step) -> FlowContext:
+    async def handle(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
         label = step.step_label
         self.calls.append(label)
         if self._mutator:
@@ -55,21 +60,23 @@ class RecordingHandler:
         return ctx
 
 
-def _intent_mutator(intent_value: str):
+def _intent_mutator(intent_value: str) -> Mutator:
     """Return a mutator that sets ctx.intent to a mock IntentResult."""
 
-    def _mutate(ctx: FlowContext, step):
+    def _mutate(ctx: FlowContext, step: FlowStep) -> None:
         from app.models.workflow import IntentResult
 
+        del step
         ctx.intent = IntentResult(intent=intent_value, confidence=0.95)
 
     return _mutate
 
 
-def _clarification_mutator():
+def _clarification_mutator() -> Mutator:
     """Return a mutator that sets a generic clarification request."""
 
-    def _mutate(ctx: FlowContext, step):
+    def _mutate(ctx: FlowContext, step: FlowStep) -> None:
+        del step
         ctx.metadata["needs_clarification"] = True
         ctx.clarification_request = {
             "response": "Which product are you asking about?",
@@ -90,9 +97,7 @@ class TestFlowRoutingAbort:
     @pytest.mark.asyncio
     async def test_abort_on_intent_match(self):
         """Pipeline aborts when intent matches out_of_scope."""
-        llm_handler = RecordingHandler(
-            "llm", mutator=_intent_mutator("out_of_scope")
-        )
+        llm_handler = RecordingHandler("llm", mutator=_intent_mutator("out_of_scope"))
 
         steps = [
             FlowStep(
@@ -100,8 +105,8 @@ class TestFlowRoutingAbort:
                 mode="intent",
                 routing=[
                     StepRoutingRule(
-                        matchField="intent.intent",
-                        matchValue="out_of_scope",
+                        match_field="intent.intent",
+                        match_value="out_of_scope",
                         action=StepRoutingAction.ABORT,
                         response="This question is out of scope.",
                     ),
@@ -132,10 +137,10 @@ class TestFlowRoutingAbort:
                 mode="intent",
                 routing=[
                     StepRoutingRule(
-                        matchField="metadata.needs_clarification",
-                        matchValue=True,
+                        match_field="metadata.needs_clarification",
+                        match_value=True,
                         action=StepRoutingAction.ABORT,
-                        responseFromField="clarification_request.response",
+                        response_from_field="clarification_request.response",
                     ),
                 ],
             ),
@@ -163,8 +168,8 @@ class TestFlowRoutingAbort:
                 mode="intent",
                 routing=[
                     StepRoutingRule(
-                        matchField="intent.intent",
-                        matchValue="out_of_scope",
+                        match_field="intent.intent",
+                        match_value="out_of_scope",
                         action=StepRoutingAction.ABORT,
                         response="Out of scope.",
                     ),
@@ -190,9 +195,7 @@ class TestFlowRoutingSkipTo:
     @pytest.mark.asyncio
     async def test_skip_to_step_label(self):
         """Pipeline skips forward to a step identified by type:mode label."""
-        handler = RecordingHandler(
-            "llm", mutator=_intent_mutator("simple_query")
-        )
+        handler = RecordingHandler("llm", mutator=_intent_mutator("simple_query"))
 
         steps = [
             FlowStep(
@@ -200,10 +203,10 @@ class TestFlowRoutingSkipTo:
                 mode="intent",
                 routing=[
                     StepRoutingRule(
-                        matchField="intent.intent",
-                        matchValue="simple_query",
+                        match_field="intent.intent",
+                        match_value="simple_query",
                         action=StepRoutingAction.SKIP_TO,
-                        targetStep="llm:answer",
+                        target_step="llm:answer",
                     ),
                 ],
             ),
@@ -227,9 +230,7 @@ class TestFlowRoutingGoto:
     @pytest.mark.asyncio
     async def test_goto_named_step(self):
         """Pipeline jumps to a named step."""
-        handler = RecordingHandler(
-            "llm", mutator=_intent_mutator("fast_answer")
-        )
+        handler = RecordingHandler("llm", mutator=_intent_mutator("fast_answer"))
         analysis_handler = RecordingHandler("analysis")
 
         steps = [
@@ -238,10 +239,10 @@ class TestFlowRoutingGoto:
                 mode="intent",
                 routing=[
                     StepRoutingRule(
-                        matchField="intent.intent",
-                        matchValue="fast_answer",
+                        match_field="intent.intent",
+                        match_value="fast_answer",
                         action=StepRoutingAction.GOTO,
-                        targetStep="final_answer",
+                        target_step="final_answer",
                     ),
                 ],
             ),
@@ -274,9 +275,7 @@ class TestFlowRoutingListMatch:
     @pytest.mark.asyncio
     async def test_match_value_in_list(self):
         """Routing rule matches when actual value is in a list of expected."""
-        handler = RecordingHandler(
-            "llm", mutator=_intent_mutator("chitchat")
-        )
+        handler = RecordingHandler("llm", mutator=_intent_mutator("chitchat"))
 
         steps = [
             FlowStep(
@@ -284,8 +283,8 @@ class TestFlowRoutingListMatch:
                 mode="intent",
                 routing=[
                     StepRoutingRule(
-                        matchField="intent.intent",
-                        matchValue=["out_of_scope", "chitchat"],
+                        match_field="intent.intent",
+                        match_value=["out_of_scope", "chitchat"],
                         action=StepRoutingAction.ABORT,
                         response="I can only answer knowledge queries.",
                     ),
@@ -342,26 +341,26 @@ class TestResolveField:
     def test_simple_field(self):
         ctx = FlowContext(query="test")
         ctx.refined_query = "refined"
-        assert FlowEngine._resolve_field(ctx, "refined_query") == "refined"
+        assert FlowEngine.resolve_field(ctx, "refined_query") == "refined"
 
     def test_nested_field(self):
         from app.models.workflow import IntentResult
 
         ctx = FlowContext(query="test")
         ctx.intent = IntentResult(intent="knowledge_query", confidence=0.9)
-        assert FlowEngine._resolve_field(ctx, "intent.intent") == "knowledge_query"
-        assert FlowEngine._resolve_field(ctx, "intent.confidence") == 0.9
+        assert FlowEngine.resolve_field(ctx, "intent.intent") == "knowledge_query"
+        assert FlowEngine.resolve_field(ctx, "intent.confidence") == 0.9
 
     def test_metadata_dict_field(self):
         ctx = FlowContext(query="test")
         ctx.metadata["custom_key"] = "custom_value"
-        assert FlowEngine._resolve_field(ctx, "metadata.custom_key") == "custom_value"
+        assert FlowEngine.resolve_field(ctx, "metadata.custom_key") == "custom_value"
 
     def test_missing_field_returns_none(self):
         ctx = FlowContext(query="test")
-        assert FlowEngine._resolve_field(ctx, "intent.intent") is None
-        assert FlowEngine._resolve_field(ctx, "nonexistent") is None
+        assert FlowEngine.resolve_field(ctx, "intent.intent") is None
+        assert FlowEngine.resolve_field(ctx, "nonexistent") is None
 
     def test_deeply_nested_none(self):
         ctx = FlowContext(query="test")
-        assert FlowEngine._resolve_field(ctx, "intent.intent.deep") is None
+        assert FlowEngine.resolve_field(ctx, "intent.intent.deep") is None

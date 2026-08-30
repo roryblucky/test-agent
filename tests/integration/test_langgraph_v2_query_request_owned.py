@@ -430,9 +430,7 @@ async def test_graph_close_failure_without_primary_error_is_reported(
             del state, options
             return FailingCloseStream()
 
-    app = persistent_tracer_app(
-        langgraph_v2_migrated_database_url, FailingCloseGraph()
-    )
+    app = persistent_tracer_app(langgraph_v2_migrated_database_url, FailingCloseGraph())
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
             V2QueryRequest(query="hello", conversation_id="conversation-1"),

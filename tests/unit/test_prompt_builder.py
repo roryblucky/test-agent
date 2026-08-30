@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from app.config.models import DomainConfig, TenantOutputConfig
 from app.prompts.builder import LayeredPromptBuilder
 
@@ -39,9 +37,7 @@ class TestBuildLayers:
         assert "approved sources" in prompt
 
     def test_context_layer(self):
-        prompt = LayeredPromptBuilder.build(
-            context={"current_date": "2026-05-17"}
-        )
+        prompt = LayeredPromptBuilder.build(context={"current_date": "2026-05-17"})
         assert "<context>" in prompt
         assert "2026-05-17" in prompt
 
@@ -106,9 +102,9 @@ class TestBuildFromConfig:
 
         class FakeTenantConfig:
             output_config = TenantOutputConfig(
-                defaultFormat="markdown",
+                default_format="markdown",
                 disclaimer="Past performance is not indicative of future results.",
-                forbiddenPhrases=["guarantee", "risk-free"],
+                forbidden_phrases=["guarantee", "risk-free"],
             )
             domain_config = None
 
@@ -126,7 +122,7 @@ class TestBuildFromConfig:
             output_config = None
             domain_config = DomainConfig(
                 name="wealth",
-                allowModelCommonKnowledge=False,
+                allow_model_common_knowledge=False,
                 locale="en-US",
             )
 
@@ -142,9 +138,7 @@ class TestBuildFromConfig:
         """Both configs produce both contract layers."""
 
         class FakeTenantConfig:
-            output_config = TenantOutputConfig(
-                disclaimer="Disclaimer text."
-            )
+            output_config = TenantOutputConfig(disclaimer="Disclaimer text.")
             domain_config = DomainConfig(name="legal")
 
         prompt = LayeredPromptBuilder.build_from_config(
@@ -166,7 +160,7 @@ class TestBuildFromConfig:
             output_config = None
             domain_config = DomainConfig(
                 name="general",
-                allowModelCommonKnowledge=True,
+                allow_model_common_knowledge=True,
             )
 
         prompt = LayeredPromptBuilder.build_from_config(

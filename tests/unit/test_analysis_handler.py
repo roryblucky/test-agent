@@ -1,5 +1,6 @@
 """Unit tests for analysis observability."""
 
+import unittest.mock
 from datetime import UTC, datetime
 
 import pytest
@@ -28,7 +29,7 @@ def _evidence(evidence_id: str) -> AggregatedEvidence:
 
 @pytest.mark.asyncio
 async def test_analysis_includes_phase7_streaming_and_review_fields(
-    mock_emitter,
+    mock_emitter: unittest.mock.AsyncMock,
 ) -> None:
     """Analysis captures streaming policy and execution data."""
     ctx = FlowContext(query="query", session_id="session-a", emitter=mock_emitter)

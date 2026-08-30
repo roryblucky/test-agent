@@ -15,11 +15,17 @@ Example::
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, overload
 
 from pydantic import BaseModel
 
 from app.core.http_client_pool import HttpClientPool
+from app.providers.base import (
+    BaseGroundednessProvider,
+    BaseModerationProvider,
+    BaseRankerProvider,
+    BaseRetrieverProvider,
+)
 
 # Global registry: (component, provider) → implementation class
 _REGISTRY: dict[tuple[str, str], type] = {}
@@ -42,6 +48,46 @@ def register_provider(component: str, provider: str):
 
 class ProviderFactory:
     """Creates provider instances from config using the registry."""
+
+    @staticmethod
+    @overload
+    def create(
+        component: Literal["retriever"],
+        provider: str,
+        config: BaseModel,
+        cloud_config: BaseModel | None,
+        http_pool: HttpClientPool,
+    ) -> BaseRetrieverProvider: ...
+
+    @staticmethod
+    @overload
+    def create(
+        component: Literal["ranker"],
+        provider: str,
+        config: BaseModel,
+        cloud_config: BaseModel | None,
+        http_pool: HttpClientPool,
+    ) -> BaseRankerProvider: ...
+
+    @staticmethod
+    @overload
+    def create(
+        component: Literal["moderation"],
+        provider: str,
+        config: BaseModel,
+        cloud_config: BaseModel | None,
+        http_pool: HttpClientPool,
+    ) -> BaseModerationProvider: ...
+
+    @staticmethod
+    @overload
+    def create(
+        component: Literal["groundedness"],
+        provider: str,
+        config: BaseModel,
+        cloud_config: BaseModel | None,
+        http_pool: HttpClientPool,
+    ) -> BaseGroundednessProvider: ...
 
     @staticmethod
     def create(

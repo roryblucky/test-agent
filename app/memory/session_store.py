@@ -42,6 +42,9 @@ class BaseSessionStore(ABC):
         raw = to_json(messages)
         await self._set_raw(session_id, raw)
 
+    async def close(self) -> None:  # noqa: B027
+        """Release backend resources, if any."""
+
     # -- backend hooks ---------------------------------------------------
 
     @abstractmethod

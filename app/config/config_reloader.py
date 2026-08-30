@@ -27,8 +27,8 @@ class ReloadResult:
 
     status: str  # "success" | "failed"
     reload_count: int = 0
-    previous_tenants: list[str] = field(default_factory=list)
-    current_tenants: list[str] = field(default_factory=list)
+    previous_tenants: list[str] = field(default_factory=list[str])
+    current_tenants: list[str] = field(default_factory=list[str])
     timestamp: str = ""
     error: str | None = None
 

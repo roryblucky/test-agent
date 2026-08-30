@@ -6,14 +6,8 @@ Lifecycle is tied to the FastAPI application lifespan.
 """
 
 import httpx
-
-try:
-    from aiohttp import ClientSession
-    from azure.core.pipeline.transport import AioHttpTransport, AsyncHttpTransport
-except ImportError:
-    ClientSession = None
-    AioHttpTransport = None
-    AsyncHttpTransport = None
+from aiohttp import ClientSession
+from azure.core.pipeline.transport import AioHttpTransport
 
 
 class HttpClientPool:
@@ -47,16 +41,11 @@ class HttpClientPool:
             )
         return self._clients[provider]
 
-    def get_azure_transport(self) -> AsyncHttpTransport:
+    def get_azure_transport(self) -> AioHttpTransport:
         """Get a shared Azure transport (AioHttpTransport).
 
         Lazily creates an underlying aiohttp.ClientSession if needed.
         """
-        if AioHttpTransport is None:
-            raise ImportError(
-                "azure-core and aiohttp are required for Azure transport."
-            )
-
         if self._aiohttp_session is None or self._aiohttp_session.closed:
             # Create shared session
             # Note: We can configure session limits here if needed via kwargs
@@ -68,6 +57,11 @@ class HttpClientPool:
             session=self._aiohttp_session,
             session_owner=False,
         )
+
+    @property
+    def has_azure_session(self) -> bool:
+        """Return whether an Azure session has been created."""
+        return self._aiohttp_session is not None
 
     async def close_all(self) -> None:
         """Close all managed HTTP clients.  Call during app shutdown."""

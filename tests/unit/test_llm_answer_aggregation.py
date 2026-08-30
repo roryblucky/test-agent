@@ -1,11 +1,14 @@
 """Unit tests for LLM answer evidence source selection."""
 
+import unittest.mock
 from datetime import UTC, datetime
-from typing import Any, Self
+from typing import Any, Self, cast
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.messages import (
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     TextPart,
@@ -62,17 +65,15 @@ class FakeAnswerAgent:
         self.last_prompt = args[0] if args else None
         self.last_deps = kwargs["deps"]
         self.last_message_history = kwargs.get("message_history")
-        new_messages = []
+        new_messages: list[ModelMessage] = []
         if self.last_prompt is not None:
-            new_messages.append(
-                ModelRequest(parts=[UserPromptPart(self.last_prompt)])
-            )
+            new_messages.append(ModelRequest(parts=[UserPromptPart(self.last_prompt)]))
         return FakeTextStream(self.output, new_messages)
 
 
 def _handler(fake_agent: FakeAnswerAgent) -> LLMHandler:
     handler = LLMHandler(MagicMock())
-    handler._agent_cache[("answer", "pro")] = fake_agent
+    handler.set_agent_override("answer", "pro", cast(Agent[Any, Any], fake_agent))
     return handler
 
 
@@ -106,12 +107,14 @@ def _structured_evidence(evidence_id: str) -> AggregatedEvidence:
 
 
 @pytest.mark.asyncio
-async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
+async def test_llm_answer_prefers_aggregated_evidence(
+    mock_emitter: unittest.mock.AsyncMock,
+) -> None:
     """When aggregation exists, answer prompt uses the evidence bundle."""
     fake_agent = FakeAnswerAgent(output="aggregated answer")
     handler = _handler(fake_agent)
     ctx = FlowContext(query="query", emitter=mock_emitter)
-    ctx.message_history = ["previous turn"]
+    ctx.message_history = [ModelRequest(parts=[UserPromptPart("previous turn")])]
     ctx.documents = [Document(id="legacy-doc", content="legacy document content")]
     ctx.aggregated_evidence = AggregatedEvidenceBundle(
         user_query="query",
@@ -129,7 +132,9 @@ async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
     assert result.llm_response == "aggregated answer"
     assert fake_agent.last_prompt is not None
     assert "<runtime_answer_input>" in fake_agent.last_prompt
-    assert "<original_user_query>\nquery\n</original_user_query>" in fake_agent.last_prompt
+    assert (
+        "<original_user_query>\nquery\n</original_user_query>" in fake_agent.last_prompt
+    )
     assert "<conversation_reference>" not in fake_agent.last_prompt
     assert "aggregated evidence content" in fake_agent.last_prompt
     assert "| type=document_chunk" in fake_agent.last_prompt
@@ -148,7 +153,9 @@ async def test_llm_answer_prefers_aggregated_evidence(mock_emitter) -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_answer_formats_structured_evidence_facts(mock_emitter) -> None:
+async def test_llm_answer_formats_structured_evidence_facts(
+    mock_emitter: unittest.mock.AsyncMock,
+) -> None:
     """Structured records are passed to answer as structured facts."""
     fake_agent = FakeAnswerAgent(output="structured answer")
     handler = _handler(fake_agent)
@@ -175,7 +182,7 @@ async def test_llm_answer_formats_structured_evidence_facts(mock_emitter) -> Non
 
 def test_llm_answer_static_prompt_defines_evidence_usage_rules() -> None:
     """Answer system prompt teaches the model how to use structured evidence."""
-    instructions = LLMHandler(MagicMock())._build_layered_instructions("answer")
+    instructions = LLMHandler(MagicMock()).instructions_for("answer")
 
     assert "<evidence_usage_rules>" in instructions
     assert "document_chunk" in instructions
@@ -186,7 +193,7 @@ def test_llm_answer_static_prompt_defines_evidence_usage_rules() -> None:
 
 @pytest.mark.asyncio
 async def test_llm_answer_blocks_when_aggregation_disallows_synthesis(
-    mock_emitter,
+    mock_emitter: unittest.mock.AsyncMock,
 ) -> None:
     """Disallowed aggregation bundle returns blocked response without model call."""
     fake_agent = FakeAnswerAgent(output="should not be used")
@@ -232,7 +239,9 @@ async def test_llm_answer_keeps_document_fallback_without_aggregation() -> None:
     assert result.llm_response == "legacy answer"
     assert fake_agent.last_prompt is not None
     assert "<runtime_answer_input>" in fake_agent.last_prompt
-    assert "<original_user_query>\nquery\n</original_user_query>" in fake_agent.last_prompt
+    assert (
+        "<original_user_query>\nquery\n</original_user_query>" in fake_agent.last_prompt
+    )
     assert fake_agent.last_deps is not None
     assert not hasattr(fake_agent.last_deps, "reference_data")
     assert "Standalone Query: standalone query" in fake_agent.last_prompt

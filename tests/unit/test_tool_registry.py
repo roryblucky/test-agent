@@ -1,5 +1,6 @@
 """Unit tests for built-in tool registry metadata and policy resolution."""
 
+import pytest
 from pydantic import BaseModel
 
 from app.agents import tools
@@ -16,9 +17,9 @@ from app.skills.schema import SkillDefinition, SkillMetadata
 
 def _tenant(tool_runtime_config: ToolRuntimeConfig | None = None) -> TenantConfig:
     return TenantConfig(
-        kmsAppName="Tool Test App",
-        applicationId="tool-test",
-        adGroups=["group1"],
+        kms_app_name="Tool Test App",
+        application_id="tool-test",
+        ad_groups=["group1"],
         llm_config=LLMConfig(models={}),
         flow_config=FlowConfig(),
         tool_runtime_config=tool_runtime_config,
@@ -69,7 +70,7 @@ def test_resolve_tools_uses_tenant_allowlist() -> None:
     """toolRuntimeConfig.enabledTools filters requested tools."""
     tenant = _tenant(
         ToolRuntimeConfig(
-            enabledTools=["rank_documents"],
+            enabled_tools=["rank_documents"],
         )
     )
 
@@ -78,9 +79,7 @@ def test_resolve_tools_uses_tenant_allowlist() -> None:
         requested_names=["search_documents", "rank_documents"],
     )
 
-    assert [definition.name for definition in result.definitions] == [
-        "rank_documents"
-    ]
+    assert [definition.name for definition in result.definitions] == ["rank_documents"]
     assert result.blocked_tool_names == ["search_documents"]
     assert result.missing_tool_names == []
 
@@ -89,7 +88,7 @@ def test_resolve_tools_intersects_skill_allowed_tools() -> None:
     """Runtime toolset is tenant allowlist intersected with skill allowed tools."""
     tenant = _tenant(
         ToolRuntimeConfig(
-            enabledTools=["search_documents", "rank_documents"],
+            enabled_tools=["search_documents", "rank_documents"],
         )
     )
     skill = _skill("ranking-skill", ["rank_documents"])
@@ -100,13 +99,13 @@ def test_resolve_tools_intersects_skill_allowed_tools() -> None:
         requested_names=["search_documents", "rank_documents"],
     )
 
-    assert [definition.name for definition in result.definitions] == [
-        "rank_documents"
-    ]
+    assert [definition.name for definition in result.definitions] == ["rank_documents"]
     assert result.blocked_tool_names == ["search_documents"]
 
 
-def test_resolve_tools_defaults_to_legacy_requested_names_without_runtime_config() -> None:
+def test_resolve_tools_defaults_to_legacy_requested_names_without_runtime_config() -> (
+    None
+):
     """Absent toolRuntimeConfig preserves the old requested-name behavior."""
     tenant = _tenant()
 
@@ -119,7 +118,7 @@ def test_resolve_tools_defaults_to_legacy_requested_names_without_runtime_config
 
 
 def test_high_risk_tool_requires_confirmation_by_default(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """High-risk tools marked for confirmation are blocked without approval."""
 
@@ -145,13 +144,13 @@ def test_high_risk_tool_requires_confirmation_by_default(
         BuiltInToolRegistry,
         "_definitions",
         {
-            **BuiltInToolRegistry._definitions,
+            **BuiltInToolRegistry.definition_map(),
             "dangerous_delete": definition,
         },
     )
     tenant = _tenant(
         ToolRuntimeConfig(
-            enabledTools=["dangerous_delete"],
+            enabled_tools=["dangerous_delete"],
         )
     )
 

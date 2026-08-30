@@ -16,8 +16,33 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol, cast
+
+from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
+
+
+class _AsyncRedis(Protocol):
+    """Typed subset of redis-py's async client used by the limiter."""
+
+    async def script_load(self, script: str) -> str: ...
+
+    async def evalsha(
+        self, sha: str, numkeys: int, *keys_and_args: object
+    ) -> list[int | float | str]: ...
+
+    async def incr(self, key: str) -> int: ...
+
+    async def decr(self, key: str) -> int: ...
+
+    async def incrby(self, key: str, amount: int) -> int: ...
+
+    async def expire(self, key: str, seconds: int) -> bool: ...
+
+    async def get(self, key: str) -> str | None: ...
+
+    async def aclose(self) -> None: ...
 
 
 @dataclass
@@ -54,9 +79,7 @@ class BaseRateLimiter(ABC):
         """Check concurrent request count. Call release_concurrency on completion."""
 
     @abstractmethod
-    async def release_concurrency(
-        self, app_id: str, endpoint_type: str
-    ) -> None:
+    async def release_concurrency(self, app_id: str, endpoint_type: str) -> None:
         """Release a concurrency slot after request completes."""
 
     @abstractmethod
@@ -68,6 +91,9 @@ class BaseRateLimiter(ABC):
         self, app_id: str, monthly_limit: int
     ) -> RateLimitResult:
         """Check if the tenant has exceeded their monthly token quota."""
+
+    async def close(self) -> None:  # noqa: B027
+        """Release backend resources, if any."""
 
 
 class InMemoryRateLimiter(BaseRateLimiter):
@@ -163,9 +189,7 @@ class InMemoryRateLimiter(BaseRateLimiter):
             reset_at=time.time() + 1,
         )
 
-    async def release_concurrency(
-        self, app_id: str, endpoint_type: str
-    ) -> None:
+    async def release_concurrency(self, app_id: str, endpoint_type: str) -> None:
         """Release a concurrency slot."""
         key = f"{app_id}:{endpoint_type}"
         self._concurrent[key] = max(0, self._concurrent[key] - 1)
@@ -229,17 +253,19 @@ class RedisRateLimiter(BaseRateLimiter):
     """
 
     def __init__(self, redis_url: str) -> None:
-        import redis.asyncio as aioredis
-
-        self._redis = aioredis.from_url(redis_url, decode_responses=True)
+        self._redis = cast(
+            _AsyncRedis,
+            Redis.from_url(  # pyright: ignore[reportUnknownMemberType] -- redis-py kwargs lack types
+                redis_url, decode_responses=True
+            ),
+        )
         self._script_sha: str | None = None
 
     async def _ensure_script(self) -> str:
         """Load the Lua script into Redis and cache its SHA."""
         if self._script_sha is None:
-            self._script_sha = await self._redis.script_load(
-                self._SLIDING_WINDOW_LUA
-            )
+            self._script_sha = await self._redis.script_load(self._SLIDING_WINDOW_LUA)
+        assert self._script_sha is not None
         return self._script_sha
 
     async def check_request(
@@ -255,9 +281,7 @@ class RedisRateLimiter(BaseRateLimiter):
 
         # Check per-minute
         rpm_key = f"ratelimit:{app_id}:{endpoint_type}:rpm"
-        rpm_result = await self._redis.evalsha(
-            sha, 1, rpm_key, now, 60, rpm_limit
-        )
+        rpm_result = await self._redis.evalsha(sha, 1, rpm_key, now, 60, rpm_limit)
 
         if rpm_result[0] == 0:
             return RateLimitResult(
@@ -270,9 +294,7 @@ class RedisRateLimiter(BaseRateLimiter):
 
         # Check per-day
         rpd_key = f"ratelimit:{app_id}:{endpoint_type}:rpd"
-        rpd_result = await self._redis.evalsha(
-            sha, 1, rpd_key, now, 86400, rpd_limit
-        )
+        rpd_result = await self._redis.evalsha(sha, 1, rpd_key, now, 86400, rpd_limit)
 
         if rpd_result[0] == 0:
             return RateLimitResult(
@@ -323,9 +345,7 @@ class RedisRateLimiter(BaseRateLimiter):
             reset_at=time.time() + 1,
         )
 
-    async def release_concurrency(
-        self, app_id: str, endpoint_type: str
-    ) -> None:
+    async def release_concurrency(self, app_id: str, endpoint_type: str) -> None:
         """Decrement the concurrency counter."""
         key = f"ratelimit:{app_id}:{endpoint_type}:concurrent"
         await self._redis.decr(key)

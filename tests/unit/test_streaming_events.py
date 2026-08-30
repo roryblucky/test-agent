@@ -1,6 +1,7 @@
 """Unit tests for streaming event helpers."""
 
 import json
+from typing import Any
 
 import pytest
 
@@ -17,7 +18,7 @@ async def test_event_emitter_supports_phase7_events() -> None:
     await emitter.emit_citations([{"index": 1, "evidence_id": "ev-1", "source": "doc"}])
     await emitter.close()
 
-    events = []
+    events: list[Any] = []
     async for line in emitter:
         payload = line.removeprefix("data: ").strip()
         events.append(json.loads(payload))
@@ -31,5 +32,8 @@ async def test_event_emitter_supports_phase7_events() -> None:
             "type": "tool_observation",
             "data": {"tool_name": "search", "status": "success"},
         },
-        {"type": "citations", "data": [{"index": 1, "evidence_id": "ev-1", "source": "doc"}]},
+        {
+            "type": "citations",
+            "data": [{"index": 1, "evidence_id": "ev-1", "source": "doc"}],
+        },
     ]

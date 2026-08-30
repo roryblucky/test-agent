@@ -1,5 +1,6 @@
 """Tests for Azure Content Safety Moderator."""
 
+import unittest.mock
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -26,12 +27,12 @@ def mock_config():
 @pytest.fixture
 def mock_azure_config():
     return AzureConfig(
-        tenantId="fake-tenant",
-        clientId="fake-client",
-        clientSecret="fake-secret",
-        openAIEndpoint="https://fake.openai.azure.com",
-        contentSafetyEndpoint="https://fake.contentsafety.azure.com",
-        aiLanguageEndpoint="https://fake.language.azure.com",
+        tenant_id="fake-tenant",
+        client_id="fake-client",
+        client_secret="fake-secret",
+        openai_endpoint="https://fake.openai.azure.com",
+        content_safety_endpoint="https://fake.contentsafety.azure.com",
+        ai_language_endpoint="https://fake.language.azure.com",
     )
 
 
@@ -39,7 +40,11 @@ def mock_azure_config():
 @patch("azure.ai.contentsafety.aio.ContentSafetyClient")
 @pytest.mark.asyncio
 async def test_azure_moderator_check(
-    mock_client_cls, mock_cred_cls, mock_config, mock_azure_config, mock_http_pool
+    mock_client_cls: unittest.mock.MagicMock,
+    mock_cred_cls: unittest.mock.MagicMock,
+    mock_config: unittest.mock.MagicMock,
+    mock_azure_config: unittest.mock.MagicMock,
+    mock_http_pool: unittest.mock.MagicMock,
 ):
     """Test AzureContentSafetyModerator check method."""
     # Setup mocks
@@ -85,7 +90,11 @@ async def test_azure_moderator_check(
 @patch("azure.ai.contentsafety.aio.ContentSafetyClient")
 @pytest.mark.asyncio
 async def test_azure_moderator_error(
-    mock_client_cls, mock_cred_cls, mock_config, mock_azure_config, mock_http_pool
+    mock_client_cls: unittest.mock.MagicMock,
+    mock_cred_cls: unittest.mock.MagicMock,
+    mock_config: unittest.mock.MagicMock,
+    mock_azure_config: unittest.mock.MagicMock,
+    mock_http_pool: unittest.mock.MagicMock,
 ):
     """Test AzureContentSafetyModerator error handling."""
     mock_client_instance = AsyncMock()

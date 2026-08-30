@@ -5,8 +5,10 @@ Separated from the main API router with a dedicated prefix.
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from app.config.config_reloader import ConfigReloader
 
@@ -17,9 +19,27 @@ class ReloadResponse(BaseModel):
     """Response from a config reload operation."""
 
     status: str
-    reload_count: int = Field(alias="reloadCount")
-    previous_tenants: list[str] = Field(alias="previousTenants")
-    current_tenants: list[str] = Field(alias="currentTenants")
+    reload_count: Annotated[
+        int,
+        Field(
+            validation_alias=AliasChoices("reload_count", "reloadCount"),
+            serialization_alias="reloadCount",
+        ),
+    ]
+    previous_tenants: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("previous_tenants", "previousTenants"),
+            serialization_alias="previousTenants",
+        ),
+    ]
+    current_tenants: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("current_tenants", "currentTenants"),
+            serialization_alias="currentTenants",
+        ),
+    ]
     timestamp: str = ""
     error: str | None = None
 
@@ -29,10 +49,34 @@ class ReloadResponse(BaseModel):
 class ConfigStatusResponse(BaseModel):
     """Current configuration status."""
 
-    tenant_count: int = Field(alias="tenantCount")
-    tenant_ids: list[str] = Field(alias="tenantIds")
-    reload_count: int = Field(alias="reloadCount")
-    last_reload: str | None = Field(None, alias="lastReload")
+    tenant_count: Annotated[
+        int,
+        Field(
+            validation_alias=AliasChoices("tenant_count", "tenantCount"),
+            serialization_alias="tenantCount",
+        ),
+    ]
+    tenant_ids: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("tenant_ids", "tenantIds"),
+            serialization_alias="tenantIds",
+        ),
+    ]
+    reload_count: Annotated[
+        int,
+        Field(
+            validation_alias=AliasChoices("reload_count", "reloadCount"),
+            serialization_alias="reloadCount",
+        ),
+    ]
+    last_reload: Annotated[
+        str | None,
+        Field(
+            validation_alias=AliasChoices("last_reload", "lastReload"),
+            serialization_alias="lastReload",
+        ),
+    ] = None
 
     model_config = {"populate_by_name": True}
 

@@ -120,7 +120,7 @@ class ToolDefinition(BaseModel):
 class ToolResolutionResult(BaseModel):
     """Result of tenant/skill-aware tool resolution."""
 
-    definitions: list[ToolDefinition] = Field(default_factory=list)
+    definitions: list[ToolDefinition] = Field(default_factory=list[ToolDefinition])
     missing_tool_names: list[str] = Field(default_factory=list)
     blocked_tool_names: list[str] = Field(default_factory=list)
 
@@ -204,6 +204,11 @@ class BuiltInToolRegistry:
     }
 
     @classmethod
+    def definition_map(cls) -> dict[str, ToolDefinition]:
+        """Return a shallow copy of registered definitions."""
+        return dict(cls._definitions)
+
+    @classmethod
     def get_tools(
         cls, application_id: str, allowed_tool_names: list[str]
     ) -> list[Callable[..., Any]]:
@@ -239,8 +244,7 @@ class BuiltInToolRegistry:
             definition = cls._definitions.get(name)
             if definition is None:
                 logger.warning(
-                    f"[{application_id}] Tool '{name}' not found in registry. "
-                    "Skipping."
+                    f"[{application_id}] Tool '{name}' not found in registry. Skipping."
                 )
                 continue
             resolved.append(definition)

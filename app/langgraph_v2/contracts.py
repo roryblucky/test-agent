@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
@@ -28,14 +28,23 @@ class V2QueryRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     query: str = Field(min_length=1)
-    conversation_id: str | None = Field(default=None, alias="sessionId")
-    client_request_id: str | None = Field(
-        default=None,
-        alias="clientRequestId",
-        min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9._:-]+$",
-    )
+    conversation_id: Annotated[
+        str | None,
+        Field(
+            validation_alias=AliasChoices("conversation_id", "sessionId"),
+            serialization_alias="sessionId",
+        ),
+    ] = None
+    client_request_id: Annotated[
+        str | None,
+        Field(
+            validation_alias=AliasChoices("client_request_id", "clientRequestId"),
+            serialization_alias="clientRequestId",
+            min_length=1,
+            max_length=128,
+            pattern="^[A-Za-z0-9._:-]+$",
+        ),
+    ] = None
 
 
 class TracerQueryResponse(BaseModel):
@@ -51,7 +60,7 @@ class TracerQueryResponse(BaseModel):
     clarification: None = None
     conversation_id: str = Field(serialization_alias="session_id")
     metadata: dict[str, Any] = Field(default_factory=dict)
-    citations: list[CitationReference] = Field(default_factory=list)
+    citations: list[CitationReference] = Field(default_factory=list[CitationReference])
 
 
 class TracerStreamEvent(BaseModel):

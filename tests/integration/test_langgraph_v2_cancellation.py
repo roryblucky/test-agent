@@ -72,7 +72,12 @@ async def _persisted_state(
                     (tenant_id, run_id),
                 )
                 events = await cursor.fetchall()
-    return run, intents, events
+    assert run is not None
+    return (
+        dict(run),
+        [dict(intent) for intent in intents],
+        [dict(event) for event in events],
+    )
 
 
 async def _persisted_message_roles(database_url: str, run_id: UUID) -> list[str]:

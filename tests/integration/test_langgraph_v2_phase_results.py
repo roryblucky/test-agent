@@ -9,7 +9,7 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import ValidationError
 
 from app.langgraph_v2.artifacts import ArtifactRepository
-from app.langgraph_v2.graph import build_tracer_graph, canonical_query
+from app.langgraph_v2.graph import TracerState, build_tracer_graph, canonical_query
 from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.phase_results import (
     ALLOWED_PHASE_NAMES,
@@ -49,11 +49,11 @@ def _phase_input(
 
 
 class RecordingPhaseResultRepository(PhaseResultRepository):
-    def __init__(self, pool: AsyncConnectionPool) -> None:
+    def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
         super().__init__(pool)
         self.phase_reads: list[PhaseName] = []
 
-    async def get_or_invoke(self, **kwargs):  # type: ignore[no-untyped-def]
+    async def get_or_invoke(self, **kwargs: Any):  # type: ignore[no-untyped-def]
         self.phase_reads.append(kwargs["phase_name"])
         return await super().get_or_invoke(**kwargs)
 
@@ -206,7 +206,7 @@ async def test_input_nodes_bypass_phase_and_event_journals_while_retrieval_uses_
             ),
             retriever=Retriever(),
         )
-        state = {
+        state: TracerState = {
             "query": "hello",
             "conversation_id": "conversation-1",
             "client_request_id": None,
@@ -269,6 +269,7 @@ async def test_flagged_input_stops_before_refinement_and_provider_access(
             }
         )
 
+        assert "halted" in result
         assert result["halted"] is True
         assert result["events"][-1]["type"] == "error"
         assert phases.phase_reads == []
@@ -473,7 +474,7 @@ def test_phase_result_rejects_volatile_or_unstructured_content() -> None:
         PhaseResultInput(
             phase_name="query",
             normalized_result={"query": "hello"},
-            artifact_refs=[{"artifact_id": "a-1", "timestamp_ms": 10}],
+            artifact_refs=cast(Any, [{"artifact_id": "a-1", "timestamp_ms": 10}]),
             events=(),
         )
     with pytest.raises(ValidationError):

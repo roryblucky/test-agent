@@ -11,6 +11,6 @@ from app.services.flow_context import FlowContext
 class StepHandler(Protocol):
     """Protocol for a flow step handler."""
 
-    async def handle(self, ctx: FlowContext, step: FlowStep) -> FlowContext:
+    async def handle(self, ctx: FlowContext, step: FlowStep, /) -> FlowContext:
         """Execute a single flow step."""
         ...

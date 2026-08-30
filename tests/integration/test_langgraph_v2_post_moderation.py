@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -11,7 +12,7 @@ from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
@@ -79,7 +80,7 @@ class _FailingPostModeration:
         raise RuntimeError("post evaluator unavailable")
 
 
-def _state() -> dict[str, object]:
+def _state() -> TracerState:
     return {
         "query": "hello",
         "conversation_id": "c1",
@@ -143,6 +144,7 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
+        assert "answer" in result
         await messages.persist_assistant_message_after_completion(
             tenant_id="tenant-a",
             conversation_id="c1",
@@ -157,7 +159,9 @@ async def test_safe_answer_passes_post_moderation_unchanged(
         )
 
     assert moderation.calls == 2
+    assert "answer" in result
     assert result["answer"] == "generated answer"
+    assert "post_moderation" in result
     assert result["post_moderation"]["is_flagged"] is False
     assert [
         event["step"]
@@ -235,6 +239,7 @@ async def test_flagged_answer_remains_canonical_through_finalization(
             owner_instance_id=run.owner_instance_id,
             execution_epoch=run.execution_epoch,
         )
+        assert "answer" in result
         await messages.persist_assistant_message_after_completion(
             tenant_id="tenant-a",
             conversation_id="c1",
@@ -248,6 +253,7 @@ async def test_flagged_answer_remains_canonical_through_finalization(
             conversation_id="c1",
         )
 
+    assert "answer" in result
     assert result["answer"] == "generated answer"
     assert any(
         event["type"] == "token" and event["data"] == "generated answer"
@@ -259,6 +265,7 @@ async def test_flagged_answer_remains_canonical_through_finalization(
         "hello",
         "generated answer",
     ]
+    assert "post_moderation" in result
     assert result["post_moderation"]["is_flagged"] is True
     assert len(audit.records) == 1
     assert audit.records[0].tenant_id == "tenant-a"
@@ -274,7 +281,7 @@ async def test_post_moderation_replays_after_commit_window_crash(
     class CrashAfterPostModerationCommit(PhaseResultRepository):
         crashed = False
 
-        async def commit(self, **kwargs):  # type: ignore[no-untyped-def]
+        async def commit(self, **kwargs: Any):  # type: ignore[no-untyped-def]
             result = await super().commit(**kwargs)
             if kwargs["phase"].phase_name == "post_moderation" and not self.crashed:
                 self.crashed = True
@@ -313,6 +320,7 @@ async def test_post_moderation_replays_after_commit_window_crash(
         events = await runs.list_events("tenant-a", run.run_id)
 
     assert moderation.calls == 3
+    assert "answer" in recovered
     assert recovered["answer"] == "generated answer"
     assert len({event.event_key for event in events}) == len(events)
     assert (
@@ -355,7 +363,9 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
 
         result = await graph.ainvoke(_state())
 
+    assert "answer" in result
     assert result["answer"] == "generated answer"
+    assert "post_moderation_error" in result
     assert result["post_moderation_error"] == "post evaluator unavailable"
     failure_event = next(
         event

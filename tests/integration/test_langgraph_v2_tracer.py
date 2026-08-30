@@ -1,16 +1,17 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from importlib import reload
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 from fastapi import FastAPI, Request
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
@@ -19,7 +20,10 @@ from app.api.schemas import QueryResponse
 from app.langgraph_v2.answer import AnswerActor
 from app.langgraph_v2.api import TracerGraph, register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.conversation_messages import (
+    ConversationMessageRepository,
+    MessageRecord,
+)
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationProvider
@@ -30,7 +34,9 @@ from app.langgraph_v2.run_events import (
     ClaimFenced,
     EventInput,
     EventInvariantConflict,
+    EventRecord,
     RunEventRepository,
+    RunRecord,
 )
 from app.services.events import EventEmitter
 
@@ -39,11 +45,14 @@ FIXTURE_PATH = (
 )
 
 
-def parse_sse(response_text: str) -> list[dict]:
-    return [
-        json.loads(frame.removeprefix("data: "))
-        for frame in response_text.strip().split("\n\n")
-    ]
+def parse_sse(response_text: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for frame in response_text.strip().split("\n\n"):
+        payload: object = json.loads(frame.removeprefix("data: "))
+        if not isinstance(payload, dict):
+            raise TypeError("SSE payload must be a JSON object")
+        events.append(cast(dict[str, Any], payload))
+    return events
 
 
 def persistent_tracer_app(
@@ -59,7 +68,7 @@ def persistent_tracer_app(
     """Create the test-only tracer with its real application database pool."""
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         async with postgres_lifespan(
             app,
             config=V2PostgresConfig(database_url=database_url),
@@ -83,11 +92,10 @@ def persistent_tracer_app(
 
 def v2_stream_endpoint(app: FastAPI) -> Any:
     """Return the public stream endpoint for direct subscriber lifecycle tests."""
-    return next(
-        route.endpoint
-        for route in app.router.routes
-        if getattr(route, "path", None) == "/v2/query/stream"
-    )
+    for route in app.router.routes:
+        if isinstance(route, APIRoute) and route.path == "/v2/query/stream":
+            return route.endpoint
+    raise LookupError("v2 stream endpoint is not registered")
 
 
 def stream_request(app: FastAPI) -> Request:
@@ -381,7 +389,7 @@ async def test_done_answer_finalization_is_atomic_on_turn_validation(
                     }
                 ],
             }
-            frames = api_module._persist_result_events(
+            frames = api_module.persist_result_events(
                 repository,
                 message_repository,
                 tenant_id="tenant-a",
@@ -603,7 +611,7 @@ def test_flagged_query_emits_error_before_finalization(
 
     run_id = UUID(response.headers["x-run-id"])
 
-    async def read_run() -> tuple[str, list]:
+    async def read_run() -> tuple[str, list[EventRecord]]:
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
@@ -670,11 +678,15 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
         def __init__(self) -> None:
             self.received_state: TracerState | None = None
 
-        def astream(self, state: TracerState | None, **options: Any) -> AsyncIterator:
+        def astream(
+            self, state: object | None, **options: Any
+        ) -> AsyncIterator[object]:
             del options
-            self.received_state = state
+            self.received_state = (
+                cast(TracerState, state) if isinstance(state, dict) else None
+            )
 
-            async def stream() -> AsyncIterator:
+            async def stream() -> AsyncIterator[object]:
                 yield (
                     "updates",
                     {
@@ -727,7 +739,7 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
     ["LANGGRAPH_V2_UAT_ENABLED", "LANGGRAPH_V2_TRACER_ENABLED"],
 )
 def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     feature_flag: str,
 ) -> None:
     import app.main as main_module
@@ -813,7 +825,9 @@ def test_completed_tracer_persists_only_later_phase_and_terminal_events(
     delivered = parse_sse(response.text)
     run_id = UUID(response.headers["x-run-id"])
 
-    async def load_persisted_result() -> tuple:
+    async def load_persisted_result() -> tuple[
+        RunRecord, list[EventRecord], list[MessageRecord]
+    ]:
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url,
             min_size=1,
@@ -856,7 +870,7 @@ def test_completed_tracer_persists_only_later_phase_and_terminal_events(
 
 def test_long_running_request_refreshes_its_claim(
     langgraph_v2_migrated_database_url: str,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     asyncio.run(
         seed_subject_conversation(langgraph_v2_migrated_database_url, "conversation-1")
@@ -864,10 +878,12 @@ def test_long_running_request_refreshes_its_claim(
     monkeypatch.setattr(api_module, "CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01)
 
     class SlowGraph:
-        def astream(self, state: TracerState | None, **options: Any) -> AsyncIterator:
+        def astream(
+            self, state: object | None, **options: Any
+        ) -> AsyncIterator[object]:
             del state, options
 
-            async def stream() -> AsyncIterator:
+            async def stream() -> AsyncIterator[object]:
                 await asyncio.sleep(0.05)
                 yield (
                     "updates",

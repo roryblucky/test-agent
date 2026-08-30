@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any
+from typing import Any, cast
 
 from app.config.models import FlowStep
 from app.core.telemetry import trace_span
@@ -35,17 +35,16 @@ class FreshnessPolicy:
         )
         if not isinstance(raw_policy, dict):
             return None
+        policy = cast(dict[str, Any], raw_policy)
 
         return cls(
-            date_field=str(
-                cls._get(raw_policy, "date_field", "dateField", "published_at")
-            ),
+            date_field=str(cls._get(policy, "date_field", "dateField", "published_at")),
             max_age_days=cls._int_or_none(
-                cls._get(raw_policy, "max_age_days", "maxAgeDays", None)
+                cls._get(policy, "max_age_days", "maxAgeDays", None)
             ),
             fail_if_missing_date=bool(
                 cls._get(
-                    raw_policy,
+                    policy,
                     "fail_if_missing_date",
                     "failIfMissingDate",
                     False,
@@ -94,9 +93,7 @@ class AggregationHandler:
             planner_allowed=ctx.planner_output.can_continue_to_aggregation,
         )
 
-        ctx.evidence_store = {
-            item.evidence_id: item for item in selected_evidence
-        }
+        ctx.evidence_store = {item.evidence_id: item for item in selected_evidence}
         ctx.aggregated_evidence = AggregatedEvidenceBundle(
             user_query=ctx.query,
             standalone_query=ctx.refined_query or ctx.query,
@@ -195,9 +192,9 @@ class AggregationHandler:
 
         if selected and all(evidence.score is not None for evidence in selected):
             selected.sort(
-                key=lambda evidence: evidence.score
-                if evidence.score is not None
-                else 0.0,
+                key=lambda evidence: (
+                    evidence.score if evidence.score is not None else 0.0
+                ),
                 reverse=True,
             )
 
@@ -206,7 +203,8 @@ class AggregationHandler:
                 update={
                     "evidence_id": f"evidence:{index}:{evidence.metadata['item_id']}",
                     "citation_index": index,
-                    "source_type": evidence.metadata.get("source_type") or evidence.source,
+                    "source_type": evidence.metadata.get("source_type")
+                    or evidence.source,
                     "page_number": safe_parse_page_number(
                         evidence.metadata.get("page_number")
                         or evidence.metadata.get("pageNumber")

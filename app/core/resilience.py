@@ -51,6 +51,7 @@ async def safe_execute[**P, R](
         async for attempt in RETRY_POLICY:
             with attempt:
                 return await func(*args, **kwargs)
+        raise RuntimeError("retry policy completed without executing the operation")
     except RetryError as e:
         logger.error(f"Operation failed after retries: {func.__name__}")
         raise e.last_attempt.result() if e.last_attempt else e

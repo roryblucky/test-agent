@@ -10,6 +10,7 @@ from GCS at startup.
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 
 from app.config.models import AzureConfig, GCPConfig, TenantConfig
@@ -25,6 +26,7 @@ from app.providers.factory import ProviderFactory
 from app.providers.federated import FederatedRetrieverProvider
 from app.services.exceptions import TenantNotFoundError
 from app.services.flow_engine import FlowEngine
+from app.services.handlers.base import StepHandler
 from app.skills.registry import TenantSkillRegistry
 
 
@@ -147,7 +149,7 @@ class TenantManager:
         agent_handler = AgentHandler(registry, providers, cfg, skill_registry)
         agent_handler.warmup(cfg.flow_config.steps)
 
-        handlers = {
+        handlers: dict[FlowStepType, StepHandler] = {
             FlowStepType.MODERATION: ModerationHandler(providers.moderation),
             FlowStepType.RETRIEVER: RetrieverHandler(providers.retriever),
             FlowStepType.RANKING: RankingHandler(providers.ranker),
@@ -192,7 +194,7 @@ class TenantManager:
 
         if cfg.retriever_config and cfg.retriever_config.sources:
             # Multi-source retrieval: instantiate all configured providers
-            source_retrievers = []
+            source_retrievers: list[BaseRetrieverProvider] = []
             for source_cfg in cfg.retriever_config.sources:
                 provider_instance = ProviderFactory.create(
                     "retriever",
@@ -238,7 +240,7 @@ class TenantManager:
     @staticmethod
     def _ensure_providers_imported() -> None:
         """Import concrete providers to trigger ``@register_provider``."""
-        import app.providers.groundedness.gcp_groundedness  # noqa: F401
-        import app.providers.moderation.azure_content_safety  # noqa: F401
-        import app.providers.ranker.gcp_ranker  # noqa: F401
-        import app.providers.retriever.gcp_vertex_search  # noqa: F401
+        importlib.import_module("app.providers.groundedness.gcp_groundedness")
+        importlib.import_module("app.providers.moderation.azure_content_safety")
+        importlib.import_module("app.providers.ranker.gcp_ranker")
+        importlib.import_module("app.providers.retriever.gcp_vertex_search")

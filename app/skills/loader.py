@@ -19,10 +19,12 @@ K8s adaptation: ``scripts/`` directory is NOT loaded or executed.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import yaml
 
@@ -34,6 +36,22 @@ from app.skills.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _GCSBlob(Protocol):
+    name: str
+
+    def download_as_text(self) -> str: ...
+
+
+class _GCSBucket(Protocol):
+    def list_blobs(self, *, prefix: str) -> list[_GCSBlob]: ...
+
+    def blob(self, blob_name: str) -> _GCSBlob: ...
+
+
+class _GCSClient(Protocol):
+    def bucket(self, bucket_name: str) -> _GCSBucket: ...
 
 
 # ---------------------------------------------------------------------------
@@ -62,14 +80,20 @@ def _parse_frontmatter_and_body(
             f"Invalid SKILL.md at {source_path}: "
             "expected YAML frontmatter between --- delimiters"
         )
-    frontmatter = yaml.safe_load(match.group(1)) or {}
+    loaded: object = yaml.safe_load(match.group(1))
+    if loaded is None:
+        frontmatter: dict[str, Any] = {}
+    elif isinstance(loaded, dict):
+        frontmatter = cast(dict[str, Any], loaded)
+    else:
+        raise ValueError(
+            f"Invalid SKILL.md at {source_path}: frontmatter must be a mapping"
+        )
     instructions = match.group(2).strip()
     return frontmatter, instructions
 
 
-def _parse_skill_md(
-    content: str, tenant_id: str, source_path: str
-) -> SkillDefinition:
+def _parse_skill_md(content: str, tenant_id: str, source_path: str) -> SkillDefinition:
     """Parse a complete SKILL.md file (Tier 2 Activation object).
 
     Args:
@@ -125,15 +149,11 @@ class SkillLoaderProtocol(Protocol):
         """Tier 1: Load only name + description for all skills."""
         ...
 
-    async def activate_skill(
-        self, summary: SkillSummary
-    ) -> SkillDefinition:
+    async def activate_skill(self, summary: SkillSummary) -> SkillDefinition:
         """Tier 2: Load full SKILL.md instructions for a specific skill."""
         ...
 
-    async def load_references(
-        self, skill: SkillDefinition
-    ) -> list[ReferenceDocument]:
+    async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
         """Tier 3: Load all files from the skill's references/ directory."""
         ...
 
@@ -170,15 +190,16 @@ class GCSSkillLoader:
 
     def __init__(self, bucket_name: str) -> None:
         self.bucket_name = bucket_name
-        self._client: Any = None
+        self._client: _GCSClient | None = None
 
-    def _get_client(self) -> Any:
+    def _get_client(self) -> _GCSClient:
         if self._client is None:
-            from google.cloud import storage
-            self._client = storage.Client()
+            storage_module = importlib.import_module("google.cloud.storage")
+            client_type = cast(Callable[[], object], storage_module.Client)
+            self._client = cast(_GCSClient, client_type())
         return self._client
 
-    def _get_bucket(self) -> Any:
+    def _get_bucket(self) -> _GCSBucket:
         return self._get_client().bucket(self.bucket_name)
 
     async def discover_skills(self, tenant_id: str) -> list[SkillSummary]:
@@ -196,9 +217,7 @@ class GCSSkillLoader:
                         content = blob.download_as_text()
                         summary = _parse_skill_summary(content, tenant_id, source_path)
                         summaries.append(summary)
-                        logger.debug(
-                            f"[{tenant_id}] Discovered skill: {summary.name}"
-                        )
+                        logger.debug(f"[{tenant_id}] Discovered skill: {summary.name}")
                     except Exception:
                         logger.exception(
                             f"[{tenant_id}] Failed to parse skill summary at "
@@ -220,9 +239,7 @@ class GCSSkillLoader:
         """Tier 2: Download and fully parse a specific SKILL.md."""
         # Derive the blob path from the source_path URI
         # source_path = gs://{bucket}/{blob_name}
-        blob_name = summary.source_path.removeprefix(
-            f"gs://{self.bucket_name}/"
-        )
+        blob_name = summary.source_path.removeprefix(f"gs://{self.bucket_name}/")
         bucket = self._get_bucket()
         blob = bucket.blob(blob_name)
         content = blob.download_as_text()
@@ -234,9 +251,7 @@ class GCSSkillLoader:
         )
         return skill
 
-    async def load_references(
-        self, skill: SkillDefinition
-    ) -> list[ReferenceDocument]:
+    async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
         """Tier 3: Download all files from references/ for a skill.
 
         GCS path: ``tenants/{tenant_id}/skills/{name}/references/*``
@@ -265,13 +280,10 @@ class GCSSkillLoader:
                             source_path=source_path,
                         )
                     )
-                    logger.debug(
-                        f"[{skill.tenant_id}] Loaded reference: {filename}"
-                    )
+                    logger.debug(f"[{skill.tenant_id}] Loaded reference: {filename}")
                 except Exception:
                     logger.exception(
-                        f"[{skill.tenant_id}] Failed to load reference: "
-                        f"{blob.name}"
+                        f"[{skill.tenant_id}] Failed to load reference: {blob.name}"
                     )
         except Exception:
             logger.exception(
@@ -357,9 +369,7 @@ class LocalSkillLoader:
         summaries: list[SkillSummary] = []
 
         if not tenant_dir.exists():
-            logger.warning(
-                f"[{tenant_id}] Skill directory not found: {tenant_dir}"
-            )
+            logger.warning(f"[{tenant_id}] Skill directory not found: {tenant_dir}")
             return summaries
 
         for skill_dir in sorted(tenant_dir.iterdir()):
@@ -370,9 +380,7 @@ class LocalSkillLoader:
                 continue
             try:
                 content = skill_file.read_text(encoding="utf-8")
-                summary = _parse_skill_summary(
-                    content, tenant_id, str(skill_file)
-                )
+                summary = _parse_skill_summary(content, tenant_id, str(skill_file))
                 summaries.append(summary)
                 logger.debug(f"[{tenant_id}] Discovered skill: {summary.name}")
             except Exception:
@@ -391,14 +399,10 @@ class LocalSkillLoader:
         skill_file = Path(summary.source_path)
         content = skill_file.read_text(encoding="utf-8")
         skill = _parse_skill_md(content, summary.tenant_id, str(skill_file))
-        logger.info(
-            f"[{summary.tenant_id}] Activated skill: {skill.metadata.name}"
-        )
+        logger.info(f"[{summary.tenant_id}] Activated skill: {skill.metadata.name}")
         return skill
 
-    async def load_references(
-        self, skill: SkillDefinition
-    ) -> list[ReferenceDocument]:
+    async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
         """Tier 3: Load all files from references/ subdirectory."""
         skill_file = Path(skill.source_path)
         refs_dir = skill_file.parent / "references"
@@ -419,9 +423,7 @@ class LocalSkillLoader:
                         source_path=str(ref_file),
                     )
                 )
-                logger.debug(
-                    f"[{skill.tenant_id}] Loaded reference: {ref_file.name}"
-                )
+                logger.debug(f"[{skill.tenant_id}] Loaded reference: {ref_file.name}")
             except Exception:
                 logger.exception(
                     f"[{skill.tenant_id}] Failed to load reference: {ref_file}"
@@ -445,6 +447,4 @@ class LocalSkillLoader:
         if not refs_dir.exists():
             return []
 
-        return sorted(
-            f.name for f in refs_dir.iterdir() if f.is_file()
-        )
+        return sorted(f.name for f in refs_dir.iterdir() if f.is_file())

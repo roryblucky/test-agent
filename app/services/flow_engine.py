@@ -37,7 +37,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
+
+from pydantic_ai.messages import ModelMessage
 
 from app.config.models import (
     FlowStepType,
@@ -70,7 +73,7 @@ class FlowEngine:
     def __init__(
         self,
         tenant_config: TenantConfig,
-        handlers: dict[FlowStepType, StepHandler],
+        handlers: Mapping[FlowStepType, StepHandler],
     ) -> None:
         self.steps = tenant_config.flow_config.steps
         self.handlers = handlers
@@ -81,7 +84,7 @@ class FlowEngine:
         query: str,
         emitter: EventEmitter | None = None,
         session_id: str | None = None,
-        message_history: list | None = None,
+        message_history: list[ModelMessage] | None = None,
     ) -> FlowContext:
         """Run the pipeline end-to-end.
 
@@ -197,7 +200,7 @@ class FlowEngine:
     ) -> tuple[StepRoutingAction, StepRoutingRule] | None:
         """Evaluate routing rules; return the first match or ``None``."""
         for rule in rules:
-            actual = self._resolve_field(ctx, rule.match_field)
+            actual = self.resolve_field(ctx, rule.match_field)
             if self._values_match(actual, rule.match_value):
                 logger.debug(
                     "Routing rule matched at step %r: %s == %r",
@@ -209,14 +212,14 @@ class FlowEngine:
         return None
 
     @staticmethod
-    def _resolve_field(ctx: FlowContext, dotted_path: str) -> Any:
+    def resolve_field(ctx: FlowContext, dotted_path: str) -> Any:
         """Resolve a dotted field path on the FlowContext.
 
         Examples::
 
-            _resolve_field(ctx, "intent.intent")  -> ctx.intent.intent
-            _resolve_field(ctx, "refined_query")  -> ctx.refined_query
-            _resolve_field(ctx, "metadata.key")   -> ctx.metadata["key"]
+            resolve_field(ctx, "intent.intent")  -> ctx.intent.intent
+            resolve_field(ctx, "refined_query")  -> ctx.refined_query
+            resolve_field(ctx, "metadata.key")   -> ctx.metadata["key"]
 
         Returns ``None`` for any missing attribute or key.
         """
@@ -225,7 +228,7 @@ class FlowEngine:
             if current is None:
                 return None
             if isinstance(current, dict):
-                current = current.get(part)
+                current = cast(dict[str, Any], current).get(part)
             else:
                 current = getattr(current, part, None)
         return current
@@ -245,7 +248,7 @@ class FlowEngine:
     ) -> str | None:
         """Get the response text for an abort rule."""
         if rule.response_from_field:
-            value = FlowEngine._resolve_field(ctx, rule.response_from_field)
+            value = FlowEngine.resolve_field(ctx, rule.response_from_field)
             if value is not None:
                 return str(value)
         return rule.response

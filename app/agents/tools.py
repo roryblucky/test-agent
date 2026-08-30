@@ -32,18 +32,22 @@ from app.api.schemas import QuestionAnswerSelector
 from app.models.domain import Document
 from app.models.workflow import (
     NormalizedToolResultItem,
+    TaskStatusHint,
     ToolCallRecord,
     ToolObservation,
+    ToolObservationStatus,
     ToolResultRecord,
 )
+from app.services.flow_context import FlowContext
 
 logger = logging.getLogger(__name__)
 
 
-def _get_flow_context(ctx: RunContext[Any]):
+def _get_flow_context(ctx: RunContext[Any]) -> FlowContext | None:
     """Return workflow context when the tool is running inside FlowEngine."""
     deps = getattr(ctx, "deps", None)
-    return getattr(deps, "flow_context", None)
+    flow_context = getattr(deps, "flow_context", None)
+    return flow_context if isinstance(flow_context, FlowContext) else None
 
 
 def _latency_ms(start: float) -> int:
@@ -56,7 +60,7 @@ def _record_tool_call(
     tool_name: str,
     task_id: str | None,
     input_payload: dict[str, Any],
-    status: str,
+    status: ToolObservationStatus,
     result_count: int = 0,
     compiled_filter: str | None = None,
     latency_ms: int | None = None,
@@ -168,22 +172,22 @@ def _store_text_result(
 def _observation(
     *,
     tool_name: str,
-    status: str,
+    status: ToolObservationStatus,
     result_count: int = 0,
     warnings: list[str] | None = None,
     error_code: str | None = None,
 ) -> ToolObservation:
-    task_status_hint = {
+    task_status_hints: dict[ToolObservationStatus, TaskStatusHint] = {
         "success": "completed",
         "empty": "missing",
         "partial": "partial",
         "stale": "stale",
         "error": "failed",
-    }[status]
+    }
     return ToolObservation(
         tool_name=tool_name,
         status=status,
-        task_status_hint=task_status_hint,
+        task_status_hint=task_status_hints[status],
         result_count=result_count,
         warnings=warnings or [],
         error_code=error_code,
@@ -245,8 +249,7 @@ async def activate_skill_tool(ctx: RunContext[AgentDeps], skill_name: str) -> st
         # Build hint from known names for the model
         known = [s.name for s in registry.get_summaries(tenant_id)]
         return (
-            f"Skill '{skill_name}' not found. "
-            f"Valid skill names are: {', '.join(known)}"
+            f"Skill '{skill_name}' not found. Valid skill names are: {', '.join(known)}"
         )
 
     ctx.deps.activated_skill_names.append(skill_name)
@@ -278,12 +281,10 @@ async def activate_skill_tool(ctx: RunContext[AgentDeps], skill_name: str) -> st
         parts.append("\n<skill_tool_policy>")
         parts.append(f"risk_level: {skill.metadata.risk_level.value}")
         parts.append(
-            "allowed_tools: "
-            f"{', '.join(skill.metadata.allowed_tools) or 'none'}"
+            f"allowed_tools: {', '.join(skill.metadata.allowed_tools) or 'none'}"
         )
         parts.append(
-            "required_tools: "
-            f"{', '.join(skill.metadata.required_tools) or 'none'}"
+            f"required_tools: {', '.join(skill.metadata.required_tools) or 'none'}"
         )
         if skill.metadata.tool_constraints:
             parts.append("tool_constraints:")
@@ -360,8 +361,7 @@ async def load_skill_references_tool(
     parts.extend(f"## {ref.filename}\n\n{ref.content}\n" for ref in refs)
 
     logger.info(
-        f"[{tenant_id}] Agent loaded {len(refs)} reference(s) "
-        f"for skill '{skill_name}'"
+        f"[{tenant_id}] Agent loaded {len(refs)} reference(s) for skill '{skill_name}'"
     )
     return "\n".join(parts)
 
@@ -866,9 +866,7 @@ async def get_user_classification_tool(
         for index, item in enumerate(questions, start=1):
             question = item.question.strip()
             options = [
-                option.strip()
-                for option in item.options
-                if option and option.strip()
+                option.strip() for option in item.options if option and option.strip()
             ]
 
             lines.append(f"{index}. {question}")

@@ -1,12 +1,16 @@
 """Unit tests for skill metadata parsing."""
 
+import pathlib
+
 import pytest
 
 from app.skills.loader import LocalSkillLoader
 from app.skills.schema import SkillRiskLevel
 
 
-def _write_skill(tmp_path, tenant_id: str, skill_name: str, content: str) -> None:
+def _write_skill(
+    tmp_path: pathlib.Path, tenant_id: str, skill_name: str, content: str
+) -> None:
     skill_dir = tmp_path / "tenants" / tenant_id / "skills" / skill_name
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
@@ -14,7 +18,7 @@ def _write_skill(tmp_path, tenant_id: str, skill_name: str, content: str) -> Non
 
 @pytest.mark.asyncio
 async def test_skill_metadata_parses_required_tools_constraints_and_risk(
-    tmp_path,
+    tmp_path: pathlib.Path,
 ) -> None:
     """New Phase 4 skill metadata loads from SKILL.md frontmatter."""
     _write_skill(
@@ -52,7 +56,9 @@ Use approved sources.
 
 
 @pytest.mark.asyncio
-async def test_legacy_skill_metadata_defaults_still_load(tmp_path) -> None:
+async def test_legacy_skill_metadata_defaults_still_load(
+    tmp_path: pathlib.Path,
+) -> None:
     """Old skills with only allowed-tools keep safe Phase 4 defaults."""
     _write_skill(
         tmp_path,

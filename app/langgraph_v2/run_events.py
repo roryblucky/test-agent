@@ -671,6 +671,8 @@ class RunEventRepository:
         conflict = False
         row = None
         async with self._transaction(connection) as connection:
+            if connection is None:
+                raise RuntimeError("transaction yielded no connection")
             async with connection.cursor(row_factory=dict_row) as run_cursor:
                 await run_cursor.execute(
                     """

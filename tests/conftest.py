@@ -1,7 +1,7 @@
 """Pytest configuration and fixtures."""
 
-import asyncio
 import os
+import unittest.mock
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,14 +15,6 @@ from app.providers.base import BaseRankerProvider, BaseRetrieverProvider
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 from tests.postgres import require_disposable_postgres_url
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for each test case."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest.fixture(scope="session")
@@ -128,7 +120,7 @@ def mock_emitter():
 
 
 @pytest.fixture
-def flow_context(mock_emitter):
+def flow_context(mock_emitter: unittest.mock.AsyncMock):
     """Fixture for FlowContext."""
     return FlowContext(
         query="test query",

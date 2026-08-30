@@ -40,8 +40,8 @@ class FlowContext:
 
     # Session / conversation continuity
     session_id: str | None = None
-    message_history: list[ModelMessage] = field(default_factory=list)
-    new_messages: list[ModelMessage] = field(default_factory=list)
+    message_history: list[ModelMessage] = field(default_factory=list[ModelMessage])
+    new_messages: list[ModelMessage] = field(default_factory=list[ModelMessage])
 
     # Resolver / intent
     refined_query: str | None = None
@@ -49,15 +49,19 @@ class FlowContext:
     intent: IntentResult | None = None
 
     # Classic RAG
-    documents: list[Document] = field(default_factory=list)
-    ranked_documents: list[Document] = field(default_factory=list)
+    documents: list[Document] = field(default_factory=list[Document])
+    ranked_documents: list[Document] = field(default_factory=list[Document])
 
     # Agent / tools / evidence
-    active_skills: list[str] = field(default_factory=list)
-    tool_observations: list[ToolObservation] = field(default_factory=list)
-    tool_calls: list[ToolCallRecord] = field(default_factory=list)
-    tool_results: list[ToolResultRecord] = field(default_factory=list)
-    evidence_store: dict[str, AggregatedEvidence] = field(default_factory=dict)
+    active_skills: list[str] = field(default_factory=list[str])
+    tool_observations: list[ToolObservation] = field(
+        default_factory=list[ToolObservation]
+    )
+    tool_calls: list[ToolCallRecord] = field(default_factory=list[ToolCallRecord])
+    tool_results: list[ToolResultRecord] = field(default_factory=list[ToolResultRecord])
+    evidence_store: dict[str, AggregatedEvidence] = field(
+        default_factory=dict[str, AggregatedEvidence]
+    )
     planner_output: PlannerOutput | None = None
     aggregated_evidence: AggregatedEvidenceBundle | None = None
 
@@ -65,10 +69,12 @@ class FlowContext:
     llm_response: str | None = None
     moderation_result: ModerationResult | None = None
     groundedness_result: GroundednessResult | None = None
-    clarification_request: Any | None = None  # Using Any to avoid circular import with schemas
+    clarification_request: Any | None = (
+        None  # Using Any to avoid circular import with schemas
+    )
 
     # Extensible metadata bucket
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict[str, Any])
 
     # Event emitter for SSE streaming (step events + tokens)
     emitter: EventEmitter | None = None

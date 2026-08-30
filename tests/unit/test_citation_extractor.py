@@ -48,7 +48,7 @@ def test_extract_claims_attribution_shift() -> None:
 def test_relaxed_whitespace_regex() -> None:
     """The relaxed whitespace pattern resolves correctly."""
     escaped = re.escape("hello  world")
-    pattern_str = re.sub(r'(?:\\\s)+', lambda _: r'\s+', escaped)
+    pattern_str = re.sub(r"(?:\\\s)+", lambda _: r"\s+", escaped)
     assert pattern_str == r"hello\s+world"
 
 
@@ -76,7 +76,9 @@ def test_located_spans_merging_reslicing() -> None:
     assert len(located) == 2
     assert located[0].start == 8
     assert located[0].end == 19
-    assert located[0].text == "a very long"  # resliced from original, not string concatenated
+    assert (
+        located[0].text == "a very long"
+    )  # resliced from original, not string concatenated
 
     assert located[1].start == 34
     assert located[1].end == 44
@@ -111,7 +113,9 @@ def test_punctuation_normalized_locator() -> None:
 def test_split_multi_sentence_locator() -> None:
     """Multi-sentence passages are split and located separately."""
     evidence = "Sentence number one. Intermediary text. Sentence number two."
-    located = validate_and_locate_quotes(evidence, ["Sentence number one. Sentence number two."])
+    located = validate_and_locate_quotes(
+        evidence, ["Sentence number one. Sentence number two."]
+    )
     assert len(located) == 2
     assert located[0].text == "Sentence number one."
     assert located[1].text == "Sentence number two."
@@ -153,7 +157,9 @@ async def test_all_failures_unlocated() -> None:
             citation_index=1,
         )
     ]
-    citations, usage = await build_citations("Some claim with numbers 100% [1]", evidence_items)
+    citations, _usage = await build_citations(
+        "Some claim with numbers 100% [1]", evidence_items
+    )
     assert len(citations) == 1
     assert citations[0].attribution_status == "unlocated"
     assert citations[0].highlight_spans == []
@@ -164,12 +170,16 @@ async def test_extract_quotes_with_llm_mock() -> None:
     """Verify extract_quotes_with_llm invokes registry agent and maps citations correctly."""
     mock_agent = MagicMock()
     mock_stream = AsyncMock()
-    mock_stream.get_output = AsyncMock(return_value=QuoteExtractionResult(
-        extractions=[
-            QuoteExtractionItem(citation_index=1, quoted_passages=["exact quote"])
-        ]
-    ))
-    mock_stream.usage = MagicMock(return_value=RunUsage(input_tokens=10, output_tokens=5))
+    mock_stream.get_output = AsyncMock(
+        return_value=QuoteExtractionResult(
+            extractions=[
+                QuoteExtractionItem(citation_index=1, quoted_passages=["exact quote"])
+            ]
+        )
+    )
+    mock_stream.usage = MagicMock(
+        return_value=RunUsage(input_tokens=10, output_tokens=5)
+    )
     mock_agent.run_stream.return_value.__aenter__ = AsyncMock(return_value=mock_stream)
     mock_agent.run_stream.return_value.__aexit__ = AsyncMock(return_value=None)
 

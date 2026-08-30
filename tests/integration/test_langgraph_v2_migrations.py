@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from typing import Any, cast
 from uuid import uuid4
 
 import psycopg
@@ -141,7 +142,7 @@ def test_conversation_authorization_migrates_existing_conversations_forward(
             max_size=2,
             kwargs={"autocommit": True, "prepare_threshold": 0},
         ) as pool:
-            saver = AsyncPostgresSaver(pool)
+            saver = AsyncPostgresSaver(cast(Any, pool))
             await saver.setup()
             graph = build_tracer_graph(checkpointer=saver)
             await graph.ainvoke(
@@ -169,6 +170,7 @@ def test_conversation_authorization_migrates_existing_conversations_forward(
             """,
             (tenant_id, conversation_id),
         ).fetchone()
+        assert migrated is not None
         assert migrated == ("__unassigned__", expected_thread_id)
 
         with pytest.raises(psycopg.errors.UniqueViolation):
@@ -189,7 +191,7 @@ def test_conversation_authorization_migrates_existing_conversations_forward(
             max_size=2,
             kwargs={"autocommit": True, "prepare_threshold": 0},
         ) as pool:
-            saver = AsyncPostgresSaver(pool)
+            saver = AsyncPostgresSaver(cast(Any, pool))
             await saver.setup()
             checkpoint = await saver.aget_tuple(
                 initial_checkpoint_config(

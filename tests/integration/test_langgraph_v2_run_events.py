@@ -605,17 +605,19 @@ async def test_replaced_claim_epoch_rejects_stale_owner_writes(
                 ("tenant-a", run_id),
             )
 
-        stale_claim = {
-            "tenant_id": "tenant-a",
-            "run_id": run_id,
-            "owner_instance_id": "instance-a",
-            "execution_epoch": created.execution_epoch,
-        }
         with pytest.raises(ClaimFenced):
-            await repository.heartbeat(**stale_claim)
+            await repository.heartbeat(
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id="instance-a",
+                execution_epoch=created.execution_epoch,
+            )
         with pytest.raises(ClaimFenced):
             await repository.append_event(
-                **stale_claim,
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id="instance-a",
+                execution_epoch=created.execution_epoch,
                 event=EventInput(
                     event_key="phase:query:step_start:1",
                     type="step_start",
@@ -624,7 +626,10 @@ async def test_replaced_claim_epoch_rejects_stale_owner_writes(
             )
         with pytest.raises(ClaimFenced):
             await repository.complete_run(
-                **stale_claim,
+                tenant_id="tenant-a",
+                run_id=run_id,
+                owner_instance_id="instance-a",
+                execution_epoch=created.execution_epoch,
                 event=EventInput(
                     event_key="lifecycle:completed:0",
                     type="done",

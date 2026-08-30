@@ -165,13 +165,13 @@ class EventEmitter:
         """Convenience: emit a single LLM streaming token."""
         await self.emit(StreamEvent(type=EventType.TOKEN, data=token))
 
-    async def emit_citations(self, citations: list[dict]) -> None:
+    async def emit_citations(self, citations: list[dict[str, Any]]) -> None:
         """Emit citation metadata with highlight spans."""
         await self.emit(StreamEvent(type=EventType.CITATIONS, data=citations))
 
     async def emit_progress(self, message: str, data: Any = None) -> None:
         """Convenience: emit a non-answer progress event."""
-        payload = {"message": message}
+        payload: dict[str, Any] = {"message": message}
         if data is not None:
             payload["data"] = data
         await self.emit(StreamEvent(type=EventType.PROGRESS, data=payload))

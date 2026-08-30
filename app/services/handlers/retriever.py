@@ -23,12 +23,16 @@ class RetrieverHandler:
                 "Flow step 'retriever' requires 'retrieverConfig' in tenant config"
             )
         effective_query = ctx.refined_query or ctx.query
+        top_k_raw = (step.settings or {}).get(
+            "top_k", (step.settings or {}).get("topK", 10)
+        )
+        top_k = int(top_k_raw) if isinstance(top_k_raw, (int, str)) else 10
 
         # Use safe_execute for retrieval
         ctx.documents = await safe_execute(
             self.provider.retrieve,
             effective_query,
-            self.provider.config.top_k,
+            top_k,
         )
         if ctx.emitter:
             await ctx.emitter.emit_step_completed(

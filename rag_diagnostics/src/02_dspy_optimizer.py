@@ -1,5 +1,4 @@
-"""
-DSPy 自动调优引擎 (DSPy Auto-optimizer)
+"""DSPy 自动调优引擎 (DSPy Auto-optimizer)
 =========================================
 利用 DSPy 3.x 的编译级 Prompt 优化能力，结合 Ragas 0.4.x 作为评分裁判，
 自动进化出防幻觉、高相关性的 RAG Prompt 配置。
@@ -17,22 +16,23 @@ DSPy 自动调优引擎 (DSPy Auto-optimizer)
 import json
 import os
 import warnings
+from typing import Any, Protocol, cast
 
-import dspy
-from dspy.teleprompt import BootstrapFewShot
+import dspy  # pyright: ignore[reportMissingTypeStubs] -- DSPy has no py.typed marker
 from dotenv import load_dotenv
+from dspy.teleprompt import BootstrapFewShot  # pyright: ignore[reportMissingTypeStubs]
 
 # Ragas 0.4.x API (using legacy metric imports compatible with evaluate())
-import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="ragas")
 
-from ragas import evaluate
+import nest_asyncio  # pyright: ignore[reportMissingTypeStubs] -- package has no stubs
+from ragas import (
+    evaluate,  # pyright: ignore[reportUnknownVariableType] -- Ragas callback internals expose Unknown
+)
 from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
-from ragas.metrics import Faithfulness, AnswerRelevancy
+from ragas.metrics import AnswerRelevancy, Faithfulness
 
-import nest_asyncio
-
-nest_asyncio.apply()
+nest_asyncio.apply()  # pyright: ignore[reportUnknownMemberType] -- untyped third-party boundary
 load_dotenv()
 
 # 抑制 Ragas deprecation 警告
@@ -41,8 +41,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="ragas")
 # ==============================================================
 # 配置 DSPy 3.x
 # ==============================================================
-turbo = dspy.LM("openai/gpt-4o-mini", temperature=0.1)
-dspy.configure(lm=turbo)
+dspy_api: Any = dspy
+turbo: Any = dspy_api.LM("openai/gpt-4o-mini", temperature=0.1)
+dspy_api.configure(lm=turbo)
 
 # ==============================================================
 # 真实系统 Prompt 模板映射
@@ -65,7 +66,7 @@ dspy.configure(lm=turbo)
 # ==============================================================
 
 
-class RAGAnswer(dspy.Signature):
+class RAGAnswer(dspy_api.Signature):  # pyright: ignore[reportUntypedBaseClass] -- DSPy dynamically builds signatures
     """You are an expert knowledge base assistant. Answer the user's
     question using ONLY the provided retrieved context.
     If the context does not contain the answer, say you don't know.
@@ -75,33 +76,37 @@ class RAGAnswer(dspy.Signature):
     """
 
     # ---- 对应模板中的动态变量 ----
-    context = dspy.InputField(
+    context: Any = dspy_api.InputField(
         desc="Retrieved reference documents from the search engine (maps to {{context}} in prompt template)"
     )
-    question = dspy.InputField(
-        desc="The user's question"
-    )
-    current_date = dspy.InputField(
+    question: Any = dspy_api.InputField(desc="The user's question")
+    current_date: Any = dspy_api.InputField(
         desc="Today's date for time-sensitive questions (maps to {{current_date}} in prompt template)",
     )
-    user_instruction = dspy.InputField(
+    user_instruction: Any = dspy_api.InputField(
         desc="Optional per-request instruction to customize behavior (maps to {{user_instruction}} in prompt template)",
     )
     # ---- 要生成的输出 ----
-    answer = dspy.OutputField(
+    answer: Any = dspy_api.OutputField(
         desc="A precise, objective answer strictly grounded in the provided context. "
-             "Do not fabricate information not present in the documents."
+        "Do not fabricate information not present in the documents."
     )
 
 
-class RAGPipeline(dspy.Module):
+class RAGPipeline(dspy_api.Module):  # pyright: ignore[reportUntypedBaseClass] -- DSPy modules are dynamically typed
     """RAG generation pipeline with template variable support."""
 
-    def __init__(self):
-        super().__init__()
-        self.generate_answer = dspy.ChainOfThought(RAGAnswer)
+    def __init__(self) -> None:
+        super().__init__()  # pyright: ignore[reportUnknownMemberType] -- DSPy base is untyped
+        self.generate_answer: Any = dspy_api.ChainOfThought(RAGAnswer)
 
-    def forward(self, question, context, current_date="", user_instruction=""):
+    def forward(
+        self,
+        question: str,
+        context: str,
+        current_date: str = "",
+        user_instruction: str = "",
+    ) -> Any:
         """Generate answer from context with optional template variables."""
         result = self.generate_answer(
             context=context,
@@ -109,15 +114,27 @@ class RAGPipeline(dspy.Module):
             current_date=current_date,
             user_instruction=user_instruction,
         )
-        return dspy.Prediction(answer=result.answer)
+        return dspy_api.Prediction(answer=result.answer)
 
 
 # ==============================================================
 # 联合评分函数 (Ragas 0.4.x 作为裁判)
 # ==============================================================
-def comprehensive_ragas_metric(example, pred, trace=None):
-    """
-    使用 Ragas 对 DSPy 每次尝试生成的答案进行评分。
+class _DSPyExampleLike(Protocol):
+    question: str
+    context: str | list[str]
+
+
+class _DSPyPredictionLike(Protocol):
+    answer: str
+
+
+def comprehensive_ragas_metric(
+    example: _DSPyExampleLike,
+    pred: _DSPyPredictionLike,
+    trace: object | None = None,
+) -> bool | float:
+    """使用 Ragas 对 DSPy 每次尝试生成的答案进行评分。
     综合考虑：
     - Faithfulness (70%): 是否有幻觉/编造
     - AnswerRelevancy (30%): 是否切题
@@ -136,29 +153,34 @@ def comprehensive_ragas_metric(example, pred, trace=None):
     dataset = EvaluationDataset(samples=[sample])
 
     try:
-        result = evaluate(
+        result: Any = evaluate(  # pyright: ignore[reportUnknownVariableType] -- Ragas overload exposes Unknown internals
             dataset=dataset,
-            metrics=[Faithfulness(), AnswerRelevancy()],
+            metrics=cast(
+                Any,
+                [
+                    Faithfulness(),  # pyright: ignore[reportCallIssue] -- dynamic Ragas class export
+                    AnswerRelevancy(),  # pyright: ignore[reportCallIssue] -- dynamic Ragas class export
+                ],
+            ),
             raise_exceptions=False,
             show_progress=False,
         )
 
         # Ragas 0.4.x: result 是 EvaluationResult, result["metric_name"] 返回分数列表
-        scores = result.scores[0] if result.scores else {}
-        score_f = scores.get("faithfulness", 0.0)
-        score_r = scores.get("answer_relevancy", 0.0)
+        scores = cast(dict[str, Any], result.scores[0] if result.scores else {})
+        score_f = float(scores.get("faithfulness") or 0.0)
+        score_r = float(scores.get("answer_relevancy") or 0.0)
     except Exception as e:
         print(f"  ⚠️ Ragas evaluation error: {e}")
         score_f, score_r = 0.0, 0.0
-
-    score_f = score_f if score_f is not None else 0.0
-    score_r = score_r if score_r is not None else 0.0
 
     # 综合惩罚公式：70% 事实（不能乱编），30% 相关（是否切题）
     total_score = (score_f * 0.7) + (score_r * 0.3)
 
     # 日志监控
-    print(f"  🚦 Score: {total_score:.2f} (faithfulness={score_f:.2f}, relevancy={score_r:.2f})")
+    print(
+        f"  🚦 Score: {total_score:.2f} (faithfulness={score_f:.2f}, relevancy={score_r:.2f})"
+    )
     print(f"     Q: {example.question[:40]}...")
     print(f"     A: {pred.answer[:50]}...")
 
@@ -172,19 +194,19 @@ def comprehensive_ragas_metric(example, pred, trace=None):
 # ==============================================================
 # 主流程
 # ==============================================================
-def optimize_pipeline(input_path: str, output_dir: str):
+def optimize_pipeline(input_path: str, output_dir: str) -> None:
     """加载日志数据，运行 DSPy 端到端优化。"""
     from datetime import date
 
     print("📂 Loading log data for optimization...")
-    with open(input_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    with open(input_path, encoding="utf-8") as f:
+        data = cast(list[dict[str, Any]], json.load(f))
 
     # 构造 DSPy 训练集
     # 每个 Example 都包含对应模板变量的真实值
-    trainset = []
+    trainset: list[Any] = []
     for item in data:
-        ex = dspy.Example(
+        ex: Any = dspy_api.Example(
             question=item["query"],
             context="\n".join(item["contexts"]),
             # 从日志中读取模板变量，没有则用默认值
@@ -196,10 +218,10 @@ def optimize_pipeline(input_path: str, output_dir: str):
     print(f"📊 Loaded {len(trainset)} training samples")
 
     # 配置 BootstrapFewShot 优化器
-    teleprompter = BootstrapFewShot(
+    teleprompter: Any = cast(Any, BootstrapFewShot)(
         metric=comprehensive_ragas_metric,
         max_bootstrapped_demos=2,  # 最多保留 2 条自动生成的 few-shot 示例
-        max_labeled_demos=0,       # 不使用人工标注示例
+        max_labeled_demos=0,  # 不使用人工标注示例
     )
 
     rag_system = RAGPipeline()
@@ -208,7 +230,7 @@ def optimize_pipeline(input_path: str, output_dir: str):
     print("🚀 Starting DSPy Auto-optimization")
     print("=" * 60)
 
-    compiled_rag = teleprompter.compile(rag_system, trainset=trainset)
+    compiled_rag: Any = teleprompter.compile(rag_system, trainset=trainset)
 
     print("\n" + "=" * 60)
     print("🏁 Optimization Complete!")

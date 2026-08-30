@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -53,10 +54,10 @@ async def test_inactive_runs_do_not_retain_local_wakeup_state() -> None:
     run_id = uuid4()
 
     async with wakeups.subscribe("tenant-a", run_id):
-        assert len(wakeups._slots) == 1
+        assert wakeups.active_subscription_count == 1
 
     await wakeups.publish("tenant-a", run_id)
-    assert wakeups._slots == {}
+    assert wakeups.active_subscription_count == 0
 
 
 @pytest.mark.asyncio
@@ -67,7 +68,7 @@ async def test_redis_publish_on_one_instance_wakes_another_instance(
     monkeypatch.setattr(
         live_events_module.aioredis,
         "from_url",
-        lambda *args, **kwargs: broker.client(),
+        broker.redis_factory,
     )
     producer = LiveEventWakeups(redis_url="redis://test")
     consumer = LiveEventWakeups(redis_url="redis://test")
@@ -95,7 +96,7 @@ async def test_cancellation_wakeup_is_addressed_only_to_owning_instance(
     monkeypatch.setattr(
         live_events_module.aioredis,
         "from_url",
-        lambda *args, **kwargs: broker.client(),
+        broker.redis_factory,
     )
     requester = LiveEventWakeups(redis_url="redis://test", instance_id="requester")
     owner = LiveEventWakeups(redis_url="redis://test", instance_id="owner")
@@ -154,6 +155,10 @@ class FakePubSub:
     async def aclose(self) -> None:
         pass
 
+    async def enqueue(self, message: dict[str, str]) -> None:
+        """Queue one broker message for the listener."""
+        await self._messages.put(message)
+
 
 class FakeRedis:
     def __init__(self, broker: FakeRedisBroker) -> None:
@@ -167,7 +172,7 @@ class FakeRedis:
         self._broker.published_channels.append(channel)
         for pubsub in self._broker.pubsubs:
             if channel in pubsub.subscribed_channels:
-                await pubsub._messages.put({"type": "message", "data": data})
+                await pubsub.enqueue({"type": "message", "data": data})
 
     async def aclose(self) -> None:
         self.closed = True
@@ -184,3 +189,7 @@ class FakeRedisBroker:
         client = FakeRedis(self)
         self.clients.append(client)
         return client
+
+    def redis_factory(self, *args: Any, **kwargs: Any) -> FakeRedis:
+        """Match redis.from_url while returning an in-memory client."""
+        return self.client()

@@ -6,10 +6,14 @@ from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import datetime
+from typing import Any, cast
 from uuid import UUID, uuid4
 
+import fastapi
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 
@@ -45,12 +49,14 @@ from tests.integration.test_langgraph_v2_tracer import (
 )
 
 
-def _thread_resume_endpoint(app):
-    return next(
-        route.endpoint
-        for route in app.router.routes
-        if getattr(route, "path", None) == "/v2/threads/{thread_id}/resume/stream"
-    )
+def _thread_resume_endpoint(app: fastapi.FastAPI) -> Any:
+    for route in app.router.routes:
+        if (
+            isinstance(route, APIRoute)
+            and route.path == "/v2/threads/{thread_id}/resume/stream"
+        ):
+            return route.endpoint
+    raise LookupError("thread resume endpoint is not registered")
 
 
 class _AnswerActor:
@@ -273,7 +279,7 @@ async def _seed_pre_answer_checkpoint(
         max_size=3,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     ) as pool:
-        checkpointer = AsyncPostgresSaver(pool)
+        checkpointer = AsyncPostgresSaver(cast(Any, pool))
         await checkpointer.setup()
         messages = ConversationMessageRepository(pool)
         conversation = await messages.resolve_conversation(
@@ -422,7 +428,7 @@ async def _advance_same_turn_checkpoint(
         max_size=3,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     ) as pool:
-        checkpointer = AsyncPostgresSaver(pool)
+        checkpointer = AsyncPostgresSaver(cast(Any, pool))
         await checkpointer.setup()
         messages = ConversationMessageRepository(pool)
         conversation = await messages.resolve_conversation(
@@ -492,7 +498,7 @@ async def _latest_checkpoint_id(database_url: str, thread_id: str) -> str:
         max_size=2,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     ) as pool:
-        saver = AsyncPostgresSaver(pool)
+        saver = AsyncPostgresSaver(cast(Any, pool))
         await saver.setup()
         checkpoint = await saver.aget_tuple(
             initial_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
@@ -506,13 +512,14 @@ class _BlockingResumeGraph:
         self.events = events
         self.started = threading.Event()
         self.release = threading.Event()
-        self.seen_config: dict[str, object] | None = None
+        self.seen_config: RunnableConfig | None = None
 
     def astream(
         self,
         graph_input: object | None,
+        /,
         *,
-        config: dict[str, object] | None = None,
+        config: RunnableConfig | None = None,
         stream_mode: list[str] | str | None = None,
         durability: str | None = None,
     ) -> AsyncIterator[object]:
@@ -693,7 +700,7 @@ def test_thread_resume_returns_404_for_missing_or_unauthorized_thread(
 def test_thread_resume_returns_404_for_missing_expected_turn(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, _ = asyncio.run(
+    thread_id, _turn_id, _ = asyncio.run(
         _seed_pre_answer_checkpoint(langgraph_v2_migrated_database_url)
     )
     app = persistent_tracer_app(
@@ -715,7 +722,7 @@ def test_thread_resume_returns_404_for_missing_expected_turn(
 def test_thread_resume_returns_404_for_expected_turn_from_other_conversation(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, _ = asyncio.run(
+    thread_id, _turn_id, _ = asyncio.run(
         _seed_pre_answer_checkpoint(langgraph_v2_migrated_database_url)
     )
     _, foreign_turn_id, _ = asyncio.run(
@@ -866,6 +873,7 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
     assert response.status_code == 200
     assert response.headers["x-turn-id"] == str(turn_id)
     assert graph.seen_config is not None
+    assert "configurable" in graph.seen_config
     configurable = graph.seen_config["configurable"]
     assert configurable["thread_id"] == thread_id
     assert configurable["checkpoint_ns"] == ""
@@ -953,7 +961,7 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
 def test_second_interruption_can_resume_before_original_deadline(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    thread_id, turn_id, run_id, resume_deadline = asyncio.run(
+    thread_id, turn_id, _run_id, resume_deadline = asyncio.run(
         _interrupt_query_after_answer_token(
             langgraph_v2_migrated_database_url,
         )

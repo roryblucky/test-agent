@@ -63,12 +63,11 @@ async def test_failed_expiry_cas_keeps_bounded_polling_latency() -> None:
         run_id=repository.run.run_id,
         after_sequence=0,
     )
-    pending = asyncio.create_task(anext(follower))
+    pending = asyncio.ensure_future(anext(follower))
 
     await asyncio.sleep(0.055)
     pending.cancel()
     with suppress(asyncio.CancelledError):
         await pending
-    await follower.aclose()
 
     assert 1 <= repository.cas_attempts <= 4

@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from typing import Self
+from typing import Any, Self, cast
 from uuid import uuid4
 
 import pytest
@@ -15,6 +15,7 @@ from app.langgraph_v2.answer import (
     build_answer_actor,
     run_answer,
 )
+from app.langgraph_v2.artifacts import ArtifactStore
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext
 from app.models.domain import Document
@@ -67,7 +68,7 @@ class _FakeStructuredAgent:
         self.prompt: str | None = None
         self.kwargs: dict[str, object] = {}
 
-    def run_stream(self, prompt: str, **kwargs: object) -> _FakeStructuredStream:
+    def run_stream(self, prompt: str, **kwargs: Any) -> _FakeStructuredStream:
         self.prompt = prompt
         self.kwargs = kwargs
         return self.stream
@@ -78,7 +79,7 @@ class _FakePhaseRepository:
         self.committed = False
         self.candidate: object | None = None
 
-    async def get_or_invoke(self, **kwargs: object) -> object:
+    async def get_or_invoke(self, **kwargs: Any) -> object:
         phase = await kwargs["invoke"]()  # type: ignore[index]
         self.candidate = phase
         self.committed = True
@@ -134,7 +135,7 @@ async def test_pydantic_ai_answer_actor_stream_cancellation_closes_agent_context
 
     first = await answer_stream.__anext__()
     assert first.delta == "partial"
-    pending = asyncio.create_task(answer_stream.__anext__())
+    pending = asyncio.ensure_future(answer_stream.__anext__())
     await asyncio.sleep(0)
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -180,7 +181,9 @@ async def test_run_answer_writes_real_deltas_and_returns_same_complete_answer() 
         ", world!",
     ]
     assert (
-        "".join(event["data"] for event in public_events if event["type"] == "token")
+        "".join(
+            str(event["data"]) for event in public_events if event["type"] == "token"
+        )
         == result.answer
     )
     assert repository.committed is True
@@ -237,9 +240,7 @@ def test_build_answer_actor_uses_registry_model_and_output_type() -> None:
     )
 
     class Registry:
-        def create_agent(
-            self, model_name: str, **kwargs: object
-        ) -> _FakeStructuredAgent:
+        def create_agent(self, model_name: str, **kwargs: Any) -> _FakeStructuredAgent:
             assert model_name == "pro"
             assert kwargs["output_type"] is AnswerOutput
             assert kwargs["instructions"] == "custom"
@@ -253,7 +254,7 @@ def test_build_answer_actor_uses_registry_model_and_output_type() -> None:
 @pytest.mark.asyncio
 async def test_answer_checks_cancellation_before_publication() -> None:
     class Repository:
-        async def get_or_invoke(self, **kwargs: object) -> object:
+        async def get_or_invoke(self, **kwargs: Any) -> object:
             raise AssertionError("cancelled answer must not invoke the repository")
 
     context = PhaseExecutionContext(
@@ -269,7 +270,7 @@ async def test_answer_checks_cancellation_before_publication() -> None:
         await run_answer(
             {"query": "hello"},
             context=context,
-            artifacts=object(),
+            artifacts=cast(ArtifactStore, object()),
             actor=object(),  # type: ignore[arg-type]
         )
 

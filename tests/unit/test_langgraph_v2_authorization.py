@@ -17,6 +17,8 @@ def test_trusted_request_context_dependency_validates_gateway_headers() -> None:
     ) -> dict[str, str]:
         return context.model_dump()
 
+    assert read_context is not None
+
     with TestClient(app) as client:
         valid = client.get(
             "/context",

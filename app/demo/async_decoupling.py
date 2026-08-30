@@ -23,7 +23,8 @@ import asyncio
 import json
 import uuid
 from collections import defaultdict
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks
 from pydantic import BaseModel
@@ -38,20 +39,21 @@ class InMemoryMessageBus:
     """A simplistic in-memory pub-sub bus for routing events by task_id."""
 
     def __init__(self):
-        self._queues: dict[str, list[asyncio.Queue]] = defaultdict(list)
+        self._queues: dict[str, list[asyncio.Queue[dict[str, Any]]]] = defaultdict(list)
 
-    async def publish(self, task_id: str, message: dict):
+    async def publish(self, task_id: str, message: dict[str, Any]) -> None:
         """Publish an event to all subscribers of a task_id."""
         for queue in self._queues[task_id]:
             await queue.put(message)
 
-    async def subscribe(self, task_id: str) -> asyncio.Queue:
+    async def subscribe(self, task_id: str) -> asyncio.Queue[dict[str, Any]]:
         """Subscribe to events for a specific task_id."""
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._queues[task_id].append(queue)
         return queue
 
-    def unsubscribe(self, task_id: str, queue: asyncio.Queue):
+    def unsubscribe(self, task_id: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
+        """Remove one task-event subscriber."""
         if queue in self._queues[task_id]:
             self._queues[task_id].remove(queue)
 
@@ -70,20 +72,27 @@ class AsyncEventEmitter:
         self.task_id = task_id
         self.bus = bus
 
-    async def emit_step_start(self, step_name: str, payload: dict | None = None):
+    async def emit_step_start(
+        self, step_name: str, payload: dict[str, Any] | None = None
+    ) -> None:
+        """Publish a step-start event."""
         msg = {"event": "step_start", "step": step_name, "data": payload or {}}
         await self.bus.publish(self.task_id, msg)
 
-    async def emit_token(self, chunk: str):
+    async def emit_token(self, chunk: str) -> None:
+        """Publish one streamed token."""
         msg = {"event": "token", "data": {"chunk": chunk}}
         await self.bus.publish(self.task_id, msg)
 
-    async def emit_step_completed(self, step_name: str, payload: dict | None = None):
+    async def emit_step_completed(
+        self, step_name: str, payload: dict[str, Any] | None = None
+    ) -> None:
+        """Publish a step-completed event."""
         msg = {"event": "step_completed", "step": step_name, "data": payload or {}}
         await self.bus.publish(self.task_id, msg)
 
 
-async def run_orchestrator_background(task_id: str, query: str):
+async def run_orchestrator_background(task_id: str, query: str) -> None:
     """The heavy background job representing the dynamic agent loop."""
     emitter = AsyncEventEmitter(task_id, bus)
 
@@ -115,15 +124,19 @@ router = APIRouter(prefix="/demo/async", tags=["Async Demo"])
 
 
 class ChatRequest(BaseModel):
+    """Minimal demo chat request."""
     query: str
 
 
 class ChatResponse(BaseModel):
+    """Accepted demo chat task identifier."""
     task_id: str
 
 
 @router.post("/chat", response_model=ChatResponse, status_code=202)
-async def submit_chat(req: ChatRequest, background_tasks: BackgroundTasks):
+async def submit_chat(
+    req: ChatRequest, background_tasks: BackgroundTasks
+) -> ChatResponse:
     """Submit a query and return a task_id immediately."""
     task_id = str(uuid.uuid4())
 
@@ -134,7 +147,7 @@ async def submit_chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
 
 @router.get("/chat/stream/{task_id}")
-async def stream_chat_events(task_id: str):
+async def stream_chat_events(task_id: str) -> EventSourceResponse:
     """Clients connect here via SSE to listen for their task's events."""
     queue = await bus.subscribe(task_id)
 

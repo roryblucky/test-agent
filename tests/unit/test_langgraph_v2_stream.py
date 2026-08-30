@@ -36,12 +36,12 @@ class _FakeGraphStream:
 
 
 class _FakeGraph:
-    def __init__(self, stream: _FakeGraphStream) -> None:
+    def __init__(self, stream: AsyncIterator[Any]) -> None:
         self.stream = stream
         self.inputs: list[Any] = []
         self.options: list[dict[str, Any]] = []
 
-    def astream(self, graph_input: Any, **options: Any) -> _FakeGraphStream:
+    def astream(self, graph_input: Any, **options: Any) -> AsyncIterator[Any]:
         self.inputs.append(graph_input)
         self.options.append(options)
         return self.stream
@@ -49,55 +49,54 @@ class _FakeGraph:
 
 @pytest.mark.asyncio
 async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() -> None:
-    graph = _FakeGraph(
-        _FakeGraphStream(
-            [
-                (
-                    "updates",
-                    {
-                        "answer": {
-                            "events": [
-                                {
-                                    "event_key": "phase:answer:step_start:1",
-                                    "type": "step_start",
-                                    "step": "answer",
-                                    "sequence": 17,
-                                }
-                            ]
-                        }
-                    },
-                ),
-                (
-                    "custom",
-                    {
-                        "event_key": "phase:answer:token:1",
-                        "type": "token",
-                        "data": "hello",
-                    },
-                ),
-                ("custom", "unknown custom text"),
-                (
-                    "messages",
-                    (" world", {"langgraph_node": "answer"}),
-                ),
-                (
-                    "messages",
-                    ("private reasoning", {"langgraph_node": "tool"}),
-                ),
+    stream = _FakeGraphStream(
+        [
+            (
+                "updates",
                 {
-                    "type": "updates",
-                    "data": {
-                        "private": {
-                            "event_key": "phase:private:step_start:1",
-                            "type": "step_start",
-                        }
-                    },
+                    "answer": {
+                        "events": [
+                            {
+                                "event_key": "phase:answer:step_start:1",
+                                "type": "step_start",
+                                "step": "answer",
+                                "sequence": 17,
+                            }
+                        ]
+                    }
                 },
-                ("checkpoints", {"state": "private"}),
-                ("debug", {"state": "private"}),
-            ]
-        )
+            ),
+            (
+                "custom",
+                {
+                    "event_key": "phase:answer:token:1",
+                    "type": "token",
+                    "data": "hello",
+                },
+            ),
+            ("custom", "unknown custom text"),
+            (
+                "messages",
+                (" world", {"langgraph_node": "answer"}),
+            ),
+            (
+                "messages",
+                ("private reasoning", {"langgraph_node": "tool"}),
+            ),
+            {
+                "type": "updates",
+                "data": {
+                    "private": {
+                        "event_key": "phase:private:step_start:1",
+                        "type": "step_start",
+                    }
+                },
+            },
+            ("checkpoints", {"state": "private"}),
+            ("debug", {"state": "private"}),
+        ]
     )
+    graph = _FakeGraph(stream)
 
     frames = [frame async for frame in stream_graph(graph, {"query": "hello"})]
 
@@ -113,8 +112,8 @@ async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() 
             "durability": "sync",
         }
     ]
-    assert graph.stream.closed is True
-    assert graph.stream.close_completed is True
+    assert stream.closed is True
+    assert stream.close_completed is True
 
 
 @pytest.mark.asyncio

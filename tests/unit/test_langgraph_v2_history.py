@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from uuid import UUID
 
 from app.langgraph_v2.conversation_messages import MessageRecord
@@ -12,7 +13,7 @@ from app.langgraph_v2.history import (
 
 def _message(
     run_number: int,
-    role: str,
+    role: Literal["user", "assistant"],
     content: str,
     order: int,
     turn_number: int | None = None,

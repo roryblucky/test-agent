@@ -20,13 +20,6 @@ from app.models.domain import Document
 from app.models.workflow import CitationReference
 
 
-class AnswerOutput(BaseModel):
-    """Validated structured answer returned by the PydanticAI actor."""
-
-    answer: str = Field(min_length=1)
-    citations: list[AnswerCitation] = Field(default_factory=list)
-
-
 class AnswerCitation(BaseModel):
     """A model citation request referring to ordered evidence by index."""
 
@@ -34,12 +27,19 @@ class AnswerCitation(BaseModel):
     quoted_text: str | None = None
 
 
+class AnswerOutput(BaseModel):
+    """Validated structured answer returned by the PydanticAI actor."""
+
+    answer: str = Field(min_length=1)
+    citations: list[AnswerCitation] = Field(default_factory=list[AnswerCitation])
+
+
 class AnswerResult(BaseModel):
     """Answer output plus stable model usage metadata."""
 
     answer: str = Field(min_length=1)
     usage: dict[str, Any] = Field(default_factory=dict)
-    citations: list[AnswerCitation] = Field(default_factory=list)
+    citations: list[AnswerCitation] = Field(default_factory=list[AnswerCitation])
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,7 @@ class BoundAnswerResult(BaseModel):
 
     answer: str = Field(min_length=1)
     usage: dict[str, Any] = Field(default_factory=dict)
-    citations: list[CitationReference] = Field(default_factory=list)
+    citations: list[CitationReference] = Field(default_factory=list[CitationReference])
 
 
 def bind_answer_citations(
@@ -165,7 +165,9 @@ class PydanticAIAnswerActor:
     @staticmethod
     def _usage_payload(result: Any) -> dict[str, Any]:
         usage = result.usage()
-        return asdict(usage) if is_dataclass(usage) else dict(vars(usage))
+        if is_dataclass(usage) and not isinstance(usage, type):
+            return asdict(usage)
+        return dict(vars(usage))
 
     async def answer_stream(
         self,
@@ -270,8 +272,6 @@ async def run_answer(
             answer_iterator = actor.answer_stream(answer_query, documents, history)
             try:
                 async for chunk in answer_iterator:
-                    if not isinstance(chunk, AnswerStreamChunk):
-                        raise TypeError("answer_stream yielded an unsupported chunk")
                     if chunk.result is not None:
                         streamed_result = chunk.result
                     if not chunk.delta:

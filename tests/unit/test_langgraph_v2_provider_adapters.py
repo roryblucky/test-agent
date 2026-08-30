@@ -24,7 +24,9 @@ from app.providers.base import (
 @pytest.mark.asyncio
 async def test_retriever_adapter_preserves_documents_and_adds_raw_provenance() -> None:
     class Provider(BaseRetrieverProvider):
-        async def retrieve(self, query: str, top_k: int = 10, filter_expr: str | None = None) -> list[Document]:
+        async def retrieve(
+            self, query: str, top_k: int = 10, filter_expr: str | None = None
+        ) -> list[Document]:
             assert (query, top_k, filter_expr) == ("refined", 10, None)
             return [Document(id="d1", content="evidence")]
 
@@ -40,9 +42,13 @@ async def test_retriever_adapter_preserves_documents_and_adds_raw_provenance() -
 
 
 @pytest.mark.asyncio
-async def test_ranker_adapter_passes_refined_query_without_changing_provider_contract() -> None:
+async def test_ranker_adapter_passes_refined_query_without_changing_provider_contract() -> (
+    None
+):
     class Provider(BaseRankerProvider):
-        async def rank(self, query: str, documents: list[Document], top_n: int = 5) -> list[Document]:
+        async def rank(
+            self, query: str, documents: list[Document], top_n: int = 5
+        ) -> list[Document]:
             assert query == "refined"
             assert [document.id for document in documents] == ["d1", "d2"]
             assert top_n == 2
@@ -59,7 +65,9 @@ async def test_ranker_adapter_passes_refined_query_without_changing_provider_con
 @pytest.mark.asyncio
 async def test_ranker_adapter_requests_all_documents_by_default() -> None:
     class Provider(BaseRankerProvider):
-        async def rank(self, query: str, documents: list[Document], top_n: int = 5) -> list[Document]:
+        async def rank(
+            self, query: str, documents: list[Document], top_n: int = 5
+        ) -> list[Document]:
             del query
             assert top_n == 6
             return documents
@@ -86,14 +94,20 @@ async def test_moderation_adapter_converts_existing_result() -> None:
     )
 
 
-def test_tenant_provider_bundle_is_adapted_without_legacy_orchestration_imports() -> None:
+def test_tenant_provider_bundle_is_adapted_without_legacy_orchestration_imports() -> (
+    None
+):
     class RetrieverProvider(BaseRetrieverProvider):
-        async def retrieve(self, query: str, top_k: int = 10, filter_expr: str | None = None) -> list[Document]:
+        async def retrieve(
+            self, query: str, top_k: int = 10, filter_expr: str | None = None
+        ) -> list[Document]:
             del query, top_k, filter_expr
             return []
 
     class RankerProvider(BaseRankerProvider):
-        async def rank(self, query: str, documents: list[Document], top_n: int = 5) -> list[Document]:
+        async def rank(
+            self, query: str, documents: list[Document], top_n: int = 5
+        ) -> list[Document]:
             del query, top_n
             return documents
 

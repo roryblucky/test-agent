@@ -6,7 +6,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from psycopg.rows import dict_row
@@ -27,8 +27,8 @@ from app.langgraph_v2.run_events import (
     EventInvariantConflict,
     EventRecord,
     RunNotFound,
-    _canonical_envelope,
-    _set_terminal_status_in_transaction,
+    _canonical_envelope,  # pyright: ignore[reportPrivateUsage] -- shared journal primitive
+    _set_terminal_status_in_transaction,  # pyright: ignore[reportPrivateUsage] -- shared transaction primitive
 )
 
 PhaseName = Literal[
@@ -67,20 +67,24 @@ class PhaseResultInput(BaseModel):
 
     phase_name: PhaseName
     normalized_result: Any = None
-    artifact_refs: list[ArtifactRef] = Field(default_factory=list)
+    artifact_refs: list[ArtifactRef] = Field(default_factory=list[ArtifactRef])
     events: tuple[EventInput, ...] = ()
     terminal_status: Literal["failed"] | None = None
 
     @model_validator(mode="after")
     def require_normalized_content(self) -> PhaseResultInput:
         """Require structured output or references to durable Artifacts."""
-        if self.normalized_result is None and not self.artifact_refs:
+        normalized_result: object = self.normalized_result
+        if normalized_result is None and not self.artifact_refs:
             raise ValueError("a PhaseResult needs normalized_result or artifact_refs")
-        if self.normalized_result is not None and not isinstance(
-            self.normalized_result, (dict, list)
+        if normalized_result is not None and not isinstance(
+            normalized_result, (dict, list)
         ):
             raise ValueError("normalized_result must be a structured object or list")
-        _assert_stable_content(self.normalized_result)
+        stable_result = cast(
+            dict[object, object] | list[object] | None, normalized_result
+        )
+        _assert_stable_content(stable_result)
         _assert_stable_content(self.artifact_refs)
         for event in self.events:
             _assert_stable_content(event.data)
@@ -95,7 +99,7 @@ class PhaseResultRecord(BaseModel):
     phase_name: PhaseName
     execution_epoch: int
     normalized_result: Any = None
-    artifact_refs: list[ArtifactRef] = Field(default_factory=list)
+    artifact_refs: list[ArtifactRef] = Field(default_factory=list[ArtifactRef])
     event_keys: tuple[str, ...] = ()
     events: tuple[EventRecord, ...] = ()
     canonical_result: str
@@ -536,17 +540,20 @@ _VOLATILE_KEYS = frozenset(
 )
 
 
-def _assert_stable_content(value: Any) -> None:
+def _assert_stable_content(value: object) -> None:
     """Reject volatile execution metadata from durable PhaseResult content."""
     if isinstance(value, dict):
-        volatile = _VOLATILE_KEYS.intersection(value)
+        mapping = cast(dict[object, object], value)
+        volatile = _VOLATILE_KEYS.intersection(
+            key for key in mapping if isinstance(key, str)
+        )
         if volatile:
             raise ValueError(
                 "volatile keys are not allowed in PhaseResult content: "
                 + ", ".join(sorted(volatile))
             )
-        for nested in value.values():
+        for nested in mapping.values():
             _assert_stable_content(nested)
     elif isinstance(value, list):
-        for nested in value:
+        for nested in cast(list[object], value):
             _assert_stable_content(nested)

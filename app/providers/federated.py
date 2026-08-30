@@ -10,7 +10,7 @@ database or API to query, while maximizing speed through concurrent execution.
 """
 
 import asyncio
-from typing import Sequence
+from collections.abc import Sequence
 
 from app.models.domain import Document
 from app.providers.base import BaseRetrieverProvider
@@ -32,12 +32,15 @@ class FederatedRetrieverProvider(BaseRetrieverProvider):
         """
         self.retrievers = retrievers
 
-    async def retrieve(self, query: str, top_k: int = 10) -> list[Document]:
+    async def retrieve(
+        self, query: str, top_k: int = 10, filter_expr: str | None = None
+    ) -> list[Document]:
         """Concurrently fetch from all underlying retrievers and merge results.
 
         Args:
             query: The search string.
             top_k: The number of documents requested per source.
+            filter_expr: Optional provider-specific filter expression.
 
         Returns:
             A deduplicated list of documents aggregated from all sources.
@@ -49,7 +52,8 @@ class FederatedRetrieverProvider(BaseRetrieverProvider):
 
         # 1. Fire off all retrieval tasks concurrently
         tasks = [
-            retriever.retrieve(query, top_k=top_k) for retriever in self.retrievers
+            retriever.retrieve(query, top_k=top_k, filter_expr=filter_expr)
+            for retriever in self.retrievers
         ]
 
         # `return_exceptions=True` ensures that if one data source goes down
@@ -63,7 +67,7 @@ class FederatedRetrieverProvider(BaseRetrieverProvider):
 
         for result in results_lists:
             # Skip if a specific provider raised an exception
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 # In production, log the exception here:
                 # logger.warning(f"A retriever failed: {result}")
                 continue

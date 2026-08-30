@@ -1,10 +1,13 @@
 """Unit tests for AgentHandler mode dispatch."""
 
+import unittest.mock
 from collections.abc import Callable
-from typing import Any, Self
+from typing import Any, Self, cast
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic_ai import Agent
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.usage import RunUsage
 
 from app.config.models import (
@@ -25,7 +28,6 @@ from app.models.workflow import (
 from app.services.flow_context import FlowContext
 from app.services.handlers.agent import AgentHandler
 from app.services.tenant_manager import TenantProviders
-from app.skills.schema import SkillDefinition, SkillMetadata
 
 
 class FakeAgentStream:
@@ -95,9 +97,9 @@ class FakeAgent:
 
 def _tenant_config() -> TenantConfig:
     return TenantConfig(
-        kmsAppName="Agent Mode Test App",
-        applicationId="agent-mode-test",
-        adGroups=["group1"],
+        kms_app_name="Agent Mode Test App",
+        application_id="agent-mode-test",
+        ad_groups=["group1"],
         llm_config=LLMConfig(models={}),
         flow_config=FlowConfig(),
     )
@@ -112,42 +114,25 @@ def _handler() -> AgentHandler:
     )
 
 
-def _skill(
-    name: str,
-    *,
-    allowed_tools: list[str],
-    required_tools: list[str],
-) -> SkillDefinition:
-    return SkillDefinition(
-        metadata=SkillMetadata(
-            name=name,
-            description=f"{name} skill",
-            allowed_tools=allowed_tools,
-            required_tools=required_tools,
-        ),
-        instructions="Use required tools.",
-        tenant_id="agent-mode-test",
-        source_path=f"/skills/{name}/SKILL.md",
-    )
-
-
 @pytest.mark.asyncio
-async def test_agent_without_mode_defaults_to_supervisor(mock_emitter) -> None:
+async def test_agent_without_mode_defaults_to_supervisor(
+    mock_emitter: unittest.mock.AsyncMock,
+) -> None:
     """Missing agent mode preserves the old supervisor-style final answer path."""
     handler = _handler()
-    agent_config = AgentConfig(llmType="fast", buildInTools=["search_documents"])
+    agent_config = AgentConfig(llm_type="fast", built_in_tools=["search_documents"])
     fake_agent = FakeAgent(
         output="final answer",
         chunks=["final", "final answer"],
     )
-    handler._agent_cache[
-        handler._cache_key("supervisor", agent_config)
-    ] = fake_agent
+    handler.set_agent_override(
+        "supervisor", agent_config, cast(Agent[Any, Any], fake_agent)
+    )
 
     ctx = FlowContext(query="answer this", emitter=mock_emitter)
     step = FlowStep(
         type=FlowStepType.AGENT,
-        agentConfig=agent_config,
+        agent_config=agent_config,
     )
 
     result = await handler.handle(ctx, step)
@@ -155,6 +140,7 @@ async def test_agent_without_mode_defaults_to_supervisor(mock_emitter) -> None:
     assert result.llm_response == "final answer"
     assert result.planner_output is None
     assert fake_agent.last_prompt == "answer this"
+    assert fake_agent.last_deps is not None
     assert fake_agent.last_deps.flow_context is ctx
     assert fake_agent.last_deps.tenant_id == "agent-mode-test"
     mock_emitter.emit_token.assert_any_await("final")
@@ -166,11 +152,11 @@ async def test_agent_without_mode_defaults_to_supervisor(mock_emitter) -> None:
 
 @pytest.mark.asyncio
 async def test_agent_planner_writes_planner_output_without_final_answer(
-    mock_emitter,
+    mock_emitter: unittest.mock.AsyncMock,
 ) -> None:
     """Planner mode writes PlannerOutput and does not populate llm_response."""
     handler = _handler()
-    agent_config = AgentConfig(llmType="fast", buildInTools=["search_documents"])
+    agent_config = AgentConfig(llm_type="fast", built_in_tools=["search_documents"])
 
     def _record_runtime_context(deps: Any) -> None:
         deps.activated_skill_names.append("generic-search")
@@ -207,12 +193,14 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
         ),
         on_enter=_record_runtime_context,
     )
-    handler._agent_cache[handler._cache_key("planner", agent_config)] = fake_agent
+    handler.set_agent_override(
+        "planner", agent_config, cast(Agent[Any, Any], fake_agent)
+    )
 
     ctx = FlowContext(
         query="find evidence",
         emitter=mock_emitter,
-        message_history=["previous user turn"],
+        message_history=[ModelRequest(parts=[UserPromptPart("previous user turn")])],
     )
     ctx.intent = IntentResult(
         intent="knowledge_query",
@@ -221,7 +209,7 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
     step = FlowStep(
         type=FlowStepType.AGENT,
         mode="planner",
-        agentConfig=agent_config,
+        agent_config=agent_config,
     )
 
     result = await handler.handle(ctx, step)
@@ -263,7 +251,7 @@ async def test_agent_planner_writes_planner_output_without_final_answer(
 
 @pytest.mark.asyncio
 async def test_agent_planner_keeps_planner_task_status_as_source_of_truth(
-    mock_emitter,
+    mock_emitter: unittest.mock.AsyncMock,
 ) -> None:
     """Runtime tool records do not overwrite planner-authored task status."""
     handler = AgentHandler(
@@ -272,8 +260,8 @@ async def test_agent_planner_keeps_planner_task_status_as_source_of_truth(
         cfg=_tenant_config(),
     )
     agent_config = AgentConfig(
-        llmType="fast",
-        buildInTools=["search_documents"],
+        llm_type="fast",
+        built_in_tools=["search_documents"],
     )
 
     def _record_successful_tool_call(deps: Any) -> None:
@@ -303,13 +291,15 @@ async def test_agent_planner_keeps_planner_task_status_as_source_of_truth(
         ),
         on_enter=_record_successful_tool_call,
     )
-    handler._agent_cache[handler._cache_key("planner", agent_config)] = fake_agent
+    handler.set_agent_override(
+        "planner", agent_config, cast(Agent[Any, Any], fake_agent)
+    )
 
     ctx = FlowContext(query="find evidence", emitter=mock_emitter)
     step = FlowStep(
         type=FlowStepType.AGENT,
         mode="planner",
-        agentConfig=agent_config,
+        agent_config=agent_config,
     )
 
     result = await handler.handle(ctx, step)
@@ -323,21 +313,23 @@ async def test_agent_planner_keeps_planner_task_status_as_source_of_truth(
 
 
 @pytest.mark.asyncio
-async def test_agent_unknown_mode_fails_closed(mock_emitter) -> None:
+async def test_agent_unknown_mode_fails_closed(
+    mock_emitter: unittest.mock.AsyncMock,
+) -> None:
     """Unknown agent modes fail before any fallback behavior runs."""
     handler = _handler()
     ctx = FlowContext(query="test", emitter=mock_emitter)
     step = FlowStep(
         type=FlowStepType.AGENT,
         mode="unknown",
-        agentConfig=AgentConfig(llmType="fast"),
+        agent_config=AgentConfig(llm_type="fast"),
     )
 
     with pytest.raises(ValueError, match="Unknown agent mode"):
         await handler.handle(ctx, step)
 
 
-def test_agent_warmup_cache_key_includes_mode(monkeypatch) -> None:
+def test_agent_warmup_cache_key_includes_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """Warmup builds separate cached agents for supervisor and planner."""
     handler = _handler()
     built_modes: list[str] = []
@@ -347,15 +339,17 @@ def test_agent_warmup_cache_key_includes_mode(monkeypatch) -> None:
         return FakeAgent(output="ok")
 
     monkeypatch.setattr(handler, "_build_tenant_agent", _fake_build)
-    agent_config = AgentConfig(llmType="fast")
+    agent_config = AgentConfig(llm_type="fast")
 
     handler.warmup(
         [
-            FlowStep(type=FlowStepType.AGENT, agentConfig=agent_config),
-            FlowStep(type=FlowStepType.AGENT, mode="planner", agentConfig=agent_config),
+            FlowStep(type=FlowStepType.AGENT, agent_config=agent_config),
+            FlowStep(
+                type=FlowStepType.AGENT, mode="planner", agent_config=agent_config
+            ),
         ]
     )
 
     assert built_modes == ["supervisor", "planner"]
-    assert handler._cache_key("supervisor", agent_config) in handler._agent_cache
-    assert handler._cache_key("planner", agent_config) in handler._agent_cache
+    assert handler.has_cached_agent("supervisor", agent_config)
+    assert handler.has_cached_agent("planner", agent_config)

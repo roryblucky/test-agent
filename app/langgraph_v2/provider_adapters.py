@@ -39,7 +39,9 @@ class V2RetrieverAdapter:
 class V2RankerAdapter:
     """Adapt a tenant's existing query-aware ranker to the v2 contract."""
 
-    def __init__(self, provider: BaseRankerProvider, *, top_n: int | None = None) -> None:
+    def __init__(
+        self, provider: BaseRankerProvider, *, top_n: int | None = None
+    ) -> None:
         self._provider = provider
         self._top_n = top_n
 
@@ -69,9 +71,20 @@ class V2ModerationAdapter:
 class TenantProvidersLike(Protocol):
     """Provider bundle shape exposed by TenantManager without legacy imports."""
 
-    retriever: BaseRetrieverProvider | None
-    ranker: BaseRankerProvider | None
-    moderation: BaseModerationProvider | None
+    @property
+    def retriever(self) -> BaseRetrieverProvider | None:
+        """Return the configured retrieval provider."""
+        ...
+
+    @property
+    def ranker(self) -> BaseRankerProvider | None:
+        """Return the configured ranking provider."""
+        ...
+
+    @property
+    def moderation(self) -> BaseModerationProvider | None:
+        """Return the configured moderation provider."""
+        ...
 
 
 class MissingRetriever:
@@ -119,9 +132,7 @@ def adapt_tenant_providers(providers: TenantProvidersLike) -> V2ProviderBundle:
             else None
         ),
         ranker=(
-            V2RankerAdapter(providers.ranker)
-            if providers.ranker is not None
-            else None
+            V2RankerAdapter(providers.ranker) if providers.ranker is not None else None
         ),
         moderation=(
             V2ModerationAdapter(providers.moderation)

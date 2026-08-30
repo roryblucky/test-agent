@@ -25,7 +25,9 @@ class GCPVertexSearchRetriever(BaseRetrieverProvider):
         self.gcp_config = cloud_config
         self.http_client = http_pool.get("gcp")
 
-    async def retrieve(self, query: str, top_k: int = 10) -> list[Document]:
+    async def retrieve(
+        self, query: str, top_k: int = 10, filter_expr: str | None = None
+    ) -> list[Document]:
         """Search documents using Vertex AI Search API.
 
         TODO: Integrate with ``google.cloud.discoveryengine`` SDK.
@@ -42,6 +44,7 @@ class GCPVertexSearchRetriever(BaseRetrieverProvider):
         # response = await client.search(request=request)
         # return [Document(id=r.id, content=r.document.derived_struct_data["extractive_answers"][0]["content"], ...) for r in response.results]
 
+        del filter_expr
         raise NotImplementedError(
             "GCP Vertex AI Search retriever: integrate with discoveryengine SDK"
         )

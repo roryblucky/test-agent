@@ -26,8 +26,8 @@ class IntentConfig:
 
     intent_name: str
     needs_refine: bool
-    data_sources: list[DataSourceConfig] = field(default_factory=list)
     system_prompt: str
+    data_sources: list[DataSourceConfig] = field(default_factory=list[DataSourceConfig])
 
 
 class IntentConfigStore:

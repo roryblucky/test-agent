@@ -15,7 +15,7 @@ from app.langgraph_v2.checkpointing import (
     initial_checkpoint_config,
     thread_id_for,
 )
-from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.run_events import ClaimFenced, RunEventRepository
 
 
@@ -25,8 +25,8 @@ async def _setup_saver(pool: Any) -> AsyncPostgresSaver:
     return saver
 
 
-def _state(query: str, conversation_id: str, turn_id: str | None = None) -> dict:
-    state = {
+def _state(query: str, conversation_id: str, turn_id: str | None = None) -> TracerState:
+    state: TracerState = {
         "query": query,
         "conversation_id": conversation_id,
         "client_request_id": None,

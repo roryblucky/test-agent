@@ -7,7 +7,7 @@ tenant/domain contracts, skill instructions, or tenant config.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
@@ -53,7 +53,13 @@ class IntentCatalogItem(BaseModel):
 
     intent: str = Field(validation_alias=AliasChoices("intent", "name"))
     description: str
-    sub_intents: list[str] = Field(default_factory=list, alias="subIntents")
+    sub_intents: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("sub_intents", "subIntents"),
+            serialization_alias="subIntents",
+        ),
+    ] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"populate_by_name": True}
@@ -63,7 +69,7 @@ class QueryUnderstandingClarificationQuestion(BaseModel):
     """User-facing clarification question with quick-select options."""
 
     question: str
-    options: list[str] = Field(default_factory=list)
+    options: list[str] = Field(default_factory=list[str])
 
 
 class QueryUnderstandingClarification(BaseModel):
@@ -71,7 +77,7 @@ class QueryUnderstandingClarification(BaseModel):
 
     scope: QueryUnderstandingClarificationScope
     questions: list[QueryUnderstandingClarificationQuestion] = Field(
-        default_factory=list
+        default_factory=list[QueryUnderstandingClarificationQuestion]
     )
     reason: str | None = None
 
@@ -180,7 +186,9 @@ class ToolResultRecord(BaseModel):
     source: str
 
     task_id: str | None = None
-    normalized_items: list[NormalizedToolResultItem] = Field(default_factory=list)
+    normalized_items: list[NormalizedToolResultItem] = Field(
+        default_factory=list[NormalizedToolResultItem]
+    )
     raw_result_ref: str | None = None
 
 
@@ -197,7 +205,7 @@ class PlannerTask(BaseModel):
 class PlannerOutput(BaseModel):
     """Structured output for ``agent:planner`` steps."""
 
-    planned_tasks: list[PlannerTask] = Field(default_factory=list)
+    planned_tasks: list[PlannerTask] = Field(default_factory=list[PlannerTask])
 
     completed_tasks: list[str] = Field(default_factory=list)
     missing_tasks: list[str] = Field(default_factory=list)
@@ -289,7 +297,7 @@ class CitationReference(BaseModel):
     published_at: datetime | None = None
 
     highlight_content: str | None = None
-    highlight_spans: list[dict[str, int]] = Field(default_factory=list)
+    highlight_spans: list[dict[str, int]] = Field(default_factory=list[dict[str, int]])
     offset_encoding: Literal["utf-16"] = "utf-16"
     attribution_status: Literal[
         "located",
@@ -321,7 +329,7 @@ class AggregatedEvidenceBundle(BaseModel):
     active_skills: list[str] = Field(default_factory=list)
 
     selected_evidence: list[AggregatedEvidence] = Field(
-        default_factory=list,
+        default_factory=list[AggregatedEvidence],
         validation_alias=AliasChoices("selected_evidence", "evidence"),
     )
     missing_tasks: list[str] = Field(default_factory=list)
@@ -329,7 +337,9 @@ class AggregatedEvidenceBundle(BaseModel):
     stale_tasks: list[str] = Field(default_factory=list)
     failed_tasks: list[str] = Field(default_factory=list)
     conflicting_evidence: list[str] = Field(default_factory=list)
-    excluded_evidence: list[ExcludedEvidence] = Field(default_factory=list)
+    excluded_evidence: list[ExcludedEvidence] = Field(
+        default_factory=list[ExcludedEvidence]
+    )
 
     synthesis_block_reason: str | None = None
 

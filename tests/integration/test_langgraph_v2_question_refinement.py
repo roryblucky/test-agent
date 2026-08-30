@@ -9,7 +9,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
 from app.langgraph_v2.question_refinement import (
@@ -23,7 +23,7 @@ from app.models.workflow import ResolvedQuery
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
-def _state() -> dict:
+def _state() -> TracerState:
     return {
         "query": "compare gold and FX",
         "conversation_id": "conversation-1",
@@ -59,6 +59,7 @@ async def test_safe_query_gets_structured_refinement_and_events(
 
         result = await graph.ainvoke(_state())
 
+        assert "refined_query" in result
         assert result["refined_query"] == "compare gold and FX"
         assert [event.get("step") for event in result["events"]] == [
             "query",
@@ -107,6 +108,7 @@ async def test_refinement_failure_halts_before_later_phases(
 
         result = await graph.ainvoke(_state())
 
+        assert "halted" in result
         assert result["halted"] is True
         assert result["events"][-1]["type"] == "error"
         assert all(event.get("step") != "finalization" for event in result["events"])

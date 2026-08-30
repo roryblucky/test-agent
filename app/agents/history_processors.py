@@ -15,13 +15,17 @@ Common use-cases:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
 )
 
+HistoryProcessor = Callable[[list[ModelMessage]], list[ModelMessage]]
 
-def trim_history(max_messages: int = 20) -> callable:
+
+def trim_history(max_messages: int = 20) -> HistoryProcessor:
     """Return a processor that keeps only the last *max_messages* messages.
 
     Always preserves the first message (system prompt / initial query).
@@ -34,11 +38,11 @@ def trim_history(max_messages: int = 20) -> callable:
             return messages
 
         # Always keep the first message
-        kept = [messages[0]]
+        kept: list[ModelMessage] = [messages[0]]
 
         # Start looking backwards to gather up to max_messages - 1
         # We process backwards and accumulate, then reverse at the end.
-        tail = []
+        tail: list[ModelMessage] = []
         i = len(messages) - 1
 
         while i > 0 and len(tail) < (max_messages - 1):
@@ -66,7 +70,7 @@ def trim_history(max_messages: int = 20) -> callable:
     return _processor
 
 
-def filter_thinking() -> callable:
+def filter_thinking() -> HistoryProcessor:
     """Return a processor that removes ThinkingPart from history.
 
     Useful to reduce token usage — thinking traces are often large

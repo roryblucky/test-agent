@@ -8,19 +8,19 @@ tenant/domain contract layers — not just the Agent step.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal, Protocol, cast, overload
 
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
-    ModelResponse,
+    ModelRequestPart,
     TextContent,
     TextPart,
     UserPromptPart,
 )
+from pydantic_ai.settings import ModelSettings
 
 from app.agents.intent_recognition import (
     DEFAULT_INSTRUCTIONS as _INTENT_INSTRUCTIONS,
@@ -38,7 +38,7 @@ from app.agents.query_understanding import (
 from app.agents.rag_answer import (
     DEFAULT_INSTRUCTIONS as _ANSWER_INSTRUCTIONS,
 )
-from app.agents.rag_answer import create_rag_answer_agent
+from app.agents.rag_answer import RAGAgentDeps, create_rag_answer_agent
 from app.agents.refine_question import (
     DEFAULT_INSTRUCTIONS as _REFINE_INSTRUCTIONS,
 )
@@ -52,6 +52,7 @@ from app.models.domain import RefinedQuestion
 from app.models.workflow import (
     AggregatedEvidenceBundle,
     IntentCatalogItem,
+    IntentResult,
     QueryUnderstandingClarification,
     QueryUnderstandingClarificationQuestion,
     QueryUnderstandingOutput,
@@ -83,7 +84,7 @@ _CONVERSATION_REFERENCE_INTENTS = {
 }
 
 
-def _build_step_settings(step: FlowStep) -> dict[str, Any] | None:
+def _build_step_settings(step: FlowStep) -> ModelSettings | None:
     """Convert ``FlowStep.settings`` to pydantic-ai ``ModelSettings``."""
     if not step.settings:
         return None
@@ -95,7 +96,17 @@ def _build_step_settings(step: FlowStep) -> dict[str, Any] | None:
         mapped_key = _SETTINGS_KEY_MAP.get(key, key)
         result[mapped_key] = value
 
-    return result
+    return cast(ModelSettings, result)
+
+
+class _AgentFactory(Protocol):
+    def __call__(
+        self,
+        registry: ModelRegistry,
+        model_name: str,
+        *,
+        instructions: str | None = None,
+    ) -> Agent[Any, Any]: ...
 
 
 class LLMHandler:
@@ -115,7 +126,7 @@ class LLMHandler:
         self.tenant_config = tenant_config
         # Agent cache: keyed by (mode, model_name) — pydantic-ai Agent
         # is stateless & thread-safe, safe to reuse across requests.
-        self._agent_cache: dict[tuple[str, str], Agent] = {}
+        self._agent_cache: dict[tuple[str, str], Agent[Any, Any]] = {}
 
     # Map modes to their canonical default instructions.  Imported from the
     # agent factory modules so there is a single source of truth.
@@ -152,7 +163,7 @@ class LLMHandler:
 
     def warmup(self, steps: list[FlowStep]) -> None:
         """Pre-warm cache for agents declared in config steps."""
-        _AGENT_FACTORIES: dict[str, Callable] = {
+        agent_factories: dict[str, _AgentFactory] = {
             "refine_question": create_refine_agent,
             "intent": create_intent_agent,
             "query_understanding": create_query_understanding_agent,
@@ -168,20 +179,51 @@ class LLMHandler:
             if step.type == "llm":  # String check or enum
                 mode = step.mode or "answer"
                 model_name = step.model or _DEFAULT_MODELS.get(mode, "pro")
-                factory = _AGENT_FACTORIES.get(mode)
+                factory = agent_factories.get(mode)
                 if factory and (mode, model_name) not in self._agent_cache:
                     # All modes now get static instructions at build time
                     # so API-level prompt caching can cache the prefix.
                     self._agent_cache[(mode, model_name)] = factory(
-                        self.registry, model_name,
+                        self.registry,
+                        model_name,
                         instructions=self._build_layered_instructions(mode),
                     )
 
-    def _get_agent(self, mode: str, model_name: str) -> Agent:
+    def set_agent_override(
+        self, mode: str, model_name: str, agent: Agent[Any, Any]
+    ) -> None:
+        """Install an explicitly supplied agent for one configured mode."""
+        self._agent_cache[(mode, model_name)] = agent
+
+    def instructions_for(self, mode: str) -> str:
+        """Build the layered static instructions for a supported mode."""
+        return self._build_layered_instructions(mode)
+
+    @overload
+    def _get_agent(
+        self, mode: Literal["refine_question"], model_name: str
+    ) -> Agent[None, ResolvedQuery]: ...
+
+    @overload
+    def _get_agent(
+        self, mode: Literal["intent"], model_name: str
+    ) -> Agent[None, IntentResult]: ...
+
+    @overload
+    def _get_agent(
+        self, mode: Literal["query_understanding"], model_name: str
+    ) -> Agent[None, QueryUnderstandingOutput]: ...
+
+    @overload
+    def _get_agent(
+        self, mode: Literal["answer"], model_name: str
+    ) -> Agent[RAGAgentDeps, str]: ...
+
+    def _get_agent(self, mode: str, model_name: str) -> Agent[Any, Any]:
         """Get or create a cached Agent for (mode, model_name)."""
         key = (mode, model_name)
         if key not in self._agent_cache:
-            factories: dict[str, Callable] = {
+            factories: dict[str, _AgentFactory] = {
                 "refine_question": create_refine_agent,
                 "intent": create_intent_agent,
                 "query_understanding": create_query_understanding_agent,
@@ -191,7 +233,8 @@ class LLMHandler:
             if factory is None:
                 raise ValueError(f"No agent factory for LLM mode: {mode!r}")
             self._agent_cache[key] = factory(
-                self.registry, model_name,
+                self.registry,
+                model_name,
                 instructions=self._build_layered_instructions(mode),
             )
         return self._agent_cache[key]
@@ -320,8 +363,6 @@ class LLMHandler:
         context_text = self._build_answer_context(ctx)
         runtime_prompt = self._build_answer_runtime_prompt(ctx, context_text)
 
-        from app.agents.rag_answer import RAGAgentDeps
-
         deps = RAGAgentDeps()
 
         settings = _build_step_settings(step)
@@ -359,14 +400,14 @@ class LLMHandler:
             answer=ctx.llm_response or "",
             evidence_items=(
                 ctx.aggregated_evidence.selected_evidence
-                if ctx.aggregated_evidence else []
+                if ctx.aggregated_evidence
+                else []
             ),
             documents=ctx.ranked_documents or ctx.documents,
             registry=self.registry,
         )
         ctx.metadata["citations"] = [
-            citation.model_dump(mode="json")
-            for citation in citations
+            citation.model_dump(mode="json") for citation in citations
         ]
         ctx.add_usage(usage)
 
@@ -395,7 +436,7 @@ class LLMHandler:
         if standalone_query and standalone_query != ctx.query:
             query_lines.append(f"Standalone Query: {standalone_query}")
 
-        document_parts = []
+        document_parts: list[str] = []
         for idx, d in enumerate(context_docs, start=1):
             doc_str = f"[Document [{idx}] | id={d.id}]\nCite as: [{idx}]"
             if getattr(d, "section_title", None):
@@ -503,9 +544,10 @@ class LLMHandler:
                 standalone_query=output.refined_query,
             )
         if isinstance(output, dict) and "refined_query" in output:
+            output_mapping = cast(dict[str, object], output)
             return ResolvedQuery(
                 original_query=ctx.query,
-                standalone_query=str(output["refined_query"]),
+                standalone_query=str(output_mapping["refined_query"]),
             )
         resolved = ResolvedQuery.model_validate(output)
         return resolved.model_copy(update={"original_query": ctx.query})
@@ -538,7 +580,9 @@ class LLMHandler:
         clarification: QueryUnderstandingClarification,
     ) -> None:
         questions = [
-            question for question in clarification.questions if question.question.strip()
+            question
+            for question in clarification.questions
+            if question.question.strip()
         ]
         if not questions:
             if clarification.scope == "query_resolution":
@@ -569,6 +613,7 @@ class LLMHandler:
             stop_reason = "query_understanding_needs_intent_clarification"
         ctx.metadata["stop_reason"] = stop_reason
 
+
 def _intent_catalog_for_step(step: FlowStep) -> list[IntentCatalogItem]:
     """Normalize optional per-step intent catalog settings."""
     settings = step.settings or {}
@@ -578,26 +623,29 @@ def _intent_catalog_for_step(step: FlowStep) -> list[IntentCatalogItem]:
     if raw_catalog is None:
         return list(DEFAULT_INTENT_CATALOG)
 
+    raw_items: object
     if isinstance(raw_catalog, dict):
-        if "intent" in raw_catalog or "name" in raw_catalog:
-            raw_items: Any = [raw_catalog]
-        elif "items" in raw_catalog:
-            raw_items = raw_catalog["items"]
-        elif "intents" in raw_catalog:
-            raw_items = raw_catalog["intents"]
+        raw_mapping = cast(dict[str, object], raw_catalog)
+        if "intent" in raw_mapping or "name" in raw_mapping:
+            raw_items = [raw_mapping]
+        elif "items" in raw_mapping:
+            raw_items = raw_mapping["items"]
+        elif "intents" in raw_mapping:
+            raw_items = raw_mapping["intents"]
         else:
-            raw_items = list(raw_catalog.values())
+            raw_items = list(raw_mapping.values())
     else:
         raw_items = raw_catalog
 
     if not isinstance(raw_items, list):
         raise ValueError("step.settings.intentCatalog must be a list of intent items")
+    typed_items = cast(list[object], raw_items)
 
     return [
         item
         if isinstance(item, IntentCatalogItem)
         else IntentCatalogItem.model_validate(item)
-        for item in raw_items
+        for item in typed_items
     ]
 
 
@@ -685,7 +733,7 @@ def _sanitize_answer_new_messages(
 
     for message in messages:
         if isinstance(message, ModelRequest) and not replaced_user_prompt:
-            parts = []
+            parts: list[ModelRequestPart] = []
             for part in message.parts:
                 if isinstance(part, UserPromptPart) and not replaced_user_prompt:
                     parts.append(replace(part, content=visible_user_query))
@@ -719,7 +767,7 @@ def _sanitize_visible_message_history(
                     text = _visible_user_prompt_text(part)
                     if text:
                         turns.append(("user", text))
-        elif isinstance(message, ModelResponse):
+        else:
             text_parts = [
                 part.content.strip()
                 for part in message.parts
@@ -732,9 +780,7 @@ def _sanitize_visible_message_history(
         return ""
 
     selected_turns = turns[-max_turns:]
-    rendered = "\n\n".join(
-        f"[{role}]\n{text}" for role, text in selected_turns
-    )
+    rendered = "\n\n".join(f"[{role}]\n{text}" for role, text in selected_turns)
     if len(rendered) <= max_chars:
         return rendered
     return "[truncated]\n" + rendered[-max_chars:]

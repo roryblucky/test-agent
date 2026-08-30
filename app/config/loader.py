@@ -6,6 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import cast
 
 from app.config.models import TenantConfig
 
@@ -17,9 +18,10 @@ def _resolve_env_vars(value: object) -> object:
     if isinstance(value, str):
         return _ENV_PATTERN.sub(lambda m: os.environ.get(m.group(1), m.group(0)), value)
     if isinstance(value, dict):
-        return {k: _resolve_env_vars(v) for k, v in value.items()}
+        mapping = cast(dict[object, object], value)
+        return {str(k): _resolve_env_vars(v) for k, v in mapping.items()}
     if isinstance(value, list):
-        return [_resolve_env_vars(item) for item in value]
+        return [_resolve_env_vars(item) for item in cast(list[object], value)]
     return value
 
 
@@ -43,10 +45,12 @@ def load_config(path: str | Path = "config.json") -> list[TenantConfig]:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    raw: object = json.loads(config_path.read_text(encoding="utf-8"))
     resolved = _resolve_env_vars(raw)
 
     if not isinstance(resolved, list):
         raise ValueError("Config file must contain a JSON array of tenant configs")
 
-    return [TenantConfig.model_validate(entry) for entry in resolved]
+    return [
+        TenantConfig.model_validate(entry) for entry in cast(list[object], resolved)
+    ]

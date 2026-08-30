@@ -73,7 +73,10 @@ class PydanticAIQuestionRefinementActor:
         usage_payload: dict[str, Any] = {}
         if callable(usage_method):
             usage = usage_method()
-            usage_payload = asdict(usage) if is_dataclass(usage) else dict(vars(usage))
+            if is_dataclass(usage) and not isinstance(usage, type):
+                usage_payload = asdict(usage)
+            else:
+                usage_payload = dict(vars(usage))
         return QuestionRefinementResult(
             resolved_query=V2ResolvedQuery.model_validate(result.output.model_dump()),
             usage=usage_payload,

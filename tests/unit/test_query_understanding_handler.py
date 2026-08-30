@@ -1,9 +1,10 @@
 """Unit tests for combined query understanding handling."""
 
-from typing import Any, Self
+from typing import Any, Self, cast
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
@@ -69,7 +70,9 @@ class FakeUnderstandingAgent:
 
 def _handler(fake_agent: FakeUnderstandingAgent) -> LLMHandler:
     handler = LLMHandler(MagicMock())
-    handler._agent_cache[("query_understanding", "intent")] = fake_agent
+    handler.set_agent_override(
+        "query_understanding", "intent", cast(Agent[Any, Any], fake_agent)
+    )
     return handler
 
 
@@ -126,7 +129,10 @@ async def test_query_understanding_sets_resolved_query_and_intent() -> None:
     assert fake_agent.last_model_settings == {"temperature": 0}
     assert fake_agent.last_prompt is not None
     assert "<query_understanding_input>" in fake_agent.last_prompt
-    assert "<latest_user_query>\n那微软呢？\n</latest_user_query>" in fake_agent.last_prompt
+    assert (
+        "<latest_user_query>\n那微软呢？\n</latest_user_query>"
+        in fake_agent.last_prompt
+    )
     assert "[user]\n苹果最近怎么看？" in fake_agent.last_prompt
     assert "[assistant]\n苹果需要基于最新证据判断。" in fake_agent.last_prompt
     assert '"intent": "market_outlook"' in fake_agent.last_prompt
@@ -148,8 +154,9 @@ def test_query_understanding_instructions_define_language_and_catalog_rules() ->
         QUERY_UNDERSTANDING_INSTRUCTIONS
     )
     assert "QueryUnderstandingOutput.clarification" in QUERY_UNDERSTANDING_INSTRUCTIONS
-    assert "ResolvedQuery and IntentResult do not contain user clarification fields" in (
-        QUERY_UNDERSTANDING_INSTRUCTIONS
+    assert (
+        "ResolvedQuery and IntentResult do not contain user clarification fields"
+        in (QUERY_UNDERSTANDING_INSTRUCTIONS)
     )
     assert "question and option strings" in QUERY_UNDERSTANDING_INSTRUCTIONS
 
@@ -325,7 +332,9 @@ async def test_refine_question_compatibility_still_accepts_legacy_output() -> No
         RefinedQuestion(refined_query="What is alpha?", keywords=["alpha"])
     )
     handler = LLMHandler(MagicMock())
-    handler._agent_cache[("refine_question", "fast")] = fake_agent
+    handler.set_agent_override(
+        "refine_question", "fast", cast(Agent[Any, Any], fake_agent)
+    )
     ctx = FlowContext(query="alpha?")
 
     result = await handler.handle(

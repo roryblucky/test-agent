@@ -94,20 +94,28 @@ async def test_postgres_startup_failure_closes_all_started_resources(
     app = FastAPI()
     pool = FailingAsyncPool(fail_open=failure == "pool_open")
     wakeups = FakeWakeups()
+
+    def wakeups_factory(*, redis_url: str | None, instance_id: str) -> FakeWakeups:
+        return wakeups
+
+    def pool_factory(**kwargs: Any) -> FailingAsyncPool:
+        return pool
+
+    def checkpointer_factory(pool: Any) -> FailingCheckpointer:
+        return FailingCheckpointer(fail_setup=failure == "checkpointer_setup")
+
     monkeypatch.setattr(
         postgres_module,
         "LiveEventWakeups",
-        lambda *, redis_url, instance_id: wakeups,
+        wakeups_factory,
     )
 
     with pytest.raises(RuntimeError, match="startup failed"):
         async with postgres_lifespan(
             app,
             config=V2PostgresConfig(database_url="postgresql://app:secret@db/v2"),
-            pool_factory=lambda **_: pool,
-            checkpointer_factory=lambda _: FailingCheckpointer(
-                fail_setup=failure == "checkpointer_setup"
-            ),
+            pool_factory=pool_factory,
+            checkpointer_factory=checkpointer_factory,
         ):
             pass
 

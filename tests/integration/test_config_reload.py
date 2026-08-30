@@ -2,33 +2,52 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Never
 
 import pytest
 from fastapi import FastAPI
 
 from app.config.config_reloader import ConfigReloader
+from app.config.models import FlowConfig, LLMConfig, TenantConfig
+from app.core.http_client_pool import HttpClientPool
 
 
 class FakeTenantManager:
     """Tiny tenant-manager double used by reload tests."""
 
-    def __init__(self, configs, http_pool) -> None:
+    def __init__(self, configs: list[TenantConfig], http_pool: HttpClientPool) -> None:
         self.configs = configs
         self.http_pool = http_pool
-        self.tenant_ids = [cfg.kmsAppName for cfg in configs]
+        self.tenant_ids = [cfg.application_id for cfg in configs]
+
+
+def _config(application_id: str) -> TenantConfig:
+    return TenantConfig(
+        kms_app_name=f"{application_id} app",
+        application_id=application_id,
+        ad_groups=[],
+        llm_config=LLMConfig(models={}),
+        flow_config=FlowConfig(),
+    )
 
 
 @pytest.mark.asyncio
-async def test_config_reload_swaps_manager_atomically(monkeypatch) -> None:
+async def test_config_reload_swaps_manager_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A successful reload replaces the active tenant manager."""
     app = FastAPI()
     app.state.tenant_manager = SimpleNamespace(tenant_ids=["old-tenant"])
-    http_pool = SimpleNamespace(label="pool")
+    http_pool = HttpClientPool()
+
+    def _load_new(_config_path: str | Path) -> list[TenantConfig]:
+        return [_config("new-tenant")]
 
     monkeypatch.setattr(
         "app.config.config_reloader.load_config",
-        lambda config_path: [SimpleNamespace(kmsAppName="new-tenant")],
+        _load_new,
     )
     monkeypatch.setattr(
         "app.config.config_reloader.TenantManager",
@@ -48,19 +67,24 @@ async def test_config_reload_swaps_manager_atomically(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_config_reload_keeps_old_manager_on_failure(monkeypatch) -> None:
+async def test_config_reload_keeps_old_manager_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A failed reload leaves the previous tenant manager in place."""
     app = FastAPI()
     old_manager = SimpleNamespace(tenant_ids=["old-tenant"])
     app.state.tenant_manager = old_manager
-    http_pool = SimpleNamespace(label="pool")
+    http_pool = HttpClientPool()
 
-    def _raise(*args, **kwargs):
+    def _raise(*args: Any, **kwargs: Any) -> Never:
         raise ValueError("invalid config")
+
+    def _load_broken(_config_path: str | Path) -> list[TenantConfig]:
+        return [_config("broken-tenant")]
 
     monkeypatch.setattr(
         "app.config.config_reloader.load_config",
-        lambda config_path: [SimpleNamespace(kmsAppName="broken-tenant")],
+        _load_broken,
     )
     monkeypatch.setattr(
         "app.config.config_reloader.TenantManager",

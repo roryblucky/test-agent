@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import unittest.mock
 from collections.abc import Callable
-from types import SimpleNamespace
-from typing import Any, Self
+from typing import Any, Self, cast
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.usage import RunUsage
 
@@ -36,6 +37,12 @@ from app.models.workflow import (
     ToolCallRecord,
     ToolObservation,
     ToolResultRecord,
+)
+from app.providers.base import (
+    BaseGroundednessProvider,
+    BaseModerationProvider,
+    BaseRankerProvider,
+    BaseRetrieverProvider,
 )
 from app.services.citation_extractor import QuoteExtractionItem, QuoteExtractionResult
 from app.services.flow_engine import FlowEngine
@@ -129,7 +136,7 @@ class FakeAgent:
         )
 
 
-class RecordingModerationProvider:
+class RecordingModerationProvider(BaseModerationProvider):
     """Moderation stub that records the texts it checks."""
 
     def __init__(self, flagged_texts: set[str] | None = None) -> None:
@@ -146,11 +153,11 @@ class RecordingModerationProvider:
         )
 
 
-class RecordingRetrieverProvider:
+class RecordingRetrieverProvider(BaseRetrieverProvider):
     """Retriever stub with a simple top-k config."""
 
     def __init__(self, docs: list[Document], top_k: int = 2) -> None:
-        self.config = SimpleNamespace(top_k=top_k)
+        self.top_k = top_k
         self.docs = docs
         self.calls: list[tuple[str, int, str | None]] = []
 
@@ -161,7 +168,7 @@ class RecordingRetrieverProvider:
         return self.docs[:top_k]
 
 
-class RecordingRankerProvider:
+class RecordingRankerProvider(BaseRankerProvider):
     """Ranker stub that reorders documents by score."""
 
     def __init__(self) -> None:
@@ -178,15 +185,13 @@ class RecordingRankerProvider:
         )[:top_n]
 
 
-class RecordingGroundednessProvider:
+class RecordingGroundednessProvider(BaseGroundednessProvider):
     """Groundedness stub that records the final answer/context pair."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, list[str]]] = []
 
-    async def check(
-        self, answer: str, context: list[Document]
-    ) -> GroundednessResult:
+    async def check(self, answer: str, context: list[Document]) -> GroundednessResult:
         self.calls.append((answer, [doc.id for doc in context]))
         return GroundednessResult(
             is_grounded=True,
@@ -232,15 +237,15 @@ def _supervisor_handler(
         registry=MagicMock(),
         providers=providers,
         cfg=TenantConfig(
-            kmsAppName=tenant_id,
-            applicationId=tenant_id,
-            adGroups=[],
+            kms_app_name=tenant_id,
+            application_id=tenant_id,
+            ad_groups=[],
             llm_config=LLMConfig(models={}),
             flow_config=FlowConfig(),
         ),
         skill_registry=None,
     )
-    handler._agent_cache[handler._cache_key("supervisor", agent_config)] = agent
+    handler.set_agent_override("supervisor", agent_config, cast(Agent[Any, Any], agent))
     return handler
 
 
@@ -255,20 +260,22 @@ def _planner_handler(
         registry=MagicMock(),
         providers=providers,
         cfg=TenantConfig(
-            kmsAppName=tenant_id,
-            applicationId=tenant_id,
-            adGroups=[],
+            kms_app_name=tenant_id,
+            application_id=tenant_id,
+            ad_groups=[],
             llm_config=LLMConfig(models={}),
             flow_config=FlowConfig(),
         ),
         skill_registry=None,
     )
-    handler._agent_cache[handler._cache_key("planner", agent_config)] = agent
+    handler.set_agent_override("planner", agent_config, cast(Agent[Any, Any], agent))
     return handler
 
 
 @pytest.mark.asyncio
-async def test_existing_rag_workflow_end_to_end(mock_emitter) -> None:
+async def test_existing_rag_workflow_end_to_end(
+    mock_emitter: unittest.mock.AsyncMock,
+) -> None:
     """A classic RAG tenant still runs moderation -> refine -> retrieve -> rank -> answer."""
     retrieved_docs = [
         Document(
@@ -299,13 +306,15 @@ async def test_existing_rag_workflow_end_to_end(mock_emitter) -> None:
     )
 
     llm_handler = _llm_handler()
-    llm_handler._agent_cache[("refine_question", "fast")] = refine_agent
-    llm_handler._agent_cache[("answer", "pro")] = answer_agent
+    llm_handler.set_agent_override(
+        "refine_question", "fast", cast(Agent[Any, Any], refine_agent)
+    )
+    llm_handler.set_agent_override("answer", "pro", cast(Agent[Any, Any], answer_agent))
 
     steps = [
         FlowStep(type=FlowStepType.MODERATION, mode="pre"),
         FlowStep(type=FlowStepType.LLM, mode="refine_question", model="fast"),
-        FlowStep(type=FlowStepType.RETRIEVER),
+        FlowStep(type=FlowStepType.RETRIEVER, settings={"top_k": retriever.top_k}),
         FlowStep(type=FlowStepType.RANKING),
         FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
         FlowStep(type=FlowStepType.GROUNDEDNESS),
@@ -313,9 +322,9 @@ async def test_existing_rag_workflow_end_to_end(mock_emitter) -> None:
         FlowStep(type=FlowStepType.ANALYSIS),
     ]
     tenant = TenantConfig(
-        kmsAppName="rag-tenant",
-        applicationId="rag-tenant",
-        adGroups=[],
+        kms_app_name="rag-tenant",
+        application_id="rag-tenant",
+        ad_groups=[],
         llm_config=LLMConfig(models={}),
         flow_config=FlowConfig(steps=steps),
     )
@@ -367,7 +376,10 @@ async def test_existing_rag_workflow_end_to_end(mock_emitter) -> None:
     assert isinstance(persisted_part, UserPromptPart)
     assert persisted_part.content == "What is alpha?"
     assert "Document two with the strongest match." not in persisted_part.content
-    assert moderation.checked_texts == ["What is alpha?", "Alpha is the strongest match."]
+    assert moderation.checked_texts == [
+        "What is alpha?",
+        "Alpha is the strongest match.",
+    ]
     assert retriever.calls == [("What is alpha in this tenant?", 2, None)]
     assert ranker.calls == [
         (
@@ -375,9 +387,7 @@ async def test_existing_rag_workflow_end_to_end(mock_emitter) -> None:
             ["doc-1", "doc-2"],
         )
     ]
-    assert groundedness.calls == [
-        ("Alpha is the strongest match.", ["doc-2", "doc-1"])
-    ]
+    assert groundedness.calls == [("Alpha is the strongest match.", ["doc-2", "doc-1"])]
     assert ctx.metadata["analysis"]["documents_retrieved"] == 2
     assert ctx.metadata["analysis"]["streaming_policy"] == "token"
     mock_emitter.emit_token.assert_any_await("Alpha is ")
@@ -386,7 +396,7 @@ async def test_existing_rag_workflow_end_to_end(mock_emitter) -> None:
 
 @pytest.mark.asyncio
 async def test_planner_aggregation_and_citation_workflow_end_to_end(
-    mock_emitter,
+    mock_emitter: unittest.mock.AsyncMock,
 ) -> None:
     """Planner + aggregation flows stream tokens, generate citations, and emit them in order."""
     tenant_id = "wealth-tenant"
@@ -446,7 +456,7 @@ async def test_planner_aggregation_and_citation_workflow_end_to_end(
             extractions=[
                 QuoteExtractionItem(
                     citation_index=1,
-                    quoted_passages=["Evidence one for wealth analysis."]
+                    quoted_passages=["Evidence one for wealth analysis."],
                 )
             ]
         )
@@ -456,28 +466,32 @@ async def test_planner_aggregation_and_citation_workflow_end_to_end(
     mock_registry.create_agent.return_value = quote_agent
 
     llm_handler = _llm_handler(mock_registry)
-    llm_handler._agent_cache[("refine_question", "fast")] = refine_agent
-    llm_handler._agent_cache[("intent", "intent")] = intent_agent
-    llm_handler._agent_cache[("answer", "pro")] = answer_agent
+    llm_handler.set_agent_override(
+        "refine_question", "fast", cast(Agent[Any, Any], refine_agent)
+    )
+    llm_handler.set_agent_override(
+        "intent", "intent", cast(Agent[Any, Any], intent_agent)
+    )
+    llm_handler.set_agent_override("answer", "pro", cast(Agent[Any, Any], answer_agent))
 
     agent_config = AgentConfig(
-        llmType="pro",
-        buildInTools=["search_documents"],
+        llm_type="pro",
+        built_in_tools=["search_documents"],
     )
     steps = [
         FlowStep(type=FlowStepType.MODERATION, mode="pre"),
         FlowStep(type=FlowStepType.LLM, mode="refine_question", model="fast"),
         FlowStep(type=FlowStepType.LLM, mode="intent", model="intent"),
-        FlowStep(type=FlowStepType.AGENT, mode="planner", agentConfig=agent_config),
+        FlowStep(type=FlowStepType.AGENT, mode="planner", agent_config=agent_config),
         FlowStep(type=FlowStepType.AGGREGATION),
         FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
         FlowStep(type=FlowStepType.MODERATION, mode="post"),
         FlowStep(type=FlowStepType.ANALYSIS),
     ]
     tenant = TenantConfig(
-        kmsAppName=tenant_id,
-        applicationId=tenant_id,
-        adGroups=[],
+        kms_app_name=tenant_id,
+        application_id=tenant_id,
+        ad_groups=[],
         llm_config=LLMConfig(models={}),
         flow_config=FlowConfig(steps=steps),
     )
@@ -521,6 +535,7 @@ async def test_planner_aggregation_and_citation_workflow_end_to_end(
     assert ctx.planner_output is not None
     assert ctx.planner_output.can_continue_to_aggregation is True
     assert ctx.planner_output.completed_tasks == ["search_documents"]
+    assert ctx.aggregated_evidence is not None
     selected_evidence = ctx.aggregated_evidence.selected_evidence
     assert ctx.aggregated_evidence == AggregatedEvidenceBundle(
         user_query="Give me the wealth view.",
@@ -563,9 +578,12 @@ async def test_planner_aggregation_and_citation_workflow_end_to_end(
     call_names = [call[0] for call in calls]
 
     token_positions = [i for i, name in enumerate(call_names) if name == "emit_token"]
-    citation_positions = [i for i, name in enumerate(call_names) if name == "emit_citations"]
+    citation_positions = [
+        i for i, name in enumerate(call_names) if name == "emit_citations"
+    ]
     completed_positions = [
-        i for i, name in enumerate(call_names)
+        i
+        for i, name in enumerate(call_names)
         if name == "emit_step_completed" and calls[i][1][0] == "llm:answer"
     ]
 
@@ -575,21 +593,26 @@ async def test_planner_aggregation_and_citation_workflow_end_to_end(
 
     for t_pos in token_positions:
         for c_pos in citation_positions:
-            assert t_pos < c_pos, f"Token emission at {t_pos} must occur before citation emission at {c_pos}"
+            assert t_pos < c_pos, (
+                f"Token emission at {t_pos} must occur before citation emission at {c_pos}"
+            )
 
     for c_pos in citation_positions:
         for comp_pos in completed_positions:
-            assert c_pos < comp_pos, f"Citation emission at {c_pos} must occur before step completion at {comp_pos}"
+            assert c_pos < comp_pos, (
+                f"Citation emission at {c_pos} must occur before step completion at {comp_pos}"
+            )
 
     assert ctx.metadata["analysis"]["streaming_policy"] == "token"
     assert ctx.metadata["analysis"]["planner_can_continue_to_aggregation"] is True
+    assert planner_agent.last_deps is not None
     assert planner_agent.last_deps.available_tool_names == ["search_documents"]
     assert planner_agent.last_deps.flow_context.metadata["tenant_id"] == tenant_id
 
 
 @pytest.mark.asyncio
 async def test_query_understanding_planner_aggregation_answer_workflow(
-    mock_emitter,
+    mock_emitter: unittest.mock.AsyncMock,
 ) -> None:
     """A combined understanding step can replace refine_question + intent."""
     tenant_id = "wealth-combined-tenant"
@@ -645,24 +668,26 @@ async def test_query_understanding_planner_aggregation_answer_workflow(
     )
 
     llm_handler = _llm_handler()
-    llm_handler._agent_cache[("query_understanding", "intent")] = understanding_agent
-    llm_handler._agent_cache[("answer", "pro")] = answer_agent
+    llm_handler.set_agent_override(
+        "query_understanding", "intent", cast(Agent[Any, Any], understanding_agent)
+    )
+    llm_handler.set_agent_override("answer", "pro", cast(Agent[Any, Any], answer_agent))
 
     agent_config = AgentConfig(
-        llmType="pro",
-        buildInTools=["search_documents"],
+        llm_type="pro",
+        built_in_tools=["search_documents"],
     )
     steps = [
         FlowStep(type=FlowStepType.LLM, mode="query_understanding", model="intent"),
-        FlowStep(type=FlowStepType.AGENT, mode="planner", agentConfig=agent_config),
+        FlowStep(type=FlowStepType.AGENT, mode="planner", agent_config=agent_config),
         FlowStep(type=FlowStepType.AGGREGATION),
         FlowStep(type=FlowStepType.LLM, mode="answer", model="pro"),
         FlowStep(type=FlowStepType.ANALYSIS),
     ]
     tenant = TenantConfig(
-        kmsAppName=tenant_id,
-        applicationId=tenant_id,
-        adGroups=[],
+        kms_app_name=tenant_id,
+        application_id=tenant_id,
+        ad_groups=[],
         llm_config=LLMConfig(models={}),
         flow_config=FlowConfig(steps=steps),
     )
@@ -718,12 +743,14 @@ async def test_query_understanding_planner_aggregation_answer_workflow(
 
 
 @pytest.mark.asyncio
-async def test_supervisor_agent_workflow_end_to_end(mock_emitter) -> None:
+async def test_supervisor_agent_workflow_end_to_end(
+    mock_emitter: unittest.mock.AsyncMock,
+) -> None:
     """A single-agent open-agent flow can complete end to end with built-in tools."""
     tenant_id = "open-agent-tenant"
     agent_config = AgentConfig(
-        llmType="pro",
-        buildInTools=["search_documents", "rank_documents"],
+        llm_type="pro",
+        built_in_tools=["search_documents", "rank_documents"],
     )
 
     def _supervisor_setup(deps: Any) -> None:
@@ -752,13 +779,13 @@ async def test_supervisor_agent_workflow_end_to_end(mock_emitter) -> None:
         agent=supervisor_agent,
     )
     steps = [
-        FlowStep(type=FlowStepType.AGENT, agentConfig=agent_config),
+        FlowStep(type=FlowStepType.AGENT, agent_config=agent_config),
         FlowStep(type=FlowStepType.ANALYSIS),
     ]
     tenant = TenantConfig(
-        kmsAppName=tenant_id,
-        applicationId=tenant_id,
-        adGroups=[],
+        kms_app_name=tenant_id,
+        application_id=tenant_id,
+        ad_groups=[],
         llm_config=LLMConfig(models={}),
         flow_config=FlowConfig(steps=steps),
     )
@@ -780,6 +807,7 @@ async def test_supervisor_agent_workflow_end_to_end(mock_emitter) -> None:
     assert ctx.planner_output is None
     assert ctx.llm_response == "Supervisor answer."
     assert ctx.tool_calls[0].tool_name == "plan_and_reason"
+    assert supervisor_agent.last_deps is not None
     assert supervisor_agent.last_deps.available_tool_names == [
         "search_documents",
         "rank_documents",

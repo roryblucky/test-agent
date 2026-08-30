@@ -66,7 +66,7 @@ async def test_remote_wakeup_loss_uses_polling_without_sequence_loss(
             LiveEventWakeups(),
             poll_interval_seconds=0.001,
         ).follow(tenant_id="tenant-a", run_id=run_id, after_sequence=1)
-        waiting = asyncio.create_task(anext(follower))
+        waiting = asyncio.ensure_future(anext(follower))
         await asyncio.sleep(0)
         appended = await writer.append_event(
             tenant_id="tenant-a",
@@ -98,7 +98,7 @@ async def test_cursor_beyond_latest_waits_for_running_run_then_closes_terminal(
             LiveEventWakeups(),
             poll_interval_seconds=0.001,
         ).follow(tenant_id="tenant-a", run_id=run_id, after_sequence=99)
-        waiting = asyncio.create_task(anext(follower))
+        waiting = asyncio.ensure_future(anext(follower))
         await asyncio.sleep(0.01)
         assert not waiting.done()
         await repository.complete_run(
@@ -214,7 +214,7 @@ async def test_direct_stale_resume_wakes_old_follower_with_boundary_below_cursor
             wakeups,
             poll_interval_seconds=1,
         ).follow(tenant_id="tenant-a", run_id=run_id, after_sequence=99)
-        waiting = asyncio.create_task(anext(follower))
+        waiting = asyncio.ensure_future(anext(follower))
         await asyncio.sleep(0)
         async with pool.connection() as connection:
             await connection.execute(

@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.toolsets import AbstractToolset
 
-from app.core.mcp import build_mcp_toolsets
 from app.core.model_registry import ModelRegistry
 from app.models.domain import Document
 from app.providers.base import BaseRankerProvider, BaseRetrieverProvider
@@ -28,18 +27,19 @@ class SharedState:
     retriever: BaseRetrieverProvider
     ranker: BaseRankerProvider
     emitter: EventEmitter | None = None
-    retrieved_documents: list[Document] = field(default_factory=list)
+    retrieved_documents: list[Document] = field(default_factory=list[Document])
 
 
 def create_router_agent(
     registry: ModelRegistry,
-    extra_toolsets: list[AbstractToolset] | None = None,        
+    extra_toolsets: list[AbstractToolset[SharedState]] | None = None,
 ) -> Agent[SharedState, str]:
     """Create the Router Agent with dynamic tools."""
     from app.agents.history_processors import filter_thinking, trim_history
 
     router = Agent[SharedState, str](
         registry.get_model("pro").model,
+        deps_type=SharedState,
         output_type=str,
         model_settings=registry.get_model("pro").settings,
         toolsets=extra_toolsets or [],
@@ -64,10 +64,12 @@ def create_router_agent(
     )
 
     @router.tool
-    async def retrieve_knowledge_base(ctx: RunContext[SharedState], query: str) -> str:
+    async def retrieve_knowledge_base(  # pyright: ignore[reportUnusedFunction] -- registered tool
+        ctx: RunContext[SharedState], query: str
+    ) -> str:
         """Retrieve documents from the knowledge base using the given query."""
         if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_start("retrieve_docs", {"query": query})
+            await ctx.deps.emitter.emit_step_start("retrieve_docs")
 
         # Perform retrieval
         docs = await ctx.deps.retriever.retrieve(query)
@@ -92,12 +94,12 @@ def create_router_agent(
         return "\n\n".join(f"[Doc {d.id}]: {d.content}" for d in docs)
 
     @router.tool
-    async def query_breakdown(ctx: RunContext[SharedState], query: str) -> list[str]:
+    async def query_breakdown(  # pyright: ignore[reportUnusedFunction] -- registered tool
+        ctx: RunContext[SharedState], query: str
+    ) -> list[str]:
         """Break down a complex query into simpler sub-queries. Use this when the initial query is too broad."""
         if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_start(
-                "query_breakdown", {"original_query": query}
-            )
+            await ctx.deps.emitter.emit_step_start("query_breakdown")
 
         # In a real scenario, this could be another fast LLM call, but here we can just ask the Router
         # or implement a simple heuristic/agent. For simplicity, we ask a fast model to split it.
@@ -107,7 +109,7 @@ def create_router_agent(
             system_prompt="Split the user's complex question into 2-3 simpler, distinct search queries. Return ONLY a JSON list of strings.",
         )
         result = await fast_agent.run(query)
-        sub_queries = result.data
+        sub_queries = result.output
 
         if ctx.deps.emitter:
             await ctx.deps.emitter.emit_step_completed(
@@ -117,12 +119,12 @@ def create_router_agent(
         return sub_queries
 
     @router.tool
-    async def ask_finance_agent(ctx: RunContext[SharedState], query: str) -> str:
+    async def ask_finance_agent(  # pyright: ignore[reportUnusedFunction] -- registered tool
+        ctx: RunContext[SharedState], query: str
+    ) -> str:
         """Hand off the query to a specialist finance agent. Use this ONLY for finance, math, or tabular data questions."""
         if ctx.deps.emitter:
-            await ctx.deps.emitter.emit_step_start(
-                "ask_finance_agent", {"query": query}
-            )
+            await ctx.deps.emitter.emit_step_start("ask_finance_agent")
 
         # Example Agentic Handoff: We create a specialized agent on the fly (or load from registry)
         finance_agent = ctx.deps.registry.create_agent(
@@ -144,9 +146,9 @@ def create_router_agent(
 
         if ctx.deps.emitter:
             await ctx.deps.emitter.emit_step_completed(
-                "ask_finance_agent", {"agent_response_length": len(result.data)}
+                "ask_finance_agent", {"agent_response_length": len(result.output)}
             )
 
-        return result.data
+        return result.output
 
     return router

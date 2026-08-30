@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+import uuid
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -21,7 +23,7 @@ from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import build_tracer_graph
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
@@ -38,6 +40,7 @@ from app.models.domain import Document, GroundednessResult, ModerationResult
 from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
+from app.services.tenant_manager import TenantManager
 
 
 class _Retriever:
@@ -145,19 +148,21 @@ class _LegacyFlow:
         context.groundedness_result = GroundednessResult(
             is_grounded=True, score=0.9, details="supported"
         )
-        context.metadata = {
-            "steps_executed": [
-                "query",
-                "pre_moderation",
-                "question_refinement",
-                "retrieval",
-                "reranking",
-                "answer",
-                "groundedness",
-                "moderation:post",
-                "finalization",
-            ]
-        }
+        context.metadata.update(
+            {
+                "steps_executed": [
+                    "query",
+                    "pre_moderation",
+                    "question_refinement",
+                    "retrieval",
+                    "reranking",
+                    "answer",
+                    "groundedness",
+                    "moderation:post",
+                    "finalization",
+                ]
+            }
+        )
         context.metadata["citations"] = [
             CitationReference(
                 index=1,
@@ -183,7 +188,7 @@ class _LegacyManager:
         return self.flow
 
 
-def _state() -> dict[str, object]:
+def _state() -> TracerState:
     return {
         "query": "hello",
         "conversation_id": "c1",
@@ -193,7 +198,10 @@ def _state() -> dict[str, object]:
 
 
 def _context(
-    pool: AsyncConnectionPool, run_id, epoch: int, repository: PhaseResultRepository
+    pool: AsyncConnectionPool[Any],
+    run_id: uuid.UUID,
+    epoch: int,
+    repository: PhaseResultRepository,
 ) -> PhaseExecutionContext:
     return PhaseExecutionContext(
         repository=repository,
@@ -262,10 +270,11 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     )
     legacy_app = FastAPI()
     legacy_manager = _LegacyManager()
+    typed_legacy_manager = cast(TenantManager, legacy_manager)
     legacy_app.include_router(legacy_router)
     legacy_app.state.tenant_manager = legacy_manager
     legacy_app.dependency_overrides[get_tenant] = lambda: TenantContext(
-        app_id="tenant-a", manager=legacy_manager
+        app_id="tenant-a", manager=typed_legacy_manager
     )
     with TestClient(legacy_app) as client:
         legacy_http = client.post(
@@ -285,6 +294,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     stable_done["citations"][0]["evidence_id"] = "__artifact_id__"
     stable_done["citations"][0]["metadata"]["artifact_id"] = "__artifact_id__"
     assert stable_done == expected["event"]["data"]
+    assert "final_response" in result
     assert result["final_response"].model_dump(by_alias=True) == done
     assert answer.calls == 1
     assert moderation.calls == 2
@@ -307,7 +317,7 @@ def test_public_v2_sse_matches_final_output_golden(
     asyncio.run(seed())
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         async with postgres_lifespan(
             app,
             config=V2PostgresConfig(database_url=langgraph_v2_migrated_database_url),
@@ -375,7 +385,7 @@ async def test_finalization_replays_after_commit_window_without_duplicate_done(
     class CrashAfterFinalizationCommit(PhaseResultRepository):
         crashed = False
 
-        async def commit(self, **kwargs):  # type: ignore[no-untyped-def]
+        async def commit(self, **kwargs: Any):  # type: ignore[no-untyped-def]
             result = await super().commit(**kwargs)
             if kwargs["phase"].phase_name == "finalization" and not self.crashed:
                 self.crashed = True

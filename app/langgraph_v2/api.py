@@ -7,15 +7,16 @@ import logging
 import os
 import socket
 import uuid
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Protocol, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import StateSnapshot
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerActor, build_answer_actor
@@ -87,6 +88,14 @@ from app.services.exceptions import TenantNotFoundError
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
 _LOGGER = logging.getLogger(__name__)
+
+
+class CheckpointGraph(Protocol):
+    """State lookup seam used by the Resume authorization path."""
+
+    async def aget_state(self, config: RunnableConfig) -> StateSnapshot:
+        """Read the current checkpoint state."""
+        ...
 
 
 def _resolve_refinement_actor(
@@ -272,11 +281,14 @@ async def _persist_event_record(
         step=event.step,
         data=event.data,
     )
-    if (
-        event.type == "done"
-        and isinstance(event.data, dict)
-        and isinstance(event.data.get("answer"), str)
-    ):
+    raw_event_data: object = event.data
+    event_data = (
+        cast(dict[str, Any], raw_event_data)
+        if isinstance(raw_event_data, dict)
+        else None
+    )
+    answer = event_data.get("answer") if event_data is not None else None
+    if event.type == "done" and isinstance(answer, str):
         try:
             resolved_turn_id = uuid.UUID(str(turn_id))
         except (TypeError, ValueError) as error:
@@ -284,6 +296,7 @@ async def _persist_event_record(
                 "completed Graph state is missing a valid turn_id"
             ) from error
         conflict: EventInvariantConflict | None = None
+        persisted: EventRecord | None = None
         async with repository.transaction() as connection:
             try:
                 async with connection.transaction():
@@ -295,7 +308,7 @@ async def _persist_event_record(
                         owner_instance_id=owner_instance_id,
                         execution_epoch=execution_epoch,
                         turn_id=resolved_turn_id,
-                        content=event.data["answer"],
+                        content=answer,
                         idempotency_key=f"turn:{resolved_turn_id}:assistant",
                     )
                     persisted = await repository.complete_run_in_transaction(
@@ -316,6 +329,8 @@ async def _persist_event_record(
                 conflict = error
         if conflict is not None:
             raise conflict
+        if persisted is None:
+            raise RuntimeError("terminal event transaction produced no event record")
         await repository.publish_wakeup(tenant_id, run_id)
         return persisted
 
@@ -345,7 +360,7 @@ async def _persist_event_record(
 
 
 async def _cleanup_request_execution(
-    graph_stream: AsyncIterator[str] | None,
+    graph_stream: AsyncGenerator[str] | None,
     cancellation_observer: CancellationObserver,
     heartbeat_task: asyncio.Task[None] | None,
     repository: RunEventRepository,
@@ -434,7 +449,7 @@ async def _await_cleanup_operation(
     return await _await_cleanup_task(asyncio.ensure_future(operation))
 
 
-async def _persist_result_events(
+async def persist_result_events(  # pyright: ignore[reportUnusedFunction] -- test seam
     repository: RunEventRepository,
     message_repository: ConversationMessageRepository,
     *,
@@ -556,7 +571,7 @@ def _checkpoint_turn_id(values: dict[str, Any]) -> uuid.UUID:
 
 async def _authorize_thread_resume_target(
     *,
-    checkpoint_graph: Any,
+    checkpoint_graph: CheckpointGraph,
     message_repository: ConversationMessageRepository,
     context: TrustedRequestContext,
     thread_id: str,
@@ -572,7 +587,9 @@ async def _authorize_thread_resume_target(
         conversation_id=conversation.conversation_id,
         turn_id=expected_turn_id,
     )
-    config = initial_checkpoint_config(thread_id=conversation.thread_id, checkpoint_ns="")
+    config = initial_checkpoint_config(
+        thread_id=conversation.thread_id, checkpoint_ns=""
+    )
     try:
         snapshot = await checkpoint_graph.aget_state(config)
     except ValueError as error:
@@ -583,12 +600,14 @@ async def _authorize_thread_resume_target(
         raise ThreadResumeConflict("checkpoint is already complete")
     if any(node not in _PRE_ANSWER_RESUME_NODES for node in snapshot.next):
         raise ThreadResumeConflict("checkpoint is not before the Answer phase")
-    if not isinstance(snapshot.values, dict):
+    raw_snapshot_values: object = snapshot.values
+    if not isinstance(raw_snapshot_values, dict):
         raise ThreadResumeConflict("checkpoint state is not a mapping")
-    if snapshot.values.get("conversation_id") != conversation.conversation_id:
+    snapshot_values = cast(dict[str, Any], raw_snapshot_values)
+    if snapshot_values.get("conversation_id") != conversation.conversation_id:
         raise ThreadResumeConflict("checkpoint belongs to another Conversation")
 
-    turn_id = _checkpoint_turn_id(snapshot.values)
+    turn_id = _checkpoint_turn_id(snapshot_values)
     if turn_id != expected_turn_id:
         raise ThreadResumeConflict("checkpoint does not match the expected Turn")
     latest_turn = await message_repository.get_latest_turn(
@@ -630,7 +649,7 @@ def create_tracer_router(
     router = APIRouter(tags=["LangGraph v2 tracer"])
 
     @router.post("/v2/query/stream")
-    async def query_stream(
+    async def query_stream(  # pyright: ignore[reportUnusedFunction] -- FastAPI route
         payload: V2QueryRequest,
         http_request: Request,
         request_context: Annotated[
@@ -688,7 +707,7 @@ def create_tracer_router(
 
         async def event_generator() -> AsyncIterator[str]:
             claim = None
-            graph_stream: AsyncIterator[str] | None = None
+            graph_stream: AsyncGenerator[str] | None = None
             heartbeat_task: asyncio.Task[None] | None = None
             terminal = False
             primary_error: BaseException | None = None
@@ -901,7 +920,7 @@ def create_tracer_router(
         )
 
     @router.post("/v2/threads/{thread_id}/resume/stream")
-    async def thread_resume_stream(
+    async def thread_resume_stream(  # pyright: ignore[reportUnusedFunction] -- FastAPI route
         thread_id: str,
         http_request: Request,
         request_context: Annotated[
@@ -1010,7 +1029,7 @@ def create_tracer_router(
 
         async def event_generator() -> AsyncIterator[str]:
             claim = None
-            graph_stream: AsyncIterator[str] | None = None
+            graph_stream: AsyncGenerator[str] | None = None
             heartbeat_task: asyncio.Task[None] | None = None
             terminal = False
             primary_error: BaseException | None = None
@@ -1173,7 +1192,7 @@ def create_tracer_router(
         )
 
     @router.get("/v2/artifacts/{artifact_id}")
-    async def get_artifact(
+    async def get_artifact(  # pyright: ignore[reportUnusedFunction] -- FastAPI route
         artifact_id: uuid.UUID,
         http_request: Request,
         x_application_id: Annotated[str, Header(alias="X-Application-Id")],
