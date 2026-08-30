@@ -4,7 +4,7 @@ import asyncio
 import json
 import socket
 from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Self
 
 import pytest
@@ -132,6 +132,80 @@ async def _serve_uvicorn(app: FastAPI) -> AsyncGenerator[int]:
             server_socket.close()
 
 
+async def _abort_and_wait(writer: asyncio.StreamWriter) -> None:
+    writer.transport.abort()
+    with suppress(TimeoutError, ConnectionError):
+        await asyncio.wait_for(writer.wait_closed(), timeout=2)
+
+
+@asynccontextmanager
+async def _serve_tcp_forwarding_proxy(upstream_port: int) -> AsyncGenerator[int]:
+    connections: set[asyncio.Task[None]] = set()
+
+    async def copy(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        while data := await reader.read(4096):
+            writer.write(data)
+            await writer.drain()
+
+    async def forward(
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        connections.add(task)
+        upstream_writer: asyncio.StreamWriter | None = None
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", upstream_port),
+                timeout=5,
+            )
+            client_to_upstream = asyncio.create_task(
+                copy(client_reader, upstream_writer)
+            )
+            upstream_to_client = asyncio.create_task(
+                copy(upstream_reader, client_writer)
+            )
+            try:
+                _, pending = await asyncio.wait(
+                    {client_to_upstream, upstream_to_client},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for pending_task in pending:
+                    pending_task.cancel()
+                await asyncio.gather(
+                    client_to_upstream,
+                    upstream_to_client,
+                    return_exceptions=True,
+                )
+            finally:
+                await _abort_and_wait(upstream_writer)
+        finally:
+            await _abort_and_wait(client_writer)
+            connections.discard(task)
+
+    server = await asyncio.start_server(forward, "127.0.0.1", 0)
+    sockets = server.sockets
+    assert sockets
+    port = int(sockets[0].getsockname()[1])
+    try:
+        yield port
+    finally:
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), timeout=5)
+        connection_snapshot = tuple(connections)
+        for connection in connection_snapshot:
+            connection.cancel()
+        if connection_snapshot:
+            await asyncio.wait_for(
+                asyncio.gather(*connection_snapshot, return_exceptions=True),
+                timeout=5,
+            )
+
+
 @pytest.mark.asyncio
 async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
     langgraph_v2_migrated_database_url: str,
@@ -171,42 +245,49 @@ async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
     app = FastAPI(lifespan=lifespan)
     register_v2_routes(app, enabled=True, graph=tracked_graph)
 
-    async with _serve_uvicorn(app) as port:
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        body = json.dumps(
-            {"query": "hello", "sessionId": conversation_id},
-            separators=(",", ":"),
-        ).encode()
-        request = (
-            b"POST /v2/query/stream HTTP/1.1\r\n"
-            + f"Host: 127.0.0.1:{port}\r\n".encode()
-            + b"Content-Type: application/json\r\n"
-            + b"X-Application-Id: tenant-a\r\n"
-            + b"X-Subject-Id: subject-a\r\n"
-            + b"Connection: close\r\n"
-            + f"Content-Length: {len(body)}\r\n\r\n".encode()
-            + body
-        )
-        writer.write(request)
-        await writer.drain()
-        received = b""
-        try:
-            async with asyncio.timeout(5):
-                while b'"data": "partial"' not in received:
-                    chunk = await reader.read(4096)
-                    assert chunk
-                    received += chunk
-        except TimeoutError as error:
-            raise AssertionError(received.decode(errors="replace")) from error
-        writer.transport.abort()
-        try:
-            await asyncio.wait_for(model_stream.exited.wait(), timeout=5)
-            assert not tracked_graph.closed.is_set()
-        finally:
-            model_stream.allow_cleanup.set()
-        await writer.wait_closed()
-        await asyncio.wait_for(tracked_graph.closed.wait(), timeout=5)
-        await asyncio.wait_for(model_stream.cleanup_completed.wait(), timeout=5)
+    async with _serve_uvicorn(app) as upstream_port:
+        async with _serve_tcp_forwarding_proxy(upstream_port) as proxy_port:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", proxy_port),
+                timeout=5,
+            )
+            try:
+                body = json.dumps(
+                    {"query": "hello", "sessionId": conversation_id},
+                    separators=(",", ":"),
+                ).encode()
+                request = (
+                    b"POST /v2/query/stream HTTP/1.1\r\n"
+                    + f"Host: 127.0.0.1:{proxy_port}\r\n".encode()
+                    + b"Content-Type: application/json\r\n"
+                    + b"X-Application-Id: tenant-a\r\n"
+                    + b"X-Subject-Id: subject-a\r\n"
+                    + b"Connection: close\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                    + body
+                )
+                writer.write(request)
+                await asyncio.wait_for(writer.drain(), timeout=5)
+                received = b""
+                try:
+                    async with asyncio.timeout(5):
+                        while b'"data": "partial"' not in received:
+                            chunk = await reader.read(4096)
+                            assert chunk
+                            received += chunk
+                except TimeoutError as error:
+                    raise AssertionError(received.decode(errors="replace")) from error
+                writer.transport.abort()
+                try:
+                    await asyncio.wait_for(model_stream.exited.wait(), timeout=5)
+                    assert not tracked_graph.closed.is_set()
+                finally:
+                    model_stream.allow_cleanup.set()
+                await asyncio.wait_for(tracked_graph.closed.wait(), timeout=5)
+                await asyncio.wait_for(model_stream.cleanup_completed.wait(), timeout=5)
+            finally:
+                model_stream.allow_cleanup.set()
+                await _abort_and_wait(writer)
 
     assert tracked_graph.cancelled.is_set()
     assert tracked_graph.closed.is_set()

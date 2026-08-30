@@ -56,5 +56,18 @@
     "session_id",
     "metadata",
     "citations"
-  ]
+  ],
+  "done_field_types": {
+    "query": "string",
+    "refined_query": "string|null",
+    "intent": "object|null",
+    "answer": "string|null",
+    "documents": "array",
+    "moderation": "object|null",
+    "groundedness": "object|null",
+    "clarification": "object|null",
+    "session_id": "string|null",
+    "metadata": "object",
+    "citations": "array"
+  }
 }

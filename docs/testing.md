@@ -1,9 +1,12 @@
 # Testing
 
-Run the default suite with:
+Run the static and full-suite gates with:
 
 ```shell
-uv run pytest tests
+uv run ruff check app tests alembic/versions/0014_drop_run_lifecycle.py
+uv run pyright --pythonpath .venv/bin/python
+LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms_test_42' \
+  PYTHONPATH=. uv run pytest tests
 ```
 
 ## LangGraph v2 UAT functional gate
@@ -13,8 +16,14 @@ deploying the v2 routes to UAT:
 
 ```shell
 LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms_test_42' \
-  PYTHONPATH=. uv run pytest tests/unit/test_langgraph_v2_*.py \
-  tests/integration/test_langgraph_v2_*.py
+  PYTHONPATH=. uv run pytest \
+  tests/unit/test_langgraph_v2_*.py \
+  tests/integration/test_langgraph_v2_migrations.py \
+  tests/integration/test_langgraph_v2_tracer.py \
+  tests/integration/test_langgraph_v2_thread_resume.py \
+  tests/integration/test_langgraph_v2_groundedness.py \
+  tests/integration/test_langgraph_v2_post_moderation.py \
+  tests/integration/test_langgraph_v2_uvicorn_disconnect.py
 ```
 
 This is the single functional UAT gate. It covers clean and incremental
@@ -22,8 +31,11 @@ migrations, schema preservation, the released request/SSE contract, real
 PostgreSQL checkpoint recovery across independent application instances, a
 real Uvicorn TCP disconnect, Tenant and Subject isolation, Turn-owned Message
 publication, advisory output assessments, and the public query and Resume
-streams. The TCP test binds only to loopback and closes its client socket and
-server under bounded timeouts.
+streams. The TCP test binds only to loopback, sends the request through a real
+local TCP forwarding proxy, and closes its client socket, proxy connections,
+and server under bounded timeouts. This deterministic proxy-boundary test does
+not reproduce an enterprise proxy implementation; repeat the disconnect case
+through the deployed UAT ingress before release.
 
 Resume rejection is expected to remain indistinguishable across authorization
 boundaries while retaining the public lifecycle statuses:

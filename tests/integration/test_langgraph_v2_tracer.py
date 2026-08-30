@@ -58,6 +58,30 @@ def _event_payload_type(event: dict[str, Any]) -> str:
     raise TypeError(f"unsupported captured event payload: {data!r}")
 
 
+def _json_value_type(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, int | float):
+        return "number"
+    raise TypeError(f"unsupported JSON value: {value!r}")
+
+
+def _assert_done_shape(data: object, contract: dict[str, Any]) -> None:
+    assert isinstance(data, dict)
+    done = cast(dict[str, Any], data)
+    assert set(done) == set(contract["done_fields"])
+    for field, expected_types in contract["done_field_types"].items():
+        assert _json_value_type(done[field]) in expected_types.split("|")
+
+
 def parse_sse(response_text: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for frame in response_text.strip().split("\n\n"):
@@ -329,9 +353,7 @@ def test_released_uat_contract_fixture_matches_public_http_shapes(
     assert set(samples_by_name) == set(fixture["event_names"])
     for event_name, sample in samples_by_name.items():
         assert _event_payload_type(sample) == fixture["payload_types"][event_name]
-    done_data = samples_by_name["done"]["data"]
-    assert isinstance(done_data, dict)
-    assert set(cast(dict[str, Any], done_data)) == set(fixture["done_fields"])
+    _assert_done_shape(samples_by_name["done"]["data"], fixture)
 
     request = V2QueryRequest.model_validate(fixture["request"])
     assert set(fixture["request"]) == set(fixture["query_request_fields"])
@@ -360,15 +382,6 @@ def test_released_uat_contract_fixture_matches_public_http_shapes(
 
     for header in fixture["query_response_headers"]:
         assert header in success.headers
-    assert fixture["resume_request_fields"] == {
-        "thread_id": "string:path",
-        "expectedTurnId": "uuid:query",
-    }
-    assert fixture["resume_response_headers"] == [
-        "x-conversation-id",
-        "x-turn-id",
-        "x-thread-id",
-    ]
     success_events = parse_sse(success.text)
     error_events = parse_sse(error.text)
     assert set(event["type"] for event in success_events) <= set(
@@ -377,10 +390,9 @@ def test_released_uat_contract_fixture_matches_public_http_shapes(
     assert set(event["type"] for event in error_events) <= set(
         fixture["event_names"]
     )
-    assert set(success_events[-1]["data"]) == set(fixture["done_fields"])
-    assert isinstance(success_events[-1]["data"], dict)
-    assert error_events[-1]["type"] == "error"
-    assert isinstance(error_events[-1]["data"], str)
+    _assert_done_shape(success_events[-1]["data"], fixture)
+    captured_error_events = _wire_fixture("v1_moderation_error_wire.json")["events"]
+    assert error_events[-len(captured_error_events) :] == captured_error_events
 
 
 def test_request_header_and_generated_conversation_variants(

@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import StateSnapshot
 from psycopg_pool import AsyncConnectionPool
+from starlette.requests import ClientDisconnect
 from starlette.types import Receive, Scope, Send
 
 from app.langgraph_v2.answer import AnswerActor, build_answer_actor
@@ -80,6 +81,15 @@ class _RequestOwnedStreamingResponse(StreamingResponse):
     """Cancel and await stream work as soon as the HTTP client disconnects."""
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await super().__call__(scope, receive, send)
+            return
+        spec_version = tuple(
+            map(
+                int,
+                scope.get("asgi", {}).get("spec_version", "2.0").split("."),
+            )
+        )
         stream_task = asyncio.create_task(self.stream_response(send))
         disconnect_task = asyncio.create_task(self.listen_for_disconnect(receive))
         try:
@@ -87,14 +97,25 @@ class _RequestOwnedStreamingResponse(StreamingResponse):
                 {stream_task, disconnect_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if stream_task in done:
-                await stream_task
-            else:
-                stream_task.cancel()
+            if disconnect_task in done:
+                await disconnect_task
+                if not stream_task.done():
+                    stream_task.cancel()
                 try:
                     await stream_task
                 except asyncio.CancelledError:
                     pass
+                except OSError as error:
+                    if spec_version >= (2, 4):
+                        raise ClientDisconnect from error
+                    raise
+            else:
+                try:
+                    await stream_task
+                except OSError as error:
+                    if spec_version >= (2, 4):
+                        raise ClientDisconnect from error
+                    raise
         finally:
             for task in (stream_task, disconnect_task):
                 if not task.done():

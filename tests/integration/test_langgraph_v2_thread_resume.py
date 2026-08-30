@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,7 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import (
+    UAT_CONTRACT_PATH,
     close_stream_after_first_token,
     parse_sse,
     persistent_tracer_app,
@@ -528,11 +530,26 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
         )
 
     delivered = parse_sse(response.text)
+    contract = json.loads(UAT_CONTRACT_PATH.read_text())
+    actual_request = {
+        "thread_id": thread_id,
+        "expectedTurnId": str(turn_id),
+    }
+    assert set(actual_request) == set(contract["resume_request_fields"])
+    assert isinstance(actual_request["thread_id"], str)
+    UUID(actual_request["expectedTurnId"])
+    expected_headers = {
+        "x-thread-id": thread_id,
+        "x-conversation-id": "conversation-1",
+        "x-turn-id": str(turn_id),
+    }
+    assert set(contract["resume_response_headers"]) == set(expected_headers)
+    assert {
+        header: response.headers[header]
+        for header in contract["resume_response_headers"]
+    } == expected_headers
     assert response.status_code == 200, response.text
     assert repeated.status_code == 409
-    assert response.headers["x-thread-id"] == thread_id
-    assert response.headers["x-conversation-id"] == "conversation-1"
-    assert response.headers["x-turn-id"] == str(turn_id)
     assert "x-run-id" not in response.headers
     assert answer_actor.calls == (
         0
