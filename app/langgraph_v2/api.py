@@ -78,7 +78,6 @@ from app.langgraph_v2.run_events import (
     RunNotFound,
     RunRecord,
 )
-from app.langgraph_v2.runtime import LocalRunRuntime
 from app.langgraph_v2.stream import (
     GraphStreamCleanupError,
     RequestOwnedGraph,
@@ -538,79 +537,6 @@ class ThreadResumeTarget:
     config: RunnableConfig
 
 
-async def _stream_unseen_events(
-    repository: RunEventRepository,
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    sent_keys: set[str],
-    suppress_replayed_phase_events: bool = False,
-) -> AsyncIterator[str]:
-    """Serialize newly journaled Events."""
-    for event in await repository.list_events(tenant_id, run_id):
-        if event.event_key in sent_keys:
-            continue
-        sent_keys.add(event.event_key)
-        if (
-            suppress_replayed_phase_events
-            and event.event_key.startswith("phase:")
-            and event.type != "token"
-            and not event.event_key.startswith("phase:finalization:")
-        ):
-            continue
-        yield TracerStreamEvent(
-            event_key=event.event_key,
-            type=cast(Any, event.type),
-            step=event.step,
-            data=event.data,
-            sequence=event.sequence,
-        ).to_sse()
-
-
-async def _subscribe_to_run(
-    repository: RunEventRepository,
-    execution_task: asyncio.Task[None],
-    *,
-    tenant_id: str,
-    run_id: uuid.UUID,
-    initial_sent_keys: set[str] | None = None,
-    suppress_replayed_phase_events: bool = False,
-) -> AsyncIterator[str]:
-    """Stream durable Events without owning or cancelling graph execution."""
-    sent_keys = set(initial_sent_keys or ())
-    while True:
-        async for frame in _stream_unseen_events(
-            repository,
-            tenant_id=tenant_id,
-            run_id=run_id,
-            sent_keys=sent_keys,
-            suppress_replayed_phase_events=suppress_replayed_phase_events,
-        ):
-            yield frame
-        if execution_task.done():
-            execution_task.result()
-            async for frame in _stream_unseen_events(
-                repository,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                sent_keys=sent_keys,
-                suppress_replayed_phase_events=suppress_replayed_phase_events,
-            ):
-                yield frame
-            return
-        if (await repository.get_run(tenant_id, run_id)).status != "running":
-            async for frame in _stream_unseen_events(
-                repository,
-                tenant_id=tenant_id,
-                run_id=run_id,
-                sent_keys=sent_keys,
-                suppress_replayed_phase_events=suppress_replayed_phase_events,
-            ):
-                yield frame
-            return
-        await asyncio.sleep(0.01)
-
-
 def _live_events(app: FastAPI) -> LiveEventWakeups:
     """Return the app-local wakeup relay used by durable Event followers."""
     wakeups = getattr(app.state, "langgraph_v2_live_events", None)
@@ -630,15 +556,6 @@ def _message_repository(
             seconds=getattr(app.state, "langgraph_v2_resume_ttl_seconds", 3600)
         ),
     )
-
-
-def _local_runtime(app: FastAPI) -> LocalRunRuntime:
-    """Return the instance-local runtime used to retain detached executions."""
-    runtime = getattr(app.state, "langgraph_v2_runtime", None)
-    if runtime is None:
-        runtime = LocalRunRuntime()
-        app.state.langgraph_v2_runtime = runtime
-    return cast(LocalRunRuntime, runtime)
 
 
 def _checkpoint_turn_id(values: dict[str, Any]) -> uuid.UUID:
@@ -736,9 +653,6 @@ def create_tracer_router(
         """Run the deterministic tracer and return its events as SSE."""
         del x_user_groups
         _ensure_tenant_available(http_request.app, request_context.tenant_id)
-        runtime = _local_runtime(http_request.app)
-        if not runtime.accepting:
-            raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
         run_id = uuid.uuid4()
         x_application_id = request_context.tenant_id
         configured_pool = getattr(
@@ -1010,9 +924,6 @@ def create_tracer_router(
         """Recover an authorized Conversation thread from its latest checkpoint."""
         x_application_id = request_context.tenant_id
         _ensure_tenant_available(http_request.app, x_application_id)
-        runtime = _local_runtime(http_request.app)
-        if not runtime.accepting:
-            raise HTTPException(status_code=503, detail="LangGraph v2 is shutting down")
         configured_pool = getattr(
             http_request.app.state,
             "langgraph_v2_postgres_pool",
@@ -1316,7 +1227,6 @@ def register_v2_routes(
 ) -> None:
     """Register the default-off v2 routes when explicitly enabled."""
     if enabled:
-        _local_runtime(app)
         router = create_tracer_router(
             graph,
             refinement_actor,

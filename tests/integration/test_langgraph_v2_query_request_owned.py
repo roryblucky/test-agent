@@ -8,7 +8,6 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from fastapi import HTTPException
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
@@ -16,7 +15,6 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.run_events import RunEventRepository
-from app.langgraph_v2.runtime import LocalRunRuntime
 from app.langgraph_v2.stream import GraphStreamCleanupError
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
@@ -454,23 +452,21 @@ async def test_graph_close_failure_without_primary_error_is_reported(
 
 
 @pytest.mark.asyncio
-async def test_query_preserves_shutdown_admission_contract(
+async def test_query_uses_request_owned_execution_without_local_runtime_state(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
-    runtime = LocalRunRuntime()
-    await runtime.stop_and_wait_for_checkpoint_boundary()
-    app.state.langgraph_v2_runtime = runtime
+    assert not hasattr(app.state, "langgraph_v2_runtime")
 
     async with app.router.lifespan_context(app):
-        with pytest.raises(HTTPException) as raised:
-            await v2_stream_endpoint(app)(
-                V2QueryRequest(query="hello"),
-                stream_request(app),
-                request_context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-            )
+        response = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello"),
+            stream_request(app),
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
+        )
+        frames = [frame async for frame in response.body_iterator]
 
-    assert raised.value.status_code == 503
-    assert raised.value.detail == "LangGraph v2 is shutting down"
+    assert frames
+    assert not hasattr(app.state, "langgraph_v2_runtime")

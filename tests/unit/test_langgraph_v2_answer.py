@@ -1,9 +1,7 @@
 import asyncio
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Self
-from unittest.mock import AsyncMock, patch
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from pydantic_ai.usage import RunUsage
@@ -17,10 +15,8 @@ from app.langgraph_v2.answer import (
     build_answer_actor,
     run_answer,
 )
-from app.langgraph_v2.api import _stream_unseen_events
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.phase_results import PhaseExecutionContext
-from app.langgraph_v2.run_events import EventRecord
 from app.models.domain import Document
 
 
@@ -288,64 +284,3 @@ def test_answer_citation_quote_must_match_bound_document() -> None:
     assert citations[0].evidence_id == "artifact-1"
     assert citations[0].attribution_status == "unlocated"
     assert citations[0].quoted_text is None
-
-
-@pytest.mark.asyncio
-async def test_answer_tokens_are_delivered_before_post_moderation_boundary() -> None:
-    run_id = UUID("00000000-0000-0000-0000-000000000002")
-    created_at = datetime.now(UTC)
-    events = [
-        EventRecord(
-            tenant_id="tenant-a",
-            run_id=run_id,
-            sequence=1,
-            event_key="phase:answer:token:0",
-            type="token",
-            data="answer",
-            created_at=created_at,
-        ),
-        EventRecord(
-            tenant_id="tenant-a",
-            run_id=run_id,
-            sequence=2,
-            event_key="phase:answer:token:1",
-            type="token",
-            data=" stream",
-            created_at=created_at,
-        ),
-        EventRecord(
-            tenant_id="tenant-a",
-            run_id=run_id,
-            sequence=3,
-            event_key="phase:moderation:post:step_start:1",
-            type="step_start",
-            step="moderation:post",
-            created_at=created_at,
-        ),
-    ]
-
-    class Repository:
-        async def list_events(
-            self, tenant_id: str, requested_run_id: UUID
-        ) -> list[EventRecord]:
-            assert tenant_id == "tenant-a"
-            assert requested_run_id == run_id
-            return events
-
-    with patch("app.langgraph_v2.api.asyncio.sleep", new_callable=AsyncMock) as sleep:
-        frames = [
-            frame
-            async for frame in _stream_unseen_events(
-                Repository(),
-                tenant_id="tenant-a",
-                run_id=run_id,
-                sent_keys=set(),
-            )
-        ]
-
-    assert '"data": "answer"' in frames[0]
-    assert '"data": " stream"' in frames[1]
-    assert frames[2].index('"type": "step_start"') < frames[2].index(
-        '"step": "moderation:post"'
-    )
-    sleep.assert_not_awaited()

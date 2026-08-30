@@ -14,7 +14,6 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
 from app.langgraph_v2.live_events import LiveEventWakeups
-from app.langgraph_v2.run_events import RunEventRepository
 
 _INSTANCE_ID = os.environ.get("LANGGRAPH_V2_INSTANCE_ID", socket.gethostname())
 
@@ -109,18 +108,7 @@ async def postgres_lifespan(
     finally:
         try:
             if pool is not None:
-                try:
-                    runtime = getattr(app.state, "langgraph_v2_runtime", None)
-                    if (
-                        runtime is not None
-                        and app.state.langgraph_v2_postgres_pool is pool
-                    ):
-                        await runtime.stop_and_wait_for_checkpoint_boundary()
-                        await RunEventRepository(pool).interrupt_runs_owned_by(
-                            _INSTANCE_ID
-                        )
-                finally:
-                    await pool.close()
+                await pool.close()
         finally:
             app.state.langgraph_v2_postgres_pool = None
             app.state.langgraph_v2_checkpointer = None
