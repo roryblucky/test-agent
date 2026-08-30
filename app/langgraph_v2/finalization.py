@@ -138,8 +138,11 @@ async def run_finalization(
             ),
         )
         normalized = response.model_dump(mode="json")
-        usages: list[Mapping[str, Any]] = [state.get("answer_usage", {})]
-        for phase_name in ("question_refinement", "groundedness"):
+        usages: list[Mapping[str, Any]] = [
+            state.get("answer_usage", {}),
+            state.get("refinement_usage", {}),
+        ]
+        for phase_name in ("groundedness",):
             phase = await context.repository.get_completed(
                 context.tenant_id, context.run_id, phase_name
             )
@@ -183,7 +186,9 @@ def finalize_in_memory(state: Mapping[str, Any]) -> dict[str, Any]:
         documents=[],
     )
     done_data = response.model_dump(by_alias=True)
-    usage = _legacy_usage(state.get("answer_usage", {}))
+    usage = _combine_usage(
+        [state.get("answer_usage", {}), state.get("refinement_usage", {})]
+    )
     if usage is not None:
         done_data["metadata"]["usage"] = usage
     events = [

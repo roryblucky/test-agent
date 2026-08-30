@@ -18,19 +18,16 @@ from app.langgraph_v2.contracts import TracerQueryResponse, TracerStreamEvent
 from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
 from app.langgraph_v2.history import ConversationTurn, select_sliding_window_history
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
+from app.langgraph_v2.phase_results import PhaseExecutionContext
 from app.langgraph_v2.post_moderation import run_post_moderation
 from app.langgraph_v2.pre_moderation import (
     MockModerationProvider,
-    ModerationDecision,
     ModerationProvider,
-    pre_moderation_events,
     run_pre_moderation,
 )
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
     QuestionRefinementActor,
-    refinement_events,
     run_question_refinement,
 )
 from app.langgraph_v2.reranking import MockRanker, Ranker, run_reranking
@@ -52,6 +49,7 @@ class TracerState(TypedDict):
     halted: NotRequired[bool]
     moderation: NotRequired[dict[str, Any]]
     refined_query: NotRequired[str]
+    refinement_usage: NotRequired[dict[str, Any]]
     refinement_error: NotRequired[str]
     retrieval_error: NotRequired[str]
     reranking_error: NotRequired[str]
@@ -76,6 +74,7 @@ class TracerStateUpdate(TypedDict, total=False):
     halted: bool
     moderation: dict[str, Any]
     refined_query: str
+    refinement_usage: dict[str, Any]
     refinement_error: str
     retrieval_error: str
     reranking_error: str
@@ -100,68 +99,34 @@ async def _query(
     query = state["query"]
     canonical = canonical_query(query)
 
-    async def invoke() -> PhaseResultInput:
-        history: list[ConversationTurn] = []
-        if phase_context is not None and phase_context.message_repository is not None:
-            messages = await phase_context.message_repository.list_messages(
-                context=cast(TrustedRequestContext, phase_context.request_context),
-                conversation_id=state["conversation_id"],
-            )
-            history = select_sliding_window_history(
-                messages,
-                token_budget=phase_context.history_token_budget,
-                current_turn_id=phase_context.current_turn_id
-                or (
-                    UUID(state["turn_id"]) if state.get("turn_id") is not None else None
-                ),
-            )
-        return PhaseResultInput(
-            phase_name="query",
-            normalized_result={
-                "query": canonical,
-                "history_snapshot": [turn.model_dump() for turn in history],
-            },
-            events=(
-                EventInput(
-                    event_key="phase:query:step_start:1",
-                    type="step_start",
-                    step="query",
-                ),
-                EventInput(
-                    event_key="phase:query:step_completed:1",
-                    type="step_completed",
-                    step="query",
-                    data={"query": canonical},
-                ),
-            ),
+    history: list[ConversationTurn] = []
+    if phase_context is not None and phase_context.message_repository is not None:
+        messages = await phase_context.message_repository.list_messages(
+            context=cast(TrustedRequestContext, phase_context.request_context),
+            conversation_id=state["conversation_id"],
         )
-
-    if phase_context is None:
-        phase = await invoke()
-        return {
-            "events": [
-                _event_state(event, index)
-                for index, event in enumerate(phase.events, 1)
-            ],
-            "history": [
-                ConversationTurn.model_validate(turn)
-                for turn in phase.normalized_result["history_snapshot"]
-            ],
-        }
-    result = await phase_context.repository.get_or_invoke(
-        tenant_id=phase_context.tenant_id,
-        run_id=phase_context.run_id,
-        owner_instance_id=phase_context.owner_instance_id,
-        execution_epoch=phase_context.execution_epoch,
-        phase_name="query",
-        invoke=invoke,
+        history = select_sliding_window_history(
+            messages,
+            token_budget=phase_context.history_token_budget,
+            current_turn_id=phase_context.current_turn_id
+            or (UUID(state["turn_id"]) if state.get("turn_id") is not None else None),
+        )
+    events = (
+        EventInput(
+            event_key="phase:query:step_start:1",
+            type="step_start",
+            step="query",
+        ),
+        EventInput(
+            event_key="phase:query:step_completed:1",
+            type="step_completed",
+            step="query",
+            data={"query": canonical},
+        ),
     )
     return {
-        "events": [_event_state(event, event.sequence) for event in result.events],
-        "history": [
-            ConversationTurn.model_validate(turn)
-            for turn in result.normalized_result["history_snapshot"]
-        ],
+        "events": [_event_state(event, index) for index, event in enumerate(events, 1)],
+        "history": history,
     }
 
 
@@ -193,20 +158,6 @@ async def _check_cancellation(context: PhaseExecutionContext | None) -> None:
         and await context.cancellation_check()
     ):
         raise CancellationObserved("cancellation observed at graph boundary")
-
-
-async def _pre_moderation_without_journal(
-    state: TracerState,
-    provider: ModerationProvider,
-) -> tuple[list[dict[str, Any]], ModerationDecision]:
-    """Run the provider for an unconfigured in-memory graph."""
-    decision = await provider.check(state["query"])
-    sequence_start = len(state["events"]) + 1
-    events = [
-        _event_state(event, sequence_start + index)
-        for index, event in enumerate(pre_moderation_events(decision))
-    ]
-    return events, decision
 
 
 def _next_after_pre_moderation(state: TracerState) -> str:
@@ -242,27 +193,19 @@ def build_tracer_graph(
 
     async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
-        if phase_context is None:
-            events, decision = await _pre_moderation_without_journal(
-                state, selected_moderation_provider
-            )
-        else:
-            events, halted, decision = await run_pre_moderation(
-                state,
-                context=phase_context,
-                provider=selected_moderation_provider,
-            )
-            return {
-                "events": [
-                    *state["events"],
-                    *[_event_state(event, event.sequence) for event in events],
-                ],
-                "halted": halted,
-                "moderation": decision.model_dump(exclude_none=True),
-            }
+        events, halted, decision = await run_pre_moderation(
+            state, provider=selected_moderation_provider
+        )
+        sequence_start = len(state["events"])
         return {
-            "events": [*state["events"], *events],
-            "halted": decision.is_flagged,
+            "events": [
+                *state["events"],
+                *[
+                    _event_state(event, sequence_start + index)
+                    for index, event in enumerate(events, 1)
+                ],
+            ],
+            "halted": halted,
             "moderation": decision.model_dump(exclude_none=True),
         }
 
@@ -270,34 +213,24 @@ def build_tracer_graph(
 
     async def question_refinement_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(phase_context)
-        if phase_context is None:
-            result = await selected_refinement_actor.refine(
-                state["query"], state.get("history", [])
-            )
-            return {
-                "events": [
-                    *state["events"],
-                    *[
-                        _event_state(event, len(state["events"]) + index)
-                        for index, event in enumerate(refinement_events(result), 1)
-                    ],
-                ],
-                "refined_query": result.standalone_query,
-            }
         events, halted, result, error = await run_question_refinement(
-            state,
-            context=phase_context,
-            actor=selected_refinement_actor,
+            state, actor=selected_refinement_actor
         )
         update: TracerStateUpdate = {
             "events": [
                 *state["events"],
-                *[_event_state(event, event.sequence) for event in events],
+                *[
+                    _event_state(event, len(state["events"]) + index)
+                    for index, event in enumerate(events, 1)
+                ],
             ],
             "halted": halted,
         }
         if result is not None:
             update["refined_query"] = result.standalone_query
+            usage = getattr(selected_refinement_actor, "last_usage", {})
+            if usage:
+                update["refinement_usage"] = usage
         if error is not None:
             update["refinement_error"] = error
         return update

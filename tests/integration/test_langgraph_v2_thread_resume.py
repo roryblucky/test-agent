@@ -4,6 +4,7 @@ import asyncio
 import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -30,6 +31,7 @@ from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRep
 from app.langgraph_v2.post_moderation import ModerationDecision
 from app.langgraph_v2.run_events import RunEventRepository
 from app.models.domain import Document
+from app.models.workflow import ResolvedQuery
 from tests.integration.test_langgraph_v2_tracer import (
     close_stream_after_first_token,
     parse_sse,
@@ -150,6 +152,38 @@ class _AssertingModerationProvider:
         return ModerationDecision(is_flagged=False)
 
 
+class _BlockingRefinementActor:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.close_completed = asyncio.Event()
+
+    async def refine(
+        self, query: str, history: Sequence[ConversationTurn]
+    ) -> ResolvedQuery:
+        del history
+        self.calls += 1
+        assert query == "hello"
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.close_completed.set()
+        raise AssertionError("unreachable")
+
+
+class _SuccessfulRefinementActor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def refine(
+        self, query: str, history: Sequence[ConversationTurn]
+    ) -> ResolvedQuery:
+        del history
+        self.calls += 1
+        return ResolvedQuery(original_query=query, standalone_query=query)
+
+
 async def _interrupt_query_after_answer_token(
     database_url: str,
 ) -> tuple[str, UUID, UUID, datetime]:
@@ -180,7 +214,41 @@ async def _interrupt_query_after_answer_token(
             response.headers["x-thread-id"],
             UUID(response.headers["x-turn-id"]),
             UUID(response.headers["x-run-id"]),
-            (await _read_turn(database_url, UUID(response.headers["x-turn-id"]))).resume_deadline,
+            (
+                await _read_turn(database_url, UUID(response.headers["x-turn-id"]))
+            ).resume_deadline,
+        )
+
+
+async def _interrupt_query_during_refinement(
+    database_url: str,
+) -> tuple[str, UUID, _BlockingRefinementActor]:
+    await seed_subject_conversation(database_url, "conversation-1")
+    actor = _BlockingRefinementActor()
+    app = persistent_tracer_app(database_url, refinement_actor=actor)
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            stream_request(app),
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
+        )
+
+        async def consume_stream() -> None:
+            async for _ in response.body_iterator:
+                pass
+
+        pending_read = asyncio.create_task(consume_stream())
+        await actor.started.wait()
+        pending_read.cancel()
+        with suppress(asyncio.CancelledError):
+            await pending_read
+        assert actor.close_completed.is_set() is True
+        return (
+            response.headers["x-thread-id"],
+            UUID(response.headers["x-turn-id"]),
+            actor,
         )
 
 
@@ -499,6 +567,52 @@ def test_thread_resume_recovers_pre_answer_checkpoint_from_fresh_app(
     ] == [("user", "resume me"), ("assistant", "recovered answer")]
 
 
+def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    thread_id, turn_id, interrupted_actor = asyncio.run(
+        _interrupt_query_during_refinement(langgraph_v2_migrated_database_url)
+    )
+    resumed_actor = _SuccessfulRefinementActor()
+    answer_actor = _StreamingAnswerActor(
+        answer="recovered answer",
+        stream_tokens=["recovered ", "answer"],
+    )
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        thread_resume_enabled=True,
+        refinement_actor=resumed_actor,
+        answer_actor=answer_actor,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={
+                "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-a",
+            },
+            params={"expectedTurnId": str(turn_id)},
+        )
+
+    delivered = parse_sse(response.text)
+    messages = asyncio.run(_read_messages(langgraph_v2_migrated_database_url))
+    assert response.status_code == 200
+    assert interrupted_actor.calls == resumed_actor.calls == 1
+    assert answer_actor.calls == 1
+    assert [event["data"] for event in delivered if event["type"] == "token"] == [
+        "recovered ",
+        "answer",
+    ]
+    assert sum(event["type"] == "done" for event in delivered) == 1
+    assert delivered[-1]["data"]["answer"] == "recovered answer"
+    assert [
+        (message.role, message.content)
+        for message in messages
+        if message.turn_id == turn_id
+    ] == [("user", "hello"), ("assistant", "recovered answer")]
+
+
 def test_thread_resume_returns_404_for_missing_or_unauthorized_thread(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -675,7 +789,7 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
                 "event_key": "recovery:completed:2",
                 "type": "done",
                 "data": {"answer": "recovered answer"},
-            }
+            },
         ]
     )
     app = persistent_tracer_app(
@@ -773,9 +887,7 @@ def test_thread_resume_replays_full_answer_from_interrupted_query_and_preserves_
         for message in messages
         if message.turn_id == turn_id and message.role == "assistant"
     )
-    original_run = asyncio.run(
-        _read_run(langgraph_v2_migrated_database_url, run_id)
-    )
+    original_run = asyncio.run(_read_run(langgraph_v2_migrated_database_url, run_id))
     assistant_run = asyncio.run(
         _read_run(langgraph_v2_migrated_database_url, assistant_run_id)
     )

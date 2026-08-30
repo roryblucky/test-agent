@@ -10,8 +10,7 @@ from pydantic import Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
-from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.langgraph_v2.run_events import EventInput
 from app.models.workflow import ResolvedQuery
 
 REFINEMENT_ERROR_MESSAGE = "Question refinement failed."
@@ -123,50 +122,16 @@ def refinement_events(
 async def run_question_refinement(
     state: Mapping[str, Any],
     *,
-    context: PhaseExecutionContext,
     actor: QuestionRefinementActor,
-) -> tuple[list[EventRecord], bool, ResolvedQuery | None, str | None]:
-    """Journal, replay, and return one structured refinement result."""
-
-    async def invoke() -> PhaseResultInput:
-        try:
-            history = [
-                ConversationTurn.model_validate(turn)
-                for turn in state.get("history", [])
-            ]
-            refined = await actor.refine(state["query"], history)
-            result = V2ResolvedQuery.model_validate(refined.model_dump())
-            normalized_result = result.model_dump(exclude_none=True)
-            usage = getattr(actor, "last_usage", {})
-            if usage:
-                normalized_result["usage"] = usage
-        except Exception as exc:
-            message = str(exc) or REFINEMENT_ERROR_MESSAGE
-            return PhaseResultInput(
-                phase_name="question_refinement",
-                normalized_result={"failed": True, "error": message},
-                events=refinement_events(error=message),
-                terminal_status="failed",
-            )
-        return PhaseResultInput(
-            phase_name="question_refinement",
-            normalized_result=normalized_result,
-            events=refinement_events(result),
-        )
-
-    result = await context.repository.get_or_invoke(
-        tenant_id=context.tenant_id,
-        run_id=context.run_id,
-        owner_instance_id=context.owner_instance_id,
-        execution_epoch=context.execution_epoch,
-        phase_name="question_refinement",
-        invoke=invoke,
-    )
-    if result.normalized_result.get("failed") is True:
-        return list(result.events), True, None, str(result.normalized_result["error"])
-    return (
-        list(result.events),
-        False,
-        V2ResolvedQuery.model_validate(result.normalized_result),
-        None,
-    )
+) -> tuple[tuple[EventInput, ...], bool, ResolvedQuery | None, str | None]:
+    """Return refinement State without reading or writing an application journal."""
+    try:
+        history = [
+            ConversationTurn.model_validate(turn) for turn in state.get("history", [])
+        ]
+        refined = await actor.refine(state["query"], history)
+        result = V2ResolvedQuery.model_validate(refined.model_dump())
+    except Exception as exc:
+        message = str(exc) or REFINEMENT_ERROR_MESSAGE
+        return refinement_events(error=message), True, None, message
+    return refinement_events(result), False, result, None

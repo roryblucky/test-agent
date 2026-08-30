@@ -7,8 +7,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
-from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultInput
-from app.langgraph_v2.run_events import EventInput, EventRecord
+from app.langgraph_v2.run_events import EventInput
 
 
 class ModerationDecision(BaseModel):
@@ -87,57 +86,28 @@ class MockModerationProvider:
 async def run_pre_moderation(
     state: Mapping[str, Any],
     *,
-    context: PhaseExecutionContext,
     provider: ModerationProvider,
-) -> tuple[list[EventRecord], bool, ModerationDecision]:
-    """Journal and return the pre-moderation Events and halt decision."""
-
-    async def invoke() -> PhaseResultInput:
-        try:
-            decision = await provider.check(state["query"])
-        except Exception as exc:
-            message = str(exc) or "Moderation failed."
-            return PhaseResultInput(
-                phase_name="pre_moderation",
-                normalized_result={"failed": True, "error": message},
-                events=(
-                    EventInput(
-                        event_key="phase:pre_moderation:step_start:1",
-                        type="step_start",
-                        step="moderation:pre",
-                    ),
-                    EventInput(
-                        event_key="phase:pre_moderation:error:1",
-                        type="error",
-                        data=message,
-                    ),
+) -> tuple[tuple[EventInput, ...], bool, ModerationDecision]:
+    """Return the pre-moderation State update without an application journal."""
+    try:
+        decision = await provider.check(state["query"])
+    except Exception as exc:
+        message = str(exc) or "Moderation failed."
+        decision = ModerationDecision(is_flagged=True, reason=message)
+        return (
+            (
+                EventInput(
+                    event_key="phase:pre_moderation:step_start:1",
+                    type="step_start",
+                    step="moderation:pre",
                 ),
-                terminal_status="failed",
-            )
-        return PhaseResultInput(
-            phase_name="pre_moderation",
-            normalized_result=decision.model_dump(exclude_none=True),
-            events=pre_moderation_events(decision),
-            terminal_status="failed" if decision.is_flagged else None,
+                EventInput(
+                    event_key="phase:pre_moderation:error:1",
+                    type="error",
+                    data=message,
+                ),
+            ),
+            True,
+            decision,
         )
-
-    result = await context.repository.get_or_invoke(
-        tenant_id=context.tenant_id,
-        run_id=context.run_id,
-        owner_instance_id=context.owner_instance_id,
-        execution_epoch=context.execution_epoch,
-        phase_name="pre_moderation",
-        invoke=invoke,
-    )
-    if result.normalized_result.get("failed") is True:
-        decision = ModerationDecision(
-            is_flagged=True,
-            reason=str(result.normalized_result.get("error", "Moderation failed.")),
-        )
-    else:
-        decision = ModerationDecision.model_validate(result.normalized_result)
-    return (
-        list(result.events),
-        decision.is_flagged,
-        decision,
-    )
+    return pre_moderation_events(decision), decision.is_flagged, decision

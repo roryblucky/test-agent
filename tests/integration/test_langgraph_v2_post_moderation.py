@@ -312,7 +312,7 @@ async def test_post_moderation_replays_after_commit_window_crash(
         recovered = await graph.ainvoke(_state())
         events = await runs.list_events("tenant-a", run.run_id)
 
-    assert moderation.calls == 2
+    assert moderation.calls == 3
     assert recovered["answer"] == "generated answer"
     assert len({event.event_key for event in events}) == len(events)
     assert (

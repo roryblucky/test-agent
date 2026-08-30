@@ -8,6 +8,7 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 from pydantic import ValidationError
 
+from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import build_tracer_graph, canonical_query
 from app.langgraph_v2.live_events import LiveEventWakeups
 from app.langgraph_v2.phase_results import (
@@ -18,13 +19,14 @@ from app.langgraph_v2.phase_results import (
     PhaseResultInput,
     PhaseResultRepository,
 )
-from app.langgraph_v2.pre_moderation import ModerationDecision
+from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.run_events import (
     ClaimFenced,
     EventInput,
     EventInvariantConflict,
     RunEventRepository,
 )
+from app.models.domain import Document
 
 
 def _phase_input(
@@ -162,15 +164,22 @@ async def test_phase_replay_reuses_result_without_invocation(
 
 
 @pytest.mark.asyncio
-async def test_pre_moderation_replay_reuses_provider_result_and_events(
+async def test_input_nodes_bypass_phase_and_event_journals_while_retrieval_uses_them(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    class CountingProvider:
-        calls = 0
+    class RecordingRepository(PhaseResultRepository):
+        phase_reads: list[PhaseName] = []
 
-        async def check(self, text: str) -> ModerationDecision:
-            self.calls += 1
-            return ModerationDecision(is_flagged=False, reason=text)
+        async def get_or_invoke(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.phase_reads.append(kwargs["phase_name"])
+            return await super().get_or_invoke(**kwargs)
+
+    class Retriever:
+        async def retrieve(self, query: str) -> RetrievalResult:
+            return RetrievalResult(
+                documents=[Document(id="d1", content=query)],
+                raw_payload={"query": query},
+            )
 
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
@@ -182,16 +191,17 @@ async def test_pre_moderation_replay_reuses_provider_result_and_events(
             conversation_id="conversation-1",
             owner_instance_id="instance-a",
         )
-        provider = CountingProvider()
+        phases = RecordingRepository(pool)
         graph = build_tracer_graph(
             phase_context=PhaseExecutionContext(
-                repository=PhaseResultRepository(pool),
+                repository=phases,
+                artifact_repository=ArtifactRepository(pool),
                 tenant_id="tenant-a",
                 run_id=run.run_id,
                 owner_instance_id=run.owner_instance_id,
                 execution_epoch=run.execution_epoch,
             ),
-            moderation_provider=provider,
+            retriever=Retriever(),
         )
         state = {
             "query": "hello",
@@ -201,18 +211,72 @@ async def test_pre_moderation_replay_reuses_provider_result_and_events(
         }
 
         await graph.ainvoke(state)
-        await graph.ainvoke(state)
 
-        assert provider.calls == 1
+        assert phases.phase_reads == ["retrieval", "reranking", "finalization"]
         events = await runs.list_events("tenant-a", run.run_id)
         assert [event.event_key for event in events] == [
-            "phase:query:step_start:1",
-            "phase:query:step_completed:1",
-            "phase:pre_moderation:step_start:1",
-            "phase:pre_moderation:step_completed:1",
-            "phase:question_refinement:step_start:1",
-            "phase:question_refinement:step_completed:1",
+            "phase:retrieval:step_start:1",
+            "phase:retrieval:step_completed:1",
+            "phase:reranking:step_start:1",
+            "phase:reranking:step_completed:1",
+            "phase:finalization:step_start:1",
+            "phase:finalization:step_completed:1",
         ]
+
+
+@pytest.mark.asyncio
+async def test_flagged_input_stops_before_refinement_and_provider_access(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class RecordingRepository(PhaseResultRepository):
+        phase_reads: list[PhaseName] = []
+
+        async def get_or_invoke(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.phase_reads.append(kwargs["phase_name"])
+            return await super().get_or_invoke(**kwargs)
+
+    class UnexpectedRefinementActor:
+        async def refine(self, query, history):  # type: ignore[no-untyped-def]
+            raise AssertionError(f"refinement received flagged input: {query!r}")
+
+    class UnexpectedRetriever:
+        async def retrieve(self, query: str) -> RetrievalResult:
+            raise AssertionError(f"retriever received flagged input: {query!r}")
+
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        run = await RunEventRepository(pool).create_run(
+            tenant_id="tenant-a",
+            run_id=uuid4(),
+            conversation_id="conversation-1",
+            owner_instance_id="instance-a",
+        )
+        phases = RecordingRepository(pool)
+        result = await build_tracer_graph(
+            phase_context=PhaseExecutionContext(
+                repository=phases,
+                artifact_repository=ArtifactRepository(pool),
+                tenant_id="tenant-a",
+                run_id=run.run_id,
+                owner_instance_id=run.owner_instance_id,
+                execution_epoch=run.execution_epoch,
+            ),
+            refinement_actor=UnexpectedRefinementActor(),
+            retriever=UnexpectedRetriever(),
+        ).ainvoke(
+            {
+                "query": "blocked input",
+                "conversation_id": "conversation-1",
+                "client_request_id": None,
+                "events": [],
+            }
+        )
+
+        assert result["halted"] is True
+        assert result["events"][-1]["type"] == "error"
+        assert phases.phase_reads == []
+        assert await RunEventRepository(pool).list_events("tenant-a", run.run_id) == []
 
 
 @pytest.mark.asyncio
