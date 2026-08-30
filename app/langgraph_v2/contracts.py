@@ -10,7 +10,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.models.domain import GroundednessResult
 from app.models.workflow import CitationReference
 
-EventPersistence = Literal["none", "transport"]
+GraphEventJournalPolicy = Literal["checkpoint_only", "transport_journal"]
+TracerEventType = Literal[
+    "step_start",
+    "step_completed",
+    "token",
+    "citations",
+    "error",
+    "done",
+    "stopped",
+]
 
 
 class V2QueryRequest(BaseModel):
@@ -49,15 +58,7 @@ class TracerStreamEvent(BaseModel):
     """One additive-sequence SSE event produced by the v2 tracer."""
 
     event_key: str = Field(min_length=1)
-    type: Literal[
-        "step_start",
-        "step_completed",
-        "token",
-        "citations",
-        "error",
-        "done",
-        "stopped",
-    ]
+    type: TracerEventType
     sequence: int = Field(ge=1)
     step: str | None = None
     data: Any = None
@@ -68,7 +69,12 @@ class TracerStreamEvent(BaseModel):
         return f"data: {json.dumps(payload, default=str)}\n\n"
 
 
-class TracerGraphEvent(TracerStreamEvent):
-    """Graph-State event with an explicit transitional journal policy."""
+class TracerGraphEvent(BaseModel):
+    """Internal event carried through Graph State."""
 
-    persistence: EventPersistence = "transport"
+    event_key: str = Field(min_length=1)
+    type: TracerEventType
+    sequence: int = Field(ge=1)
+    step: str | None = None
+    data: Any = None
+    journal_policy: GraphEventJournalPolicy = "transport_journal"

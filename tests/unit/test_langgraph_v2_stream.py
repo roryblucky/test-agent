@@ -119,6 +119,11 @@ async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() 
 
 @pytest.mark.asyncio
 async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
+    persisted_events: list[Any] = []
+
+    async def persist_event(event: Any) -> None:
+        persisted_events.append(event)
+
     graph = _FakeGraph(
         _FakeGraphStream(
             [
@@ -129,6 +134,7 @@ async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
                             "event_key": "phase:query:step_completed:1",
                             "type": "step_completed",
                             "data": {"query": "continued"},
+                            "journal_policy": "checkpoint_only",
                         }
                     },
                 )
@@ -142,6 +148,7 @@ async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
             graph,
             None,
             config={"configurable": {"thread_id": "thread-1"}},
+            event_sink=persist_event,
         )
     ]
 
@@ -151,6 +158,7 @@ async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
         "data": {"query": "continued"},
     }
     assert graph.inputs == [None]
+    assert persisted_events == []
     assert graph.options == [
         {
             "config": {"configurable": {"thread_id": "thread-1"}},

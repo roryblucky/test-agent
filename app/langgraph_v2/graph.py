@@ -15,7 +15,7 @@ from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
 from app.langgraph_v2.artifacts import ArtifactRef
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import (
-    EventPersistence,
+    GraphEventJournalPolicy,
     TracerGraphEvent,
     TracerQueryResponse,
     TracerStreamEvent,
@@ -131,7 +131,7 @@ async def _query(
     )
     return {
         "events": [
-            _event_state(event, index, persistence="none")
+            _event_state(event, index, journal_policy="checkpoint_only")
             for index, event in enumerate(events, 1)
         ],
         "history": history,
@@ -142,7 +142,7 @@ def _event_state(
     event: EventInput | EventRecord,
     sequence: int,
     *,
-    persistence: EventPersistence = "transport",
+    journal_policy: GraphEventJournalPolicy = "transport_journal",
 ) -> dict[str, Any]:
     """Convert journal or in-memory event data into graph state."""
     state_event = TracerGraphEvent(
@@ -151,11 +151,11 @@ def _event_state(
         step=event.step,
         data=event.data,
         sequence=sequence,
-        persistence=persistence,
+        journal_policy=journal_policy,
     )
     return state_event.model_dump(
         exclude_none=True,
-        exclude={"persistence"} if persistence == "transport" else None,
+        exclude={"journal_policy"} if journal_policy == "transport_journal" else None,
     )
 
 
@@ -219,7 +219,11 @@ def build_tracer_graph(
             "events": [
                 *state["events"],
                 *[
-                    _event_state(event, sequence_start + index, persistence="none")
+                    _event_state(
+                        event,
+                        sequence_start + index,
+                        journal_policy="checkpoint_only",
+                    )
                     for index, event in enumerate(events, 1)
                 ],
             ],
@@ -241,7 +245,7 @@ def build_tracer_graph(
                     _event_state(
                         event,
                         len(state["events"]) + index,
-                        persistence="none",
+                        journal_policy="checkpoint_only",
                     )
                     for index, event in enumerate(events, 1)
                 ],

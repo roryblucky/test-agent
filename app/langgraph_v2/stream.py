@@ -9,7 +9,7 @@ from typing import Any, Protocol, cast
 
 from langchain_core.runnables import RunnableConfig
 
-from app.langgraph_v2.contracts import EventPersistence, TracerStreamEvent
+from app.langgraph_v2.contracts import GraphEventJournalPolicy, TracerStreamEvent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,13 +109,13 @@ async def stream_graph(
                 event_key = candidate.get("event_key")
                 if isinstance(event_key, str) and event_key in seen_event_keys:
                     continue
-                event, next_sequence, persistence = _event_from_mapping(
+                event, next_sequence, journal_policy = _event_from_mapping(
                     candidate,
                     next_sequence=next_sequence,
                     mode=mode,
                 )
                 seen_event_keys.add(event.event_key)
-                if event_sink is not None and persistence == "transport":
+                if event_sink is not None and journal_policy == "transport_journal":
                     await event_sink(event)
                 yield event.to_sse()
     except BaseException as error:
@@ -185,7 +185,7 @@ def _event_from_mapping(
     *,
     next_sequence: int,
     mode: str,
-) -> tuple[TracerStreamEvent, int, EventPersistence]:
+) -> tuple[TracerStreamEvent, int, GraphEventJournalPolicy]:
     # Graph state updates may carry node-local journal sequences (and repeated
     # snapshots), so the SSE projection owns one contiguous public sequence.
     sequence = next_sequence + 1
@@ -200,7 +200,7 @@ def _event_from_mapping(
         step=mapping.get("step"),
         data=mapping.get("data"),
     )
-    persistence = mapping.get("persistence", "transport")
-    if persistence not in {"none", "transport"}:
-        raise ValueError(f"unknown Graph event persistence: {persistence!r}")
-    return event, sequence, cast(EventPersistence, persistence)
+    journal_policy = mapping.get("journal_policy", "transport_journal")
+    if journal_policy not in {"checkpoint_only", "transport_journal"}:
+        raise ValueError(f"unknown Graph event journal policy: {journal_policy!r}")
+    return event, sequence, cast(GraphEventJournalPolicy, journal_policy)
