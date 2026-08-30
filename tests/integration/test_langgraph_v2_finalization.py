@@ -13,15 +13,23 @@ import psycopg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import (
+    ChannelVersions,
+    Checkpoint,
+    CheckpointMetadata,
+)
 from psycopg_pool import AsyncConnectionPool
 from pydantic_ai.usage import RunUsage
 
+import app.langgraph_v2.api as api_module
 from app.api.dependencies import TenantContext, get_tenant
 from app.api.router import router as legacy_router
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.checkpointing import FencedAsyncPostgresSaver
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
@@ -45,7 +53,24 @@ from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
-from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
+from tests.integration.test_langgraph_v2_tracer import (
+    parse_sse,
+    persistent_tracer_app,
+    seed_subject_conversation,
+)
+
+
+class _FailingTerminalCheckpointSaver(FencedAsyncPostgresSaver):
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        if "final_response" in checkpoint.get("channel_values", {}):
+            raise RuntimeError("forced terminal checkpoint failure")
+        return await super().aput(config, checkpoint, metadata, new_versions)
 
 
 class _Retriever:
@@ -564,3 +589,57 @@ def test_terminal_transaction_rolls_back_message_when_run_completion_crashes(
             connection.execute(
                 "DROP FUNCTION IF EXISTS langgraph_v2.reject_run_completion()"
             )
+
+
+def test_terminal_checkpoint_failure_does_not_publish_done_or_assistant_message(
+    langgraph_v2_migrated_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        seed_subject_conversation(
+            langgraph_v2_migrated_database_url, "terminal-checkpoint-failure"
+        )
+    )
+    monkeypatch.setattr(
+        api_module,
+        "FencedAsyncPostgresSaver",
+        _FailingTerminalCheckpointSaver,
+    )
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        moderation_provider=_Moderation(),
+        answer_actor=_Answer(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "hello", "sessionId": "terminal-checkpoint-failure"},
+            headers={
+                "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-a",
+            },
+        )
+
+    run_id = uuid.UUID(response.headers["x-run-id"])
+
+    async def read_publication() -> tuple[list[str], str]:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            messages = await ConversationMessageRepository(pool).list_messages(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="terminal-checkpoint-failure",
+            )
+            run = await RunEventRepository(pool).get_run("tenant-a", run_id)
+            return [message.role for message in messages], run.status
+
+    delivered = parse_sse(response.text)
+    assert all(event["type"] != "done" for event in delivered)
+    assert delivered[-1]["type"] == "error"
+    assert "forced terminal checkpoint failure" in delivered[-1]["data"]
+    assert asyncio.run(read_publication()) == (["user"], "failed")

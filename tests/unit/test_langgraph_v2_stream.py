@@ -168,6 +168,36 @@ async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
 
 
 @pytest.mark.asyncio
+async def test_answer_error_update_does_not_confirm_a_failing_checkpoint() -> None:
+    terminal_events: list[Any] = []
+    answer_error = {
+        "event_key": "phase:answer:error:1",
+        "type": "error",
+        "data": "answer failed",
+        "journal_policy": "checkpoint_only",
+    }
+
+    async def failing_checkpoint_stream() -> AsyncIterator[Any]:
+        yield ("custom", answer_error)
+        yield ("updates", {"answer": {"events": [answer_error]}})
+        raise RuntimeError("sync checkpoint failed")
+
+    async def terminal_sink(event: Any) -> None:
+        terminal_events.append(event)
+
+    consumer = stream_graph(
+        _FakeGraph(failing_checkpoint_stream()),
+        {"query": "hello"},
+        terminal_sink=terminal_sink,
+    )
+
+    with pytest.raises(RuntimeError, match="sync checkpoint failed"):
+        await anext(consumer)
+
+    assert terminal_events == []
+
+
+@pytest.mark.asyncio
 async def test_stream_graph_closes_and_awaits_iterator_on_consumer_cancellation() -> (
     None
 ):

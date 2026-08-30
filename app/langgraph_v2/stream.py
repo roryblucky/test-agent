@@ -98,6 +98,9 @@ async def stream_graph(
     )
     seen_event_keys: set[str] = set()
     next_sequence = 0
+    pending_terminal: TracerStreamEvent | None = None
+    pending_terminal_update_seen = False
+    deferred_frames: list[str] = []
 
     primary_error: BaseException | None = None
     try:
@@ -110,6 +113,13 @@ async def stream_graph(
 
             for candidate in candidates:
                 event_key = candidate.get("event_key")
+                if (
+                    pending_terminal is not None
+                    and mode == "updates"
+                    and event_key == pending_terminal.event_key
+                ):
+                    pending_terminal_update_seen = True
+                    continue
                 if isinstance(event_key, str) and event_key in seen_event_keys:
                     continue
                 event, next_sequence, journal_policy = _event_from_mapping(
@@ -121,8 +131,7 @@ async def stream_graph(
                 if event_sink is not None and journal_policy == "transport_journal":
                     await event_sink(event)
                 if (
-                    terminal_sink is not None
-                    and journal_policy == "checkpoint_only"
+                    journal_policy == "checkpoint_only"
                     and (
                         event.type == "done"
                         or (
@@ -131,8 +140,25 @@ async def stream_graph(
                         )
                     )
                 ):
-                    await terminal_sink(event)
-                yield event.to_sse()
+                    pending_terminal = event
+                    pending_terminal_update_seen = mode == "updates"
+                    deferred_frames.append(event.to_sse())
+                    continue
+                frame = event.to_sse()
+                if pending_terminal is None:
+                    yield frame
+                else:
+                    deferred_frames.append(frame)
+
+        if pending_terminal is not None:
+            if not pending_terminal_update_seen:
+                raise RuntimeError(
+                    "checkpoint terminal event was not confirmed by graph updates"
+                )
+            if terminal_sink is not None:
+                await terminal_sink(pending_terminal)
+            for frame in deferred_frames:
+                yield frame
     except BaseException as error:
         primary_error = error
         raise
