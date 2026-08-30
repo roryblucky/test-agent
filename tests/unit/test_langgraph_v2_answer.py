@@ -1,6 +1,5 @@
 import asyncio
 from typing import Any, Self
-from uuid import uuid4
 
 import pytest
 from pydantic_ai.usage import RunUsage
@@ -13,16 +12,9 @@ from app.langgraph_v2.answer import (
     build_answer_actor,
     run_answer,
 )
-from app.langgraph_v2.artifacts import ArtifactScope
-from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.evidence import Evidence
 from app.langgraph_v2.history import ConversationTurn
 from app.models.domain import Document
-
-_SCOPE = ArtifactScope(
-    context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-    conversation_id="c1",
-    turn_id=uuid4(),
-)
 
 
 class _FakeStructuredStream:
@@ -146,9 +138,7 @@ async def test_run_answer_writes_real_deltas_and_returns_same_complete_answer() 
     public_events: list[dict[str, object]] = []
 
     _, result, halted, error = await run_answer(
-        {"query": "question"},
-        scope=_SCOPE,
-        artifacts=object(),  # type: ignore[arg-type]
+        {"query": "question", "ranked_evidence": []},
         actor=actor,
         stream_writer=public_events.append,
     )
@@ -189,10 +179,14 @@ def test_build_answer_actor_uses_registry_model_and_output_type() -> None:
 def test_answer_citation_quote_must_match_bound_document() -> None:
     citations = bind_answer_citations(
         [AnswerCitation(index=1, quoted_text="not in evidence")],
-        [{"artifact_id": "artifact-1", "artifact_type": "document"}],
-        [Document(id="doc-1", content="actual evidence")],
+        [
+            Evidence(
+                evidence_id="evidence-1",
+                document=Document(id="doc-1", content="actual evidence"),
+            )
+        ],
     )
 
-    assert citations[0].evidence_id == "artifact-1"
+    assert citations[0].evidence_id == "evidence-1"
     assert citations[0].attribution_status == "unlocated"
     assert citations[0].quoted_text is None

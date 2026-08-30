@@ -19,7 +19,6 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import initial_checkpoint_config
 from app.langgraph_v2.contracts import V2QueryRequest
@@ -37,6 +36,7 @@ from app.langgraph_v2.question_refinement import (
     QuestionRefinementResult,
     V2ResolvedQuery,
 )
+from app.langgraph_v2.retrieval import RetrievalResult, Retriever
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_linear_core import (
     UAT_CONTRACT_PATH,
@@ -271,6 +271,7 @@ async def _seed_pre_answer_checkpoint(
     conversation_id: str = "conversation-1",
     interrupt_before: str | None = "answer",
     checkpoint_turn_id: UUID | None = None,
+    retriever: Retriever | None = None,
 ) -> tuple[str, UUID, datetime]:
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     async with AsyncConnectionPool(
@@ -298,12 +299,12 @@ async def _seed_pre_answer_checkpoint(
             checkpointer,
             tenant_id="tenant-a",
             current_turn_id=turn_id,
-            artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
             request_context=context,
             history_token_budget=4096,
             answer_actor=_AnswerActor(),
             groundedness_actor=_AssertingGroundednessActor("recovered answer"),
+            retriever=retriever,
         )
         state: LinearGraphState = {
             "query": "resume me",
@@ -405,7 +406,6 @@ async def _advance_same_turn_checkpoint(
             checkpointer,
             tenant_id="tenant-a",
             current_turn_id=turn_id,
-            artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
             request_context=context,
             history_token_budget=4096,
@@ -551,17 +551,8 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
     assert response.status_code == 200, response.text
     assert repeated.status_code == 409
     assert "x-run-id" not in response.headers
-    assert answer_actor.calls == (
-        0
-        if interrupt_before in {"groundedness", "post_moderation", "finalization"}
-        else 1
-    )
-    expected_token_count = (
-        0
-        if interrupt_before in {"groundedness", "post_moderation", "finalization"}
-        else 2
-    )
-    assert sum(event["type"] == "token" for event in delivered) == expected_token_count
+    assert answer_actor.calls == 1
+    assert sum(event["type"] == "token" for event in delivered) == 2
     assert delivered[-1]["type"] == "done"
     assert delivered[-1]["data"]["answer"] == "recovered answer"
 
@@ -575,6 +566,48 @@ def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
         for message in messages
         if message.turn_id == turn_id
     ] == [("user", "resume me"), ("assistant", "recovered answer")]
+
+
+def test_downstream_resume_refetches_transient_retrieval_evidence(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class CountingRetriever:
+        def __init__(self, content: str) -> None:
+            self.content = content
+            self.calls = 0
+
+        async def retrieve(self, query: str) -> RetrievalResult:
+            self.calls += 1
+            return RetrievalResult(
+                documents=[Document(id="mock-doc-1", content=self.content)]
+            )
+
+    initial_retriever = CountingRetriever("initial chunk")
+    thread_id, turn_id, _ = asyncio.run(
+        _seed_pre_answer_checkpoint(
+            langgraph_v2_migrated_database_url,
+            interrupt_before="answer",
+            retriever=initial_retriever,
+        )
+    )
+    resumed_retriever = CountingRetriever("refetched chunk")
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        thread_resume_enabled=True,
+        retriever=resumed_retriever,
+        answer_actor=_AnswerActor(),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/threads/{thread_id}/resume/stream",
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+            params={"expectedTurnId": str(turn_id)},
+        )
+
+    assert response.status_code == 200
+    assert initial_retriever.calls == 1
+    assert resumed_retriever.calls == 1
 
 
 def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(
@@ -834,7 +867,7 @@ def test_thread_resume_rechecks_supersession_when_execution_starts(
     assert answer_actor.calls == 0
 
 
-def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
+def test_thread_resume_rewinds_the_authorized_checkpoint_before_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     thread_id, turn_id, _ = asyncio.run(
@@ -895,7 +928,7 @@ def test_thread_resume_pins_the_authorized_checkpoint_before_execution(
     configurable = graph.seen_config["configurable"]
     assert configurable["thread_id"] == thread_id
     assert configurable["checkpoint_ns"] == ""
-    assert configurable["checkpoint_id"] == original_checkpoint_id
+    assert configurable["checkpoint_id"] != original_checkpoint_id
     assert configurable["checkpoint_id"] != advanced_checkpoint_id
     assert [event["type"] for event in delivered] == ["token", "done"]
 

@@ -7,7 +7,6 @@ import pytest
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
@@ -18,7 +17,7 @@ from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
+from tests.integration.langgraph_v2_turn_support import seed_turn_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -126,9 +125,7 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
 
     assert moderation.calls == 2
     events = parse_sse("".join(frames))
-    token_text = "".join(
-        event["data"] for event in events if event["type"] == "token"
-    )
+    token_text = "".join(event["data"] for event in events if event["type"] == "token")
     assert token_text == "generated answer"
     assert events[-1]["type"] == "done"
     assert events[-1]["data"]["answer"] == token_text
@@ -159,11 +156,10 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             idempotency_key=f"turn:{turn_id}:user",
         )
         moderation = _SafeModeration()
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             moderation_provider=moderation,
             retriever=_Retriever(),
@@ -206,10 +202,9 @@ async def test_flagged_answer_remains_canonical_through_finalization(
             idempotency_key=f"turn:{turn_id}:user",
         )
         audit = MockOutputAssessmentAudit()
-        scope = await seed_artifact_scope(pool, turn_id=turn_id)
+        scope = await seed_turn_scope(pool, turn_id=turn_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             request_context=scope.context,
             output_assessment_audit=audit,
@@ -251,11 +246,10 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             moderation_provider=_FailingPostModeration(),
             retriever=_Retriever(),

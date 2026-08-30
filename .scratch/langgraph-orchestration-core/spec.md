@@ -114,7 +114,7 @@ Keep only records with independent product value:
 
 - Conversation and Message history;
 - LangGraph PostgreSQL checkpoints;
-- document/source Artifacts and provenance needed by the final response;
+- lightweight document/source citation metadata needed by the final response;
 - BigQuery audit records;
 - deterministic calculation inputs/results when that later capability is added.
 
@@ -126,6 +126,11 @@ Do not replace them with equivalent Redis state.
 Provider/model calls may execute again after a node-boundary Resume. This POC
 accepts repeated read/model cost. Any future irreversible side effect must be
 idempotent at its domain boundary.
+
+Retrieved document chunks and raw provider payloads are request-local
+`UntrackedValue` channels. They are not persisted in PostgreSQL checkpoints or
+application tables. Resume from a downstream node first rewinds to retrieval
+so the evidence is fetched and ranked again.
 
 ## Verification
 

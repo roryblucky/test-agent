@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import unicodedata
 from collections.abc import AsyncIterator, Hashable, Iterable
-from typing import Any, NotRequired, Protocol, TypedDict, cast
+from typing import Annotated, Any, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
 from langchain_core.runnables import RunnableConfig
+from langgraph.channels import UntrackedValue  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
@@ -18,11 +19,11 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.types import StateSnapshot
 
 from app.langgraph_v2.answer import AnswerActor, run_answer
-from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import LinearQueryResponse, LiveStreamEvent
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.finalization import finalize_in_memory, run_finalization
+from app.langgraph_v2.evidence import Evidence
+from app.langgraph_v2.finalization import run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
 from app.langgraph_v2.history import (
     DEFAULT_HISTORY_TOKEN_BUDGET,
@@ -62,8 +63,8 @@ class LinearGraphState(TypedDict):
     refinement_error: NotRequired[str | None]
     retrieval_error: NotRequired[str | None]
     reranking_error: NotRequired[str | None]
-    artifact_refs: NotRequired[list[ArtifactRef]]
-    ranked_refs: NotRequired[list[ArtifactRef]]
+    evidence: NotRequired[Annotated[list[Evidence], UntrackedValue]]
+    ranked_evidence: NotRequired[Annotated[list[Evidence], UntrackedValue]]
     answer: NotRequired[str | None]
     answer_usage: NotRequired[dict[str, Any]]
     citations: NotRequired[list[CitationReference]]
@@ -87,8 +88,8 @@ class LinearGraphStateUpdate(TypedDict, total=False):
     refinement_error: str | None
     retrieval_error: str | None
     reranking_error: str | None
-    artifact_refs: list[ArtifactRef]
-    ranked_refs: list[ArtifactRef]
+    evidence: list[Evidence]
+    ranked_evidence: list[Evidence]
     answer: str | None
     answer_usage: dict[str, Any]
     citations: list[CitationReference]
@@ -116,6 +117,15 @@ class LinearGraph(Protocol):
 
     async def aget_state(self, config: RunnableConfig) -> StateSnapshot:
         """Read the current checkpoint state."""
+        ...
+
+    async def aupdate_state(
+        self,
+        config: RunnableConfig,
+        values: dict[str, Any],
+        as_node: str,
+    ) -> RunnableConfig:
+        """Create a state checkpoint attributed to one node."""
         ...
 
     def astream(
@@ -178,8 +188,8 @@ async def _query(
         "refinement_error": None,
         "retrieval_error": None,
         "reranking_error": None,
-        "artifact_refs": [],
-        "ranked_refs": [],
+        "evidence": [],
+        "ranked_evidence": [],
         "answer": None,
         "answer_usage": {},
         "citations": [],
@@ -205,21 +215,6 @@ def canonical_query(query: str) -> str:
     return unicodedata.normalize("NFC", query.replace("\r\n", "\n")).strip()
 
 
-async def _finalize(state: LinearGraphState) -> LinearGraphStateUpdate:
-    events, response = finalize_in_memory(state)
-    _emit_events(events)
-    _emit_events(
-        (
-            LiveStreamEvent(
-                type="done",
-                data=response.model_dump(by_alias=True),
-                checkpoint_terminal=True,
-            ),
-        )
-    )
-    return {"final_response": response}
-
-
 def _next_after_pre_moderation(state: LinearGraphState) -> str:
     """Stop the graph on a flagged query before any later phase."""
     return "end" if state.get("halted", False) else "question_refinement"
@@ -238,7 +233,6 @@ def build_linear_graph(
     *,
     tenant_id: str | None = None,
     current_turn_id: UUID | None = None,
-    artifact_repository: ArtifactStore | None = None,
     message_repository: ConversationMessageRepository | None = None,
     request_context: TrustedRequestContext | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
@@ -253,6 +247,8 @@ def build_linear_graph(
     """Compile the deterministic ingress-to-finalization Linear Graph."""
     if message_repository is not None and request_context is None:
         raise ValueError("request_context is required with message_repository")
+    if answer_actor is not None and tenant_id is None:
+        raise ValueError("tenant_id is required with answer_actor")
     if (
         tenant_id is not None
         and request_context is not None
@@ -278,23 +274,6 @@ def build_linear_graph(
     selected_refinement_actor = refinement_actor or MockQuestionRefinementActor()
     selected_retriever = retriever or MockRetriever()
     selected_ranker = ranker or MockRanker()
-    selected_artifact_repository = artifact_repository
-
-    def artifact_scope(state: LinearGraphState) -> ArtifactScope | None:
-        if request_context is None:
-            return None
-        raw_turn_id = current_turn_id or state.get("turn_id")
-        if raw_turn_id is None:
-            return None
-        try:
-            turn_id = UUID(str(raw_turn_id))
-        except ValueError:
-            return None
-        return ArtifactScope(
-            context=request_context,
-            conversation_id=state["conversation_id"],
-            turn_id=turn_id,
-        )
 
     async def pre_moderation_node(state: LinearGraphState) -> LinearGraphStateUpdate:
         events, halted, decision = await run_pre_moderation(
@@ -333,19 +312,14 @@ def build_linear_graph(
     )
 
     async def retrieval_node(state: LinearGraphState) -> LinearGraphStateUpdate:
-        scope = artifact_scope(state)
-        if scope is None or selected_artifact_repository is None:
-            return {"artifact_refs": []}
-        events, refs, _, halted, error = await run_retrieval(
+        events, evidence, halted, error = await run_retrieval(
             state,
-            scope=scope,
-            artifacts=selected_artifact_repository,
             retriever=selected_retriever,
         )
         _emit_events(events)
         update: LinearGraphStateUpdate = {
             "halted": halted,
-            "artifact_refs": refs,
+            "evidence": evidence,
         }
         if error is not None:
             update["retrieval_error"] = error
@@ -356,19 +330,14 @@ def build_linear_graph(
     )
 
     async def reranking_node(state: LinearGraphState) -> LinearGraphStateUpdate:
-        scope = artifact_scope(state)
-        if scope is None or selected_artifact_repository is None:
-            return {"ranked_refs": state.get("artifact_refs", [])}
-        events, refs, halted, error = await run_reranking(
+        events, evidence, halted, error = await run_reranking(
             state,
-            scope=scope,
-            artifacts=selected_artifact_repository,
             ranker=selected_ranker,
         )
         _emit_events(events)
         update: LinearGraphStateUpdate = {
             "halted": halted,
-            "ranked_refs": refs,
+            "ranked_evidence": evidence,
         }
         if error is not None:
             update["reranking_error"] = error
@@ -378,23 +347,13 @@ def build_linear_graph(
         "reranking", reranking_node
     )
 
-    answer_enabled = (
-        answer_actor is not None
-        and selected_artifact_repository is not None
-        and request_context is not None
-    )
+    answer_enabled = answer_actor is not None
     if answer_enabled:
 
         async def answer_node(state: LinearGraphState) -> LinearGraphStateUpdate:
-            assert tenant_id is not None
-            assert selected_artifact_repository is not None
             assert answer_actor is not None
-            scope = artifact_scope(state)
-            assert scope is not None
             _, result, halted, error = await run_answer(
                 state,
-                scope=scope,
-                artifacts=selected_artifact_repository,
                 actor=answer_actor,
                 stream_writer=get_stream_writer(),
             )
@@ -419,15 +378,11 @@ def build_linear_graph(
                 state: LinearGraphState,
             ) -> LinearGraphStateUpdate:
                 assert tenant_id is not None
-                assert selected_artifact_repository is not None
-                scope = artifact_scope(state)
-                assert scope is not None
                 events, result, usage, error = await run_groundedness(
                     state,
-                    scope=scope,
+                    tenant_id=tenant_id,
                     current_turn_id=current_turn_id,
                     output_assessment_audit=output_assessment_audit,
-                    artifacts=selected_artifact_repository,
                     actor=groundedness_actor,
                 )
                 _emit_events(events)
@@ -465,21 +420,19 @@ def build_linear_graph(
         )
 
     async def finalization_node(state: LinearGraphState) -> LinearGraphStateUpdate:
-        scope = artifact_scope(state)
-        if scope is None or selected_artifact_repository is None:
-            return await _finalize(state)
-        events, response = await run_finalization(
-            state,
-            scope=scope,
-            artifacts=selected_artifact_repository,
-        )
-        if message_repository is not None and response.answer is not None:
+        events, response = await run_finalization(state)
+        if (
+            message_repository is not None
+            and request_context is not None
+            and current_turn_id is not None
+            and response.answer is not None
+        ):
             await message_repository.persist_assistant_message(
-                context=scope.context,
-                conversation_id=scope.conversation_id,
-                turn_id=scope.turn_id,
+                context=request_context,
+                conversation_id=state["conversation_id"],
+                turn_id=current_turn_id,
                 content=response.answer,
-                idempotency_key=f"turn:{scope.turn_id}:assistant",
+                idempotency_key=f"turn:{current_turn_id}:assistant",
             )
         _emit_events(events)
         _emit_events(

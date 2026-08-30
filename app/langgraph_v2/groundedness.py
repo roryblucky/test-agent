@@ -9,8 +9,8 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
-from app.langgraph_v2.artifacts import ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
+from app.langgraph_v2.evidence import Evidence
 from app.langgraph_v2.model_usage import model_usage_payload
 from app.langgraph_v2.output_assessments import (
     OutputAssessmentAudit,
@@ -99,17 +99,16 @@ def build_groundedness_actor(
 async def run_groundedness(
     state: Mapping[str, Any],
     *,
-    scope: ArtifactScope,
+    tenant_id: str,
     current_turn_id: UUID | None,
     output_assessment_audit: OutputAssessmentAudit | None,
-    artifacts: ArtifactStore,
     actor: GroundednessActor,
 ) -> tuple[
     list[LiveStreamEvent], GroundednessResult | None, dict[str, Any], str | None
 ]:
     """Evaluate the canonical Answer and record the advisory audit result."""
     assessment_scope = build_output_assessment_scope(
-        tenant_id=scope.context.tenant_id,
+        tenant_id=tenant_id,
         conversation_id=(
             state.get("conversation_id")
             if isinstance(state.get("conversation_id"), str)
@@ -126,22 +125,9 @@ async def run_groundedness(
             else citation.get("evidence_id")
             for citation in citations
         }
-        refs = [
-            ref
-            for ref in state.get("ranked_refs", state.get("artifact_refs", []))
-            if ref.get("artifact_type") == "document"
-            and ref.get("artifact_id") in cited_ids
-        ]
+        evidence = [Evidence.model_validate(item) for item in state["ranked_evidence"]]
         documents = [
-            Document.model_validate(
-                (
-                    await artifacts.get(
-                        scope=scope,
-                        artifact_id=UUID(ref["artifact_id"]),
-                    )
-                ).payload
-            )
-            for ref in refs
+            item.document for item in evidence if item.evidence_id in cited_ids
         ]
         answer = state.get("answer")
         actor_result = await actor.evaluate(

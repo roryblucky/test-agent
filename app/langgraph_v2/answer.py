@@ -7,13 +7,12 @@ import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
-from uuid import UUID
 
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
-from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
+from app.langgraph_v2.evidence import Evidence
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
 from app.langgraph_v2.model_usage import model_usage_payload
 from app.langgraph_v2.stream import await_task_completion
@@ -52,7 +51,7 @@ class AnswerStreamChunk:
 
 
 class BoundAnswerResult(BaseModel):
-    """Answer result with citations bound to durable Artifact provenance."""
+    """Answer result with citations bound to request-local evidence."""
 
     answer: str = Field(min_length=1)
     usage: dict[str, Any] = Field(default_factory=dict)
@@ -61,24 +60,23 @@ class BoundAnswerResult(BaseModel):
 
 def bind_answer_citations(
     citations: list[AnswerCitation],
-    refs: list[ArtifactRef],
-    documents: list[Document],
+    evidence: list[Evidence],
 ) -> list[CitationReference]:
-    """Bind indexed model citations to ranked Artifacts with quote validation."""
+    """Bind indexed model citations to ranked evidence with quote validation."""
     bound: list[CitationReference] = []
     seen_indices: set[int] = set()
     for citation in citations:
-        if citation.index > len(refs) or citation.index in seen_indices:
+        if citation.index > len(evidence) or citation.index in seen_indices:
             continue
         seen_indices.add(citation.index)
-        ref = refs[citation.index - 1]
-        document = documents[citation.index - 1]
+        item = evidence[citation.index - 1]
+        document = item.document
         quote = citation.quoted_text
         located = bool(quote and quote in document.content)
         bound.append(
             CitationReference(
                 index=citation.index,
-                evidence_id=ref["artifact_id"],
+                evidence_id=item.evidence_id,
                 source=document.source_url or document.id,
                 source_type=document.source_type,
                 title=document.section_title,
@@ -89,7 +87,7 @@ def bind_answer_citations(
                 page_number=document.page_number,
                 section=document.section_title,
                 attribution_status="located" if located else "unlocated",
-                metadata={"artifact_id": ref["artifact_id"]},
+                metadata={"document_id": document.id},
             )
         )
     return bound
@@ -97,24 +95,25 @@ def bind_answer_citations(
 
 async def build_inline_citations(
     answer: str,
-    refs: list[ArtifactRef],
-    documents: list[Document],
+    evidence: list[Evidence],
 ) -> list[CitationReference]:
-    """Extract ``[n]`` references and map them through ranked ArtifactRefs."""
+    """Extract ``[n]`` references and map them through ranked evidence."""
     citations: list[CitationReference] = []
     for match in re.finditer(r"\[([1-9]\d*)\]", answer):
         index = int(match.group(1))
-        if index > len(refs) or any(citation.index == index for citation in citations):
+        if index > len(evidence) or any(
+            citation.index == index for citation in citations
+        ):
             continue
-        ref = refs[index - 1]
-        document = documents[index - 1]
+        item = evidence[index - 1]
+        document = item.document
         source = str(
             document.metadata.get("source") or document.source_url or document.id
         )
         citations.append(
             CitationReference(
                 index=index,
-                evidence_id=ref["artifact_id"],
+                evidence_id=item.evidence_id,
                 source=source,
                 source_type=document.source_type,
                 title=document.section_title,
@@ -123,7 +122,7 @@ async def build_inline_citations(
                 page_number=document.page_number,
                 section=document.section_title,
                 highlight_content=document.content,
-                metadata={"artifact_id": ref["artifact_id"]},
+                metadata={"document_id": document.id},
             )
         )
     return citations
@@ -218,12 +217,10 @@ def build_answer_actor(
 async def run_answer(
     state: Mapping[str, Any],
     *,
-    scope: ArtifactScope,
-    artifacts: ArtifactStore,
     actor: AnswerActor,
     stream_writer: Any | None = None,
 ) -> tuple[list[LiveStreamEvent], BoundAnswerResult | None, bool, str | None]:
-    """Hydrate ranked evidence and stream one checkpoint-owned Answer result."""
+    """Stream one Answer from request-local ranked evidence."""
 
     def write_event(event: LiveStreamEvent) -> None:
         if stream_writer is not None:
@@ -231,22 +228,8 @@ async def run_answer(
 
     answer_started = False
     try:
-        refs = [
-            ref
-            for ref in state.get("ranked_refs", state.get("artifact_refs", []))
-            if ref.get("artifact_type") == "document"
-        ]
-        documents = [
-            Document.model_validate(
-                (
-                    await artifacts.get(
-                        scope=scope,
-                        artifact_id=UUID(ref["artifact_id"]),
-                    )
-                ).payload
-            )
-            for ref in refs
-        ]
+        evidence = [Evidence.model_validate(item) for item in state["ranked_evidence"]]
+        documents = [item.document for item in evidence]
         history = [
             ConversationTurn.model_validate(turn) for turn in state.get("history", [])
         ]
@@ -299,9 +282,9 @@ async def run_answer(
         normalized_answer = validated.answer
         if "".join(chunks) != normalized_answer:
             raise ValueError("streamed Answer deltas do not match final Answer")
-        citations = await build_inline_citations(normalized_answer, refs, documents)
+        citations = await build_inline_citations(normalized_answer, evidence)
         if "[" not in normalized_answer and "]" not in normalized_answer:
-            citations = bind_answer_citations(validated.citations, refs, documents)
+            citations = bind_answer_citations(validated.citations, evidence)
         if citations:
             event = LiveStreamEvent(
                 type="citations",

@@ -1,7 +1,7 @@
 -- LangGraph Linear Core PostgreSQL bootstrap DDL.
 --
 -- This file represents the schema at Alembic revision
--- 0014_drop_run_lifecycle. It is intended for a new, empty PostgreSQL
+-- 0015_drop_artifacts. It is intended for a new, empty PostgreSQL
 -- database. Existing databases should continue to use Alembic migrations.
 --
 -- The public checkpoint tables match langgraph-checkpoint-postgres 3.1.2.
@@ -48,27 +48,6 @@ CREATE TABLE langgraph_v2.messages (
         REFERENCES langgraph_v2.conversations (tenant_id, conversation_id)
         ON DELETE CASCADE
 );
-
-CREATE TABLE langgraph_v2.artifacts (
-    tenant_id TEXT NOT NULL,
-    artifact_id UUID NOT NULL,
-    artifact_type TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    conversation_id TEXT NOT NULL,
-    turn_id UUID NOT NULL,
-    turn_role TEXT GENERATED ALWAYS AS ('user'::TEXT) STORED,
-    PRIMARY KEY (tenant_id, artifact_id),
-    CONSTRAINT artifacts_turn_fk
-        FOREIGN KEY (tenant_id, conversation_id, turn_id, turn_role)
-        REFERENCES langgraph_v2.messages
-            (tenant_id, conversation_id, turn_id, role)
-        ON DELETE CASCADE
-);
-
-CREATE INDEX artifacts_turn_scope_idx
-    ON langgraph_v2.artifacts
-        (tenant_id, conversation_id, turn_id, created_at, artifact_id);
 
 -- Official LangGraph PostgreSQL checkpointer tables intentionally remain in
 -- the public schema because AsyncPostgresSaver uses these unqualified names.
@@ -133,6 +112,6 @@ CREATE TABLE public.alembic_version (
 );
 
 INSERT INTO public.alembic_version (version_num)
-VALUES ('0014_drop_run_lifecycle');
+VALUES ('0015_drop_artifacts');
 
 COMMIT;

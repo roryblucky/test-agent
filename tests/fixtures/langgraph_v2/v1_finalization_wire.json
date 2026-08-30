@@ -57,7 +57,7 @@
             "highlight_spans": [],
             "offset_encoding": "utf-16",
             "attribution_status": "unlocated",
-            "metadata": {"artifact_id": "__artifact_id__"}
+            "metadata": {"document_id": "d1"}
           }
         ]
       }
@@ -125,7 +125,7 @@
                     "highlight_spans": [],
                     "offset_encoding": "utf-16",
                     "attribution_status": "unlocated",
-                    "metadata": {"artifact_id": "__artifact_id__"}
+                    "metadata": {"document_id": "d1"}
                 }
             ]
         }

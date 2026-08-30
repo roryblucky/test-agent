@@ -179,7 +179,7 @@ def test_application_base_revision_upgrades_and_downgrades(
     assert exists_after_downgrade == (False,)
 
 
-def test_upgrade_from_0013_preserves_product_and_checkpoint_data(
+def test_upgrade_from_0013_preserves_conversation_and_checkpoint_but_drops_artifacts(
     langgraph_v2_test_database_url: str,
 ) -> None:
     config = build_alembic_config(langgraph_v2_test_database_url)
@@ -282,22 +282,16 @@ def test_upgrade_from_0013_preserves_product_and_checkpoint_data(
             WHERE tenant_id = %s AND conversation_id = %s""",
             (tenant_id, conversation_id),
         ).fetchone() == ("user", "preserved question", turn_id)
-        assert connection.execute(
-            """SELECT payload, conversation_id, turn_id
-            FROM langgraph_v2.artifacts
-            WHERE tenant_id = %s AND artifact_id = %s""",
-            (tenant_id, artifact_id),
-        ).fetchone() == (
-            {"id": "preserved-evidence"},
-            conversation_id,
-            turn_id,
-        )
-        assert connection.execute(
-            """SELECT table_name FROM information_schema.tables
+        assert (
+            connection.execute(
+                """SELECT table_name FROM information_schema.tables
             WHERE table_schema = 'langgraph_v2'
               AND table_name IN
-                  ('runs', 'events', 'phase_results', 'cancellation_intents')"""
-        ).fetchall() == []
+                  ('runs', 'events', 'phase_results', 'cancellation_intents',
+                   'artifacts')"""
+            ).fetchall()
+            == []
+        )
 
     async def read_checkpoint() -> None:
         async with AsyncConnectionPool(
@@ -472,7 +466,7 @@ def test_artifact_migration_backfills_turn_provenance_and_downgrades(
             (tenant_id, run_artifact_id, Jsonb(run_payload), run_created_at),
         )
 
-    command.upgrade(config, "head")
+    command.upgrade(config, "0013_artifact_turn_provenance")
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
         assert connection.execute(
             """SELECT conversation_id, turn_id
@@ -527,7 +521,7 @@ def test_artifact_migration_rejects_unmatched_legacy_provenance(
         RuntimeError,
         match=rf"Artifact {artifact_id} has 0 provenance matches",
     ):
-        command.upgrade(config, "head")
+        command.upgrade(config, "0013_artifact_turn_provenance")
     command.downgrade(config, "base")
 
 

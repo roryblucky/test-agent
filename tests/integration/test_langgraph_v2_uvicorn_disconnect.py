@@ -14,7 +14,6 @@ from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerOutput, PydanticAIAnswerActor
 from app.langgraph_v2.api import LinearGraphStream, register_v2_routes
-from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import initial_checkpoint_config, thread_id_for
 from app.langgraph_v2.graph import build_linear_graph
@@ -239,11 +238,9 @@ async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
             app,
             config=V2PostgresConfig(database_url=langgraph_v2_migrated_database_url),
         ):
-            pool = app.state.langgraph_v2_postgres_pool
             tracked_graph.target = build_linear_graph(
                 app.state.langgraph_v2_checkpointer,
                 tenant_id="tenant-a",
-                artifact_repository=ArtifactRepository(pool),
                 request_context=context,
                 retriever=_Retriever(),
                 ranker=_Ranker(),

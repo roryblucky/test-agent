@@ -20,9 +20,6 @@ from starlette.requests import ClientDisconnect
 from starlette.types import Receive, Scope, Send
 
 from app.langgraph_v2.answer import AnswerActor, build_answer_actor
-from app.langgraph_v2.artifacts import (
-    ArtifactRepository,
-)
 from app.langgraph_v2.authorization import (
     TrustedRequestContext,
     get_trusted_request_context,
@@ -141,6 +138,15 @@ class CheckpointGraph(Protocol):
         """Read the current checkpoint state."""
         ...
 
+    async def aupdate_state(
+        self,
+        config: RunnableConfig,
+        values: dict[str, Any],
+        as_node: str,
+    ) -> RunnableConfig:
+        """Create a checkpoint whose next node can rebuild transient evidence."""
+        ...
+
 
 def _resolve_refinement_actor(
     app: FastAPI,
@@ -220,9 +226,7 @@ def _resolve_groundedness_actor_safely(
 ) -> GroundednessActor | None:
     """Keep groundedness setup failures inside the advisory phase."""
     try:
-        return _resolve_groundedness_actor(
-            app, tenant_id, injected, provider_bundle
-        )
+        return _resolve_groundedness_actor(app, tenant_id, injected, provider_bundle)
     except Exception as exc:
         return UnavailableGroundednessActor(exc)
 
@@ -287,7 +291,6 @@ class LinearGraphDependencies:
 
     checkpointer: BaseCheckpointSaver[Any] | None
     tenant_id: str
-    artifact_repository: ArtifactRepository
     message_repository: ConversationMessageRepository
     request_context: TrustedRequestContext
     history_token_budget: int
@@ -340,7 +343,6 @@ def _resolve_linear_graph_dependencies(
             getattr(app.state, "langgraph_v2_checkpointer", None),
         ),
         tenant_id=tenant_id,
-        artifact_repository=ArtifactRepository(pool),
         message_repository=message_repository,
         request_context=request_context,
         history_token_budget=overrides.history_token_budget,
@@ -373,7 +375,6 @@ def _build_request_graph(
         dependencies.checkpointer,
         tenant_id=dependencies.tenant_id,
         current_turn_id=turn_id,
-        artifact_repository=dependencies.artifact_repository,
         message_repository=dependencies.message_repository,
         request_context=dependencies.request_context,
         history_token_budget=dependencies.history_token_budget,
@@ -512,6 +513,9 @@ _RESUMABLE_NODES = frozenset(
         "finalization",
     }
 )
+_NODES_REQUIRING_EVIDENCE = frozenset(
+    {"reranking", "answer", "groundedness", "post_moderation", "finalization"}
+)
 
 
 def _reject_removed_replay_query_parameters(request: Request) -> None:
@@ -558,7 +562,7 @@ def _checkpoint_turn_id(values: dict[str, Any]) -> uuid.UUID:
         raise ThreadResumeConflict("checkpoint is missing a valid turn_id") from error
 
 
-async def _authorize_thread_resume_target(
+async def _prepare_thread_resume_target(
     *,
     checkpoint_graph: CheckpointGraph,
     message_repository: ConversationMessageRepository,
@@ -566,7 +570,7 @@ async def _authorize_thread_resume_target(
     thread_id: str,
     expected_turn_id: uuid.UUID,
 ) -> ThreadResumeTarget:
-    """Authorize one thread Resume and reject non-recoverable checkpoints."""
+    """Authorize Resume and rewind when request-local evidence must be rebuilt."""
     conversation = await message_repository.get_conversation_by_thread(
         context=context,
         thread_id=thread_id,
@@ -610,14 +614,21 @@ async def _authorize_thread_resume_target(
     checkpoint_ns = checkpoint_configurable.get("checkpoint_ns")
     if not isinstance(checkpoint_id, str) or not isinstance(checkpoint_ns, str):
         raise ThreadResumeConflict("checkpoint is missing a valid checkpoint config")
+    exact_config = exact_checkpoint_config(
+        thread_id=conversation.thread_id,
+        checkpoint_ns=checkpoint_ns,
+        checkpoint_id=checkpoint_id,
+    )
+    if _NODES_REQUIRING_EVIDENCE.intersection(snapshot.next):
+        exact_config = await checkpoint_graph.aupdate_state(
+            exact_config,
+            {},
+            as_node="question_refinement",
+        )
     return ThreadResumeTarget(
         conversation=conversation,
         turn=turn,
-        config=exact_checkpoint_config(
-            thread_id=conversation.thread_id,
-            checkpoint_ns=checkpoint_ns,
-            checkpoint_id=checkpoint_id,
-        ),
+        config=exact_config,
     )
 
 
@@ -781,7 +792,7 @@ def create_linear_router(
             )
         checkpoint_graph = _build_request_graph(dependencies)
         try:
-            target = await _authorize_thread_resume_target(
+            target = await _prepare_thread_resume_target(
                 checkpoint_graph=checkpoint_graph,
                 message_repository=message_repository,
                 context=request_context,

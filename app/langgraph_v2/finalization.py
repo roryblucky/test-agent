@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, cast
-from uuid import UUID
 
-from app.langgraph_v2.artifacts import ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LinearQueryResponse, LiveStreamEvent
+from app.langgraph_v2.evidence import Evidence
 from app.models.domain import Document
 
 
@@ -23,9 +22,7 @@ def _steps(state: Mapping[str, Any]) -> list[str]:
         steps.append("answer")
     if state.get("groundedness") is not None or state.get("groundedness_error"):
         steps.append("groundedness")
-    if state.get("post_moderation") is not None or state.get(
-        "post_moderation_error"
-    ):
+    if state.get("post_moderation") is not None or state.get("post_moderation_error"):
         steps.append("moderation:post")
     steps.append("finalization")
     return steps
@@ -123,25 +120,16 @@ def _build_response(
 
 async def run_finalization(
     state: Mapping[str, Any],
-    *,
-    scope: ArtifactScope,
-    artifacts: ArtifactStore,
 ) -> tuple[list[LiveStreamEvent], LinearQueryResponse]:
-    """Assemble the response and its checkpoint-owned finalization events."""
-    documents = []
-    if isinstance(state.get("answer"), str):
-        documents = [
-            Document.model_validate(
-                (
-                    await artifacts.get(
-                        scope=scope,
-                        artifact_id=UUID(ref["artifact_id"]),
-                    )
-                ).payload
-            )
-            for ref in state.get("ranked_refs", state.get("artifact_refs", []))
-            if ref.get("artifact_type") == "document"
+    """Assemble the response from request-local ranked evidence."""
+    documents = (
+        [
+            Evidence.model_validate(item).document
+            for item in state.get("ranked_evidence", [])
         ]
+        if isinstance(state.get("answer"), str)
+        else []
+    )
     response = _build_response(state, documents=documents)
     events = [
         LiveStreamEvent(
@@ -161,7 +149,11 @@ def finalize_in_memory(
     state: Mapping[str, Any],
 ) -> tuple[list[LiveStreamEvent], LinearQueryResponse]:
     """Assemble the same response shape for a non-persistent graph."""
-    response = _build_response(state, documents=[])
+    documents = [
+        Evidence.model_validate(item).document
+        for item in state.get("ranked_evidence", [])
+    ]
+    response = _build_response(state, documents=documents)
     return [
         LiveStreamEvent(type="step_start", step="finalization"),
         LiveStreamEvent(

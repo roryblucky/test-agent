@@ -25,7 +25,6 @@ from app.api.dependencies import TenantContext, get_tenant
 from app.api.router import router as legacy_router
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.api import register_v2_routes
-from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
@@ -44,7 +43,7 @@ from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
-from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
+from tests.integration.langgraph_v2_turn_support import seed_turn_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     seed_subject_conversation,
@@ -193,7 +192,7 @@ class _LegacyFlow:
                 url="https://example.test/d1",
                 snippet="hello",
                 highlight_content="hello",
-                metadata={"artifact_id": "__artifact_id__"},
+                metadata={"document_id": "d1"},
             ).model_dump(mode="json")
         ]
         context.total_usage = RunUsage(requests=3, input_tokens=7, output_tokens=8)
@@ -226,11 +225,10 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     ) as pool:
         answer = _Answer()
         moderation = _Moderation()
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             moderation_provider=moderation,
             refinement_actor=_UsageRefinement(),
@@ -294,7 +292,6 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     assert legacy_frames[-1] == expected["event"]
     stable_done = json.loads(json.dumps(done))
     stable_done["citations"][0]["evidence_id"] = "__artifact_id__"
-    stable_done["citations"][0]["metadata"]["artifact_id"] = "__artifact_id__"
     assert stable_done == expected["event"]["data"]
     assert final_response.model_dump(by_alias=True) == done
     assert answer.calls == 1
@@ -324,11 +321,10 @@ async def test_graph_persists_assistant_before_finalization_checkpoint_completes
             idempotency_key=f"turn:{turn_id}:user",
         )
         answer = _Answer()
-        await seed_artifact_scope(pool, turn_id=turn_id, context=request_context)
+        await seed_turn_scope(pool, turn_id=turn_id, context=request_context)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=turn_id,
-            artifact_repository=ArtifactRepository(pool),
             message_repository=messages,
             request_context=request_context,
             moderation_provider=_Moderation(),
@@ -428,7 +424,6 @@ def test_public_v2_sse_matches_final_output_golden(
     ]
     stable_done = events[-1]
     stable_done["data"]["citations"][0]["evidence_id"] = "__artifact_id__"
-    stable_done["data"]["citations"][0]["metadata"]["artifact_id"] = "__artifact_id__"
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert "x-run-id" not in response.headers

@@ -291,7 +291,7 @@ def test_enabled_linear_core_preserves_the_minimal_stream_contract(
             "data": {
                 "document_count": 1,
                 "documents": [{"id": "mock-doc-1", "score": 1.0}],
-                "artifact_ids": actual_events[7]["data"]["artifact_ids"],
+                "evidence_ids": actual_events[7]["data"]["evidence_ids"],
             },
         },
         {"type": "step_start", "step": "reranker"},
@@ -384,12 +384,8 @@ def test_released_uat_contract_fixture_matches_public_http_shapes(
         assert header in success.headers
     success_events = parse_sse(success.text)
     error_events = parse_sse(error.text)
-    assert set(event["type"] for event in success_events) <= set(
-        fixture["event_names"]
-    )
-    assert set(event["type"] for event in error_events) <= set(
-        fixture["event_names"]
-    )
+    assert set(event["type"] for event in success_events) <= set(fixture["event_names"])
+    assert set(event["type"] for event in error_events) <= set(fixture["event_names"])
     _assert_done_shape(success_events[-1]["data"], fixture)
     captured_error_events = _wire_fixture("v1_moderation_error_wire.json")["events"]
     assert error_events[-len(captured_error_events) :] == captured_error_events
@@ -522,6 +518,7 @@ def test_flagged_query_emits_error_before_finalization(
         "Content flagged by moderation: query contains blocked term: blocked"
     )
     assert all(event.get("step") != "finalization" for event in delivered)
+
 
 @pytest.mark.asyncio
 async def test_http_adapter_accepts_a_deterministic_graph_fake(

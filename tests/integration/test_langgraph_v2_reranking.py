@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.memory import MemorySaver
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.artifacts import ArtifactRepository
-from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
+from app.langgraph_v2.graph import build_linear_graph
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
+from tests.integration.langgraph_v2_turn_support import seed_turn_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -21,7 +16,7 @@ from tests.integration.test_langgraph_v2_linear_core import (
 
 
 @pytest.mark.asyncio
-async def test_ranker_receives_original_documents_and_persists_reordered_refs(
+async def test_ranker_receives_original_documents_and_returns_reordered_evidence(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class Retriever:
@@ -46,11 +41,10 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         ranker = Ranker()
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         result = await build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=Retriever(),
             ranker=ranker,
@@ -63,11 +57,13 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
         )
 
         assert ranker.received == ["d1", "d2"]
-        assert "artifact_refs" in result
-        assert "ranked_refs" in result
-        assert [ref["artifact_id"] for ref in result["ranked_refs"]] == [
-            result["artifact_refs"][1]["artifact_id"],
-            result["artifact_refs"][0]["artifact_id"],
+        assert "evidence" in result
+        assert "ranked_evidence" in result
+        evidence = result["evidence"]
+        ranked_evidence = result["ranked_evidence"]
+        assert [item.evidence_id for item in ranked_evidence] == [
+            evidence[1].evidence_id,
+            evidence[0].evidence_id,
         ]
 
 
@@ -93,11 +89,10 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         result = await build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=DuplicateRetriever(),
             ranker=InvalidRanker(),
@@ -139,11 +134,10 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         result = await build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=DuplicateRetriever(),
             ranker=ReverseRanker(),
@@ -157,12 +151,14 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
 
     assert "halted" in result
     assert result["halted"] is False
-    assert "artifact_refs" in result
-    assert "ranked_refs" in result
-    assert [ref["artifact_id"] for ref in result["ranked_refs"]] == [
-        result["artifact_refs"][2]["artifact_id"],
-        result["artifact_refs"][1]["artifact_id"],
-        result["artifact_refs"][0]["artifact_id"],
+    assert "evidence" in result
+    assert "ranked_evidence" in result
+    evidence = result["evidence"]
+    ranked_evidence = result["ranked_evidence"]
+    assert [item.evidence_id for item in ranked_evidence] == [
+        evidence[2].evidence_id,
+        evidence[1].evidence_id,
+        evidence[0].evidence_id,
     ]
 
 
@@ -188,49 +184,3 @@ def test_failed_ranker_terminates_public_stream(
     assert events[-1]["type"] == "error"
     assert events[-1]["data"] == "ranker unavailable"
     assert all(event.get("step") != "finalization" for event in events)
-
-
-@pytest.mark.asyncio
-async def test_interrupted_reranking_repeats_provider_with_stable_artifact_refs(
-    langgraph_v2_migrated_database_url: str,
-) -> None:
-    class CountingRanker:
-        calls = 0
-
-        async def rank(self, query: str, documents: list[Document]) -> RerankingResult:
-            self.calls += 1
-            del query
-            if self.calls == 1:
-                raise asyncio.CancelledError
-            return RerankingResult(documents=list(reversed(documents)))
-
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        ranker = CountingRanker()
-        scope = await seed_artifact_scope(pool)
-        graph = build_linear_graph(
-            checkpointer=MemorySaver(),
-            tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
-            request_context=scope.context,
-            ranker=ranker,
-        )
-        state: LinearGraphState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "client_request_id": None,
-        }
-        config: RunnableConfig = {"configurable": {"thread_id": "reranking-recovery"}}
-        with pytest.raises(asyncio.CancelledError):
-            await graph.ainvoke(state, config)
-        checkpoint = await graph.aget_state(config)
-        assert checkpoint.next == ("reranking",)
-        recovered = await graph.ainvoke(None, config)
-
-        assert ranker.calls == 2
-        assert "artifact_refs" in recovered
-        assert "ranked_refs" in recovered
-        assert len(recovered["ranked_refs"]) == 1
-        assert recovered["ranked_refs"] == [recovered["artifact_refs"][0]]

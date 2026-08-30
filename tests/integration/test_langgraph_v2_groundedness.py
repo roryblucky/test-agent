@@ -11,7 +11,6 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerCitation, AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
@@ -25,7 +24,7 @@ from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
+from tests.integration.langgraph_v2_turn_support import seed_turn_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -118,10 +117,9 @@ async def test_low_groundedness_is_advisory_on_each_execution(
         evaluator = _Groundedness()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
-        scope = await seed_artifact_scope(pool, turn_id=turn_id)
+        scope = await seed_turn_scope(pool, turn_id=turn_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             request_context=scope.context,
             output_assessment_audit=audit,
@@ -203,9 +201,7 @@ def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
             return messages[-1].content
 
     events = parse_sse(response.text)
-    token_text = "".join(
-        event["data"] for event in events if event["type"] == "token"
-    )
+    token_text = "".join(event["data"] for event in events if event["type"] == "token")
     assert token_text == "answer [1]"
     assert events[-1]["type"] == "done"
     assert events[-1]["data"]["answer"] == token_text
@@ -303,10 +299,9 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         evaluator = Failing()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
-        scope = await seed_artifact_scope(pool, turn_id=turn_id)
+        scope = await seed_turn_scope(pool, turn_id=turn_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
             request_context=scope.context,
             output_assessment_audit=audit,
@@ -354,11 +349,10 @@ async def test_groundedness_uses_only_cited_documents(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -393,11 +387,10 @@ async def test_groundedness_rejects_out_of_range_scores(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -480,10 +473,9 @@ async def test_assessment_audit_failure_does_not_gate_answer(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            artifact_repository=ArtifactRepository(pool),
             current_turn_id=scope.turn_id,
             request_context=scope.context,
             output_assessment_audit=_FailingAssessmentAudit(),

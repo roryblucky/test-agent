@@ -38,5 +38,11 @@ ordered stages across every application instance:
 Do not run pre-task48 application instances against the 0014 schema, and do not
 mix old and new schema expectations during a rolling deployment. Downgrading
 0014 recreates an empty 0013-compatible journal schema; deleted lifecycle rows
-are intentionally not restored. Conversation, Message, Artifact, and official
-LangGraph checkpoint data are unaffected by this migration.
+are intentionally not restored. Conversation, Message, and official LangGraph
+checkpoint data are unaffected by this migration.
+
+Migration `0015_drop_artifacts` removes persisted retrieval chunks. The runtime
+must be deployed first because it carries retrieved and ranked evidence in
+LangGraph `UntrackedValue` channels. If Resume starts after retrieval, the API
+creates a checkpoint that routes execution back through retrieval; provider
+results may therefore change and provider cost may be incurred again.

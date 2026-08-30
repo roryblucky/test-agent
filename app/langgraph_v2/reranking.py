@@ -1,4 +1,4 @@
-"""Replay-safe document reranking phase for the v2 linear graph."""
+"""Request-local document reranking phase for the v2 linear graph."""
 
 from __future__ import annotations
 
@@ -6,12 +6,11 @@ import json
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Protocol
-from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
+from app.langgraph_v2.evidence import Evidence
 from app.models.domain import Document
 
 
@@ -41,28 +40,12 @@ class MockRanker:
 async def run_reranking(
     state: Mapping[str, Any],
     *,
-    scope: ArtifactScope,
-    artifacts: ArtifactStore,
     ranker: Ranker,
-) -> tuple[list[LiveStreamEvent], list[ArtifactRef], bool, str | None]:
-    """Hydrate retrieved Documents and return checkpoint-owned ranked refs."""
+) -> tuple[list[LiveStreamEvent], list[Evidence], bool, str | None]:
+    """Rank request-local evidence without writing document payloads."""
     try:
-        refs = [
-            ref
-            for ref in state.get("artifact_refs", [])
-            if ref.get("artifact_type") == "document"
-        ]
-        documents = [
-            Document.model_validate(
-                (
-                    await artifacts.get(
-                        scope=scope,
-                        artifact_id=UUID(ref["artifact_id"]),
-                    )
-                ).payload
-            )
-            for ref in refs
-        ]
+        evidence = [Evidence.model_validate(item) for item in state["evidence"]]
+        documents = [item.document for item in evidence]
         refined_query = state.get("refined_query")
         ranked = await ranker.rank(
             refined_query if isinstance(refined_query, str) else state["query"],
@@ -73,10 +56,10 @@ async def run_reranking(
         output_keys = [_document_key(document) for document in ranked.documents]
         if Counter(output_keys) != Counter(input_keys):
             raise ValueError("ranker must return every retrieved document exactly once")
-        refs_by_key: dict[str, list[ArtifactRef]] = {}
-        for document, ref in zip(documents, refs, strict=True):
-            refs_by_key.setdefault(_document_key(document), []).append(ref)
-        ordered_refs = [refs_by_key[key].pop(0) for key in output_keys]
+        evidence_by_key: dict[str, list[Evidence]] = {}
+        for document, item in zip(documents, evidence, strict=True):
+            evidence_by_key.setdefault(_document_key(document), []).append(item)
+        ranked_evidence = [evidence_by_key[key].pop(0) for key in output_keys]
         return (
             [
                 LiveStreamEvent(
@@ -92,7 +75,7 @@ async def run_reranking(
                     },
                 ),
             ],
-            ordered_refs,
+            ranked_evidence,
             False,
             None,
         )

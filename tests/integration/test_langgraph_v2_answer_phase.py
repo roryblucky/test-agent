@@ -15,7 +15,6 @@ from app.langgraph_v2.answer import (
     AnswerResult,
     AnswerStreamChunk,
 )
-from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
@@ -25,7 +24,7 @@ from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence
 from app.services.citation_extractor import build_citations
 from app.services.events import EventEmitter
-from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
+from tests.integration.langgraph_v2_turn_support import seed_turn_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -202,11 +201,10 @@ async def test_answer_receives_ranked_documents_on_each_execution(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _AnswerActor()
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -236,12 +234,11 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             checkpointer=MemorySaver(),
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -384,11 +381,10 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _CitingAnswer()
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -420,11 +416,10 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _InlineCitationAnswer()
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -486,7 +481,7 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
 
 
 @pytest.mark.asyncio
-async def test_inline_citation_uses_reranked_artifact_position(
+async def test_inline_citation_uses_reranked_evidence_position(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class TwoRetriever:
@@ -508,11 +503,10 @@ async def test_inline_citation_uses_reranked_artifact_position(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _RankedInlineAnswer()
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=TwoRetriever(),
             ranker=ReverseRanker(),
@@ -527,9 +521,11 @@ async def test_inline_citation_uses_reranked_artifact_position(
         )
 
     assert actor.calls == 1
-    assert "ranked_refs" in result
+    assert "ranked_evidence" in result
     assert "citations" in result
-    assert result["citations"][0].evidence_id == result["ranked_refs"][0]["artifact_id"]
+    assert (
+        result["citations"][0].evidence_id == result["ranked_evidence"][0].evidence_id
+    )
 
 
 @pytest.mark.asyncio
@@ -540,11 +536,10 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _MalformedCitationAnswer()
-        scope = await seed_artifact_scope(pool)
+        scope = await seed_turn_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_turn_id=scope.turn_id,
-            artifact_repository=ArtifactRepository(pool),
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
