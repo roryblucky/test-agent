@@ -26,42 +26,14 @@ from app.langgraph_v2.artifacts import (
     ArtifactScope,
 )
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
+from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
-
-
-async def _artifact_scope(
-    pool: AsyncConnectionPool[Any],
-    *,
-    tenant_id: str = "tenant-a",
-    subject_id: str = "subject-a",
-    conversation_id: str = "c1",
-    turn_id: UUID | None = None,
-) -> ArtifactScope:
-    context = TrustedRequestContext(tenant_id=tenant_id, subject_id=subject_id)
-    messages = ConversationMessageRepository(pool)
-    await messages.resolve_conversation(
-        context=context, conversation_id=conversation_id
-    )
-    resolved_turn_id = turn_id or uuid4()
-    await messages.create_turn(
-        context=context,
-        conversation_id=conversation_id,
-        turn_id=resolved_turn_id,
-        content="question",
-        idempotency_key=f"turn:{resolved_turn_id}:user",
-    )
-    return ArtifactScope(
-        context=context,
-        conversation_id=conversation_id,
-        turn_id=resolved_turn_id,
-    )
 
 
 @pytest.mark.asyncio
@@ -72,7 +44,7 @@ async def test_artifact_repository_is_tenant_scoped(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = ArtifactRepository(pool)
-        scope = await _artifact_scope(pool)
+        scope = await seed_artifact_scope(pool)
         artifact = await repository.create(
             scope=scope, artifact_type="document", payload={"id": "d1"}
         )
@@ -121,6 +93,32 @@ async def test_artifact_repository_is_tenant_scoped(
 
 
 @pytest.mark.asyncio
+async def test_artifact_table_rejects_nonexistent_turn(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async with AsyncConnectionPool(
+        langgraph_v2_migrated_database_url, min_size=1, max_size=2
+    ) as pool:
+        scope = await seed_artifact_scope(pool)
+        async with pool.connection() as connection:
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                async with connection.transaction():
+                    await connection.execute(
+                        """INSERT INTO langgraph_v2.artifacts
+                        (tenant_id, artifact_id, conversation_id, turn_id,
+                         artifact_type, payload)
+                        VALUES (%s, %s, %s, %s, 'document', %s)""",
+                        (
+                            scope.context.tenant_id,
+                            uuid4(),
+                            scope.conversation_id,
+                            uuid4(),
+                            Jsonb({"id": "wrong-turn"}),
+                        ),
+                    )
+
+
+@pytest.mark.asyncio
 async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -144,7 +142,7 @@ async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        scope = await _artifact_scope(pool)
+        scope = await seed_artifact_scope(pool)
         retriever = CountingRetriever()
         graph = build_tracer_graph(
             tenant_id="tenant-a",
@@ -218,12 +216,18 @@ def test_artifact_lookup_is_404_across_tenant_boundary(
             params={"conversationId": "c1", "turnId": str(uuid4())},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
+        wrong_conversation = client.get(
+            f"/v2/artifacts/{artifact_id}",
+            params={"conversationId": "c2", "turnId": str(turn_id)},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
     assert (
         own.status_code,
         other.status_code,
         wrong_subject.status_code,
         wrong_turn.status_code,
-    ) == (200, 404, 404, 404)
+        wrong_conversation.status_code,
+    ) == (200, 404, 404, 404, 404)
 
 
 def test_empty_retrieval_is_explicit_on_public_stream(
@@ -355,7 +359,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
         artifacts = InterruptAfterArtifacts(ArtifactRepository(pool))
         retriever = CountingRetriever()
         turn_id = uuid4()
-        scope = await _artifact_scope(pool, turn_id=turn_id)
+        scope = await seed_artifact_scope(pool, turn_id=turn_id)
         checkpointer = MemorySaver()
         first_graph = build_tracer_graph(
             checkpointer=checkpointer,

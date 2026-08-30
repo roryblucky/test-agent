@@ -10,12 +10,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.artifacts import ArtifactRepository
-from app.langgraph_v2.graph import TracerState
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
-from tests.integration.langgraph_v2_artifact_support import build_artifact_test_graph
+from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
@@ -51,11 +51,13 @@ async def test_ranker_receives_original_documents_and_persists_reordered_refs(
             owner_instance_id="i1",
         )
         ranker = Ranker()
-        result = await build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        result = await build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=Retriever(),
             ranker=ranker,
         ).ainvoke(
@@ -103,11 +105,13 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        result = await build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        result = await build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=DuplicateRetriever(),
             ranker=InvalidRanker(),
         ).ainvoke(
@@ -152,11 +156,13 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        result = await build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        result = await build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=DuplicateRetriever(),
             ranker=ReverseRanker(),
         ).ainvoke(
@@ -226,12 +232,14 @@ async def test_interrupted_reranking_repeats_provider_with_stable_artifact_refs(
             owner_instance_id="i1",
         )
         ranker = CountingRanker()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             checkpointer=MemorySaver(),
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             ranker=ranker,
         )
         state: TracerState = {

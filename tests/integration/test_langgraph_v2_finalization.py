@@ -31,7 +31,7 @@ from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import FencedAsyncPostgresSaver
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import TracerState
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
@@ -48,7 +48,7 @@ from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
-from tests.integration.langgraph_v2_artifact_support import build_artifact_test_graph
+from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import (
     parse_sse,
     persistent_tracer_app,
@@ -237,11 +237,13 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
         )
         answer = _Answer()
         moderation = _Moderation()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             moderation_provider=moderation,
             refinement_actor=_UsageRefinement(),
             retriever=_Retriever(),
@@ -340,8 +342,8 @@ async def test_graph_completion_does_not_publish_message_before_done_is_consumed
             idempotency_key=f"turn:{turn_id}:user",
         )
         answer = _Answer()
-        graph = build_artifact_test_graph(
-            pool,
+        await seed_artifact_scope(pool, turn_id=turn_id, context=request_context)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
             current_turn_id=turn_id,

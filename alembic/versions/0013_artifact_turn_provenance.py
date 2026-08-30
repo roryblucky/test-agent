@@ -51,7 +51,9 @@ def upgrade() -> None:
         """
         ALTER TABLE langgraph_v2.artifacts
             ADD COLUMN conversation_id TEXT,
-            ADD COLUMN turn_id UUID
+            ADD COLUMN turn_id UUID,
+            ADD COLUMN turn_role TEXT
+                GENERATED ALWAYS AS ('user'::text) STORED
         """
     )
     connection = op.get_bind()
@@ -126,9 +128,10 @@ def upgrade() -> None:
         ALTER TABLE langgraph_v2.artifacts
             ALTER COLUMN conversation_id SET NOT NULL,
             ALTER COLUMN turn_id SET NOT NULL,
-            ADD CONSTRAINT artifacts_conversation_fk
-            FOREIGN KEY (tenant_id, conversation_id)
-            REFERENCES langgraph_v2.conversations (tenant_id, conversation_id)
+            ADD CONSTRAINT artifacts_turn_fk
+            FOREIGN KEY (tenant_id, conversation_id, turn_id, turn_role)
+            REFERENCES langgraph_v2.messages
+                (tenant_id, conversation_id, turn_id, role)
             ON DELETE CASCADE
         """
     )
@@ -145,7 +148,8 @@ def downgrade() -> None:
     op.execute(
         """
         ALTER TABLE langgraph_v2.artifacts
-            DROP CONSTRAINT artifacts_conversation_fk,
+            DROP CONSTRAINT artifacts_turn_fk,
+            DROP COLUMN turn_role,
             DROP COLUMN turn_id,
             DROP COLUMN conversation_id
         """

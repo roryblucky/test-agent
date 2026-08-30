@@ -181,6 +181,8 @@ def test_artifact_migration_backfills_turn_provenance_and_downgrades(
     turn_id = uuid4()
     run_id = uuid4()
     payload = {"content": "evidence", "id": "d1"}
+    run_payload = {"query": "legacy", "source": "mock"}
+    run_created_at = datetime(2026, 3, 4, 5, 6, tzinfo=UTC)
     canonical = json.dumps(
         payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
@@ -196,6 +198,26 @@ def test_artifact_migration_backfills_turn_provenance_and_downgrades(
                 "retrieval",
                 "document",
                 canonical,
+            )
+        ),
+    )
+    run_artifact_id = uuid5(
+        NAMESPACE_URL,
+        ":".join(
+            (
+                "langgraph-v2",
+                tenant_id,
+                conversation_id,
+                "run",
+                str(run_id),
+                "retrieval",
+                "retrieval_raw",
+                json.dumps(
+                    run_payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
             )
         ),
     )
@@ -226,6 +248,12 @@ def test_artifact_migration_backfills_turn_provenance_and_downgrades(
             VALUES (%s, %s, 'document', %s)""",
             (tenant_id, artifact_id, Jsonb(payload)),
         )
+        connection.execute(
+            """INSERT INTO langgraph_v2.artifacts
+            (tenant_id, artifact_id, artifact_type, payload, created_at)
+            VALUES (%s, %s, 'retrieval_raw', %s, %s)""",
+            (tenant_id, run_artifact_id, Jsonb(run_payload), run_created_at),
+        )
 
     command.upgrade(config, "head")
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
@@ -235,6 +263,12 @@ def test_artifact_migration_backfills_turn_provenance_and_downgrades(
             WHERE tenant_id = %s AND artifact_id = %s""",
             (tenant_id, artifact_id),
         ).fetchone() == (conversation_id, turn_id)
+        assert connection.execute(
+            """SELECT conversation_id, turn_id, created_at
+            FROM langgraph_v2.artifacts
+            WHERE tenant_id = %s AND artifact_id = %s""",
+            (tenant_id, run_artifact_id),
+        ).fetchone() == (conversation_id, turn_id, run_created_at)
 
     command.downgrade(config, "0012_message_turn_identity")
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
@@ -250,6 +284,11 @@ def test_artifact_migration_backfills_turn_provenance_and_downgrades(
             "SELECT payload FROM langgraph_v2.artifacts WHERE artifact_id = %s",
             (artifact_id,),
         ).fetchone() == (payload,)
+        assert connection.execute(
+            """SELECT payload, created_at FROM langgraph_v2.artifacts
+            WHERE artifact_id = %s""",
+            (run_artifact_id,),
+        ).fetchone() == (run_payload, run_created_at)
     command.downgrade(config, "base")
 
 

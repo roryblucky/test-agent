@@ -11,7 +11,7 @@ from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerCitation, AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.artifacts import ArtifactRepository
-from app.langgraph_v2.graph import TracerState
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.groundedness import (
     GroundednessAssessment,
     GroundednessOutput,
@@ -23,7 +23,7 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
-from tests.integration.langgraph_v2_artifact_support import build_artifact_test_graph
+from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
@@ -119,12 +119,13 @@ async def test_low_groundedness_is_advisory_on_each_execution(
         evaluator = _Groundedness()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool, turn_id=turn_id)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
+            request_context=scope.context,
             output_assessment_audit=audit,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -190,12 +191,13 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         evaluator = Failing()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool, turn_id=turn_id)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
+            request_context=scope.context,
             output_assessment_audit=audit,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -246,11 +248,13 @@ async def test_groundedness_uses_only_cited_documents(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_UncitedAnswer(),
@@ -289,11 +293,13 @@ async def test_groundedness_rejects_out_of_range_scores(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_Answer(),
@@ -387,12 +393,13 @@ async def test_assessment_audit_failure_does_not_gate_answer(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
-            current_turn_id=uuid4(),
+            current_turn_id=scope.turn_id,
+            request_context=scope.context,
             output_assessment_audit=_FailingAssessmentAudit(),
             retriever=_Retriever(),
             ranker=_Ranker(),

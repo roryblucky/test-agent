@@ -11,7 +11,7 @@ from app.langgraph_v2.artifacts import ArtifactRepository
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.graph import TracerState
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.pre_moderation import ModerationDecision
@@ -19,7 +19,7 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
-from tests.integration.langgraph_v2_artifact_support import build_artifact_test_graph
+from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import (
     persistent_tracer_app,
     seed_subject_conversation,
@@ -159,11 +159,13 @@ async def test_safe_answer_passes_post_moderation_unchanged(
             idempotency_key=f"turn:{turn_id}:user",
         )
         moderation = _SafeModeration()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             moderation_provider=moderation,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -208,12 +210,13 @@ async def test_flagged_answer_remains_canonical_through_finalization(
             idempotency_key=f"turn:{turn_id}:user",
         )
         audit = MockOutputAssessmentAudit()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool, turn_id=turn_id)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
             current_turn_id=turn_id,
+            request_context=scope.context,
             output_assessment_audit=audit,
             moderation_provider=_FlaggingModeration(),
             retriever=_Retriever(),
@@ -255,11 +258,13 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             moderation_provider=_FailingPostModeration(),
             retriever=_Retriever(),
             ranker=_Ranker(),

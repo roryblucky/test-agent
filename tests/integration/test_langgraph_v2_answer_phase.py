@@ -17,7 +17,7 @@ from app.langgraph_v2.answer import (
     AnswerStreamChunk,
 )
 from app.langgraph_v2.artifacts import ArtifactRepository
-from app.langgraph_v2.graph import TracerState
+from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
@@ -27,7 +27,7 @@ from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence
 from app.services.citation_extractor import build_citations
 from app.services.events import EventEmitter
-from tests.integration.langgraph_v2_artifact_support import build_artifact_test_graph
+from tests.integration.langgraph_v2_artifact_support import seed_artifact_scope
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
@@ -208,11 +208,13 @@ async def test_answer_receives_ranked_documents_on_each_execution(
             owner_instance_id="i1",
         )
         actor = _AnswerActor()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -248,12 +250,14 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             checkpointer=MemorySaver(),
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_StreamingAnswerActor(),
@@ -351,11 +355,13 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
             owner_instance_id="i1",
         )
         actor = _CitingAnswer()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -393,11 +399,13 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
             owner_instance_id="i1",
         )
         actor = _InlineCitationAnswer()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -487,11 +495,13 @@ async def test_inline_citation_uses_reranked_artifact_position(
             owner_instance_id="i1",
         )
         actor = _RankedInlineAnswer()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=TwoRetriever(),
             ranker=ReverseRanker(),
             answer_actor=actor,
@@ -525,11 +535,13 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
             owner_instance_id="i1",
         )
         actor = _MalformedCitationAnswer()
-        graph = build_artifact_test_graph(
-            pool,
+        scope = await seed_artifact_scope(pool)
+        graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
