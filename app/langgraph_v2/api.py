@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Annotated, Any, Protocol, cast
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -505,19 +505,7 @@ async def _persist_setup_failure(
     ).to_sse()
 
 
-class TracerInvoker(Protocol):
-    """Legacy invocation seam retained by detached transitional execution."""
-
-    async def ainvoke(
-        self,
-        state: TracerState | None,
-        config: RunnableConfig | None = None,
-    ) -> dict[str, Any]:
-        """Run one graph invocation and return its final state."""
-        ...
-
-
-type TracerGraph = RequestOwnedGraph | TracerInvoker
+type TracerGraph = RequestOwnedGraph
 
 _PRE_ANSWER_RESUME_NODES = frozenset(
     {"pre_moderation", "question_refinement", "retrieval", "reranking", "answer"}
@@ -636,7 +624,7 @@ def create_tracer_router(
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     output_assessment_audit: OutputAssessmentAudit | None = None,
 ) -> APIRouter:
-    """Create the test-only router around an injected graph invocation seam."""
+    """Create the test-only router around an injected request-owned stream seam."""
     if history_token_budget < 0:
         raise ValueError("history_token_budget must not be negative")
     router = APIRouter(tags=["LangGraph v2 tracer"])
