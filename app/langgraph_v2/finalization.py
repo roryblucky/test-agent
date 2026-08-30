@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 from uuid import UUID
 
-from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent, TracerQueryResponse
 from app.models.domain import Document
 
@@ -87,7 +87,7 @@ def _legacy_moderation(value: Mapping[str, Any] | None) -> dict[str, Any] | None
 async def run_finalization(
     state: Mapping[str, Any],
     *,
-    tenant_id: str,
+    scope: ArtifactScope,
     artifacts: ArtifactStore,
 ) -> tuple[list[LiveStreamEvent], TracerQueryResponse]:
     """Assemble the response and its checkpoint-owned finalization events."""
@@ -97,7 +97,7 @@ async def run_finalization(
             Document.model_validate(
                 (
                     await artifacts.get(
-                        tenant_id=tenant_id,
+                        scope=scope,
                         artifact_id=UUID(ref["artifact_id"]),
                     )
                 ).payload

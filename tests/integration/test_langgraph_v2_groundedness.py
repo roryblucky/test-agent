@@ -11,7 +11,7 @@ from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerCitation, AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.artifacts import ArtifactRepository
-from app.langgraph_v2.graph import TracerState, build_tracer_graph
+from app.langgraph_v2.graph import TracerState
 from app.langgraph_v2.groundedness import (
     GroundednessAssessment,
     GroundednessOutput,
@@ -23,6 +23,7 @@ from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
+from tests.integration.langgraph_v2_artifact_support import build_artifact_test_graph
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
@@ -118,7 +119,8 @@ async def test_low_groundedness_is_advisory_on_each_execution(
         evaluator = _Groundedness()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
-        graph = build_tracer_graph(
+        graph = build_artifact_test_graph(
+            pool,
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
@@ -188,7 +190,8 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         evaluator = Failing()
         audit = MockOutputAssessmentAudit()
         turn_id = uuid4()
-        graph = build_tracer_graph(
+        graph = build_artifact_test_graph(
+            pool,
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
@@ -243,7 +246,8 @@ async def test_groundedness_uses_only_cited_documents(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        graph = build_tracer_graph(
+        graph = build_artifact_test_graph(
+            pool,
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
@@ -285,7 +289,8 @@ async def test_groundedness_rejects_out_of_range_scores(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        graph = build_tracer_graph(
+        graph = build_artifact_test_graph(
+            pool,
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),
@@ -382,7 +387,8 @@ async def test_assessment_audit_failure_does_not_gate_answer(
             conversation_id="c1",
             owner_instance_id="i1",
         )
-        graph = build_tracer_graph(
+        graph = build_artifact_test_graph(
+            pool,
             tenant_id="tenant-a",
             run_id=run.run_id,
             artifact_repository=ArtifactRepository(pool),

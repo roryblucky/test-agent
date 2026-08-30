@@ -12,7 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
-from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.history import ConversationTurn, to_model_message_history
 from app.langgraph_v2.runs import CancellationObserved
@@ -228,7 +228,7 @@ def build_answer_actor(
 async def run_answer(
     state: Mapping[str, Any],
     *,
-    tenant_id: str,
+    scope: ArtifactScope,
     cancellation_check: Callable[[], Awaitable[bool]] | None,
     artifacts: ArtifactStore,
     actor: AnswerActor,
@@ -253,7 +253,7 @@ async def run_answer(
             Document.model_validate(
                 (
                     await artifacts.get(
-                        tenant_id=tenant_id,
+                        scope=scope,
                         artifact_id=UUID(ref["artifact_id"]),
                     )
                 ).payload

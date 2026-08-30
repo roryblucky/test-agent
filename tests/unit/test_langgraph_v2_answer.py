@@ -1,5 +1,6 @@
 import asyncio
 from typing import Any, Self, cast
+from uuid import uuid4
 
 import pytest
 from pydantic_ai.usage import RunUsage
@@ -13,9 +14,16 @@ from app.langgraph_v2.answer import (
     build_answer_actor,
     run_answer,
 )
-from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactScope, ArtifactStore
+from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.history import ConversationTurn
 from app.models.domain import Document
+
+_SCOPE = ArtifactScope(
+    context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+    conversation_id="c1",
+    turn_id=uuid4(),
+)
 
 
 class _FakeStructuredStream:
@@ -140,7 +148,7 @@ async def test_run_answer_writes_real_deltas_and_returns_same_complete_answer() 
 
     _, result, halted, error = await run_answer(
         {"query": "question"},
-        tenant_id="tenant-a",
+        scope=_SCOPE,
         cancellation_check=None,
         artifacts=object(),  # type: ignore[arg-type]
         actor=actor,
@@ -184,7 +192,7 @@ async def test_run_answer_cancellation_after_delta_does_not_commit_partial_resul
     with pytest.raises(AnswerCancelled):
         await run_answer(
             {"query": "question"},
-            tenant_id="tenant-a",
+            scope=_SCOPE,
             cancellation_check=cancellation_check,
             artifacts=object(),  # type: ignore[arg-type]
             actor=actor,
@@ -220,7 +228,7 @@ async def test_answer_checks_cancellation_before_publication() -> None:
     with pytest.raises(AnswerCancelled):
         await run_answer(
             {"query": "hello"},
-            tenant_id="tenant-a",
+            scope=_SCOPE,
             cancellation_check=lambda: asyncio.sleep(0, result=True),
             artifacts=cast(ArtifactStore, object()),
             actor=object(),  # type: ignore[arg-type]

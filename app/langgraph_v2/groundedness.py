@@ -10,7 +10,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
-from app.langgraph_v2.artifacts import ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.output_assessments import (
     OutputAssessmentAudit,
@@ -101,7 +101,7 @@ def build_groundedness_actor(
 async def run_groundedness(
     state: Mapping[str, Any],
     *,
-    tenant_id: str,
+    scope: ArtifactScope,
     current_turn_id: UUID | None,
     output_assessment_audit: OutputAssessmentAudit | None,
     artifacts: ArtifactStore,
@@ -111,7 +111,7 @@ async def run_groundedness(
 ]:
     """Evaluate the canonical Answer and record the advisory audit result."""
     assessment_scope = build_output_assessment_scope(
-        tenant_id=tenant_id,
+        tenant_id=scope.context.tenant_id,
         conversation_id=(
             state.get("conversation_id")
             if isinstance(state.get("conversation_id"), str)
@@ -138,7 +138,7 @@ async def run_groundedness(
             Document.model_validate(
                 (
                     await artifacts.get(
-                        tenant_id=tenant_id,
+                        scope=scope,
                         artifact_id=UUID(ref["artifact_id"]),
                     )
                 ).payload

@@ -18,7 +18,7 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.types import StateSnapshot
 
 from app.langgraph_v2.answer import AnswerActor, AnswerCancelled, run_answer
-from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import LiveStreamEvent, TracerQueryResponse
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
@@ -273,6 +273,22 @@ def build_tracer_graph(
     selected_ranker = ranker or MockRanker()
     selected_artifact_repository = artifact_repository
 
+    def artifact_scope(state: TracerState) -> ArtifactScope | None:
+        if request_context is None:
+            return None
+        raw_turn_id = current_turn_id or state.get("turn_id")
+        if raw_turn_id is None:
+            return None
+        try:
+            turn_id = UUID(str(raw_turn_id))
+        except ValueError:
+            return None
+        return ArtifactScope(
+            context=request_context,
+            conversation_id=state["conversation_id"],
+            turn_id=turn_id,
+        )
+
     async def pre_moderation_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(cancellation_check)
         events, halted, decision = await run_pre_moderation(
@@ -311,13 +327,12 @@ def build_tracer_graph(
 
     async def retrieval_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(cancellation_check)
-        if tenant_id is None or run_id is None or selected_artifact_repository is None:
+        scope = artifact_scope(state)
+        if scope is None or selected_artifact_repository is None:
             return {"artifact_refs": []}
         events, refs, _, halted, error = await run_retrieval(
             state,
-            tenant_id=tenant_id,
-            run_id=run_id,
-            current_turn_id=current_turn_id,
+            scope=scope,
             artifacts=selected_artifact_repository,
             retriever=selected_retriever,
         )
@@ -336,11 +351,12 @@ def build_tracer_graph(
 
     async def reranking_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(cancellation_check)
-        if tenant_id is None or selected_artifact_repository is None:
+        scope = artifact_scope(state)
+        if scope is None or selected_artifact_repository is None:
             return {"ranked_refs": state.get("artifact_refs", [])}
         events, refs, halted, error = await run_reranking(
             state,
-            tenant_id=tenant_id,
+            scope=scope,
             artifacts=selected_artifact_repository,
             ranker=selected_ranker,
         )
@@ -360,7 +376,7 @@ def build_tracer_graph(
     answer_enabled = (
         answer_actor is not None
         and selected_artifact_repository is not None
-        and tenant_id is not None
+        and request_context is not None
     )
     if answer_enabled:
 
@@ -368,10 +384,12 @@ def build_tracer_graph(
             assert tenant_id is not None
             assert selected_artifact_repository is not None
             assert answer_actor is not None
+            scope = artifact_scope(state)
+            assert scope is not None
             await _check_cancellation(cancellation_check)
             _, result, halted, error = await run_answer(
                 state,
-                tenant_id=tenant_id,
+                scope=scope,
                 cancellation_check=cancellation_check,
                 artifacts=selected_artifact_repository,
                 actor=answer_actor,
@@ -403,10 +421,12 @@ def build_tracer_graph(
             async def groundedness_node(state: TracerState) -> TracerStateUpdate:
                 assert tenant_id is not None
                 assert selected_artifact_repository is not None
+                scope = artifact_scope(state)
+                assert scope is not None
                 await _check_cancellation(cancellation_check)
                 events, result, usage, error = await run_groundedness(
                     state,
-                    tenant_id=tenant_id,
+                    scope=scope,
                     current_turn_id=current_turn_id,
                     output_assessment_audit=output_assessment_audit,
                     artifacts=selected_artifact_repository,
@@ -450,11 +470,12 @@ def build_tracer_graph(
 
     async def finalization_node(state: TracerState) -> TracerStateUpdate:
         await _check_cancellation(cancellation_check)
-        if tenant_id is None or selected_artifact_repository is None:
+        scope = artifact_scope(state)
+        if scope is None or selected_artifact_repository is None:
             return await _finalize(state)
         events, response = await run_finalization(
             state,
-            tenant_id=tenant_id,
+            scope=scope,
             artifacts=selected_artifact_repository,
         )
         _emit_events(events)

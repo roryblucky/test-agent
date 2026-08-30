@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from typing import Any, cast
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import psycopg
 import pytest
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from alembic import command
@@ -167,6 +169,110 @@ def test_application_base_revision_upgrades_and_downgrades(
             ("langgraph_v2",),
         ).fetchone()
     assert exists_after_downgrade == (False,)
+
+
+def test_artifact_migration_backfills_turn_provenance_and_downgrades(
+    langgraph_v2_test_database_url: str,
+) -> None:
+    config = build_alembic_config(langgraph_v2_test_database_url)
+    command.upgrade(config, "0012_message_turn_identity")
+    tenant_id = "tenant-a"
+    conversation_id = "conversation-artifact"
+    turn_id = uuid4()
+    run_id = uuid4()
+    payload = {"content": "evidence", "id": "d1"}
+    canonical = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    artifact_id = uuid5(
+        NAMESPACE_URL,
+        ":".join(
+            (
+                "langgraph-v2",
+                tenant_id,
+                conversation_id,
+                "turn",
+                str(turn_id),
+                "retrieval",
+                "document",
+                canonical,
+            )
+        ),
+    )
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        connection.execute(
+            """INSERT INTO langgraph_v2.conversations
+            (tenant_id, conversation_id, owner_subject_id, thread_id)
+            VALUES (%s, %s, 'subject-a', %s)""",
+            (tenant_id, conversation_id, str(uuid4())),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.messages
+            (tenant_id, message_id, conversation_id, turn_id, role, content,
+             idempotency_key, resume_deadline)
+            VALUES (%s, %s, %s, %s, 'user', 'question', 'artifact:user',
+                    now() + interval '1 hour')""",
+            (tenant_id, uuid4(), conversation_id, turn_id),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.runs
+            (tenant_id, run_id, conversation_id, status, turn_id)
+            VALUES (%s, %s, %s, 'completed', %s)""",
+            (tenant_id, run_id, conversation_id, turn_id),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.artifacts
+            (tenant_id, artifact_id, artifact_type, payload)
+            VALUES (%s, %s, 'document', %s)""",
+            (tenant_id, artifact_id, Jsonb(payload)),
+        )
+
+    command.upgrade(config, "head")
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        assert connection.execute(
+            """SELECT conversation_id, turn_id
+            FROM langgraph_v2.artifacts
+            WHERE tenant_id = %s AND artifact_id = %s""",
+            (tenant_id, artifact_id),
+        ).fetchone() == (conversation_id, turn_id)
+
+    command.downgrade(config, "0012_message_turn_identity")
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        assert (
+            connection.execute(
+                """SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'langgraph_v2' AND table_name = 'artifacts'
+              AND column_name IN ('conversation_id', 'turn_id')"""
+            ).fetchall()
+            == []
+        )
+        assert connection.execute(
+            "SELECT payload FROM langgraph_v2.artifacts WHERE artifact_id = %s",
+            (artifact_id,),
+        ).fetchone() == (payload,)
+    command.downgrade(config, "base")
+
+
+def test_artifact_migration_rejects_unmatched_legacy_provenance(
+    langgraph_v2_test_database_url: str,
+) -> None:
+    config = build_alembic_config(langgraph_v2_test_database_url)
+    command.upgrade(config, "0012_message_turn_identity")
+    artifact_id = uuid4()
+    with psycopg.connect(langgraph_v2_test_database_url) as connection:
+        connection.execute(
+            """INSERT INTO langgraph_v2.artifacts
+            (tenant_id, artifact_id, artifact_type, payload)
+            VALUES ('tenant-a', %s, 'document', %s)""",
+            (artifact_id, Jsonb({"id": "unmatched"})),
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"Artifact {artifact_id} has 0 provenance matches",
+    ):
+        command.upgrade(config, "head")
+    command.downgrade(config, "base")
 
 
 def test_message_turn_migration_restores_transitional_run_identity_on_downgrade(

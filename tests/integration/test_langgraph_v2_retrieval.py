@@ -19,10 +19,14 @@ from app.langgraph_v2.answer import (
     AnswerStreamChunk,
 )
 from app.langgraph_v2.artifacts import (
+    ArtifactInvariantConflict,
     ArtifactNotFound,
     ArtifactRecord,
     ArtifactRepository,
+    ArtifactScope,
 )
+from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.reranking import RerankingResult
@@ -30,6 +34,34 @@ from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.runs import RunRepository
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
+
+
+async def _artifact_scope(
+    pool: AsyncConnectionPool[Any],
+    *,
+    tenant_id: str = "tenant-a",
+    subject_id: str = "subject-a",
+    conversation_id: str = "c1",
+    turn_id: UUID | None = None,
+) -> ArtifactScope:
+    context = TrustedRequestContext(tenant_id=tenant_id, subject_id=subject_id)
+    messages = ConversationMessageRepository(pool)
+    await messages.resolve_conversation(
+        context=context, conversation_id=conversation_id
+    )
+    resolved_turn_id = turn_id or uuid4()
+    await messages.create_turn(
+        context=context,
+        conversation_id=conversation_id,
+        turn_id=resolved_turn_id,
+        content="question",
+        idempotency_key=f"turn:{resolved_turn_id}:user",
+    )
+    return ArtifactScope(
+        context=context,
+        conversation_id=conversation_id,
+        turn_id=resolved_turn_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -40,14 +72,52 @@ async def test_artifact_repository_is_tenant_scoped(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         repository = ArtifactRepository(pool)
+        scope = await _artifact_scope(pool)
         artifact = await repository.create(
-            tenant_id="tenant-a", artifact_type="document", payload={"id": "d1"}
+            scope=scope, artifact_type="document", payload={"id": "d1"}
         )
+        repeated = await repository.create(
+            scope=scope,
+            artifact_id=artifact.artifact_id,
+            artifact_type="document",
+            payload={"id": "d1"},
+        )
+        assert repeated.created_at == artifact.created_at
         assert (
-            await repository.get(tenant_id="tenant-a", artifact_id=artifact.artifact_id)
+            await repository.get(scope=scope, artifact_id=artifact.artifact_id)
         ).payload == {"id": "d1"}
+        with pytest.raises(ArtifactInvariantConflict):
+            await repository.create(
+                scope=scope,
+                artifact_id=artifact.artifact_id,
+                artifact_type="document",
+                payload={"id": "changed"},
+            )
+        wrong_subject = ArtifactScope(
+            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-b"),
+            conversation_id=scope.conversation_id,
+            turn_id=scope.turn_id,
+        )
         with pytest.raises(ArtifactNotFound):
-            await repository.get(tenant_id="tenant-b", artifact_id=artifact.artifact_id)
+            await repository.get(scope=wrong_subject, artifact_id=artifact.artifact_id)
+        with pytest.raises(ArtifactNotFound):
+            await repository.create(
+                scope=wrong_subject,
+                artifact_id=artifact.artifact_id,
+                artifact_type="document",
+                payload={"id": "d1"},
+            )
+        with pytest.raises(ArtifactNotFound):
+            await repository.get(
+                scope=ArtifactScope(
+                    context=TrustedRequestContext(
+                        tenant_id="tenant-b", subject_id="subject-a"
+                    ),
+                    conversation_id=scope.conversation_id,
+                    turn_id=scope.turn_id,
+                ),
+                artifact_id=artifact.artifact_id,
+            )
 
 
 @pytest.mark.asyncio
@@ -74,11 +144,14 @@ async def test_retrieval_persists_stable_artifact_refs_across_reexecution(
             conversation_id="c1",
             owner_instance_id="i1",
         )
+        scope = await _artifact_scope(pool)
         retriever = CountingRetriever()
         graph = build_tracer_graph(
             tenant_id="tenant-a",
             run_id=run.run_id,
+            current_turn_id=scope.turn_id,
             artifact_repository=ArtifactRepository(pool),
+            request_context=scope.context,
             retriever=retriever,
         )
         state: TracerState = {
@@ -100,22 +173,57 @@ def test_artifact_lookup_is_404_across_tenant_boundary(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     artifact_id = uuid4()
+    turn_id = uuid4()
     with psycopg.connect(
         langgraph_v2_migrated_database_url, autocommit=True
     ) as connection:
         connection.execute(
-            "INSERT INTO langgraph_v2.artifacts (tenant_id, artifact_id, artifact_type, payload) VALUES (%s, %s, %s, %s)",
-            ("tenant-a", artifact_id, "document", Jsonb({"id": "d1"})),
+            """INSERT INTO langgraph_v2.conversations
+            (tenant_id, conversation_id, owner_subject_id, thread_id)
+            VALUES (%s, %s, %s, %s)""",
+            ("tenant-a", "c1", "subject-a", "thread-1"),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.messages
+            (tenant_id, message_id, conversation_id, turn_id, role, content,
+             idempotency_key, resume_deadline)
+            VALUES (%s, %s, %s, %s, 'user', 'question', %s, now() + interval '1 hour')""",
+            ("tenant-a", uuid4(), "c1", turn_id, f"turn:{turn_id}:user"),
+        )
+        connection.execute(
+            """INSERT INTO langgraph_v2.artifacts
+            (tenant_id, artifact_id, conversation_id, turn_id, artifact_type, payload)
+            VALUES (%s, %s, %s, %s, %s, %s)""",
+            ("tenant-a", artifact_id, "c1", turn_id, "document", Jsonb({"id": "d1"})),
         )
     app = persistent_tracer_app(langgraph_v2_migrated_database_url)
     with TestClient(app) as client:
         own = client.get(
-            f"/v2/artifacts/{artifact_id}", headers={"X-Application-Id": "tenant-a"}
+            f"/v2/artifacts/{artifact_id}",
+            params={"conversationId": "c1", "turnId": str(turn_id)},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         other = client.get(
-            f"/v2/artifacts/{artifact_id}", headers={"X-Application-Id": "tenant-b"}
+            f"/v2/artifacts/{artifact_id}",
+            params={"conversationId": "c1", "turnId": str(turn_id)},
+            headers={"X-Application-Id": "tenant-b", "X-Subject-Id": "subject-a"},
         )
-    assert (own.status_code, other.status_code) == (200, 404)
+        wrong_subject = client.get(
+            f"/v2/artifacts/{artifact_id}",
+            params={"conversationId": "c1", "turnId": str(turn_id)},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-b"},
+        )
+        wrong_turn = client.get(
+            f"/v2/artifacts/{artifact_id}",
+            params={"conversationId": "c1", "turnId": str(uuid4())},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+    assert (
+        own.status_code,
+        other.status_code,
+        wrong_subject.status_code,
+        wrong_turn.status_code,
+    ) == (200, 404, 404, 404)
 
 
 def test_empty_retrieval_is_explicit_on_public_stream(
@@ -247,6 +355,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
         artifacts = InterruptAfterArtifacts(ArtifactRepository(pool))
         retriever = CountingRetriever()
         turn_id = uuid4()
+        scope = await _artifact_scope(pool, turn_id=turn_id)
         checkpointer = MemorySaver()
         first_graph = build_tracer_graph(
             checkpointer=checkpointer,
@@ -254,6 +363,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
             run_id=run.run_id,
             current_turn_id=turn_id,
             artifact_repository=artifacts,
+            request_context=scope.context,
             retriever=retriever,
             ranker=IdentityRanker(),
             answer_actor=CitingAnswer(),
@@ -280,6 +390,7 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
             run_id=resume_run.run_id,
             current_turn_id=turn_id,
             artifact_repository=artifacts,
+            request_context=scope.context,
             retriever=retriever,
             ranker=IdentityRanker(),
             answer_actor=CitingAnswer(),
@@ -296,11 +407,11 @@ async def test_retrieval_resume_with_new_run_preserves_artifact_and_citation_ide
         assert citation.evidence_id == document_refs[0]["artifact_id"]
         assert citation.metadata == {"artifact_id": document_refs[0]["artifact_id"]}
         original_d2 = await artifacts.get(
-            tenant_id="tenant-a",
+            scope=scope,
             artifact_id=UUID(artifacts.first_document_ids["d2"]),
         )
         resumed_d2 = await artifacts.get(
-            tenant_id="tenant-a",
+            scope=scope,
             artifact_id=UUID(document_refs[0]["artifact_id"]),
         )
         assert original_d2.payload["content"] == "hello-two"

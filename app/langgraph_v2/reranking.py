@@ -10,7 +10,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.langgraph_v2.artifacts import ArtifactRef, ArtifactStore
+from app.langgraph_v2.artifacts import ArtifactRef, ArtifactScope, ArtifactStore
 from app.langgraph_v2.contracts import LiveStreamEvent
 from app.models.domain import Document
 
@@ -41,7 +41,7 @@ class MockRanker:
 async def run_reranking(
     state: Mapping[str, Any],
     *,
-    tenant_id: str,
+    scope: ArtifactScope,
     artifacts: ArtifactStore,
     ranker: Ranker,
 ) -> tuple[list[LiveStreamEvent], list[ArtifactRef], bool, str | None]:
@@ -56,7 +56,7 @@ async def run_reranking(
             Document.model_validate(
                 (
                     await artifacts.get(
-                        tenant_id=tenant_id,
+                        scope=scope,
                         artifact_id=UUID(ref["artifact_id"]),
                     )
                 ).payload

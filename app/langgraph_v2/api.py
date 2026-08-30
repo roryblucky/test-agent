@@ -20,7 +20,11 @@ from langgraph.types import StateSnapshot
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerActor, build_answer_actor
-from app.langgraph_v2.artifacts import ArtifactNotFound, ArtifactRepository
+from app.langgraph_v2.artifacts import (
+    ArtifactNotFound,
+    ArtifactRepository,
+    ArtifactScope,
+)
 from app.langgraph_v2.authorization import (
     TrustedRequestContext,
     get_trusted_request_context,
@@ -1078,7 +1082,11 @@ def create_tracer_router(
     async def get_artifact(  # pyright: ignore[reportUnusedFunction] -- FastAPI route
         artifact_id: uuid.UUID,
         http_request: Request,
-        tenant_id: Annotated[str, Header(alias="X-Application-Id")],
+        conversation_id: Annotated[str, Query(alias="conversationId", min_length=1)],
+        turn_id: Annotated[uuid.UUID, Query(alias="turnId")],
+        request_context: Annotated[
+            TrustedRequestContext, Depends(get_trusted_request_context)
+        ],
     ) -> dict[str, Any]:
         """Read one Artifact through the caller's Tenant boundary."""
         configured_pool = getattr(
@@ -1090,7 +1098,12 @@ def create_tracer_router(
             )
         try:
             artifact = await ArtifactRepository(configured_pool).get(
-                tenant_id=tenant_id, artifact_id=artifact_id
+                scope=ArtifactScope(
+                    context=request_context,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                ),
+                artifact_id=artifact_id,
             )
         except ArtifactNotFound as error:
             raise HTTPException(status_code=404, detail="Artifact not found") from error
