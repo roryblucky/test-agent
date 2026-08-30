@@ -112,7 +112,9 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
     assert "halted" in result
     assert result["halted"] is True
     assert "reranking_error" in result
-    assert "every retrieved document exactly once" in result["reranking_error"]
+    reranking_error = result["reranking_error"]
+    assert isinstance(reranking_error, str)
+    assert "every retrieved document exactly once" in reranking_error
 
 
 @pytest.mark.asyncio
