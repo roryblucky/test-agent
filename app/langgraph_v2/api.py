@@ -359,6 +359,58 @@ async def _persist_event_record(
     )
 
 
+async def _terminalize_checkpoint_event(
+    repository: RunEventRepository,
+    message_repository: ConversationMessageRepository,
+    event: TracerStreamEvent,
+    *,
+    tenant_id: str,
+    run_id: uuid.UUID,
+    conversation_id: str,
+    turn_id: uuid.UUID,
+    owner_instance_id: str,
+    execution_epoch: int,
+) -> None:
+    """Publish a checkpoint-owned terminal outcome without an Event journal."""
+    if event.type == "error":
+        await repository.fail_run_without_event(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+            error=event.data,
+        )
+        return
+    if event.type != "done":
+        raise ValueError("checkpoint terminalization requires done or error")
+
+    raw_data: object = event.data
+    data = cast(dict[str, Any], raw_data) if isinstance(raw_data, dict) else {}
+    answer = data.get("answer")
+    async with repository.transaction() as connection:
+        if isinstance(answer, str):
+            await message_repository.persist_assistant_message_in_terminal_transaction(
+                connection,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                run_id=run_id,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+                turn_id=turn_id,
+                content=answer,
+                idempotency_key=f"turn:{turn_id}:assistant",
+            )
+        await repository.complete_run_without_event_in_transaction(
+            connection,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            owner_instance_id=owner_instance_id,
+            execution_epoch=execution_epoch,
+            outcome=event.data,
+        )
+    await repository.publish_wakeup(tenant_id, run_id)
+
+
 async def _cleanup_request_execution(
     graph_stream: AsyncGenerator[str] | None,
     cancellation_observer: CancellationObserver,
@@ -522,8 +574,17 @@ async def _persist_setup_failure(
 
 type TracerGraph = RequestOwnedGraph
 
-_PRE_ANSWER_RESUME_NODES = frozenset(
-    {"pre_moderation", "question_refinement", "retrieval", "reranking", "answer"}
+_RESUMABLE_NODES = frozenset(
+    {
+        "pre_moderation",
+        "question_refinement",
+        "retrieval",
+        "reranking",
+        "answer",
+        "groundedness",
+        "post_moderation",
+        "finalization",
+    }
 )
 
 
@@ -598,8 +659,8 @@ async def _authorize_thread_resume_target(
         raise ConversationNotFound(thread_id)
     if not snapshot.next:
         raise ThreadResumeConflict("checkpoint is already complete")
-    if any(node not in _PRE_ANSWER_RESUME_NODES for node in snapshot.next):
-        raise ThreadResumeConflict("checkpoint is not before the Answer phase")
+    if any(node not in _RESUMABLE_NODES for node in snapshot.next):
+        raise ThreadResumeConflict("checkpoint is not resumable")
     raw_snapshot_values: object = snapshot.values
     if not isinstance(raw_snapshot_values, dict):
         raise ThreadResumeConflict("checkpoint state is not a mapping")
@@ -852,22 +913,17 @@ def create_tracer_router(
                     event: TracerStreamEvent,
                 ) -> None:
                     nonlocal terminal
-                    if event.type == "done":
-                        await repository.complete_run_without_event(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                            outcome=event.data,
-                        )
-                    else:
-                        await repository.fail_run_without_event(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                            error=event.data,
-                        )
+                    await _terminalize_checkpoint_event(
+                        repository,
+                        message_repository,
+                        event,
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        conversation_id=conversation_id,
+                        turn_id=turn_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                    )
                     terminal = True
 
                 graph_stream = stream_graph(
@@ -1148,22 +1204,17 @@ def create_tracer_router(
                     event: TracerStreamEvent,
                 ) -> None:
                     nonlocal terminal
-                    if event.type == "done":
-                        await repository.complete_run_without_event(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                            outcome=event.data,
-                        )
-                    else:
-                        await repository.fail_run_without_event(
-                            tenant_id=x_application_id,
-                            run_id=run_id,
-                            owner_instance_id=claim.owner_instance_id,
-                            execution_epoch=claim.execution_epoch,
-                            error=event.data,
-                        )
+                    await _terminalize_checkpoint_event(
+                        repository,
+                        message_repository,
+                        event,
+                        tenant_id=x_application_id,
+                        run_id=run_id,
+                        conversation_id=target.conversation.conversation_id,
+                        turn_id=target.turn.turn_id,
+                        owner_instance_id=claim.owner_instance_id,
+                        execution_epoch=claim.execution_epoch,
+                    )
                     terminal = True
 
                 graph_stream = stream_graph(

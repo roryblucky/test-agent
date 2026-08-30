@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
+import psycopg
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -44,6 +45,7 @@ from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
+from tests.integration.test_langgraph_v2_tracer import parse_sse, persistent_tracer_app
 
 
 class _Retriever:
@@ -325,7 +327,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
 
 
 @pytest.mark.asyncio
-async def test_finalization_persists_one_complete_assistant_message_per_turn(
+async def test_graph_completion_does_not_publish_message_before_done_is_consumed(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     request_context = TrustedRequestContext(
@@ -385,7 +387,7 @@ async def test_finalization_persists_one_complete_assistant_message_per_turn(
         (message.role, message.content)
         for message in retained
         if message.turn_id == turn_id
-    ] == [("user", "hello"), ("assistant", "grounded answer [1]")]
+    ] == [("user", "hello")]
 
 
 def test_public_v2_sse_matches_final_output_golden(
@@ -430,6 +432,18 @@ def test_public_v2_sse_matches_final_output_golden(
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
+    async def read_messages() -> list[tuple[str, str]]:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            messages = await ConversationMessageRepository(pool).list_messages(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="c1",
+            )
+            return [(message.role, message.content) for message in messages]
+
     fixture = json.loads(
         (
             Path(__file__).parents[1]
@@ -464,3 +478,89 @@ def test_public_v2_sse_matches_final_output_golden(
         assert header in response.headers
     stable_done.pop("sequence", None)
     assert stable_done == fixture["event"]
+    assert asyncio.run(read_messages()) == [
+        ("user", "hello"),
+        ("assistant", "grounded answer [1]"),
+    ]
+
+
+def test_terminal_transaction_rolls_back_message_when_run_completion_crashes(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    async def seed() -> None:
+        async with AsyncConnectionPool(
+            langgraph_v2_migrated_database_url, min_size=1, max_size=2
+        ) as pool:
+            await ConversationMessageRepository(pool).resolve_conversation(
+                context=TrustedRequestContext(
+                    tenant_id="tenant-a", subject_id="subject-a"
+                ),
+                conversation_id="c1",
+            )
+
+    asyncio.run(seed())
+    with psycopg.connect(langgraph_v2_migrated_database_url) as connection:
+        connection.execute(
+            """
+            CREATE FUNCTION langgraph_v2.reject_run_completion()
+            RETURNS trigger AS $$
+            BEGIN
+                IF NEW.status = 'completed' THEN
+                    RAISE EXCEPTION 'forced terminalization failure';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER reject_run_completion
+            BEFORE UPDATE ON langgraph_v2.runs
+            FOR EACH ROW EXECUTE FUNCTION langgraph_v2.reject_run_completion()
+            """
+        )
+
+    app = persistent_tracer_app(
+        langgraph_v2_migrated_database_url,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        moderation_provider=_Moderation(),
+        answer_actor=_Answer(),
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/v2/query/stream",
+                json={"query": "hello", "sessionId": "c1"},
+                headers={
+                    "X-Application-Id": "tenant-a",
+                    "X-Subject-Id": "subject-a",
+                },
+            )
+
+        async def read_roles() -> list[str]:
+            async with AsyncConnectionPool(
+                langgraph_v2_migrated_database_url, min_size=1, max_size=2
+            ) as pool:
+                messages = await ConversationMessageRepository(pool).list_messages(
+                    context=TrustedRequestContext(
+                        tenant_id="tenant-a", subject_id="subject-a"
+                    ),
+                    conversation_id="c1",
+                )
+                return [message.role for message in messages]
+
+        assert parse_sse(response.text)[-1]["type"] == "error"
+        assert "forced terminalization failure" in parse_sse(response.text)[-1]["data"]
+        assert asyncio.run(read_roles()) == ["user"]
+    finally:
+        with psycopg.connect(
+            langgraph_v2_migrated_database_url, autocommit=True
+        ) as connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reject_run_completion ON langgraph_v2.runs"
+            )
+            connection.execute(
+                "DROP FUNCTION IF EXISTS langgraph_v2.reject_run_completion()"
+            )

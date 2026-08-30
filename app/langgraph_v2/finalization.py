@@ -145,21 +145,6 @@ async def run_finalization(
     if usage is not None:
         normalized["metadata"]["usage"] = usage
     response = TracerQueryResponse.model_validate(normalized)
-    answer = response.answer
-    turn_id = context.current_turn_id
-    if (
-        answer is not None
-        and turn_id is not None
-        and context.message_repository is not None
-        and context.request_context is not None
-    ):
-        await context.message_repository.persist_assistant_message_for_turn(
-            context=context.request_context,
-            conversation_id=response.conversation_id,
-            run_id=context.run_id,
-            turn_id=turn_id,
-            content=answer,
-        )
     return events, response
 
 

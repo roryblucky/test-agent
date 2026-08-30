@@ -28,7 +28,7 @@ from app.langgraph_v2.conversation_messages import (
     TurnRecord,
 )
 from app.langgraph_v2.graph import TracerState, build_tracer_graph
-from app.langgraph_v2.groundedness import GroundednessResult
+from app.langgraph_v2.groundedness import GroundednessAssessment
 from app.langgraph_v2.history import ConversationTurn
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.phase_results import PhaseExecutionContext, PhaseResultRepository
@@ -141,11 +141,11 @@ class _AssertingGroundednessActor:
 
     async def evaluate(
         self, answer: str, documents: list[Document]
-    ) -> GroundednessResult:
+    ) -> GroundednessAssessment:
         self.calls += 1
         assert answer == self.expected_answer
         assert [document.id for document in documents] == ["mock-doc-1"]
-        return GroundednessResult(is_grounded=True, score=1.0, details="advisory")
+        return GroundednessAssessment(is_grounded=True, score=1.0, details="advisory")
 
 
 class _AssertingModerationProvider:
@@ -318,6 +318,7 @@ async def _seed_pre_answer_checkpoint(
             checkpointer,
             phase_context=phase_context,
             answer_actor=_AnswerActor(),
+            groundedness_actor=_AssertingGroundednessActor("recovered answer"),
         )
         state: TracerState = {
             "query": "resume me",
@@ -536,9 +537,18 @@ class _BlockingResumeGraph:
 
 @pytest.mark.parametrize(
     "interrupt_before",
-    ["pre_moderation", "question_refinement", "retrieval", "reranking", "answer"],
+    [
+        "pre_moderation",
+        "question_refinement",
+        "retrieval",
+        "reranking",
+        "answer",
+        "groundedness",
+        "post_moderation",
+        "finalization",
+    ],
 )
-def test_thread_resume_recovers_pre_answer_checkpoint_from_fresh_app(
+def test_thread_resume_recovers_any_incomplete_node_from_fresh_app(
     langgraph_v2_migrated_database_url: str,
     interrupt_before: str,
 ) -> None:
@@ -555,6 +565,9 @@ def test_thread_resume_recovers_pre_answer_checkpoint_from_fresh_app(
         thread_resume_enabled=True,
         answer_actor=answer_actor,
     )
+    app.state.langgraph_v2_groundedness_actor = _AssertingGroundednessActor(
+        "recovered answer"
+    )
 
     with TestClient(app) as client:
         response = client.post(
@@ -569,7 +582,11 @@ def test_thread_resume_recovers_pre_answer_checkpoint_from_fresh_app(
     assert response.headers["x-conversation-id"] == "conversation-1"
     assert response.headers["x-turn-id"] == str(turn_id)
     assert "x-run-id" not in response.headers
-    assert answer_actor.calls == 1
+    assert answer_actor.calls == (
+        0
+        if interrupt_before in {"groundedness", "post_moderation", "finalization"}
+        else 1
+    )
     assert [event["type"] for event in delivered if event["type"] == "token"] == [
         "token",
         "token",
@@ -587,6 +604,8 @@ def test_thread_resume_recovers_pre_answer_checkpoint_from_fresh_app(
         for message in messages
         if message.turn_id == turn_id
     ] == [("user", "resume me"), ("assistant", "recovered answer")]
+    turn_messages = [message for message in messages if message.turn_id == turn_id]
+    assert turn_messages[0].run_id != turn_messages[1].run_id
 
 
 def test_thread_resume_reexecutes_interrupted_refinement_once_from_checkpoint(

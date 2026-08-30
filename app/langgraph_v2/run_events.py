@@ -624,32 +624,52 @@ class RunEventRepository:
         """Complete a transitional Run without persisting a transport Event."""
         async with self._pool.connection() as connection:
             async with connection.transaction():
-                async with connection.cursor(row_factory=dict_row) as cursor:
-                    await self._lock_and_validate_claim(
-                        cursor,
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        owner_instance_id=owner_instance_id,
-                        execution_epoch=execution_epoch,
-                    )
-                    await cursor.execute(
-                        """
-                        SELECT 1 FROM langgraph_v2.cancellation_intents
-                        WHERE tenant_id = %s AND run_id = %s
-                        """,
-                        (tenant_id, run_id),
-                    )
-                    if await cursor.fetchone() is not None:
-                        raise CancellationObserved(str(run_id))
-                await _set_terminal_status_in_transaction(
+                await self.complete_run_without_event_in_transaction(
                     connection,
                     tenant_id=tenant_id,
                     run_id=run_id,
-                    status="completed",
+                    owner_instance_id=owner_instance_id,
+                    execution_epoch=execution_epoch,
                     outcome=outcome,
                 )
         await self._publish_wakeup(tenant_id, run_id)
         return await self.get_run(tenant_id, run_id)
+
+    async def complete_run_without_event_in_transaction(
+        self,
+        connection: Any,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        owner_instance_id: str,
+        execution_epoch: int,
+        outcome: object,
+    ) -> None:
+        """Complete a claim inside a caller-owned terminal transaction."""
+        async with connection.cursor(row_factory=dict_row) as cursor:
+            await self._lock_and_validate_claim(
+                cursor,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                owner_instance_id=owner_instance_id,
+                execution_epoch=execution_epoch,
+            )
+            await cursor.execute(
+                """
+                SELECT 1 FROM langgraph_v2.cancellation_intents
+                WHERE tenant_id = %s AND run_id = %s
+                """,
+                (tenant_id, run_id),
+            )
+            if await cursor.fetchone() is not None:
+                raise CancellationObserved(str(run_id))
+        await _set_terminal_status_in_transaction(
+            connection,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            status="completed",
+            outcome=outcome,
+        )
 
     async def fail_run_without_event(
         self,
