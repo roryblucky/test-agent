@@ -81,21 +81,22 @@ async def test_fifty_warmed_query_streams_enter_graph_without_application_queue(
 
             graph.reset(concurrency)
             tasks: list[asyncio.Task[Response]] = []
-            async with asyncio.TaskGroup() as task_group:
-                tasks = [
-                    task_group.create_task(
-                        client.post(
-                            "/v2/query/stream",
-                            json={
-                                "query": "profile",
-                                "sessionId": f"profile-{index}",
-                            },
-                            headers=headers,
+            async with asyncio.timeout(15):
+                async with asyncio.TaskGroup() as task_group:
+                    tasks = [
+                        task_group.create_task(
+                            client.post(
+                                "/v2/query/stream",
+                                json={
+                                    "query": "profile",
+                                    "sessionId": f"profile-{index}",
+                                },
+                                headers=headers,
+                            )
                         )
-                    )
-                    for index in range(concurrency)
-                ]
-                await asyncio.wait_for(graph.all_entered.wait(), timeout=15)
+                        for index in range(concurrency)
+                    ]
+                    await graph.all_entered.wait()
 
             assert all(task.result().status_code == 200 for task in tasks)
 

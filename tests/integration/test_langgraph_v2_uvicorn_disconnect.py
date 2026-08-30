@@ -158,31 +158,38 @@ async def _serve_tcp_forwarding_proxy(upstream_port: int) -> AsyncGenerator[int]
         assert task is not None
         connections.add(task)
         upstream_writer: asyncio.StreamWriter | None = None
+        copy_tasks: tuple[asyncio.Task[None], ...] = ()
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", upstream_port),
                 timeout=5,
             )
-            client_to_upstream = asyncio.create_task(
-                copy(client_reader, upstream_writer)
-            )
-            upstream_to_client = asyncio.create_task(
-                copy(upstream_reader, client_writer)
-            )
             try:
+                client_to_upstream = asyncio.create_task(
+                    copy(client_reader, upstream_writer)
+                )
+                copy_tasks = (client_to_upstream,)
+                upstream_to_client = asyncio.create_task(
+                    copy(upstream_reader, client_writer)
+                )
+                copy_tasks = (client_to_upstream, upstream_to_client)
                 _, pending = await asyncio.wait(
-                    {client_to_upstream, upstream_to_client},
+                    set(copy_tasks),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for pending_task in pending:
                     pending_task.cancel()
-                await asyncio.gather(
-                    client_to_upstream,
-                    upstream_to_client,
-                    return_exceptions=True,
-                )
             finally:
-                await _abort_and_wait(upstream_writer)
+                try:
+                    for copy_task in copy_tasks:
+                        if not copy_task.done():
+                            copy_task.cancel()
+                    await asyncio.wait_for(
+                        asyncio.gather(*copy_tasks, return_exceptions=True),
+                        timeout=5,
+                    )
+                finally:
+                    await _abort_and_wait(upstream_writer)
         finally:
             await _abort_and_wait(client_writer)
             connections.discard(task)
@@ -195,15 +202,17 @@ async def _serve_tcp_forwarding_proxy(upstream_port: int) -> AsyncGenerator[int]
         yield port
     finally:
         server.close()
-        await asyncio.wait_for(server.wait_closed(), timeout=5)
-        connection_snapshot = tuple(connections)
-        for connection in connection_snapshot:
-            connection.cancel()
-        if connection_snapshot:
-            await asyncio.wait_for(
-                asyncio.gather(*connection_snapshot, return_exceptions=True),
-                timeout=5,
-            )
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=5)
+        finally:
+            connection_snapshot = tuple(connections)
+            for connection in connection_snapshot:
+                connection.cancel()
+            if connection_snapshot:
+                await asyncio.wait_for(
+                    asyncio.gather(*connection_snapshot, return_exceptions=True),
+                    timeout=5,
+                )
 
 
 @pytest.mark.asyncio
