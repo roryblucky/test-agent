@@ -20,7 +20,7 @@ from app.config.models import (
 )
 from app.core.http_client_pool import HttpClientPool
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.history import ConversationExchange
+from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.question_refinement import MockQuestionRefinementActor
 from app.models.domain import Document, GroundednessResult, ModerationResult

@@ -9,9 +9,8 @@ from psycopg_pool import AsyncConnectionPool
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
-from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
@@ -119,12 +118,6 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
             request_context=context,
         )
         frames = [frame async for frame in response.body_iterator]
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            messages = await ConversationMessageRepository(pool).list_messages(
-                context=context, conversation_id="00000000-0000-0000-0000-000000000001"
-            )
 
     assert moderation.calls == 2
     events = parse_sse("".join(frames))
@@ -132,10 +125,6 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
     assert token_text == "generated answer"
     assert events[-1]["type"] == "done"
     assert events[-1]["data"]["answer"] == token_text
-    assert [(message.role, message.content) for message in messages] == [
-        ("user", "hello"),
-        ("assistant", "generated answer"),
-    ]
 
 
 @pytest.mark.asyncio
@@ -145,21 +134,11 @@ async def test_safe_answer_passes_post_moderation_unchanged(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        messages = ConversationMessageRepository(pool)
-        await seed_subject_conversation(pool)
-        request_id = uuid4()
-        await messages.persist_user_message(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="00000000-0000-0000-0000-000000000001",
-            request_id=str(request_id),
-            content="hello",
-        )
         moderation = _SafeModeration()
         scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             moderation_provider=moderation,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -187,21 +166,12 @@ async def test_flagged_answer_remains_canonical_through_finalization(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        messages = ConversationMessageRepository(pool)
-        await seed_subject_conversation(pool)
         request_id = uuid4()
-        await messages.persist_user_message(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="00000000-0000-0000-0000-000000000001",
-            request_id=str(request_id),
-            content="hello",
-        )
         audit = MockOutputAssessmentAudit()
-        scope = await seed_request_scope(pool, request_id=request_id)
+        await seed_request_scope(pool, request_id=request_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=request_id,
-            request_context=scope.context,
             output_assessment_audit=audit,
             moderation_provider=_FlaggingModeration(),
             retriever=_Retriever(),
@@ -211,10 +181,6 @@ async def test_flagged_answer_remains_canonical_through_finalization(
         state = _state()
         state["request_id"] = str(request_id)
         result = await graph.ainvoke(state)
-        persisted_messages = await messages.list_messages(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="00000000-0000-0000-0000-000000000001",
-        )
 
     assert "answer" in result
     assert result["answer"] == "generated answer"
@@ -222,7 +188,6 @@ async def test_flagged_answer_remains_canonical_through_finalization(
     final_response = result["final_response"]
     assert final_response is not None
     assert final_response.answer == "generated answer"
-    assert [message.content for message in persisted_messages] == ["hello"]
     assert "post_moderation" in result
     post_moderation = result["post_moderation"]
     assert post_moderation is not None
@@ -245,7 +210,6 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             moderation_provider=_FailingPostModeration(),
             retriever=_Retriever(),
             ranker=_Ranker(),

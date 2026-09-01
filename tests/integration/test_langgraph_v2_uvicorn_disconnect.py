@@ -246,7 +246,6 @@ async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
             tracked_graph.target = build_linear_graph(
                 app.state.langgraph_v2_checkpointer,
                 tenant_id="tenant-a",
-                request_context=context,
                 retriever=_Retriever(),
                 ranker=_Ranker(),
                 answer_actor=answer_actor,

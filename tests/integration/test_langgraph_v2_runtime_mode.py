@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
-from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -19,7 +18,6 @@ from app.config.models import (
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.stream import RequestOwnedGraph
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
@@ -33,22 +31,6 @@ async def _conversation_count(database_url: str) -> int:
         async with pool.connection() as connection:
             result = await connection.execute(
                 "SELECT COUNT(*) FROM langgraph_v2.conversations"
-            )
-            row = await result.fetchone()
-    assert row is not None
-    return int(row[0])
-
-
-async def _message_count(database_url: str, conversation_id: UUID | str) -> int:
-    async with AsyncConnectionPool(database_url, min_size=1, max_size=1) as pool:
-        async with pool.connection() as connection:
-            result = await connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM langgraph_v2.messages
-                WHERE conversation_id = %s
-                """,
-                (conversation_id,),
             )
             row = await result.fetchone()
     assert row is not None
@@ -112,10 +94,9 @@ class _AgentRuntimeFactory:
         app: FastAPI,
         pool: AsyncConnectionPool[Any],
         request_context: TrustedRequestContext,
-        message_repository: ConversationMessageRepository,
         checkpointer: BaseCheckpointSaver[Any],
     ) -> GraphRuntimeAdapter:
-        del app, pool, request_context, message_repository, checkpointer
+        del app, pool, request_context, checkpointer
         return self.runtime
 
 
@@ -147,6 +128,16 @@ class _AgentTenantManager:
     def get_providers(self, tenant_id: str) -> object:
         assert tenant_id == "tenant-a"
         return object()
+
+
+class _ForbiddenCheckpointer:
+    def __init__(self) -> None:
+        self.reads = 0
+
+    async def aget_tuple(self, config: object) -> None:
+        del config
+        self.reads += 1
+        raise AssertionError("mode mismatch must not access checkpoints")
 
 
 def test_agent_tenant_query_ignores_client_mode_override(
@@ -184,6 +175,7 @@ def test_agent_tenant_query_ignores_client_mode_override(
             "query": "agent query",
             "conversation_id": str(conversation_id),
             "request_id": response.headers["X-Request-Id"],
+            "conversation_messages": [],
         }
     ]
 
@@ -223,9 +215,41 @@ def test_agent_runtime_cannot_override_shared_query_identity(
         }
     ]
     assert runtime.graph.inputs == []
-    assert asyncio.run(
-        _message_count(langgraph_v2_migrated_database_url, conversation_id)
-    ) == 0
+
+
+def test_fixed_conversation_mode_mismatch_precedes_graph_and_checkpoint_access(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    conversation_id = asyncio.run(
+        seed_subject_conversation(
+            langgraph_v2_migrated_database_url,
+            "linear-conversation-agent-tenant",
+            runtime_mode=LangGraphRuntimeMode.LINEAR,
+        )
+    )
+    runtime = _AgentRuntime()
+    checkpointer = _ForbiddenCheckpointer()
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=_AgentRuntimeFactory(runtime),
+    )
+    app.state.tenant_manager = _AgentTenantManager()
+
+    with TestClient(app) as client:
+        app.state.langgraph_v2_checkpointer = checkpointer
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "agent query", "sessionId": str(conversation_id)},
+            headers={
+                "X-Application-Id": "tenant-a",
+                "X-Subject-Id": "subject-a",
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Conversation not found"}
+    assert checkpointer.reads == 0
+    assert runtime.graph.inputs == []
 
 
 def test_query_requires_trusted_tenant_runtime_configuration(

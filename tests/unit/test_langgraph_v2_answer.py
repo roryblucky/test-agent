@@ -12,8 +12,8 @@ from app.langgraph_v2.answer import (
     build_answer_actor,
     run_answer,
 )
+from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.evidence import Evidence
-from app.langgraph_v2.history import ConversationExchange
 from app.models.domain import Document
 
 

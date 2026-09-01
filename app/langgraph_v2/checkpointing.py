@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import Any, cast
 
+from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
+from app.langgraph_v2.conversation_context import validate_request_identity
 
 
 def thread_id_for(tenant_id: str, conversation_id: str) -> str:
@@ -21,6 +26,36 @@ def thread_checkpoint_config(*, thread_id: str, checkpoint_ns: str) -> RunnableC
             "checkpoint_ns": checkpoint_ns,
         }
     }
+
+
+async def read_conversation_messages(
+    checkpointer: BaseCheckpointSaver[Any],
+    config: RunnableConfig,
+) -> list[BaseMessage]:
+    """Read the typed Conversation Message channel from the latest checkpoint."""
+    checkpoint_tuple = await checkpointer.aget_tuple(config)
+    if checkpoint_tuple is None:
+        return []
+    channel_values = checkpoint_tuple.checkpoint.get("channel_values", {})
+    raw_messages = cast(object, channel_values.get("conversation_messages", []))
+    if not isinstance(raw_messages, list) or not all(
+        isinstance(message, BaseMessage)
+        for message in cast(list[object], raw_messages)
+    ):
+        raise TypeError("checkpoint conversation_messages are invalid")
+    return cast(list[BaseMessage], raw_messages)
+
+
+async def validate_checkpoint_request_identity(
+    checkpointer: BaseCheckpointSaver[Any],
+    config: RunnableConfig,
+    *,
+    request_id: str,
+    query: str,
+) -> None:
+    """Validate a logical request against checkpointed Conversation Messages."""
+    messages = await read_conversation_messages(checkpointer, config)
+    validate_request_identity(messages, request_id=request_id, query=query)
 
 def _encode_parts(*parts: str) -> str:
     payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()

@@ -9,7 +9,10 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.contracts import LiveStreamEvent
-from app.langgraph_v2.history import ConversationExchange, to_model_message_history
+from app.langgraph_v2.conversation_context import (
+    ConversationExchange,
+    to_model_message_history,
+)
 from app.langgraph_v2.model_usage import model_usage_payload
 from app.models.workflow import ResolvedQuery
 

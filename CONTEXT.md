@@ -23,9 +23,12 @@ _Avoid_: Session, thread, chat session
 **Request**:
 A logical user request identified by the stable client `request_id`. Its user
 Message and final assistant Message share that identity within one Conversation.
+In the current Linear Core these Messages are short-term checkpoint state, not
+a product History record.
 
 **Conversation Summary**:
-A versioned compression of earlier Messages within one Conversation, used only to construct model context while the original Messages remain authoritative.
+A future versioned compression of earlier Conversation context, used only to
+construct model input. It is not implemented in the Linear Core.
 _Avoid_: Long-term memory, Evidence, source of truth
 
 **Run**:

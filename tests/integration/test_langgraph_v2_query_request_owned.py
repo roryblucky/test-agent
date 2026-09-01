@@ -8,12 +8,10 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.stream import GraphStreamCleanupError
 from tests.integration.test_langgraph_v2_linear_core import (
     close_stream_after_first_token,
@@ -150,6 +148,10 @@ class _BlockingAnswerActor:
         history: Sequence[Any],
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
+        if self.calls > 1:
+            yield AnswerStreamChunk(delta=result.answer)
+            yield AnswerStreamChunk(result=result)
+            return
         yield AnswerStreamChunk(delta="partial ")
         self.blocked_on_followup_read.set()
         try:
@@ -160,7 +162,7 @@ class _BlockingAnswerActor:
 
 
 @pytest.mark.asyncio
-async def test_query_executes_astream_in_request_and_persists_one_assistant_message(
+async def test_query_executes_request_owned_astream_and_emits_done(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
@@ -182,29 +184,15 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
         )
         frames = [frame async for frame in response.body_iterator]
 
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            messages = await ConversationMessageRepository(pool).list_messages(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="00000000-0000-0000-0000-000000000001",
-            )
-
     assert graph.astream_called is True
     assert _event_frame(frames[0]) == {
         "type": "done",
         "data": {"answer": "canonical answer"},
     }
-    assert [(message.role, message.content) for message in messages] == [
-        ("user", "hello"),
-        ("assistant", "canonical answer"),
-    ]
 
 
 @pytest.mark.asyncio
-async def test_query_retry_does_not_duplicate_request_messages(
+async def test_query_retry_reuses_client_request_id_header(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
@@ -229,18 +217,7 @@ async def test_query_retry_does_not_duplicate_request_messages(
             payload, stream_request(app), request_context=context
         )
         _ = [frame async for frame in repeated.body_iterator]
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            messages = await ConversationMessageRepository(pool).list_messages(
-                context=context, conversation_id="00000000-0000-0000-0000-000000000001"
-            )
-
     assert first.headers["x-request-id"] == repeated.headers["x-request-id"]
-    assert [(message.role, message.content) for message in messages] == [
-        ("user", "hello"),
-        ("assistant", "canonical answer"),
-    ]
 
 
 @pytest.mark.asyncio
@@ -324,30 +301,15 @@ async def test_query_yields_answer_delta_before_graph_completion(
         graph.stream.release.set()
         remaining = [frame async for frame in subscriber]
 
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            messages = await ConversationMessageRepository(pool).list_messages(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="00000000-0000-0000-0000-000000000001",
-            )
-
     assert _event_frame(remaining[-1])["data"]["answer"] == "partial complete"
-    assert [(message.role, message.content) for message in messages] == [
-        ("user", "hello"),
-        ("assistant", "partial complete"),
-    ]
 
 
 @pytest.mark.asyncio
 async def test_closing_query_after_answer_token_closes_answer_stream_and_persists_no_partial_assistant_message(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
+    conversation_id = UUID("00000000-0000-0000-0000-000000000022")
+    await seed_subject_conversation(langgraph_v2_migrated_database_url, conversation_id)
     answer_actor = _BlockingAnswerActor()
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
@@ -356,7 +318,7 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id=UUID("00000000-0000-0000-0000-000000000001")),
+            V2QueryRequest(query="hello", conversation_id=conversation_id),
             stream_request(app),
             request_context=TrustedRequestContext(
                 tenant_id="tenant-a", subject_id="subject-a"
@@ -368,21 +330,19 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
         )
         assert token_frame["data"] == "partial "
 
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            messages = await ConversationMessageRepository(pool).list_messages(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="00000000-0000-0000-0000-000000000001",
-            )
+        follow_up = await v2_stream_endpoint(app)(
+            V2QueryRequest(query="hello", conversation_id=conversation_id),
+            stream_request(app),
+            request_context=TrustedRequestContext(
+                tenant_id="tenant-a", subject_id="subject-a"
+            ),
+        )
+        follow_up_frames = [frame async for frame in follow_up.body_iterator]
 
-    assert answer_actor.calls == 1
+    assert answer_actor.calls == 2
     assert answer_actor.close_completed.is_set() is True
-    assert [(message.role, message.content) for message in messages] == [
-        ("user", "hello"),
-    ]
+    last_follow_up = _event_frame(follow_up_frames[-1])
+    assert last_follow_up["type"] == "done", last_follow_up
 
 
 @pytest.mark.asyncio

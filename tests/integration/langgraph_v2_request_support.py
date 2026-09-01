@@ -10,7 +10,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from app.config.models import LangGraphRuntimeMode
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.conversations import ConversationRepository
 
 
 @dataclass(frozen=True)
@@ -28,21 +28,15 @@ async def seed_request_scope(
     request_id: UUID | str | None = None,
     context: TrustedRequestContext | None = None,
 ) -> RequestScope:
-    """Create one authorized Conversation and user request Message."""
+    """Create one authorized Conversation request scope."""
     resolved_context = context or TrustedRequestContext(
         tenant_id="tenant-a", subject_id="subject-a"
     )
     resolved_request_id = str(request_id or uuid4())
-    messages = ConversationMessageRepository(pool)
-    conversation = await messages.create_conversation(
+    conversations = ConversationRepository(pool)
+    conversation = await conversations.create_conversation(
         context=resolved_context,
         runtime_mode=LangGraphRuntimeMode.LINEAR,
-    )
-    await messages.persist_user_message(
-        context=resolved_context,
-        conversation_id=conversation.conversation_id,
-        request_id=resolved_request_id,
-        content="question",
     )
     return RequestScope(
         context=resolved_context,

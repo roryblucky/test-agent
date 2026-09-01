@@ -28,9 +28,7 @@ from app.langgraph_v2.api import (
 )
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
-from app.langgraph_v2.conversation_messages import (
-    ConversationMessageRepository,
-)
+from app.langgraph_v2.conversations import ConversationRepository
 from app.langgraph_v2.graph import LinearGraphState
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationProvider
@@ -475,19 +473,20 @@ def test_request_header_and_generated_conversation_variants(
     UUID(conversation_id)
     assert repeated.headers["x-request-id"] == generated.headers["x-request-id"]
 
-    async def read_messages():
+    async def read_conversation():
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
-            return await ConversationMessageRepository(pool).list_messages(
+            return await ConversationRepository(pool).get_conversation(
                 context=TrustedRequestContext(
                     tenant_id="tenant-a", subject_id="subject-a"
                 ),
                 conversation_id=UUID(conversation_id),
             )
 
-    messages = asyncio.run(read_messages())
-    assert {message.request_id for message in messages} == {"request-1"}
+    conversation = asyncio.run(read_conversation())
+    assert conversation.updated_at > conversation.created_at
+
     assert parse_sse(generated.text)[-1]["data"]["session_id"] == conversation_id
     assert invalid_client_id.status_code == 422
 
@@ -629,6 +628,7 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
         "query": "hello",
         "conversation_id": "00000000-0000-0000-0000-000000000001",
         "request_id": request_id,
+        "conversation_messages": [],
     }
 
 

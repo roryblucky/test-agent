@@ -15,8 +15,8 @@ from app.langgraph_v2.answer import (
     AnswerResult,
     AnswerStreamChunk,
 )
+from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
-from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.stream import stream_graph
@@ -205,7 +205,6 @@ async def test_answer_receives_ranked_documents_on_each_execution(
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -239,7 +238,6 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
             checkpointer=MemorySaver(),
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_StreamingAnswerActor(),
@@ -385,7 +383,6 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -420,7 +417,6 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,
@@ -507,7 +503,6 @@ async def test_inline_citation_uses_reranked_evidence_position(
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=TwoRetriever(),
             ranker=ReverseRanker(),
             answer_actor=actor,
@@ -540,7 +535,6 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=actor,

@@ -64,20 +64,25 @@ query
   metadata, but they must not affect the Answer.
 - Never emit chain-of-thought.
 
-## Conversation, history and authorization
+## Conversation context and authorization
 
 - PostgreSQL `Conversation` is the durable authority for Tenant and Subject
-  ownership. Every query and history operation authorizes the requested
-  Conversation before accessing its Messages or checkpoints.
+  ownership, fixed runtime mode, and lifecycle. Every query authorizes the
+  requested Conversation before accessing its checkpoints.
+- An accepted query refreshes the Conversation's `updated_at` activity time.
 - Persist the Conversation's fixed `runtime_mode`. Derive LangGraph `thread_id`
   from Tenant plus Conversation UUID; never store or accept it as authorization
   input.
-- Persist one user Message and at most one final assistant Message with the same
-  stable logical `request_id`. Use `UNIQUE (conversation_id, request_id, role)`
-  for retry idempotency and an atomically allocated per-Conversation `sequence`
-  for history order. Do not store Turn identity or a separate idempotency key.
-- History initially uses the configured token-budgeted sliding window. LLM
-  context compression is a separate policy to add later.
+- Do not maintain an application Message History table. Store only one user
+  Message and at most one final assistant Message per stable logical
+  `request_id` in checkpointed Graph state using `add_messages`. Stable Message
+  IDs are derived from request ID plus role; internal Agent and Tool messages do
+  not enter this channel.
+- Model context includes only complete prior user/final-assistant request pairs
+  under the configured token-budgeted sliding window. The current request and
+  incomplete, failed, halted, or disconnected requests are excluded.
+- Reusing `clientRequestId` with the same query re-executes without duplicating
+  the request pair. Reusing it for a different query returns `409 Conflict`.
 - Redis is an optional cache only. Redis loss or eviction cannot grant access
   or override PostgreSQL/Checkpoint state.
 
@@ -99,7 +104,8 @@ query
 
 Keep only records with independent product value:
 
-- Conversation and Message history;
+- the minimal Conversation ownership and lifecycle registry;
+- checkpointed Conversation context Messages;
 - LangGraph PostgreSQL checkpoints;
 - lightweight document/source citation metadata needed by the final response;
 - BigQuery audit records;
@@ -119,10 +125,10 @@ application tables.
 - Contract tests compare v2 request and SSE behavior with the released UI/v1
   contract, including a real-time Answer stream and unchanged `done.answer`.
 - Tests prove low groundedness and flagged post-moderation do not suppress,
-  replace or alter the Answer or persisted assistant Message.
-- Real PostgreSQL tests prove Conversation Tenant/Subject authorization,
-  request-paired Message idempotency, atomic sequence order, fixed runtime mode,
-  and official checkpoint persistence.
+  replace or alter the Answer or final checkpointed assistant Message.
+- Real PostgreSQL tests prove Conversation Tenant/Subject authorization, fixed
+  runtime mode, request-paired checkpoint Message idempotency, incomplete
+  request exclusion, and official checkpoint persistence across multiple turns.
 - Disconnect tests run through real Uvicorn and the deployment proxy boundary
   and prove the Graph iterator is cancelled and awaited.
 - An opt-in load profile proves 50 simultaneous `/v2/query/stream` requests

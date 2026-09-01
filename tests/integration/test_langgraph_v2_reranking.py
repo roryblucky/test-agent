@@ -45,7 +45,6 @@ async def test_ranker_receives_original_documents_and_returns_reordered_evidence
         result = await build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=Retriever(),
             ranker=ranker,
         ).ainvoke(
@@ -93,7 +92,6 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
         result = await build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=DuplicateRetriever(),
             ranker=InvalidRanker(),
         ).ainvoke(
@@ -138,7 +136,6 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
         result = await build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=DuplicateRetriever(),
             ranker=ReverseRanker(),
         ).ainvoke(

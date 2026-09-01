@@ -19,6 +19,9 @@ Conversation/Message history model agreed for the chat UI.
 
 ## Comments
 
+- Superseded before deployment by Task 52, which removes the application
+  Message History table and moves multi-turn context to official checkpoints.
+
 - User confirmed that `sessionId` remains the Conversation ID and
   `clientRequestId` is the stable logical request ID shared by the user Message
   and final assistant Message. Agent intermediate events remain SSE-only.

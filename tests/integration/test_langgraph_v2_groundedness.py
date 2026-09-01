@@ -11,15 +11,13 @@ from psycopg_pool import AsyncConnectionPool
 from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerCitation, AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.groundedness import (
     GroundednessAssessment,
     GroundednessOutput,
     PydanticAIGroundednessActor,
 )
-from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
@@ -117,11 +115,10 @@ async def test_low_groundedness_is_advisory_on_each_execution(
         evaluator = _Groundedness()
         audit = MockOutputAssessmentAudit()
         request_id = uuid4()
-        scope = await seed_request_scope(pool, request_id=request_id)
+        await seed_request_scope(pool, request_id=request_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=request_id,
-            request_context=scope.context,
             output_assessment_audit=audit,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -168,7 +165,6 @@ def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = "00000000-0000-0000-0000-000000000004"
-    context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     asyncio.run(
         seed_subject_conversation(
             langgraph_v2_migrated_database_url,
@@ -190,22 +186,11 @@ def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
-    async def read_assistant_message() -> str:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            messages = await ConversationMessageRepository(pool).list_messages(
-                context=context,
-                conversation_id=conversation_id,
-            )
-            return messages[-1].content
-
     events = parse_sse(response.text)
     token_text = "".join(event["data"] for event in events if event["type"] == "token")
     assert token_text == "answer [1]"
     assert events[-1]["type"] == "done"
     assert events[-1]["data"]["answer"] == token_text
-    assert asyncio.run(read_assistant_message()) == token_text
 
 
 def test_new_request_does_not_inherit_prior_groundedness_when_evaluation_fails(
@@ -299,11 +284,10 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         evaluator = Failing()
         audit = MockOutputAssessmentAudit()
         request_id = uuid4()
-        scope = await seed_request_scope(pool, request_id=request_id)
+        await seed_request_scope(pool, request_id=request_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=request_id,
-            request_context=scope.context,
             output_assessment_audit=audit,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -352,7 +336,6 @@ async def test_groundedness_uses_only_cited_documents(
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_UncitedAnswer(),
@@ -390,7 +373,6 @@ async def test_groundedness_rejects_out_of_range_scores(
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
             answer_actor=_Answer(),
@@ -476,7 +458,6 @@ async def test_assessment_audit_failure_does_not_gate_answer(
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             output_assessment_audit=_FailingAssessmentAudit(),
             retriever=_Retriever(),
             ranker=_Ranker(),

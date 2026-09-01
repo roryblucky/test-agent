@@ -3,7 +3,7 @@
 Run the static and full-suite gates with:
 
 ```shell
-uv run ruff check app tests alembic/versions/0014_drop_run_lifecycle.py
+uv run ruff check app tests alembic/versions/0017_drop_message_history.py
 uv run pyright --pythonpath .venv/bin/python
 LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms_test_42' \
   PYTHONPATH=. uv run pytest tests
@@ -28,8 +28,9 @@ LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms
 This is the single functional UAT gate. It covers clean and incremental
 migrations, schema preservation, the released request/SSE contract, official
 PostgreSQL checkpoint persistence, a real Uvicorn TCP disconnect, Tenant and
-Subject isolation, Request-paired Message publication, advisory output assessments,
-and the public query stream. The TCP test binds only to loopback, sends the request through a real
+Subject isolation, Request-paired checkpoint context, advisory output
+assessments, and the public query stream. The TCP test binds only to loopback,
+sends the request through a real
 local TCP forwarding proxy, and closes its client socket, proxy connections,
 and server under bounded timeouts. This deterministic proxy-boundary test does
 not reproduce an enterprise proxy implementation; repeat the disconnect case

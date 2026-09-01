@@ -16,6 +16,7 @@ from typing import Annotated, Any, Protocol, TypedDict, cast
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from psycopg_pool import AsyncConnectionPool
 from starlette.requests import ClientDisconnect
@@ -27,18 +28,25 @@ from app.langgraph_v2.authorization import (
     TrustedRequestContext,
     get_trusted_request_context,
 )
-from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
+from app.langgraph_v2.checkpointing import (
+    thread_checkpoint_config,
+    thread_id_for,
+    validate_checkpoint_request_identity,
+)
 from app.langgraph_v2.contracts import (
     LiveStreamEvent,
     V2QueryRequest,
 )
-from app.langgraph_v2.conversation_messages import (
-    ConversationMessageRepository,
+from app.langgraph_v2.conversation_context import (
+    DEFAULT_HISTORY_TOKEN_BUDGET,
+    RequestIdentityConflict,
+)
+from app.langgraph_v2.conversations import (
     ConversationModeConflict,
     ConversationNotFound,
+    ConversationRepository,
 )
 from app.langgraph_v2.groundedness import GroundednessActor
-from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
 from app.langgraph_v2.linear_runtime import LinearGraphOverrides, build_linear_runtime
 from app.langgraph_v2.output_assessments import OutputAssessmentAudit
 from app.langgraph_v2.pre_moderation import ModerationProvider
@@ -120,32 +128,6 @@ def _ensure_tenant_available(app: FastAPI, tenant_id: str) -> None:
             manager.get_model_registry(tenant_id)
     except TenantNotFoundError as error:
         raise HTTPException(status_code=404, detail="Tenant not found") from error
-
-
-async def _terminalize_checkpoint_event(
-    message_repository: ConversationMessageRepository,
-    event: LiveStreamEvent,
-    *,
-    context: TrustedRequestContext,
-    conversation_id: uuid.UUID,
-    request_id: str,
-) -> None:
-    """Persist a successful final answer exactly once by request."""
-    if event.type == "error":
-        return
-    if event.type != "done":
-        raise ValueError("checkpoint terminalization requires done or error")
-
-    raw_data: object = event.data
-    data = cast(dict[str, Any], raw_data) if isinstance(raw_data, dict) else {}
-    answer = data.get("answer")
-    if isinstance(answer, str):
-        await message_repository.persist_assistant_message(
-            context=context,
-            conversation_id=conversation_id,
-            request_id=request_id,
-            content=answer,
-        )
 
 
 async def _cleanup_request_execution(
@@ -247,11 +229,11 @@ def _reject_removed_replay_query_parameters(request: Request) -> None:
         )
 
 
-def _message_repository(
+def _conversation_repository(
     pool: AsyncConnectionPool[Any],
-) -> ConversationMessageRepository:
-    """Build the Tenant-scoped Message repository."""
-    return ConversationMessageRepository(pool)
+) -> ConversationRepository:
+    """Build the Tenant-scoped Conversation registry."""
+    return ConversationRepository(pool)
 
 
 class GraphRuntimeAdapter(Protocol):
@@ -283,7 +265,6 @@ class GraphRuntimeFactory(Protocol):
         app: FastAPI,
         pool: AsyncConnectionPool[Any],
         request_context: TrustedRequestContext,
-        message_repository: ConversationMessageRepository,
         checkpointer: BaseCheckpointSaver[Any],
     ) -> GraphRuntimeAdapter:
         """Return the runtime for the authenticated Tenant request."""
@@ -296,6 +277,7 @@ class _QueryGraphState(TypedDict):
     query: str
     conversation_id: str
     request_id: str
+    conversation_messages: list[BaseMessage]
 
 
 def _initial_graph_state(
@@ -309,6 +291,7 @@ def _initial_graph_state(
         "query": payload.query,
         "conversation_id": conversation_id,
         "request_id": request_id,
+        "conversation_messages": [],
     }
     runtime_fields = runtime.initial_state_fields(payload=payload)
     overlapping_fields = common_state.keys() & runtime_fields.keys()
@@ -335,7 +318,6 @@ def _resolve_graph_runtime(
     *,
     pool: AsyncConnectionPool[Any],
     request_context: TrustedRequestContext,
-    message_repository: ConversationMessageRepository,
     checkpointer: BaseCheckpointSaver[Any],
     runtime_mode: LangGraphRuntimeMode,
     linear_graph_override: RequestOwnedGraph | None,
@@ -347,8 +329,6 @@ def _resolve_graph_runtime(
         return build_linear_runtime(
             app,
             tenant_id=request_context.tenant_id,
-            request_context=request_context,
-            message_repository=message_repository,
             checkpointer=checkpointer,
             overrides=linear_overrides,
             graph_override=linear_graph_override,
@@ -359,7 +339,6 @@ def _resolve_graph_runtime(
         app=app,
         pool=pool,
         request_context=request_context,
-        message_repository=message_repository,
         checkpointer=checkpointer,
     )
     if runtime.runtime_mode is not LangGraphRuntimeMode.AGENT:
@@ -413,12 +392,11 @@ def create_v2_router(
                 status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
             )
         pool = cast(AsyncConnectionPool[Any], configured_pool)
-        message_repository = _message_repository(pool)
+        conversation_repository = _conversation_repository(pool)
         runtime = _resolve_graph_runtime(
             http_request.app,
             pool=pool,
             request_context=request_context,
-            message_repository=message_repository,
             checkpointer=checkpointer,
             runtime_mode=runtime_mode,
             linear_graph_override=linear_graph_override,
@@ -427,12 +405,12 @@ def create_v2_router(
         )
         try:
             if payload.conversation_id is None:
-                conversation = await message_repository.create_conversation(
+                conversation = await conversation_repository.create_conversation(
                     context=request_context,
                     runtime_mode=runtime_mode,
                 )
             else:
-                conversation = await message_repository.get_conversation(
+                conversation = await conversation_repository.get_conversation(
                     context=request_context,
                     conversation_id=payload.conversation_id,
                     runtime_mode=runtime_mode,
@@ -443,40 +421,39 @@ def create_v2_router(
             ) from error
         conversation_id = str(conversation.conversation_id)
         request_id = payload.client_request_id or str(uuid.uuid4())
+        graph_config = thread_checkpoint_config(
+            thread_id=thread_id_for(tenant_id, conversation_id),
+            checkpoint_ns="",
+        )
+        try:
+            await validate_checkpoint_request_identity(
+                checkpointer,
+                graph_config,
+                request_id=request_id,
+                query=payload.query,
+            )
+        except RequestIdentityConflict as error:
+            raise HTTPException(
+                status_code=409,
+                detail="clientRequestId was already used for a different query",
+            ) from error
+        await conversation_repository.touch_conversation(
+            context=request_context,
+            conversation_id=conversation.conversation_id,
+        )
 
         async def create_graph_stream() -> AsyncGenerator[str]:
             selected_graph = runtime.build_graph(request_id=request_id)
-            graph_config = thread_checkpoint_config(
-                thread_id=thread_id_for(tenant_id, conversation_id),
-                checkpoint_ns="",
-            )
             state = _initial_graph_state(
                 runtime,
                 payload=payload,
                 conversation_id=conversation_id,
                 request_id=request_id,
             )
-            await message_repository.persist_user_message(
-                context=request_context,
-                conversation_id=conversation.conversation_id,
-                request_id=request_id,
-                content=payload.query,
-            )
-
-            async def terminalize_checkpoint_event(event: LiveStreamEvent) -> None:
-                await _terminalize_checkpoint_event(
-                    message_repository,
-                    event,
-                    context=request_context,
-                    conversation_id=conversation.conversation_id,
-                    request_id=request_id,
-                )
-
             return stream_graph(
                 selected_graph,
                 state,
                 config=graph_config,
-                terminal_sink=terminalize_checkpoint_event,
             )
 
         return _RequestOwnedStreamingResponse(

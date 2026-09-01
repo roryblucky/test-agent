@@ -6,8 +6,8 @@ from collections.abc import Sequence
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
+from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
-from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
     PydanticAIQuestionRefinementActor,

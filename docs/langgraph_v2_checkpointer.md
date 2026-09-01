@@ -16,8 +16,15 @@ Application identifiers are encoded as URL-safe base64 JSON tuples:
 Query passes the shared official saver directly to LangGraph. PostgreSQL holds
 the official checkpoint state; there is no application checkpoint pointer,
 fenced saver, claim, lease, heartbeat, or execution epoch. This stage exposes
-no Resume or computation-recovery API. Completed finalization writes the
-assistant Message idempotently by logical request ID.
+no Resume or computation-recovery API.
+
+The root Graph state carries `conversation_messages` with LangGraph's
+`add_messages` reducer. Only the logical user Message and final assistant
+Message enter that channel, using stable request-and-role IDs. Completed
+finalization checkpoints the final assistant Message before `done` is released
+to the client. Model context is projected from complete prior request pairs;
+incomplete failed, halted, or disconnected requests are ignored. There is no
+separate application Message History table.
 
 Checkpoint rows are internal journal state. They do not create application
 Events and are not emitted in the query SSE stream.

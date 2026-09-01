@@ -11,9 +11,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.config.models import LangGraphRuntimeMode
 from app.langgraph_v2.answer import AnswerActor, build_answer_actor
-from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import LinearGraph, build_linear_graph
 from app.langgraph_v2.groundedness import (
     GroundednessActor,
@@ -61,8 +59,6 @@ class _LinearGraphDependencies:
 
     checkpointer: BaseCheckpointSaver[Any]
     tenant_id: str
-    message_repository: ConversationMessageRepository
-    request_context: TrustedRequestContext
     history_token_budget: int
     output_assessment_audit: OutputAssessmentAudit
     refinement_actor: QuestionRefinementActor | None
@@ -106,8 +102,6 @@ def build_linear_runtime(
     app: FastAPI,
     *,
     tenant_id: str,
-    request_context: TrustedRequestContext,
-    message_repository: ConversationMessageRepository,
     checkpointer: BaseCheckpointSaver[Any],
     overrides: LinearGraphOverrides,
     graph_override: RequestOwnedGraph | None,
@@ -122,8 +116,6 @@ def build_linear_runtime(
     dependencies = _LinearGraphDependencies(
         checkpointer=checkpointer,
         tenant_id=tenant_id,
-        message_repository=message_repository,
-        request_context=request_context,
         history_token_budget=overrides.history_token_budget,
         output_assessment_audit=_resolve_output_assessment_audit(
             app, overrides.output_assessment_audit
@@ -265,8 +257,6 @@ def _build_graph(
         dependencies.checkpointer,
         tenant_id=dependencies.tenant_id,
         current_request_id=request_id,
-        message_repository=dependencies.message_repository,
-        request_context=dependencies.request_context,
         history_token_budget=dependencies.history_token_budget,
         output_assessment_audit=dependencies.output_assessment_audit,
         refinement_actor=dependencies.refinement_actor,

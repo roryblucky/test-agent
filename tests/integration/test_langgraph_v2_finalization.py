@@ -25,11 +25,17 @@ from app.api.dependencies import TenantContext, get_tenant
 from app.api.router import router as legacy_router
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.api import register_v2_routes
-from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.checkpointing import (
+    read_conversation_messages,
+    thread_checkpoint_config,
+    thread_id_for,
+)
+from app.langgraph_v2.conversation_context import (
+    ConversationExchange,
+    select_conversation_context,
+)
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
-from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.question_refinement import (
@@ -230,7 +236,6 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
         graph = build_linear_graph(
             tenant_id="tenant-a",
             current_request_id=scope.request_id,
-            request_context=scope.context,
             moderation_provider=moderation,
             refinement_actor=_UsageRefinement(),
             retriever=_Retriever(),
@@ -300,49 +305,30 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
 
 
 @pytest.mark.asyncio
-async def test_graph_finalization_does_not_own_assistant_message_persistence(
+async def test_graph_finalization_records_complete_conversation_exchange(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    request_context = TrustedRequestContext(
-        tenant_id="tenant-a", subject_id="subject-a"
-    )
     request_id = uuid4()
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        messages = ConversationMessageRepository(pool)
-        await seed_subject_conversation(pool)
-        await messages.persist_user_message(
-            context=request_context,
-            conversation_id="00000000-0000-0000-0000-000000000001",
-            request_id=str(request_id),
-            content="hello",
-        )
-        answer = _Answer()
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=request_id,
-            message_repository=messages,
-            request_context=request_context,
-            moderation_provider=_Moderation(),
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=answer,
-        )
-        state: LinearGraphState = {**_state(), "request_id": str(request_id)}
+    answer = _Answer()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=str(request_id),
+        moderation_provider=_Moderation(),
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=answer,
+    )
+    state: LinearGraphState = {**_state(), "request_id": str(request_id)}
 
-        await graph.ainvoke(state)
-        await graph.ainvoke(state)
-        retained = await messages.list_messages(
-            context=request_context, conversation_id="00000000-0000-0000-0000-000000000001"
-        )
+    result = await graph.ainvoke(state)
+    retained = select_conversation_context(
+        result.get("conversation_messages", []), token_budget=100
+    )
 
-    assert answer.calls == 2
-    assert [
-        (message.role, message.content)
-        for message in retained
-        if message.request_id == str(request_id)
-    ] == [("user", "hello")]
+    assert answer.calls == 1
+    assert [exchange.model_dump() for exchange in retained] == [
+        {"user": "hello", "assistant": "grounded answer [1]"}
+    ]
 
 
 def test_public_v2_sse_matches_final_output_golden(
@@ -383,18 +369,6 @@ def test_public_v2_sse_matches_final_output_golden(
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
-    async def read_messages() -> list[tuple[str, str]]:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            messages = await ConversationMessageRepository(pool).list_messages(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="00000000-0000-0000-0000-000000000001",
-            )
-            return [(message.role, message.content) for message in messages]
-
     fixture = json.loads(
         (
             Path(__file__).parents[1]
@@ -427,10 +401,6 @@ def test_public_v2_sse_matches_final_output_golden(
     for header in v2_fixture["required_response_headers"]:
         assert header in response.headers
     assert stable_done == fixture["event"]
-    assert asyncio.run(read_messages()) == [
-        ("user", "hello"),
-        ("assistant", "grounded answer [1]"),
-    ]
 
 
 def test_terminal_checkpoint_failure_does_not_persist_assistant(
@@ -472,21 +442,20 @@ def test_terminal_checkpoint_failure_does_not_persist_assistant(
                 "X-Subject-Id": "subject-a",
             },
         )
-
-    async def read_roles() -> list[str]:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            messages = await ConversationMessageRepository(pool).list_messages(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id=conversation_id,
-            )
-            return [message.role for message in messages]
+        assert client.portal is not None
+        messages = client.portal.call(
+            read_conversation_messages,
+            app.state.langgraph_v2_checkpointer,
+            thread_checkpoint_config(
+                thread_id=thread_id_for("tenant-a", conversation_id),
+                checkpoint_ns="",
+            ),
+        )
 
     delivered = parse_sse(response.text)
     assert all(event["type"] != "done" for event in delivered)
     assert delivered[-1]["type"] == "error"
     assert "forced terminal checkpoint failure" in delivered[-1]["data"]
-    assert asyncio.run(read_roles()) == ["user"]
+    assert [message.id for message in messages if message.id is not None] == [
+        f"{response.headers['x-request-id']}:user"
+    ]

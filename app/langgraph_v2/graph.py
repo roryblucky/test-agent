@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Hashable, Iterable, Mapping
 from typing import Annotated, Any, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
+from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.channels import UntrackedValue  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -16,20 +17,23 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
     START,
     StateGraph,
 )
+from langgraph.graph.message import (  # pyright: ignore[reportMissingTypeStubs]
+    add_messages,
+)
 from langgraph.types import StateSnapshot
 
 from app.langgraph_v2.answer import AnswerActor, run_answer
-from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import LinearQueryResponse, LiveStreamEvent
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
+from app.langgraph_v2.conversation_context import (
+    DEFAULT_HISTORY_TOKEN_BUDGET,
+    ConversationExchange,
+    assistant_conversation_message,
+    request_user_message_update,
+    select_conversation_context,
+)
 from app.langgraph_v2.evidence import Evidence
 from app.langgraph_v2.finalization import run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
-from app.langgraph_v2.history import (
-    DEFAULT_HISTORY_TOKEN_BUDGET,
-    ConversationExchange,
-    select_sliding_window_history,
-)
 from app.langgraph_v2.output_assessments import OutputAssessmentAudit
 from app.langgraph_v2.post_moderation import run_post_moderation
 from app.langgraph_v2.pre_moderation import (
@@ -54,7 +58,8 @@ class LinearGraphState(TypedDict):
     query: str
     conversation_id: str
     request_id: str
-    history: NotRequired[list[ConversationExchange]]
+    conversation_messages: NotRequired[Annotated[list[BaseMessage], add_messages]]
+    history: NotRequired[Annotated[list[ConversationExchange], UntrackedValue]]
     halted: NotRequired[bool]
     moderation: NotRequired[dict[str, Any] | None]
     refined_query: NotRequired[str | None]
@@ -80,6 +85,7 @@ class LinearGraphStateUpdate(TypedDict, total=False):
     """Partial state update returned by one Linear Graph node."""
 
     history: list[ConversationExchange]
+    conversation_messages: list[BaseMessage]
     halted: bool
     moderation: dict[str, Any] | None
     refined_query: str | None
@@ -134,25 +140,22 @@ class LinearGraph(Protocol):
 async def _query(
     state: LinearGraphState,
     *,
-    message_repository: ConversationMessageRepository | None = None,
-    request_context: TrustedRequestContext | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
-    current_request_id: UUID | str | None = None,
 ) -> LinearGraphStateUpdate:
     query = state["query"]
     canonical = canonical_query(query)
 
-    history: list[ConversationExchange] = []
-    if message_repository is not None and request_context is not None:
-        messages = await message_repository.list_messages(
-            context=request_context,
-            conversation_id=UUID(state["conversation_id"]),
-        )
-        history = select_sliding_window_history(
-            messages,
-            token_budget=history_token_budget,
-            current_request_id=str(current_request_id or state["request_id"]),
-        )
+    conversation_messages = state.get("conversation_messages", [])
+    message_update = request_user_message_update(
+        conversation_messages,
+        request_id=state["request_id"],
+        query=query,
+    )
+    history = select_conversation_context(
+        conversation_messages,
+        token_budget=history_token_budget,
+        current_request_id=state["request_id"],
+    )
     _emit_events(
         (
             LiveStreamEvent(
@@ -168,6 +171,7 @@ async def _query(
     )
     return {
         "history": history,
+        "conversation_messages": message_update,
         "halted": False,
         "moderation": None,
         "refined_query": None,
@@ -220,8 +224,6 @@ def build_linear_graph(
     *,
     tenant_id: str | None = None,
     current_request_id: UUID | str | None = None,
-    message_repository: ConversationMessageRepository | None = None,
-    request_context: TrustedRequestContext | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     output_assessment_audit: OutputAssessmentAudit | None = None,
     moderation_provider: ModerationProvider | None = None,
@@ -232,16 +234,8 @@ def build_linear_graph(
     groundedness_actor: GroundednessActor | None = None,
 ) -> LinearGraph:
     """Compile the deterministic ingress-to-finalization Linear Graph."""
-    if message_repository is not None and request_context is None:
-        raise ValueError("request_context is required with message_repository")
     if answer_actor is not None and tenant_id is None:
         raise ValueError("tenant_id is required with answer_actor")
-    if (
-        tenant_id is not None
-        and request_context is not None
-        and request_context.tenant_id != tenant_id
-    ):
-        raise ValueError("request_context tenant_id must match tenant_id")
 
     builder: StateGraph[LinearGraphState, None, LinearGraphState, LinearGraphState] = (
         StateGraph(LinearGraphState)
@@ -250,10 +244,7 @@ def build_linear_graph(
     async def query_node(state: LinearGraphState) -> LinearGraphStateUpdate:
         return await _query(
             state,
-            message_repository=message_repository,
-            request_context=request_context,
             history_token_budget=history_token_budget,
-            current_request_id=current_request_id,
         )
 
     builder.add_node("query", query_node)  # pyright: ignore[reportUnknownMemberType]
@@ -418,9 +409,14 @@ def build_linear_graph(
                 ),
             )
         )
-        return {
+        update: LinearGraphStateUpdate = {
             "final_response": response,
         }
+        if response.answer is not None:
+            update["conversation_messages"] = [
+                assistant_conversation_message(state["request_id"], response.answer)
+            ]
+        return update
 
     builder.add_node(  # pyright: ignore[reportUnknownMemberType]
         "finalization", finalization_node

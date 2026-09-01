@@ -1,7 +1,7 @@
 -- LangGraph Linear Core PostgreSQL bootstrap DDL.
 --
 -- This file represents the schema at Alembic revision
--- 0016_history_redesign. It is intended for a new, empty PostgreSQL
+-- 0017_drop_history. It is intended for a new, empty PostgreSQL
 -- database. Existing databases should continue to use Alembic migrations.
 --
 -- The public checkpoint tables match langgraph-checkpoint-postgres 3.1.2.
@@ -19,36 +19,12 @@ CREATE TABLE langgraph_v2.conversations (
     runtime_mode TEXT NOT NULL
         CONSTRAINT conversations_runtime_mode_check
         CHECK (runtime_mode IN ('linear', 'agent')),
-    next_message_sequence BIGINT NOT NULL DEFAULT 1
-        CONSTRAINT conversations_next_message_sequence_check
-        CHECK (next_message_sequence > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX conversations_history_idx
-    ON langgraph_v2.conversations (
-        tenant_id, owner_subject_id, updated_at DESC
-    );
-
-CREATE TABLE langgraph_v2.messages (
-    message_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    conversation_id UUID NOT NULL
-        REFERENCES langgraph_v2.conversations (conversation_id)
-        ON DELETE CASCADE,
-    request_id TEXT NOT NULL,
-    sequence BIGINT NOT NULL
-        CONSTRAINT messages_sequence_check CHECK (sequence > 0),
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT messages_role_check
-        CHECK (role IN ('user', 'assistant')),
-    CONSTRAINT messages_request_role_unique
-        UNIQUE (conversation_id, request_id, role),
-    CONSTRAINT messages_conversation_sequence_unique
-        UNIQUE (conversation_id, sequence)
-);
+CREATE INDEX conversations_owner_idx
+    ON langgraph_v2.conversations (tenant_id, owner_subject_id);
 
 -- Official LangGraph PostgreSQL checkpointer tables intentionally remain in
 -- the public schema because AsyncPostgresSaver uses these unqualified names.
@@ -113,6 +89,6 @@ CREATE TABLE public.alembic_version (
 );
 
 INSERT INTO public.alembic_version (version_num)
-VALUES ('0016_history_redesign');
+VALUES ('0017_drop_history');
 
 COMMIT;
