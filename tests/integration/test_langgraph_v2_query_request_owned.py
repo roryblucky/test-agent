@@ -5,6 +5,7 @@ import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
 from typing import Any
+from uuid import UUID
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -163,14 +164,17 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
     graph = _CompletedGraph()
     app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            V2QueryRequest(
+                query="hello",
+                conversation_id=UUID("00000000-0000-0000-0000-000000000001"),
+            ),
             stream_request(app),
             request_context=TrustedRequestContext(
                 tenant_id="tenant-a", subject_id="subject-a"
@@ -185,7 +189,7 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
                 context=TrustedRequestContext(
                     tenant_id="tenant-a", subject_id="subject-a"
                 ),
-                conversation_id="conversation-1",
+                conversation_id="00000000-0000-0000-0000-000000000001",
             )
 
     assert graph.astream_called is True
@@ -200,11 +204,11 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
 
 
 @pytest.mark.asyncio
-async def test_query_retry_does_not_duplicate_turn_messages(
+async def test_query_retry_does_not_duplicate_request_messages(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url, _RetryCompletedGraph()
@@ -212,7 +216,7 @@ async def test_query_retry_does_not_duplicate_turn_messages(
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     payload = V2QueryRequest(
         query="hello",
-        conversation_id="conversation-1",
+        conversation_id=UUID("00000000-0000-0000-0000-000000000001"),
         client_request_id="request-1",
     )
 
@@ -229,10 +233,10 @@ async def test_query_retry_does_not_duplicate_turn_messages(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
             messages = await ConversationMessageRepository(pool).list_messages(
-                context=context, conversation_id="conversation-1"
+                context=context, conversation_id="00000000-0000-0000-0000-000000000001"
             )
 
-    assert first.headers["x-turn-id"] == repeated.headers["x-turn-id"]
+    assert first.headers["x-request-id"] == repeated.headers["x-request-id"]
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
         ("assistant", "canonical answer"),
@@ -244,7 +248,7 @@ async def test_closing_query_sse_closes_graph_without_persisting_a_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
 
     class BlockingStream:
@@ -277,7 +281,7 @@ async def test_closing_query_sse_closes_graph_without_persisting_a_run(
     app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            V2QueryRequest(query="hello", conversation_id=UUID("00000000-0000-0000-0000-000000000001")),
             stream_request(app),
             request_context=TrustedRequestContext(
                 tenant_id="tenant-a", subject_id="subject-a"
@@ -300,14 +304,14 @@ async def test_query_yields_answer_delta_before_graph_completion(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
     graph = _RealtimeGraph()
     app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            V2QueryRequest(query="hello", conversation_id=UUID("00000000-0000-0000-0000-000000000001")),
             stream_request(app),
             request_context=TrustedRequestContext(
                 tenant_id="tenant-a", subject_id="subject-a"
@@ -327,7 +331,7 @@ async def test_query_yields_answer_delta_before_graph_completion(
                 context=TrustedRequestContext(
                     tenant_id="tenant-a", subject_id="subject-a"
                 ),
-                conversation_id="conversation-1",
+                conversation_id="00000000-0000-0000-0000-000000000001",
             )
 
     assert _event_frame(remaining[-1])["data"]["answer"] == "partial complete"
@@ -342,7 +346,7 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
     answer_actor = _BlockingAnswerActor()
     app = persistent_linear_app(
@@ -352,7 +356,7 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            V2QueryRequest(query="hello", conversation_id=UUID("00000000-0000-0000-0000-000000000001")),
             stream_request(app),
             request_context=TrustedRequestContext(
                 tenant_id="tenant-a", subject_id="subject-a"
@@ -371,7 +375,7 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
                 context=TrustedRequestContext(
                     tenant_id="tenant-a", subject_id="subject-a"
                 ),
-                conversation_id="conversation-1",
+                conversation_id="00000000-0000-0000-0000-000000000001",
             )
 
     assert answer_actor.calls == 1
@@ -386,7 +390,7 @@ async def test_graph_close_failure_is_reported_after_request_cleanup(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
 
     class FailingCloseStream:
@@ -417,7 +421,7 @@ async def test_graph_close_failure_is_reported_after_request_cleanup(
     app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            V2QueryRequest(query="hello", conversation_id=UUID("00000000-0000-0000-0000-000000000001")),
             stream_request(app),
             request_context=TrustedRequestContext(
                 tenant_id="tenant-a", subject_id="subject-a"
@@ -438,7 +442,7 @@ async def test_graph_close_failure_without_primary_error_is_reported(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
 
     class FailingCloseStream:
@@ -459,7 +463,7 @@ async def test_graph_close_failure_without_primary_error_is_reported(
     app = persistent_linear_app(langgraph_v2_migrated_database_url, FailingCloseGraph())
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            V2QueryRequest(query="hello", conversation_id=UUID("00000000-0000-0000-0000-000000000001")),
             stream_request(app),
             request_context=TrustedRequestContext(
                 tenant_id="tenant-a", subject_id="subject-a"

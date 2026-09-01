@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -86,11 +85,11 @@ class LinearGraphRuntimeAdapter:
         """Identify this adapter as the Linear runtime."""
         return LangGraphRuntimeMode.LINEAR
 
-    def build_graph(self, *, turn_id: uuid.UUID) -> RequestOwnedGraph:
-        """Build the request-owned Linear Graph for one Turn."""
+    def build_graph(self, *, request_id: str) -> RequestOwnedGraph:
+        """Build the request-owned Linear Graph for one request."""
         return self.graph_override or _build_graph(
             self.dependencies,
-            turn_id=turn_id,
+            request_id=request_id,
         )
 
     def initial_state_fields(
@@ -260,12 +259,12 @@ def _resolve_phase_providers(
 def _build_graph(
     dependencies: _LinearGraphDependencies,
     *,
-    turn_id: uuid.UUID,
+    request_id: str,
 ) -> LinearGraph:
     return build_linear_graph(
         dependencies.checkpointer,
         tenant_id=dependencies.tenant_id,
-        current_turn_id=turn_id,
+        current_request_id=request_id,
         message_repository=dependencies.message_repository,
         request_context=dependencies.request_context,
         history_token_budget=dependencies.history_token_budget,

@@ -27,15 +27,15 @@ from app.langgraph_v2.authorization import (
     TrustedRequestContext,
     get_trusted_request_context,
 )
-from app.langgraph_v2.checkpointing import thread_checkpoint_config
+from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
 from app.langgraph_v2.contracts import (
     LiveStreamEvent,
     V2QueryRequest,
 )
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
+    ConversationModeConflict,
     ConversationNotFound,
-    turn_id_for_client_request,
 )
 from app.langgraph_v2.groundedness import GroundednessActor
 from app.langgraph_v2.history import DEFAULT_HISTORY_TOKEN_BUDGET
@@ -127,10 +127,10 @@ async def _terminalize_checkpoint_event(
     event: LiveStreamEvent,
     *,
     context: TrustedRequestContext,
-    conversation_id: str,
-    turn_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    request_id: str,
 ) -> None:
-    """Persist a successful checkpoint outcome exactly once by Turn."""
+    """Persist a successful final answer exactly once by request."""
     if event.type == "error":
         return
     if event.type != "done":
@@ -143,9 +143,8 @@ async def _terminalize_checkpoint_event(
         await message_repository.persist_assistant_message(
             context=context,
             conversation_id=conversation_id,
-            turn_id=turn_id,
+            request_id=request_id,
             content=answer,
-            idempotency_key=f"turn:{turn_id}:assistant",
         )
 
 
@@ -263,8 +262,8 @@ class GraphRuntimeAdapter(Protocol):
         """Return the trusted Tenant mode implemented by this adapter."""
         ...
 
-    def build_graph(self, *, turn_id: uuid.UUID) -> RequestOwnedGraph:
-        """Build the Graph that executes a Turn."""
+    def build_graph(self, *, request_id: str) -> RequestOwnedGraph:
+        """Build the Graph that executes a logical request."""
         ...
 
     def initial_state_fields(
@@ -296,8 +295,7 @@ class _QueryGraphState(TypedDict):
 
     query: str
     conversation_id: str
-    turn_id: str
-    client_request_id: str | None
+    request_id: str
 
 
 def _initial_graph_state(
@@ -305,13 +303,12 @@ def _initial_graph_state(
     *,
     payload: V2QueryRequest,
     conversation_id: str,
-    turn_id: uuid.UUID,
+    request_id: str,
 ) -> dict[str, Any]:
     common_state: _QueryGraphState = {
         "query": payload.query,
         "conversation_id": conversation_id,
-        "turn_id": str(turn_id),
-        "client_request_id": payload.client_request_id,
+        "request_id": request_id,
     }
     runtime_fields = runtime.initial_state_fields(payload=payload)
     overlapping_fields = common_state.keys() & runtime_fields.keys()
@@ -430,45 +427,40 @@ def create_v2_router(
         )
         try:
             if payload.conversation_id is None:
-                conversation = await message_repository.resolve_conversation(
+                conversation = await message_repository.create_conversation(
                     context=request_context,
+                    runtime_mode=runtime_mode,
                 )
             else:
                 conversation = await message_repository.get_conversation(
                     context=request_context,
                     conversation_id=payload.conversation_id,
+                    runtime_mode=runtime_mode,
                 )
-        except ConversationNotFound as error:
+        except (ConversationNotFound, ConversationModeConflict) as error:
             raise HTTPException(
                 status_code=404, detail="Conversation not found"
             ) from error
-        conversation_id = conversation.conversation_id
-        if payload.client_request_id is None:
-            turn_id = uuid.uuid4()
-        else:
-            turn_id = turn_id_for_client_request(
-                tenant_id, conversation_id, payload.client_request_id
-            )
-        user_idempotency_key = f"turn:{turn_id}:user"
+        conversation_id = str(conversation.conversation_id)
+        request_id = payload.client_request_id or str(uuid.uuid4())
 
         async def create_graph_stream() -> AsyncGenerator[str]:
-            selected_graph = runtime.build_graph(turn_id=turn_id)
+            selected_graph = runtime.build_graph(request_id=request_id)
             graph_config = thread_checkpoint_config(
-                thread_id=conversation.thread_id,
+                thread_id=thread_id_for(tenant_id, conversation_id),
                 checkpoint_ns="",
             )
             state = _initial_graph_state(
                 runtime,
                 payload=payload,
                 conversation_id=conversation_id,
-                turn_id=turn_id,
+                request_id=request_id,
             )
-            await message_repository.create_turn(
+            await message_repository.persist_user_message(
                 context=request_context,
-                conversation_id=conversation_id,
-                turn_id=turn_id,
+                conversation_id=conversation.conversation_id,
+                request_id=request_id,
                 content=payload.query,
-                idempotency_key=user_idempotency_key,
             )
 
             async def terminalize_checkpoint_event(event: LiveStreamEvent) -> None:
@@ -476,8 +468,8 @@ def create_v2_router(
                     message_repository,
                     event,
                     context=request_context,
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
+                    conversation_id=conversation.conversation_id,
+                    request_id=request_id,
                 )
 
             return stream_graph(
@@ -494,7 +486,7 @@ def create_v2_router(
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
                 "X-Conversation-Id": conversation_id,
-                "X-Turn-Id": str(turn_id),
+                "X-Request-Id": request_id,
             },
         )
 

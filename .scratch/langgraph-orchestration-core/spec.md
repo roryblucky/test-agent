@@ -17,7 +17,8 @@ during migration, but no Flow Engine execution abstraction is reused by v2.
   removed or retyped.
 - A request begins Graph execution immediately in the receiving FastAPI
   instance. There is no queue, worker, detached runtime or background pickup.
-- Return the stable public `conversation_id` and `turn_id` needed by the UI.
+- Return the database-generated public `conversation_id` and stable logical
+  `request_id` needed by the UI.
   Keep the checkpointer `thread_id` internal and do not introduce a public
   `run_id` merely to map to it.
 - The API Gateway supplies trusted Tenant and Subject identity. The application
@@ -68,11 +69,13 @@ query
 - PostgreSQL `Conversation` is the durable authority for Tenant and Subject
   ownership. Every query and history operation authorizes the requested
   Conversation before accessing its Messages or checkpoints.
-- Store the stable LangGraph `thread_id` on the Conversation for internal
-  checkpoint identity; never accept it as public authorization input.
-- Persist the user Message once at Turn creation and the assistant Message once
-  after successful finalization. Store the same `turn_id` in Message records and
-  LangGraph State and use it for idempotency.
+- Persist the Conversation's fixed `runtime_mode`. Derive LangGraph `thread_id`
+  from Tenant plus Conversation UUID; never store or accept it as authorization
+  input.
+- Persist one user Message and at most one final assistant Message with the same
+  stable logical `request_id`. Use `UNIQUE (conversation_id, request_id, role)`
+  for retry idempotency and an atomically allocated per-Conversation `sequence`
+  for history order. Do not store Turn identity or a separate idempotency key.
 - History initially uses the configured token-budgeted sliding window. LLM
   context compression is a separate policy to add later.
 - Redis is an optional cache only. Redis loss or eviction cannot grant access
@@ -87,7 +90,7 @@ query
 - When the execution-owning SSE disconnects, cancel and await the active Graph
   iterator. Do not continue hidden work.
 - There is no computation-recovery API in this stage. After disconnect or
-  process failure, the client starts a new Turn and the Graph executes normally.
+  process failure, the client starts a new request and the Graph executes normally.
 - This pre-release repository has no deployed or stamped v2 database. Before
   the first deployment, superseded v2 schema can therefore be consolidated in
   its original migration; no pre-release schema upgrade path is supported.
@@ -118,7 +121,8 @@ application tables.
 - Tests prove low groundedness and flagged post-moderation do not suppress,
   replace or alter the Answer or persisted assistant Message.
 - Real PostgreSQL tests prove Conversation Tenant/Subject authorization,
-  Message idempotency and official checkpoint persistence.
+  request-paired Message idempotency, atomic sequence order, fixed runtime mode,
+  and official checkpoint persistence.
 - Disconnect tests run through real Uvicorn and the deployment proxy boundary
   and prove the Graph iterator is cancelled and awaited.
 - An opt-in load profile proves 50 simultaneous `/v2/query/stream` requests

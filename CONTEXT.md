@@ -20,8 +20,9 @@ _Avoid_: Caller, operator
 A persistent, user-visible exchange that can contain multiple Runs and be continued over time.
 _Avoid_: Session, thread, chat session
 
-**Turn**:
-One user Message and its resulting assistant Message within a Conversation; distinct from a Run execution.
+**Request**:
+A logical user request identified by the stable client `request_id`. Its user
+Message and final assistant Message share that identity within one Conversation.
 
 **Conversation Summary**:
 A versioned compression of earlier Messages within one Conversation, used only to construct model context while the original Messages remain authoritative.

@@ -53,10 +53,10 @@ async def run_retrieval(
         result = await retriever.retrieve(
             refined_query if isinstance(refined_query, str) else state["query"]
         )
-        turn_id = str(state.get("turn_id", ""))
+        request_id = str(state.get("request_id", ""))
         evidence = [
             Evidence(
-                evidence_id=_evidence_id(turn_id=turn_id, document=document),
+                evidence_id=_evidence_id(request_id=request_id, document=document),
                 document=document,
             )
             for document in result.documents
@@ -104,7 +104,7 @@ async def run_retrieval(
         )
 
 
-def _evidence_id(*, turn_id: str, document: Document) -> str:
+def _evidence_id(*, request_id: str, document: Document) -> str:
     """Create a stable citation ID without persisting the document payload."""
     canonical_payload = json.dumps(
         document.model_dump(mode="json", exclude_none=True),
@@ -115,6 +115,8 @@ def _evidence_id(*, turn_id: str, document: Document) -> str:
     return str(
         uuid5(
             NAMESPACE_URL,
-            ":".join(("langgraph-v2", "turn", turn_id, "retrieval", canonical_payload)),
+            ":".join(
+                ("langgraph-v2", "request", request_id, "retrieval", canonical_payload)
+            ),
         )
     )

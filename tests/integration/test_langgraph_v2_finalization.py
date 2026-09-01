@@ -29,7 +29,7 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
 from app.langgraph_v2.groundedness import GroundednessAssessment
-from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.question_refinement import (
@@ -43,7 +43,7 @@ from app.models.workflow import CitationReference
 from app.services.events import EventEmitter
 from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
-from tests.integration.langgraph_v2_turn_support import seed_turn_scope
+from tests.integration.langgraph_v2_request_support import seed_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     configure_linear_tenant,
     parse_sse,
@@ -90,7 +90,7 @@ class _Answer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         del history
         self.calls += 1
@@ -99,7 +99,7 @@ class _Answer:
         return AnswerResult(answer="grounded answer [1]", usage={"output_tokens": 3})
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -108,7 +108,7 @@ class _Answer:
 
 class _UsageRefinement:
     async def refine(
-        self, query: str, history: Sequence[ConversationTurn]
+        self, query: str, history: Sequence[ConversationExchange]
     ) -> QuestionRefinementResult:
         del history
         return QuestionRefinementResult(
@@ -212,8 +212,8 @@ class _LegacyManager:
 def _state() -> LinearGraphState:
     return {
         "query": "hello",
-        "conversation_id": "c1",
-        "client_request_id": None,
+        "conversation_id": "00000000-0000-0000-0000-000000000001",
+        "request_id": "request-1",
     }
 
 
@@ -226,10 +226,10 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     ) as pool:
         answer = _Answer()
         moderation = _Moderation()
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             moderation_provider=moderation,
             refinement_actor=_UsageRefinement(),
@@ -243,7 +243,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     final_response = result["final_response"]
     assert final_response is not None
     done = final_response.model_dump(by_alias=True)
-    assert done["session_id"] == "c1"
+    assert done["session_id"] == "00000000-0000-0000-0000-000000000001"
     assert done["answer"] == "grounded answer [1]"
     assert done["documents"][0]["id"] == "d1"
     assert done["moderation"]["is_flagged"] is False
@@ -280,7 +280,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     with TestClient(legacy_app) as client:
         legacy_http = client.post(
             "/api/v1/query/stream",
-            json={"query": "hello", "sessionId": "c1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a"},
         )
     legacy_frames = [
@@ -306,26 +306,22 @@ async def test_graph_finalization_does_not_own_assistant_message_persistence(
     request_context = TrustedRequestContext(
         tenant_id="tenant-a", subject_id="subject-a"
     )
-    turn_id = uuid4()
+    request_id = uuid4()
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         messages = ConversationMessageRepository(pool)
-        await messages.resolve_conversation(
-            context=request_context, conversation_id="c1"
-        )
-        await messages.create_turn(
+        await seed_subject_conversation(pool)
+        await messages.persist_user_message(
             context=request_context,
-            conversation_id="c1",
-            turn_id=turn_id,
+            conversation_id="00000000-0000-0000-0000-000000000001",
+            request_id=str(request_id),
             content="hello",
-            idempotency_key=f"turn:{turn_id}:user",
         )
         answer = _Answer()
-        await seed_turn_scope(pool, turn_id=turn_id, context=request_context)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=turn_id,
+            current_request_id=request_id,
             message_repository=messages,
             request_context=request_context,
             moderation_provider=_Moderation(),
@@ -333,19 +329,19 @@ async def test_graph_finalization_does_not_own_assistant_message_persistence(
             ranker=_Ranker(),
             answer_actor=answer,
         )
-        state: LinearGraphState = {**_state(), "turn_id": str(turn_id)}
+        state: LinearGraphState = {**_state(), "request_id": str(request_id)}
 
         await graph.ainvoke(state)
         await graph.ainvoke(state)
         retained = await messages.list_messages(
-            context=request_context, conversation_id="c1"
+            context=request_context, conversation_id="00000000-0000-0000-0000-000000000001"
         )
 
     assert answer.calls == 2
     assert [
         (message.role, message.content)
         for message in retained
-        if message.turn_id == turn_id
+        if message.request_id == str(request_id)
     ] == [("user", "hello")]
 
 
@@ -356,12 +352,7 @@ def test_public_v2_sse_matches_final_output_golden(
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
-            await ConversationMessageRepository(pool).resolve_conversation(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="c1",
-            )
+            await seed_subject_conversation(pool)
 
     asyncio.run(seed())
 
@@ -388,7 +379,7 @@ def test_public_v2_sse_matches_final_output_golden(
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "c1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
@@ -400,7 +391,7 @@ def test_public_v2_sse_matches_final_output_golden(
                 context=TrustedRequestContext(
                     tenant_id="tenant-a", subject_id="subject-a"
                 ),
-                conversation_id="c1",
+                conversation_id="00000000-0000-0000-0000-000000000001",
             )
             return [(message.role, message.content) for message in messages]
 
@@ -429,7 +420,7 @@ def test_public_v2_sse_matches_final_output_golden(
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert "x-run-id" not in response.headers
-    assert response.headers["x-conversation-id"] == "c1"
+    assert response.headers["x-conversation-id"] == "00000000-0000-0000-0000-000000000001"
     assert v2_fixture["intentional_additive_fields"] == []
     assert all("sequence" not in event for event in events), events
     assert set(events[-1]["data"]) == set(v2_fixture["done_data_fields"])
@@ -445,7 +436,7 @@ def test_public_v2_sse_matches_final_output_golden(
 def test_terminal_checkpoint_failure_does_not_persist_assistant(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    conversation_id = "terminal-checkpoint-failure"
+    conversation_id = "00000000-0000-0000-0000-000000000003"
     asyncio.run(
         seed_subject_conversation(
             langgraph_v2_migrated_database_url,

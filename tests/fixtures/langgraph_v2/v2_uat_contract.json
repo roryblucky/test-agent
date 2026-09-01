@@ -1,7 +1,7 @@
 {
   "request": {
     "query": "hello",
-    "sessionId": "contract-conversation",
+    "sessionId": "00000000-0000-0000-0000-000000000002",
     "clientRequestId": "contract-request-1"
   },
   "query_request_fields": {
@@ -11,7 +11,7 @@
   },
   "query_response_headers": [
     "x-conversation-id",
-    "x-turn-id"
+    "x-request-id"
   ],
   "event_names": [
     "step_start",

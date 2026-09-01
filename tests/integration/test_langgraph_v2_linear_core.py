@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager, suppress
 from importlib import reload
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 from fastapi import FastAPI, Request
@@ -14,7 +14,12 @@ from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
 from app.api.schemas import QueryResponse
-from app.config.models import FlowConfig, LLMConfig, TenantConfig
+from app.config.models import (
+    FlowConfig,
+    LangGraphRuntimeMode,
+    LLMConfig,
+    TenantConfig,
+)
 from app.langgraph_v2.answer import AnswerActor
 from app.langgraph_v2.api import (
     GraphRuntimeFactory,
@@ -198,19 +203,36 @@ async def close_stream_after_first_token(
 
 async def seed_subject_conversation(
     pool_or_database_url: AsyncConnectionPool[Any] | str,
-    conversation_id: str = "conversation-1",
-) -> None:
+    conversation_id: UUID | str = UUID("00000000-0000-0000-0000-000000000001"),
+    *,
+    runtime_mode: LangGraphRuntimeMode = LangGraphRuntimeMode.LINEAR,
+) -> UUID:
     """Seed the Conversation authorization required by v2 stream tests."""
     if isinstance(pool_or_database_url, str):
         async with AsyncConnectionPool(
             pool_or_database_url, min_size=1, max_size=2
         ) as pool:
-            await seed_subject_conversation(pool, conversation_id)
-        return
-    await ConversationMessageRepository(pool_or_database_url).resolve_conversation(
-        context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-        conversation_id=conversation_id,
-    )
+            return await seed_subject_conversation(
+                pool, conversation_id, runtime_mode=runtime_mode
+            )
+    if isinstance(conversation_id, UUID):
+        resolved_id = conversation_id
+    else:
+        try:
+            resolved_id = UUID(conversation_id)
+        except ValueError:
+            resolved_id = uuid5(NAMESPACE_URL, conversation_id)
+    async with pool_or_database_url.connection() as connection:
+        await connection.execute(
+            """
+            INSERT INTO langgraph_v2.conversations (
+                conversation_id, tenant_id, owner_subject_id, runtime_mode
+            ) VALUES (%s, 'tenant-a', 'subject-a', %s)
+            ON CONFLICT (conversation_id) DO NOTHING
+            """,
+            (resolved_id, runtime_mode.value),
+        )
+    return resolved_id
 
 
 @pytest.mark.asyncio
@@ -261,7 +283,7 @@ def test_enabled_linear_core_preserves_the_minimal_stream_contract(
 ) -> None:
     asyncio.run(
         seed_subject_conversation(
-            langgraph_v2_migrated_database_url, "conversation-123"
+            langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000123"
         )
     )
     fixture = json.loads(FIXTURE_PATH.read_text())
@@ -281,7 +303,7 @@ def test_enabled_linear_core_preserves_the_minimal_stream_contract(
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert "x-run-id" not in response.headers
-    assert response.headers["x-conversation-id"] == "conversation-123"
+    assert response.headers["x-conversation-id"] == "00000000-0000-0000-0000-000000000123"
     assert response.text.endswith("\n\n")
     actual_events = parse_sse(response.text)
     assert actual_events == [
@@ -386,25 +408,25 @@ def test_released_uat_contract_fixture_matches_public_http_shapes(
     request = V2QueryRequest.model_validate(fixture["request"])
     assert set(fixture["request"]) == set(fixture["query_request_fields"])
     assert isinstance(request.query, str)
-    assert isinstance(request.conversation_id, str)
+    assert isinstance(request.conversation_id, UUID)
     assert isinstance(request.client_request_id, str)
 
     asyncio.run(
         seed_subject_conversation(
             langgraph_v2_migrated_database_url,
-            "contract-conversation",
+            "00000000-0000-0000-0000-000000000002",
         )
     )
     app = persistent_linear_app(langgraph_v2_migrated_database_url)
     with TestClient(app) as client:
         success = client.post(
             "/v2/query/stream",
-            json={**fixture["request"], "sessionId": "contract-conversation"},
+            json={**fixture["request"], "sessionId": "00000000-0000-0000-0000-000000000002"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         error = client.post(
             "/v2/query/stream",
-            json={"query": "blocked", "sessionId": "contract-conversation"},
+            json={"query": "blocked", "sessionId": "00000000-0000-0000-0000-000000000002"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
@@ -451,22 +473,21 @@ def test_request_header_and_generated_conversation_variants(
     assert repeated.status_code == 200
     conversation_id = generated.headers["x-conversation-id"]
     UUID(conversation_id)
-    assert repeated.headers["x-turn-id"] == generated.headers["x-turn-id"]
+    assert repeated.headers["x-request-id"] == generated.headers["x-request-id"]
 
-    async def read_turn():
+    async def read_messages():
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
-            return await ConversationMessageRepository(pool).get_turn(
+            return await ConversationMessageRepository(pool).list_messages(
                 context=TrustedRequestContext(
                     tenant_id="tenant-a", subject_id="subject-a"
                 ),
-                conversation_id=conversation_id,
-                turn_id=UUID(generated.headers["x-turn-id"]),
+                conversation_id=UUID(conversation_id),
             )
 
-    turn = asyncio.run(read_turn())
-    assert turn.turn_id == UUID(generated.headers["x-turn-id"])
+    messages = asyncio.run(read_messages())
+    assert {message.request_id for message in messages} == {"request-1"}
     assert parse_sse(generated.text)[-1]["data"]["session_id"] == conversation_id
     assert invalid_client_id.status_code == 422
 
@@ -479,7 +500,7 @@ def test_query_authorizes_existing_conversation_before_streaming(
     with TestClient(app) as client:
         owner = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={
                 "X-Application-Id": "tenant-a",
                 "X-Subject-Id": "subject-a",
@@ -487,7 +508,7 @@ def test_query_authorizes_existing_conversation_before_streaming(
         )
         missing = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "missing-conversation"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000099"},
             headers={
                 "X-Application-Id": "tenant-a",
                 "X-Subject-Id": "subject-a",
@@ -495,7 +516,7 @@ def test_query_authorizes_existing_conversation_before_streaming(
         )
         cross_subject = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={
                 "X-Application-Id": "tenant-a",
                 "X-Subject-Id": "subject-b",
@@ -503,12 +524,12 @@ def test_query_authorizes_existing_conversation_before_streaming(
         )
         missing_subject = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a"},
         )
         empty_subject = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": ""},
         )
 
@@ -523,14 +544,14 @@ def test_flagged_query_emits_error_before_finalization(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     asyncio.run(
-        seed_subject_conversation(langgraph_v2_migrated_database_url, "conversation-1")
+        seed_subject_conversation(langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001")
     )
     app = persistent_linear_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
-            json={"query": "please blocked this", "sessionId": "conversation-1"},
+            json={"query": "please blocked this", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
@@ -553,7 +574,7 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
 
     class DeterministicGraphFake:
@@ -594,7 +615,7 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
@@ -602,13 +623,12 @@ async def test_http_adapter_accepts_a_deterministic_graph_fake(
         "step_start",
         "done",
     ]
-    turn_id = response.headers["X-Turn-Id"]
-    UUID(turn_id)
+    request_id = response.headers["X-Request-Id"]
+    UUID(request_id)
     assert graph.received_state == {
         "query": "hello",
-        "conversation_id": "conversation-1",
-        "turn_id": turn_id,
-        "client_request_id": None,
+        "conversation_id": "00000000-0000-0000-0000-000000000001",
+        "request_id": request_id,
     }
 
 
@@ -663,9 +683,12 @@ def test_query_openapi_preserves_released_camel_case_request_fields() -> None:
     }
     assert (
         V2QueryRequest.model_validate(
-            {"query": "hello", "session_id": "conversation-1"}
+            {
+                "query": "hello",
+                "session_id": "00000000-0000-0000-0000-000000000001",
+            }
         ).conversation_id
-        == "conversation-1"
+        == UUID("00000000-0000-0000-0000-000000000001")
     )
 
 
@@ -676,7 +699,7 @@ def test_query_openapi_preserves_released_camel_case_request_fields() -> None:
         (
             "post",
             "/v2/threads/thread-a/resume/stream"
-            "?expectedTurnId=00000000-0000-0000-0000-000000000001",
+            "?expectedRequestId=request-1",
         ),
         ("get", "/v2/runs/00000000-0000-0000-0000-000000000001/stream"),
         ("post", "/v2/runs/00000000-0000-0000-0000-000000000001/cancel"),

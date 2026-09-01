@@ -1,7 +1,7 @@
 {
   "request": {
     "query": "What is LangGraph?",
-    "sessionId": "conversation-123"
+    "sessionId": "00000000-0000-0000-0000-000000000123"
   },
   "events": [
     {
@@ -37,7 +37,7 @@
         "moderation": null,
         "groundedness": null,
         "clarification": null,
-        "session_id": "conversation-123",
+        "session_id": "00000000-0000-0000-0000-000000000123",
         "metadata": {
           "steps_executed": [
             "query",

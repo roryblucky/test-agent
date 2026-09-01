@@ -8,7 +8,7 @@ from app.langgraph_v2.graph import build_linear_graph
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_turn_support import seed_turn_scope
+from tests.integration.langgraph_v2_request_support import seed_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -41,10 +41,10 @@ async def test_ranker_receives_original_documents_and_returns_reordered_evidence
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         ranker = Ranker()
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         result = await build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=Retriever(),
             ranker=ranker,
@@ -52,7 +52,7 @@ async def test_ranker_receives_original_documents_and_returns_reordered_evidence
             {
                 "query": "hello",
                 "conversation_id": "c1",
-                "client_request_id": None,
+                "request_id": "request-1",
             }
         )
 
@@ -89,10 +89,10 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         result = await build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=DuplicateRetriever(),
             ranker=InvalidRanker(),
@@ -100,7 +100,7 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
             {
                 "query": "hello",
                 "conversation_id": "c1",
-                "client_request_id": None,
+                "request_id": "request-1",
             }
         )
 
@@ -134,10 +134,10 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         result = await build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=DuplicateRetriever(),
             ranker=ReverseRanker(),
@@ -145,7 +145,7 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
             {
                 "query": "hello",
                 "conversation_id": "c1",
-                "client_request_id": None,
+                "request_id": "request-1",
             }
         )
 

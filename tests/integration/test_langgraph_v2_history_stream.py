@@ -11,9 +11,7 @@ from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
-from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.question_refinement import (
     QuestionRefinementResult,
     V2ResolvedQuery,
@@ -24,6 +22,7 @@ from app.models.domain import Document
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
+    seed_subject_conversation,
 )
 
 _FIXTURE_PATH = (
@@ -36,12 +35,12 @@ _FIXTURE_PATH = (
 
 class _RefinementActor:
     def __init__(self) -> None:
-        self.histories: list[list[ConversationTurn]] = []
+        self.histories: list[list[ConversationExchange]] = []
 
     async def refine(
         self,
         query: str,
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> QuestionRefinementResult:
         self.histories.append(list(history))
         return QuestionRefinementResult(
@@ -51,20 +50,20 @@ class _RefinementActor:
 
 class _AnswerActor:
     def __init__(self) -> None:
-        self.histories: list[list[ConversationTurn]] = []
+        self.histories: list[list[ConversationExchange]] = []
 
     async def answer(
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         del documents
         self.histories.append(list(history))
         return AnswerResult(answer=f"answer for {query}")
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -89,12 +88,7 @@ def test_second_public_stream_receives_one_complete_prior_turn(
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
-            await ConversationMessageRepository(pool).resolve_conversation(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="conversation-1",
-            )
+            await seed_subject_conversation(pool)
 
     asyncio.run(seed())
     refinement = _RefinementActor()
@@ -110,22 +104,22 @@ def test_second_public_stream_receives_one_complete_prior_turn(
     with TestClient(app) as client:
         first = client.post(
             "/v2/query/stream",
-            json={"query": "first question", "sessionId": "conversation-1"},
+            json={"query": "first question", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
         second = client.post(
             "/v2/query/stream",
-            json={"query": "follow up", "sessionId": "conversation-1"},
+            json={"query": "follow up", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
     expected_history = [
-        ConversationTurn(user="first question", assistant="answer for first question")
+        ConversationExchange(user="first question", assistant="answer for first question")
     ]
     fixture = json.loads(_FIXTURE_PATH.read_text())
     assert fixture["requests"] == [
-        {"query": "first question", "sessionId": "conversation-1"},
-        {"query": "follow up", "sessionId": "conversation-1"},
+        {"query": "first question", "sessionId": "00000000-0000-0000-0000-000000000001"},
+        {"query": "follow up", "sessionId": "00000000-0000-0000-0000-000000000001"},
     ]
     assert first.status_code == second.status_code == 200
     assert refinement.histories == [[], expected_history]

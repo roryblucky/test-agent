@@ -100,7 +100,7 @@ async def run_groundedness(
     state: Mapping[str, Any],
     *,
     tenant_id: str,
-    current_turn_id: UUID | None,
+    current_request_id: UUID | str | None,
     output_assessment_audit: OutputAssessmentAudit | None,
     actor: GroundednessActor,
 ) -> tuple[
@@ -114,7 +114,7 @@ async def run_groundedness(
             if isinstance(state.get("conversation_id"), str)
             else None
         ),
-        turn_id=current_turn_id or state.get("turn_id"),
+        request_id=str(current_request_id or state.get("request_id", "")),
     )
 
     try:

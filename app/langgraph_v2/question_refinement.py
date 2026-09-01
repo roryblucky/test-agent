@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 
 from app.langgraph_v2.contracts import LiveStreamEvent
-from app.langgraph_v2.history import ConversationTurn, to_model_message_history
+from app.langgraph_v2.history import ConversationExchange, to_model_message_history
 from app.langgraph_v2.model_usage import model_usage_payload
 from app.models.workflow import ResolvedQuery
 
@@ -33,7 +33,7 @@ class QuestionRefinementActor(Protocol):
     """PydanticAI-backed seam for producing structured standalone questions."""
 
     async def refine(
-        self, query: str, history: Sequence[ConversationTurn]
+        self, query: str, history: Sequence[ConversationExchange]
     ) -> QuestionRefinementResult:
         """Return a validated standalone question and its model usage."""
         ...
@@ -43,7 +43,7 @@ class MockQuestionRefinementActor:
     """Deterministic actor used when no tenant model registry is configured."""
 
     async def refine(
-        self, query: str, history: Sequence[ConversationTurn] = ()
+        self, query: str, history: Sequence[ConversationExchange] = ()
     ) -> QuestionRefinementResult:
         """Keep the query unchanged while satisfying the structured contract."""
         del history
@@ -59,7 +59,7 @@ class PydanticAIQuestionRefinementActor:
         self._agent = agent
 
     async def refine(
-        self, query: str, history: Sequence[ConversationTurn] = ()
+        self, query: str, history: Sequence[ConversationExchange] = ()
     ) -> QuestionRefinementResult:
         """Run the agent and return its validated structured output."""
         if history:
@@ -132,7 +132,7 @@ async def run_question_refinement(
     """Return refinement State without reading or writing an application journal."""
     try:
         history = [
-            ConversationTurn.model_validate(turn) for turn in state.get("history", [])
+            ConversationExchange.model_validate(exchange) for exchange in state.get("history", [])
         ]
         result = await actor.refine(state["query"], history)
         result = QuestionRefinementResult.model_validate(result)

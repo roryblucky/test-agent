@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from psycopg_pool import AsyncConnectionPool
@@ -11,13 +11,13 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
-from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_turn_support import seed_turn_scope
+from tests.integration.langgraph_v2_request_support import seed_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -42,14 +42,14 @@ class _Answer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         del history
         del query, documents
         return AnswerResult(answer="generated answer")
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -87,8 +87,8 @@ class _FailingPostModeration:
 def _state() -> LinearGraphState:
     return {
         "query": "hello",
-        "conversation_id": "c1",
-        "client_request_id": None,
+        "conversation_id": "00000000-0000-0000-0000-000000000001",
+        "request_id": "request-1",
     }
 
 
@@ -98,7 +98,7 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
 ) -> None:
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "conversation-1"
+        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
     )
     moderation = _FlaggingModeration()
     app = persistent_linear_app(
@@ -111,7 +111,10 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            V2QueryRequest(query="hello", conversation_id="conversation-1"),
+            V2QueryRequest(
+                query="hello",
+                conversation_id=UUID("00000000-0000-0000-0000-000000000001"),
+            ),
             stream_request(app),
             request_context=context,
         )
@@ -120,7 +123,7 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
             messages = await ConversationMessageRepository(pool).list_messages(
-                context=context, conversation_id="conversation-1"
+                context=context, conversation_id="00000000-0000-0000-0000-000000000001"
             )
 
     assert moderation.calls == 2
@@ -143,23 +146,19 @@ async def test_safe_answer_passes_post_moderation_unchanged(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         messages = ConversationMessageRepository(pool)
-        await messages.resolve_conversation(
+        await seed_subject_conversation(pool)
+        request_id = uuid4()
+        await messages.persist_user_message(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="c1",
-        )
-        turn_id = uuid4()
-        await messages.create_turn(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="c1",
-            turn_id=turn_id,
+            conversation_id="00000000-0000-0000-0000-000000000001",
+            request_id=str(request_id),
             content="hello",
-            idempotency_key=f"turn:{turn_id}:user",
         )
         moderation = _SafeModeration()
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             moderation_provider=moderation,
             retriever=_Retriever(),
@@ -189,23 +188,19 @@ async def test_flagged_answer_remains_canonical_through_finalization(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         messages = ConversationMessageRepository(pool)
-        await messages.resolve_conversation(
+        await seed_subject_conversation(pool)
+        request_id = uuid4()
+        await messages.persist_user_message(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="c1",
-        )
-        turn_id = uuid4()
-        await messages.create_turn(
-            context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="c1",
-            turn_id=turn_id,
+            conversation_id="00000000-0000-0000-0000-000000000001",
+            request_id=str(request_id),
             content="hello",
-            idempotency_key=f"turn:{turn_id}:user",
         )
         audit = MockOutputAssessmentAudit()
-        scope = await seed_turn_scope(pool, turn_id=turn_id)
+        scope = await seed_request_scope(pool, request_id=request_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=turn_id,
+            current_request_id=request_id,
             request_context=scope.context,
             output_assessment_audit=audit,
             moderation_provider=_FlaggingModeration(),
@@ -214,11 +209,11 @@ async def test_flagged_answer_remains_canonical_through_finalization(
             answer_actor=_Answer(),
         )
         state = _state()
-        state["turn_id"] = str(turn_id)
+        state["request_id"] = str(request_id)
         result = await graph.ainvoke(state)
         persisted_messages = await messages.list_messages(
             context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
-            conversation_id="c1",
+            conversation_id="00000000-0000-0000-0000-000000000001",
         )
 
     assert "answer" in result
@@ -234,8 +229,8 @@ async def test_flagged_answer_remains_canonical_through_finalization(
     assert post_moderation["is_flagged"] is True
     assert len(audit.records) == 1
     assert audit.records[0].tenant_id == "tenant-a"
-    assert audit.records[0].conversation_id == "c1"
-    assert audit.records[0].turn_id == turn_id
+    assert audit.records[0].conversation_id == "00000000-0000-0000-0000-000000000001"
+    assert audit.records[0].request_id == str(request_id)
     assert audit.records[0].assessment_type == "post_moderation"
 
 
@@ -246,10 +241,10 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             moderation_provider=_FailingPostModeration(),
             retriever=_Retriever(),

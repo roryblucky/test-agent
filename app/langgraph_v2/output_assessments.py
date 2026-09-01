@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import logging
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, Field
 
@@ -20,11 +21,11 @@ OutputAssessmentType = Literal["groundedness", "post_moderation"]
 
 
 class OutputAssessmentAuditRecord(BaseModel):
-    """Tenant- and Turn-scoped assessment payload for an audit sink."""
+    """Tenant- and request-scoped assessment payload for an audit sink."""
 
     tenant_id: str = Field(min_length=1)
     conversation_id: str = Field(min_length=1)
-    turn_id: UUID
+    request_id: str = Field(min_length=1)
     assessment_id: str = Field(min_length=1)
     assessment_type: OutputAssessmentType
     result: dict[str, Any]
@@ -38,12 +39,31 @@ class OutputAssessmentAudit(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class OutputAssessmentScope:
+    """Trusted identity scope supplied by a phase to its audit port."""
+
+    tenant_id: str
+    conversation_id: str
+    request_id: str
+
+
 def output_assessment_id(
-    turn_id: UUID | str,
+    scope: OutputAssessmentScope,
     assessment_type: OutputAssessmentType,
 ) -> str:
     """Build a deterministic identity suitable for downstream deduplication."""
-    return f"turn:{turn_id}:assessment:{assessment_type}"
+    identity = json.dumps(
+        [
+            scope.tenant_id,
+            scope.conversation_id,
+            scope.request_id,
+            assessment_type,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return f"assessment:{uuid5(NAMESPACE_URL, identity)}"
 
 
 class LoggingOutputAssessmentAudit:
@@ -103,7 +123,7 @@ class BigQueryOutputAssessmentAudit:
             bigquery.SchemaField("recorded_at", "TIMESTAMP", mode="REQUIRED"),
             bigquery.SchemaField("tenant_id", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("conversation_id", "STRING", mode="REQUIRED"),
-            bigquery.SchemaField("turn_id", "STRING", mode="REQUIRED"),
+            bigquery.SchemaField("request_id", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("assessment_id", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("assessment_type", "STRING", mode="REQUIRED"),
             bigquery.SchemaField("result", "JSON", mode="REQUIRED"),
@@ -152,38 +172,22 @@ class MockOutputAssessmentAudit:
         self.records.append(assessment)
 
 
-@dataclass(frozen=True)
-class OutputAssessmentScope:
-    """Trusted identity scope supplied by a phase to its audit port."""
-
-    tenant_id: str
-    conversation_id: str
-    turn_id: UUID
-
-
 def build_output_assessment_scope(
     *,
     tenant_id: str,
     conversation_id: str | None,
-    turn_id: UUID | str | None,
+    request_id: UUID | str | None,
 ) -> OutputAssessmentScope | None:
-    """Build a scope only when the phase has complete Turn identity."""
-    if not conversation_id or turn_id is None:
+    """Build a scope only when the phase has complete request identity."""
+    if not conversation_id or request_id is None:
         logger.warning(
-            "Skipping output assessment audit without Conversation and Turn identity"
-        )
-        return None
-    try:
-        normalized_turn_id = UUID(str(turn_id))
-    except (TypeError, ValueError):
-        logger.warning(
-            "Skipping output assessment audit without a valid Turn identity"
+            "Skipping output assessment audit without Conversation and request identity"
         )
         return None
     return OutputAssessmentScope(
         tenant_id=tenant_id,
         conversation_id=conversation_id,
-        turn_id=normalized_turn_id,
+        request_id=str(request_id),
     )
 
 
@@ -200,8 +204,8 @@ async def record_output_assessment(
     record = OutputAssessmentAuditRecord(
         tenant_id=scope.tenant_id,
         conversation_id=scope.conversation_id,
-        turn_id=scope.turn_id,
-        assessment_id=output_assessment_id(scope.turn_id, assessment_type),
+        request_id=scope.request_id,
+        assessment_id=output_assessment_id(scope, assessment_type),
         assessment_type=assessment_type,
         result=dict(result),
     )

@@ -27,7 +27,7 @@ from app.langgraph_v2.finalization import run_finalization
 from app.langgraph_v2.groundedness import GroundednessActor, run_groundedness
 from app.langgraph_v2.history import (
     DEFAULT_HISTORY_TOKEN_BUDGET,
-    ConversationTurn,
+    ConversationExchange,
     select_sliding_window_history,
 )
 from app.langgraph_v2.output_assessments import OutputAssessmentAudit
@@ -53,9 +53,8 @@ class LinearGraphState(TypedDict):
 
     query: str
     conversation_id: str
-    turn_id: NotRequired[str]
-    client_request_id: str | None
-    history: NotRequired[list[ConversationTurn]]
+    request_id: str
+    history: NotRequired[list[ConversationExchange]]
     halted: NotRequired[bool]
     moderation: NotRequired[dict[str, Any] | None]
     refined_query: NotRequired[str | None]
@@ -80,7 +79,7 @@ class LinearGraphState(TypedDict):
 class LinearGraphStateUpdate(TypedDict, total=False):
     """Partial state update returned by one Linear Graph node."""
 
-    history: list[ConversationTurn]
+    history: list[ConversationExchange]
     halted: bool
     moderation: dict[str, Any] | None
     refined_query: str | None
@@ -112,7 +111,7 @@ class LinearGraph(Protocol):
         config: RunnableConfig | None = None,
         **kwargs: Any,
     ) -> LinearGraphState:
-        """Invoke one graph Turn."""
+        """Invoke one graph request."""
         ...
 
     async def aget_state(self, config: RunnableConfig) -> StateSnapshot:
@@ -138,24 +137,21 @@ async def _query(
     message_repository: ConversationMessageRepository | None = None,
     request_context: TrustedRequestContext | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
-    current_turn_id: UUID | None = None,
+    current_request_id: UUID | str | None = None,
 ) -> LinearGraphStateUpdate:
     query = state["query"]
     canonical = canonical_query(query)
 
-    history: list[ConversationTurn] = []
+    history: list[ConversationExchange] = []
     if message_repository is not None and request_context is not None:
         messages = await message_repository.list_messages(
             context=request_context,
-            conversation_id=state["conversation_id"],
+            conversation_id=UUID(state["conversation_id"]),
         )
         history = select_sliding_window_history(
             messages,
             token_budget=history_token_budget,
-            current_turn_id=current_turn_id
-            or (
-                UUID(turn_id) if (turn_id := state.get("turn_id")) is not None else None
-            ),
+            current_request_id=str(current_request_id or state["request_id"]),
         )
     _emit_events(
         (
@@ -223,7 +219,7 @@ def build_linear_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     *,
     tenant_id: str | None = None,
-    current_turn_id: UUID | None = None,
+    current_request_id: UUID | str | None = None,
     message_repository: ConversationMessageRepository | None = None,
     request_context: TrustedRequestContext | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
@@ -257,7 +253,7 @@ def build_linear_graph(
             message_repository=message_repository,
             request_context=request_context,
             history_token_budget=history_token_budget,
-            current_turn_id=current_turn_id,
+            current_request_id=current_request_id,
         )
 
     builder.add_node("query", query_node)  # pyright: ignore[reportUnknownMemberType]
@@ -372,7 +368,7 @@ def build_linear_graph(
                 events, result, usage, error = await run_groundedness(
                     state,
                     tenant_id=tenant_id,
-                    current_turn_id=current_turn_id,
+                    current_request_id=current_request_id,
                     output_assessment_audit=output_assessment_audit,
                     actor=groundedness_actor,
                 )
@@ -394,7 +390,7 @@ def build_linear_graph(
             events, decision, error = await run_post_moderation(
                 state,
                 tenant_id=tenant_id,
-                current_turn_id=current_turn_id,
+                current_request_id=current_request_id,
                 output_assessment_audit=output_assessment_audit,
                 provider=selected_moderation_provider,
             )

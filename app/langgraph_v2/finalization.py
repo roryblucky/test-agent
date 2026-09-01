@@ -88,7 +88,7 @@ def _build_response(
     *,
     documents: list[Document],
 ) -> LinearQueryResponse:
-    """Build the shared final response and aggregate current-Turn model usage."""
+    """Build the shared final response and aggregate current-request model usage."""
     answer = state.get("answer")
     has_answer = isinstance(answer, str)
     response = LinearQueryResponse(

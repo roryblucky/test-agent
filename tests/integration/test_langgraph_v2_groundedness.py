@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 from unittest.mock import patch
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,12 +19,12 @@ from app.langgraph_v2.groundedness import (
     GroundednessOutput,
     PydanticAIGroundednessActor,
 )
-from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_turn_support import seed_turn_scope
+from tests.integration.langgraph_v2_request_support import seed_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -47,7 +47,7 @@ class _Answer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         return AnswerResult(
             answer="answer [1]",
@@ -55,7 +55,7 @@ class _Answer:
         )
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -79,13 +79,13 @@ class _UncitedAnswer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         del query, documents, history
         return AnswerResult(answer="answer without a source")
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -116,11 +116,11 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     ) as pool:
         evaluator = _Groundedness()
         audit = MockOutputAssessmentAudit()
-        turn_id = uuid4()
-        scope = await seed_turn_scope(pool, turn_id=turn_id)
+        request_id = uuid4()
+        scope = await seed_request_scope(pool, request_id=request_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=turn_id,
+            current_request_id=request_id,
             request_context=scope.context,
             output_assessment_audit=audit,
             retriever=_Retriever(),
@@ -131,8 +131,7 @@ async def test_low_groundedness_is_advisory_on_each_execution(
         state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
-            "turn_id": str(turn_id),
-            "client_request_id": None,
+            "request_id": str(request_id),
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
@@ -158,16 +157,17 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     groundedness_audit = groundedness_records[0]
     assert groundedness_audit.tenant_id == "tenant-a"
     assert groundedness_audit.conversation_id == "c1"
-    assert groundedness_audit.turn_id == turn_id
-    assert groundedness_audit.assessment_id == (
-        f"turn:{turn_id}:assessment:groundedness"
-    )
+    assert groundedness_audit.request_id == str(request_id)
+    assert groundedness_audit.assessment_id.startswith("assessment:")
+    assert {record.assessment_id for record in groundedness_records} == {
+        groundedness_audit.assessment_id
+    }
 
 
 def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    conversation_id = "low-groundedness-http"
+    conversation_id = "00000000-0000-0000-0000-000000000004"
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     asyncio.run(
         seed_subject_conversation(
@@ -208,7 +208,7 @@ def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
     assert asyncio.run(read_assistant_message()) == token_text
 
 
-def test_new_turn_does_not_inherit_prior_groundedness_when_evaluation_fails(
+def test_new_request_does_not_inherit_prior_groundedness_when_evaluation_fails(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class SucceedsThenFails:
@@ -220,14 +220,14 @@ def test_new_turn_does_not_inherit_prior_groundedness_when_evaluation_fails(
             del answer, documents
             self.calls += 1
             if self.calls == 2:
-                raise RuntimeError("second-turn evaluator unavailable")
+                raise RuntimeError("second-request evaluator unavailable")
             return GroundednessAssessment(
                 is_grounded=False,
                 score=0.2,
-                details="first-turn assessment",
+                details="first-request assessment",
             )
 
-    conversation_id = "groundedness-turn-isolation"
+    conversation_id = "00000000-0000-0000-0000-000000000005"
     asyncio.run(
         seed_subject_conversation(
             langgraph_v2_migrated_database_url,
@@ -252,7 +252,7 @@ def test_new_turn_does_not_inherit_prior_groundedness_when_evaluation_fails(
             json={
                 "query": "first",
                 "sessionId": conversation_id,
-                "clientRequestId": "first-turn",
+                "clientRequestId": "first-request",
             },
             headers=headers,
         )
@@ -261,7 +261,7 @@ def test_new_turn_does_not_inherit_prior_groundedness_when_evaluation_fails(
             json={
                 "query": "second",
                 "sessionId": conversation_id,
-                "clientRequestId": "second-turn",
+                "clientRequestId": "second-request",
             },
             headers=headers,
         )
@@ -273,7 +273,7 @@ def test_new_turn_does_not_inherit_prior_groundedness_when_evaluation_fails(
     assert first_done["data"]["groundedness"] == {
         "is_grounded": False,
         "score": 0.2,
-        "details": "first-turn assessment",
+        "details": "first-request assessment",
     }
     assert second_done["type"] == "done"
     assert second_done["data"]["query"] == "second"
@@ -298,11 +298,11 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
     ) as pool:
         evaluator = Failing()
         audit = MockOutputAssessmentAudit()
-        turn_id = uuid4()
-        scope = await seed_turn_scope(pool, turn_id=turn_id)
+        request_id = uuid4()
+        scope = await seed_request_scope(pool, request_id=request_id)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=turn_id,
+            current_request_id=request_id,
             request_context=scope.context,
             output_assessment_audit=audit,
             retriever=_Retriever(),
@@ -313,8 +313,7 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
         state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
-            "turn_id": str(turn_id),
-            "client_request_id": None,
+            "request_id": str(request_id),
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
@@ -349,10 +348,10 @@ async def test_groundedness_uses_only_cited_documents(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -363,7 +362,7 @@ async def test_groundedness_uses_only_cited_documents(
             {
                 "query": "hello",
                 "conversation_id": "c1",
-                "client_request_id": None,
+                "request_id": "request-1",
             }
         )
 
@@ -387,10 +386,10 @@ async def test_groundedness_rejects_out_of_range_scores(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -401,7 +400,7 @@ async def test_groundedness_rejects_out_of_range_scores(
             {
                 "query": "hello",
                 "conversation_id": "c1",
-                "client_request_id": None,
+                "request_id": "request-1",
             }
         )
 
@@ -459,7 +458,7 @@ async def test_groundedness_actor_setup_failure_is_advisory(
     )
     assert groundedness_audit.tenant_id == "tenant-a"
     assert groundedness_audit.conversation_id == response.headers["x-conversation-id"]
-    assert groundedness_audit.turn_id == UUID(response.headers["x-turn-id"])
+    assert groundedness_audit.request_id == response.headers["x-request-id"]
     assert groundedness_audit.result == {
         "failed": True,
         "error": "groundedness model is unavailable",
@@ -473,10 +472,10 @@ async def test_assessment_audit_failure_does_not_gate_answer(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             output_assessment_audit=_FailingAssessmentAudit(),
             retriever=_Retriever(),
@@ -489,7 +488,7 @@ async def test_assessment_audit_failure_does_not_gate_answer(
             LinearGraphState(
                 query="hello",
                 conversation_id="c1",
-                client_request_id=None,
+                request_id="request-1",
             )
         )
 

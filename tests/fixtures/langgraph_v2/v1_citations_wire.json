@@ -10,6 +10,6 @@
     ]
   },
   "documented_v2_differences": [
-    "v2 adds deterministic Turn-local evidence_id values and highlight metadata"
+    "v2 adds deterministic request-local evidence_id values and highlight metadata"
   ]
 }

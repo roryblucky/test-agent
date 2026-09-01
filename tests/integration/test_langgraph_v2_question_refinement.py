@@ -6,10 +6,8 @@ from collections.abc import Sequence
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
-from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.conversation_messages import ConversationMessageRepository
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
-from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.question_refinement import (
     MockQuestionRefinementActor,
     PydanticAIQuestionRefinementActor,
@@ -20,14 +18,15 @@ from app.models.workflow import ResolvedQuery
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
+    seed_subject_conversation,
 )
 
 
 def _state() -> LinearGraphState:
     return {
         "query": "compare gold and FX",
-        "conversation_id": "conversation-1",
-        "client_request_id": None,
+        "conversation_id": "00000000-0000-0000-0000-000000000001",
+        "request_id": "request-1",
     }
 
 
@@ -50,7 +49,7 @@ async def test_refinement_failure_halts_before_later_phases(
 ) -> None:
     class FailingActor:
         async def refine(
-            self, query: str, history: Sequence[ConversationTurn]
+            self, query: str, history: Sequence[ConversationExchange]
         ) -> QuestionRefinementResult:
             del history
             raise ValueError(f"invalid output for {query}")
@@ -73,7 +72,7 @@ async def test_refinement_reexecution_reinvokes_actor(
         calls = 0
 
         async def refine(
-            self, query: str, history: Sequence[ConversationTurn]
+            self, query: str, history: Sequence[ConversationExchange]
         ) -> QuestionRefinementResult:
             del history
             self.calls += 1
@@ -124,12 +123,7 @@ def test_http_query_uses_injected_refinement_actor(
         async with AsyncConnectionPool(
             langgraph_v2_migrated_database_url, min_size=1, max_size=2
         ) as pool:
-            await ConversationMessageRepository(pool).resolve_conversation(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id="conversation-1",
-            )
+            await seed_subject_conversation(pool)
 
     asyncio.run(seed())
 
@@ -137,7 +131,7 @@ def test_http_query_uses_injected_refinement_actor(
         calls = 0
 
         async def refine(
-            self, query: str, history: Sequence[ConversationTurn]
+            self, query: str, history: Sequence[ConversationExchange]
         ) -> QuestionRefinementResult:
             del history
             self.calls += 1
@@ -158,7 +152,7 @@ def test_http_query_uses_injected_refinement_actor(
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 
@@ -168,14 +162,14 @@ def test_http_query_uses_injected_refinement_actor(
     assert delivered[-1]["data"]["refined_query"] == "http-refined"
 
 
-def test_new_turn_does_not_inherit_prior_refinement_usage(
+def test_new_request_does_not_inherit_prior_refinement_usage(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     class UsageThenNoUsageActor:
         calls = 0
 
         async def refine(
-            self, query: str, history: Sequence[ConversationTurn]
+            self, query: str, history: Sequence[ConversationExchange]
         ) -> QuestionRefinementResult:
             del history
             self.calls += 1
@@ -201,7 +195,7 @@ def test_new_turn_does_not_inherit_prior_refinement_usage(
     with TestClient(app) as client:
         first = client.post(
             "/v2/query/stream",
-            json={"query": "first", "clientRequestId": "first-turn"},
+            json={"query": "first", "clientRequestId": "first-request"},
             headers=headers,
         )
         second = client.post(
@@ -209,7 +203,7 @@ def test_new_turn_does_not_inherit_prior_refinement_usage(
             json={
                 "query": "second",
                 "sessionId": first.headers["x-conversation-id"],
-                "clientRequestId": "second-turn",
+                "clientRequestId": "second-request",
             },
             headers=headers,
         )

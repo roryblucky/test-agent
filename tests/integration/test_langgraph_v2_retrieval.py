@@ -31,8 +31,7 @@ async def test_retrieved_chunks_are_not_checkpointed() -> None:
     state: LinearGraphState = {
         "query": "hello",
         "conversation_id": "c1",
-        "turn_id": str(uuid4()),
-        "client_request_id": None,
+        "request_id": str(uuid4()),
     }
 
     result = await graph.ainvoke(

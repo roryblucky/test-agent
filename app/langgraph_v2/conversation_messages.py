@@ -1,325 +1,243 @@
-"""Tenant-scoped durable Conversation and Message persistence."""
+"""Tenant-scoped durable Conversation and Message history."""
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from typing import Any, Literal
-from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+from uuid import UUID
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
 
+from app.config.models import LangGraphRuntimeMode
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.checkpointing import thread_id_for
 
 
 class ConversationNotFound(LookupError):
     """A Conversation is absent from the requested Tenant boundary."""
 
 
+class ConversationModeConflict(RuntimeError):
+    """A Conversation belongs to a different fixed runtime mode."""
+
+
 class MessageNotFound(LookupError):
     """A Message is absent from the requested Tenant boundary."""
 
 
-class TurnNotFound(LookupError):
-    """A Turn is absent from the requested Tenant/Conversation boundary."""
+class RequestNotFound(LookupError):
+    """A request has no user Message in the Conversation."""
 
 
 class MessageInvariantConflict(RuntimeError):
-    """An idempotency key was reused for a different Message."""
-
-
-def turn_id_for_client_request(
-    tenant_id: str, conversation_id: str, client_request_id: str
-) -> UUID:
-    """Derive a collision-safe stable Turn ID for one client retry identity."""
-    payload = json.dumps(
-        [tenant_id, conversation_id, client_request_id],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return uuid5(NAMESPACE_URL, payload)
+    """A request/role identity was reused for different Message content."""
 
 
 class ConversationRecord(BaseModel):
-    """One durable Conversation within a Tenant."""
+    """One durable Conversation owned by a Tenant Subject."""
 
+    conversation_id: UUID
     tenant_id: str
-    conversation_id: str
     owner_subject_id: str
-    thread_id: str
+    runtime_mode: LangGraphRuntimeMode
+    next_message_sequence: int
     created_at: datetime
+    updated_at: datetime
 
 
 class MessageRecord(BaseModel):
-    """One durable user or assistant Message."""
+    """One durable user or final assistant Message."""
 
-    tenant_id: str
     message_id: UUID
-    conversation_id: str
-    turn_id: UUID
+    conversation_id: UUID
+    request_id: str
+    sequence: int
     role: Literal["user", "assistant"]
     content: str
-    idempotency_key: str
-    created_at: datetime
-
-
-class TurnRecord(BaseModel):
-    """A durable Conversation interaction anchored by its user Message."""
-
-    tenant_id: str
-    conversation_id: str
-    turn_id: UUID
     created_at: datetime
 
 
 class ConversationMessageRepository:
-    """Persist tenant-isolated Conversations and exactly-once Messages."""
+    """Persist authorized Conversations and ordered, request-paired Messages."""
 
     def __init__(self, pool: AsyncConnectionPool[Any]) -> None:
         self._pool = pool
 
-    async def create_turn(
+    @staticmethod
+    def _conversation_uuid(conversation_id: UUID | str) -> UUID:
+        """Normalize a boundary value before using the UUID database key."""
+        return UUID(str(conversation_id))
+
+    async def create_conversation(
         self,
         *,
         context: TrustedRequestContext,
-        conversation_id: str,
-        turn_id: UUID,
-        content: str,
-        idempotency_key: str,
-    ) -> TurnRecord:
-        """Create one Turn and its exactly-once user Message atomically."""
+        runtime_mode: LangGraphRuntimeMode,
+    ) -> ConversationRecord:
+        """Create a Conversation whose UUID identity is assigned by PostgreSQL."""
         async with self._pool.connection() as connection:
             async with connection.transaction():
-                await self._resolve_conversation_in_transaction(
-                    connection,
-                    context=context,
-                    conversation_id=conversation_id,
-                    for_update=True,
-                )
-                await self._persist_message_in_transaction(
-                    connection,
-                    tenant_id=context.tenant_id,
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
-                    role="user",
-                    content=content,
-                    idempotency_key=idempotency_key,
-                )
-                return await self._get_turn_in_transaction(
-                    connection,
-                    tenant_id=context.tenant_id,
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
-                )
-
-    async def get_turn(
-        self,
-        *,
-        context: TrustedRequestContext,
-        conversation_id: str,
-        turn_id: UUID,
-    ) -> TurnRecord:
-        """Return an authorized Turn anchored to its authoritative user Message."""
-        await self.get_conversation(context=context, conversation_id=conversation_id)
-        async with self._pool.connection() as connection:
-            return await self._get_turn_in_transaction(
-                connection,
-                tenant_id=context.tenant_id,
-                conversation_id=conversation_id,
-                turn_id=turn_id,
-            )
-
-    async def resolve_conversation(
-        self,
-        *,
-        context: TrustedRequestContext,
-        conversation_id: str | None = None,
-    ) -> ConversationRecord:
-        """Resolve or create a Conversation for the trusted Subject."""
-        resolved_conversation_id = conversation_id or str(uuid4())
-        async with self._pool.connection() as connection:
-            async with connection.transaction():
-                return await self._resolve_conversation_in_transaction(
-                    connection,
-                    context=context,
-                    conversation_id=resolved_conversation_id,
-                )
-
-    async def _resolve_conversation_in_transaction(
-        self,
-        connection: Any,
-        *,
-        context: TrustedRequestContext,
-        conversation_id: str,
-        for_update: bool = False,
-    ) -> ConversationRecord:
-        """Resolve within a caller-owned transaction for the admission seam."""
-        async with connection.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(
-                """
-                INSERT INTO langgraph_v2.conversations (
-                    tenant_id, conversation_id, owner_subject_id, thread_id
-                ) VALUES (%s, %s, %s, %s)
-                ON CONFLICT (tenant_id, conversation_id) DO NOTHING
-                """,
-                (
-                    context.tenant_id,
-                    conversation_id,
-                    context.subject_id,
-                    thread_id_for(context.tenant_id, conversation_id),
-                ),
-            )
-            if for_update:
-                await cursor.execute(
-                    """
-                    SELECT 1
-                    FROM langgraph_v2.conversations
-                    WHERE tenant_id = %s AND conversation_id = %s
-                    FOR UPDATE
-                    """,
-                    (context.tenant_id, conversation_id),
-                )
-            await cursor.execute(
-                """
-                SELECT tenant_id, conversation_id, owner_subject_id, thread_id,
-                       created_at
-                FROM langgraph_v2.conversations
-                WHERE tenant_id = %s AND conversation_id = %s
-                """,
-                (context.tenant_id, conversation_id),
-            )
-            row = await cursor.fetchone()
-        if row is None or row["owner_subject_id"] != context.subject_id:
-            raise ConversationNotFound(conversation_id)
-        return ConversationRecord.model_validate(row)
+                async with connection.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(
+                        """
+                        INSERT INTO langgraph_v2.conversations (
+                            tenant_id, owner_subject_id, runtime_mode
+                        ) VALUES (%s, %s, %s)
+                        RETURNING conversation_id, tenant_id, owner_subject_id,
+                                  runtime_mode, next_message_sequence,
+                                  created_at, updated_at
+                        """,
+                        (context.tenant_id, context.subject_id, runtime_mode.value),
+                    )
+                    row = await cursor.fetchone()
+                    assert row is not None
+                    return ConversationRecord.model_validate(row)
 
     async def get_conversation(
         self,
         *,
         context: TrustedRequestContext,
-        conversation_id: str,
+        conversation_id: UUID | str,
+        runtime_mode: LangGraphRuntimeMode | None = None,
     ) -> ConversationRecord:
-        """Return only a Conversation owned by the trusted Subject."""
+        """Return only a Conversation owned by the trusted Subject and mode."""
         async with self._pool.connection() as connection:
-            async with connection.cursor(row_factory=dict_row) as cursor:
-                await cursor.execute(
-                    """
-                    SELECT tenant_id, conversation_id, owner_subject_id, thread_id,
-                           created_at
-                    FROM langgraph_v2.conversations
-                    WHERE tenant_id = %s AND owner_subject_id = %s
-                      AND conversation_id = %s
-                    """,
-                    (context.tenant_id, context.subject_id, conversation_id),
-                )
-                row = await cursor.fetchone()
+            return await self._get_conversation_in_transaction(
+                connection,
+                context=context,
+                conversation_id=self._conversation_uuid(conversation_id),
+                runtime_mode=runtime_mode,
+            )
+
+    async def _get_conversation_in_transaction(
+        self,
+        connection: Any,
+        *,
+        context: TrustedRequestContext,
+        conversation_id: UUID,
+        runtime_mode: LangGraphRuntimeMode | None,
+        for_update: bool = False,
+    ) -> ConversationRecord:
+        lock = " FOR UPDATE" if for_update else ""
+        async with connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(
+                """
+                SELECT conversation_id, tenant_id, owner_subject_id,
+                       runtime_mode, next_message_sequence, created_at, updated_at
+                FROM langgraph_v2.conversations
+                WHERE conversation_id = %s
+                  AND tenant_id = %s
+                  AND owner_subject_id = %s
+                """
+                + lock,
+                (conversation_id, context.tenant_id, context.subject_id),
+            )
+            row = await cursor.fetchone()
         if row is None:
             raise ConversationNotFound(conversation_id)
-        return ConversationRecord.model_validate(row)
+        conversation = ConversationRecord.model_validate(row)
+        if runtime_mode is not None and conversation.runtime_mode is not runtime_mode:
+            raise ConversationModeConflict(conversation_id)
+        return conversation
+
+    async def persist_user_message(
+        self,
+        *,
+        context: TrustedRequestContext,
+        conversation_id: UUID | str,
+        request_id: str,
+        content: str,
+    ) -> MessageRecord:
+        """Persist exactly one user Message for a logical request."""
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                await self._get_conversation_in_transaction(
+                    connection,
+                    context=context,
+                    conversation_id=self._conversation_uuid(conversation_id),
+                    runtime_mode=None,
+                    for_update=True,
+                )
+                return await self._persist_message_in_transaction(
+                    connection,
+                    conversation_id=self._conversation_uuid(conversation_id),
+                    request_id=request_id,
+                    role="user",
+                    content=content,
+                )
 
     async def persist_assistant_message(
         self,
         *,
         context: TrustedRequestContext,
-        conversation_id: str,
+        conversation_id: UUID | str,
+        request_id: str,
         content: str,
-        idempotency_key: str,
-        turn_id: UUID,
     ) -> MessageRecord:
-        """Persist exactly one assistant Message for an existing Turn."""
+        """Persist one final assistant Message for an existing user request."""
         async with self._pool.connection() as connection:
             async with connection.transaction():
-                await self._resolve_conversation_in_transaction(
+                await self._get_conversation_in_transaction(
                     connection,
                     context=context,
-                    conversation_id=conversation_id,
+                    conversation_id=self._conversation_uuid(conversation_id),
+                    runtime_mode=None,
+                    for_update=True,
                 )
-                await self._require_user_turn_in_transaction(
+                await self._require_user_request_in_transaction(
                     connection,
-                    tenant_id=context.tenant_id,
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
+                    conversation_id=self._conversation_uuid(conversation_id),
+                    request_id=request_id,
                 )
                 return await self._persist_message_in_transaction(
                     connection,
-                    tenant_id=context.tenant_id,
-                    conversation_id=conversation_id,
-                    turn_id=turn_id,
+                    conversation_id=self._conversation_uuid(conversation_id),
+                    request_id=request_id,
                     role="assistant",
                     content=content,
-                    idempotency_key=idempotency_key,
                 )
 
-    async def _get_turn_in_transaction(
+    async def _require_user_request_in_transaction(
         self,
         connection: Any,
         *,
-        tenant_id: str,
-        conversation_id: str,
-        turn_id: UUID,
-    ) -> TurnRecord:
-        """Read a Turn using its authoritative user Message timestamp."""
-        async with connection.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(
-                """
-                    SELECT tenant_id, conversation_id, turn_id, created_at
-                FROM langgraph_v2.messages
-                WHERE tenant_id = %s AND conversation_id = %s
-                  AND turn_id = %s AND role = 'user'
-                """,
-                (tenant_id, conversation_id, turn_id),
-            )
-            row = await cursor.fetchone()
-        if row is None:
-            raise TurnNotFound(str(turn_id))
-        return TurnRecord.model_validate(row)
-
-    async def _require_user_turn_in_transaction(
-        self,
-        connection: Any,
-        *,
-        tenant_id: str,
-        conversation_id: str,
-        turn_id: UUID,
+        conversation_id: UUID,
+        request_id: str,
     ) -> None:
-        """Ensure an assistant attaches to an existing user Message Turn."""
-        async with connection.cursor(row_factory=dict_row) as cursor:
+        async with connection.cursor() as cursor:
             await cursor.execute(
                 """
-                SELECT turn_id
-                FROM langgraph_v2.messages
-                WHERE tenant_id = %s AND conversation_id = %s
-                  AND turn_id = %s AND role = 'user'
+                SELECT 1 FROM langgraph_v2.messages
+                WHERE conversation_id = %s AND request_id = %s
+                  AND role = 'user'
                 """,
-                (tenant_id, conversation_id, turn_id),
+                (conversation_id, request_id),
             )
             row = await cursor.fetchone()
         if row is None:
-            raise TurnNotFound(str(turn_id))
+            raise RequestNotFound(request_id)
 
     async def get_message(
         self,
         *,
         context: TrustedRequestContext,
-        conversation_id: str,
+        conversation_id: UUID | str,
         message_id: UUID,
     ) -> MessageRecord:
         """Return a Message only after authorizing its Conversation owner."""
-        await self.get_conversation(context=context, conversation_id=conversation_id)
+        normalized_id = self._conversation_uuid(conversation_id)
+        await self.get_conversation(context=context, conversation_id=normalized_id)
         async with self._pool.connection() as connection:
             async with connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
                     """
-                    SELECT tenant_id, message_id, conversation_id, role,
-                           turn_id, content, idempotency_key, created_at
+                    SELECT message_id, conversation_id, request_id, sequence,
+                           role, content, created_at
                     FROM langgraph_v2.messages
-                    WHERE tenant_id = %s AND conversation_id = %s
-                      AND message_id = %s
+                    WHERE conversation_id = %s AND message_id = %s
                     """,
-                    (context.tenant_id, conversation_id, message_id),
+                    (normalized_id, message_id),
                 )
                 row = await cursor.fetchone()
         if row is None:
@@ -330,21 +248,22 @@ class ConversationMessageRepository:
         self,
         *,
         context: TrustedRequestContext,
-        conversation_id: str,
+        conversation_id: UUID | str,
     ) -> list[MessageRecord]:
-        """Return authorized Conversation Messages chronologically."""
-        await self.get_conversation(context=context, conversation_id=conversation_id)
+        """Return authorized Conversation Messages in durable sequence order."""
+        normalized_id = self._conversation_uuid(conversation_id)
+        await self.get_conversation(context=context, conversation_id=normalized_id)
         async with self._pool.connection() as connection:
             async with connection.cursor(row_factory=dict_row) as cursor:
                 await cursor.execute(
                     """
-                    SELECT tenant_id, message_id, conversation_id, role,
-                           turn_id, content, idempotency_key, created_at
+                    SELECT message_id, conversation_id, request_id, sequence,
+                           role, content, created_at
                     FROM langgraph_v2.messages
-                    WHERE tenant_id = %s AND conversation_id = %s
-                    ORDER BY created_at, message_id
+                    WHERE conversation_id = %s
+                    ORDER BY sequence
                     """,
-                    (context.tenant_id, conversation_id),
+                    (normalized_id,),
                 )
                 rows = await cursor.fetchall()
         return [MessageRecord.model_validate(row) for row in rows]
@@ -353,59 +272,55 @@ class ConversationMessageRepository:
         self,
         connection: Any,
         *,
-        tenant_id: str,
-        conversation_id: str,
-        turn_id: UUID,
+        conversation_id: UUID,
+        request_id: str,
         role: Literal["user", "assistant"],
         content: str,
-        idempotency_key: str,
     ) -> MessageRecord:
-        message_id = uuid4()
-        insert_sql = """
-            INSERT INTO langgraph_v2.messages (
-                tenant_id, message_id, conversation_id, turn_id, role,
-                content, idempotency_key
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-            RETURNING tenant_id, message_id, conversation_id, role,
-                      turn_id, content, idempotency_key, created_at
-            """
-        insert_params = (
-            tenant_id,
-            message_id,
-            conversation_id,
-            turn_id,
-            role,
-            content,
-            idempotency_key,
-        )
         async with connection.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(insert_sql, insert_params)
-            row = await cursor.fetchone()
-            if row is None:
-                await cursor.execute(
-                    """
-                    SELECT tenant_id, message_id, conversation_id, role,
-                           turn_id, content, idempotency_key, created_at
-                    FROM langgraph_v2.messages
-                    WHERE tenant_id = %s
-                      AND (
-                          idempotency_key = %s
-                          OR (conversation_id = %s AND turn_id = %s AND role = %s)
-                      )
-                    """,
-                    (tenant_id, idempotency_key, conversation_id, turn_id, role),
-                )
-                row = await cursor.fetchone()
-        if row is None:
-            raise MessageInvariantConflict(idempotency_key)
-        same_message = (
-            row["conversation_id"] == conversation_id
-            and row["turn_id"] == turn_id
-            and row["role"] == role
-            and row["content"] == content
-            and row["idempotency_key"] == idempotency_key
-        )
-        if not same_message:
-            raise MessageInvariantConflict(idempotency_key)
-        return MessageRecord.model_validate(row)
+            await cursor.execute(
+                """
+                SELECT message_id, conversation_id, request_id, sequence,
+                       role, content, created_at
+                FROM langgraph_v2.messages
+                WHERE conversation_id = %s AND request_id = %s AND role = %s
+                """,
+                (conversation_id, request_id, role),
+            )
+            existing = await cursor.fetchone()
+            if existing is not None:
+                if existing["content"] != content:
+                    raise MessageInvariantConflict(request_id)
+                return MessageRecord.model_validate(existing)
+
+            await cursor.execute(
+                """
+                UPDATE langgraph_v2.conversations
+                SET next_message_sequence = next_message_sequence + 1,
+                    updated_at = now()
+                WHERE conversation_id = %s
+                RETURNING next_message_sequence - 1 AS sequence
+                """,
+                (conversation_id,),
+            )
+            sequence_row = await cursor.fetchone()
+            assert sequence_row is not None
+            await cursor.execute(
+                """
+                INSERT INTO langgraph_v2.messages (
+                    conversation_id, request_id, sequence, role, content
+                ) VALUES (%s, %s, %s, %s, %s)
+                RETURNING message_id, conversation_id, request_id, sequence,
+                          role, content, created_at
+                """,
+                (
+                    conversation_id,
+                    request_id,
+                    sequence_row["sequence"],
+                    role,
+                    content,
+                ),
+            )
+            inserted = await cursor.fetchone()
+        assert inserted is not None
+        return MessageRecord.model_validate(inserted)

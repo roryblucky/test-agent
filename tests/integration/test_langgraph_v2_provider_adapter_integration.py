@@ -20,7 +20,7 @@ from app.config.models import (
 )
 from app.core.http_client_pool import HttpClientPool
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
-from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.question_refinement import MockQuestionRefinementActor
 from app.models.domain import Document, GroundednessResult, ModerationResult
@@ -111,7 +111,7 @@ class _AnswerActor:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AsyncIterator[AnswerStreamChunk]:
         del query, documents, history
         yield AnswerStreamChunk(delta="answer")
@@ -236,7 +236,7 @@ def test_tenant_config_limits_reach_v2_retriever_and_ranker(
     asyncio.run(
         seed_subject_conversation(
             langgraph_v2_migrated_database_url,
-            "conversation-1",
+            "00000000-0000-0000-0000-000000000001",
         )
     )
     app = persistent_linear_app(
@@ -249,7 +249,7 @@ def test_tenant_config_limits_reach_v2_retriever_and_ranker(
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
-            json={"query": "hello", "sessionId": "conversation-1"},
+            json={"query": "hello", "sessionId": "00000000-0000-0000-0000-000000000001"},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
 

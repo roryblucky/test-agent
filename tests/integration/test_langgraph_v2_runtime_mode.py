@@ -39,16 +39,16 @@ async def _conversation_count(database_url: str) -> int:
     return int(row[0])
 
 
-async def _message_count(database_url: str, conversation_id: str) -> int:
+async def _message_count(database_url: str, conversation_id: UUID | str) -> int:
     async with AsyncConnectionPool(database_url, min_size=1, max_size=1) as pool:
         async with pool.connection() as connection:
             result = await connection.execute(
                 """
                 SELECT COUNT(*)
                 FROM langgraph_v2.messages
-                WHERE tenant_id = %s AND conversation_id = %s
+                WHERE conversation_id = %s
                 """,
-                ("tenant-a", conversation_id),
+                (conversation_id,),
             )
             row = await result.fetchone()
     assert row is not None
@@ -90,8 +90,8 @@ class _AgentRuntime:
     def runtime_mode(self) -> LangGraphRuntimeMode:
         return LangGraphRuntimeMode.AGENT
 
-    def build_graph(self, *, turn_id: UUID) -> RequestOwnedGraph:
-        del turn_id
+    def build_graph(self, *, request_id: str) -> RequestOwnedGraph:
+        del request_id
         return self.graph
 
     def initial_state_fields(
@@ -126,7 +126,7 @@ class _IdentityOverridingAgentRuntime(_AgentRuntime):
         payload: V2QueryRequest,
     ) -> Mapping[str, Any]:
         del payload
-        return {"turn_id": "forged-turn"}
+        return {"request_id": "forged-request"}
 
 
 class _AgentTenantManager:
@@ -152,10 +152,11 @@ class _AgentTenantManager:
 def test_agent_tenant_query_ignores_client_mode_override(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    asyncio.run(
+    conversation_id = asyncio.run(
         seed_subject_conversation(
             langgraph_v2_migrated_database_url,
             "agent-query-conversation",
+            runtime_mode=LangGraphRuntimeMode.AGENT,
         )
     )
     runtime = _AgentRuntime()
@@ -170,7 +171,7 @@ def test_agent_tenant_query_ignores_client_mode_override(
             "/v2/query/stream",
             json={
                 "query": "agent query",
-                "sessionId": "agent-query-conversation",
+                "sessionId": str(conversation_id),
                 "mode": "linear",
             },
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
@@ -181,9 +182,8 @@ def test_agent_tenant_query_ignores_client_mode_override(
     assert runtime.graph.inputs == [
         {
             "query": "agent query",
-            "conversation_id": "agent-query-conversation",
-            "turn_id": response.headers["X-Turn-Id"],
-            "client_request_id": None,
+            "conversation_id": str(conversation_id),
+            "request_id": response.headers["X-Request-Id"],
         }
     ]
 
@@ -191,11 +191,11 @@ def test_agent_tenant_query_ignores_client_mode_override(
 def test_agent_runtime_cannot_override_shared_query_identity(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    conversation_id = "agent-identity-conflict"
-    asyncio.run(
+    conversation_id = asyncio.run(
         seed_subject_conversation(
             langgraph_v2_migrated_database_url,
-            conversation_id,
+            "agent-identity-conflict",
+            runtime_mode=LangGraphRuntimeMode.AGENT,
         )
     )
     runtime = _IdentityOverridingAgentRuntime()
@@ -208,7 +208,7 @@ def test_agent_runtime_cannot_override_shared_query_identity(
     with TestClient(app) as client:
         response = client.post(
             "/v2/query/stream",
-            json={"query": "agent query", "sessionId": conversation_id},
+            json={"query": "agent query", "sessionId": str(conversation_id)},
             headers={
                 "X-Application-Id": "tenant-a",
                 "X-Subject-Id": "subject-a",
@@ -219,7 +219,7 @@ def test_agent_runtime_cannot_override_shared_query_identity(
     assert parse_sse(response.text) == [
         {
             "type": "error",
-            "data": "Runtime redefined shared Query state: turn_id",
+            "data": "Runtime redefined shared Query state: request_id",
         }
     ]
     assert runtime.graph.inputs == []

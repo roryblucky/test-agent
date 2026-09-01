@@ -16,7 +16,7 @@ from app.langgraph_v2.answer import (
     AnswerStreamChunk,
 )
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
-from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.history import ConversationExchange
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.langgraph_v2.stream import stream_graph
@@ -24,7 +24,7 @@ from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence
 from app.services.citation_extractor import build_citations
 from app.services.events import EventEmitter
-from tests.integration.langgraph_v2_turn_support import seed_turn_scope
+from tests.integration.langgraph_v2_request_support import seed_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -38,7 +38,7 @@ class _AnswerActor:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         self.calls += 1
         assert query == "hello"
@@ -46,7 +46,7 @@ class _AnswerActor:
         return AnswerResult(answer="One. Two\nThree; four", usage={"output_tokens": 4})
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -68,7 +68,7 @@ class _StreamingAnswerActor:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AsyncIterator[AnswerStreamChunk]:
         del query, documents, history
         result = AnswerResult(answer="One. Two.", usage={"output_tokens": 2})
@@ -82,13 +82,13 @@ class _FailingAnswer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         del query, documents, history
         raise RuntimeError("answer model unavailable")
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -102,7 +102,7 @@ class _CitingAnswer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         self.calls += 1
         del query, documents, history
@@ -118,7 +118,7 @@ class _CitingAnswer:
         )
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -132,7 +132,7 @@ class _InlineCitationAnswer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         self.calls += 1
         del query, documents, history
@@ -141,7 +141,7 @@ class _InlineCitationAnswer:
         )
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -155,14 +155,14 @@ class _RankedInlineAnswer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         self.calls += 1
         del query, documents, history
         return AnswerResult(answer="World claim [1].")
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -176,7 +176,7 @@ class _MalformedCitationAnswer:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AnswerResult:
         self.calls += 1
         del query, documents, history
@@ -186,7 +186,7 @@ class _MalformedCitationAnswer:
         )
 
     async def answer_stream(
-        self, query: str, documents: list[Document], history: Sequence[ConversationTurn]
+        self, query: str, documents: list[Document], history: Sequence[ConversationExchange]
     ) -> AsyncIterator[AnswerStreamChunk]:
         result = await self.answer(query, documents, history)
         yield AnswerStreamChunk(delta=result.answer)
@@ -201,10 +201,10 @@ async def test_answer_receives_ranked_documents_on_each_execution(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _AnswerActor()
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -213,7 +213,7 @@ async def test_answer_receives_ranked_documents_on_each_execution(
         state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
-            "client_request_id": None,
+            "request_id": "request-1",
         }
 
         first = await graph.ainvoke(state)
@@ -234,11 +234,11 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             checkpointer=MemorySaver(),
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -247,7 +247,7 @@ async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
         state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
-            "client_request_id": None,
+            "request_id": "request-1",
         }
 
         config: RunnableConfig = {"configurable": {"thread_id": "ticket34-stream"}}
@@ -322,7 +322,7 @@ def test_answer_chunks_are_streamed_before_finalization(
     assert max(token_positions) < finalization_position
 
 
-def test_new_turn_does_not_inherit_answer_when_answer_actor_is_unavailable(
+def test_new_request_does_not_inherit_answer_when_answer_actor_is_unavailable(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     app = persistent_linear_app(
@@ -339,7 +339,7 @@ def test_new_turn_does_not_inherit_answer_when_answer_actor_is_unavailable(
     with TestClient(app) as client:
         first = client.post(
             "/v2/query/stream",
-            json={"query": "first", "clientRequestId": "first-turn"},
+            json={"query": "first", "clientRequestId": "first-request"},
             headers=headers,
         )
         conversation_id = first.headers["x-conversation-id"]
@@ -349,7 +349,7 @@ def test_new_turn_does_not_inherit_answer_when_answer_actor_is_unavailable(
             json={
                 "query": "second",
                 "sessionId": conversation_id,
-                "clientRequestId": "second-turn",
+                "clientRequestId": "second-request",
             },
             headers=headers,
         )
@@ -381,10 +381,10 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _CitingAnswer()
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -393,7 +393,7 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
         state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
-            "client_request_id": None,
+            "request_id": "request-1",
         }
         first = await graph.ainvoke(state)
         second = await graph.ainvoke(state)
@@ -416,10 +416,10 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _InlineCitationAnswer()
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -428,7 +428,7 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
         state: LinearGraphState = {
             "query": "hello",
             "conversation_id": "c1",
-            "client_request_id": None,
+            "request_id": "request-1",
         }
         result = await graph.ainvoke(state)
 
@@ -503,10 +503,10 @@ async def test_inline_citation_uses_reranked_evidence_position(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _RankedInlineAnswer()
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=TwoRetriever(),
             ranker=ReverseRanker(),
@@ -516,7 +516,7 @@ async def test_inline_citation_uses_reranked_evidence_position(
             {
                 "query": "hello",
                 "conversation_id": "c1",
-                "client_request_id": None,
+                "request_id": "request-1",
             }
         )
 
@@ -536,10 +536,10 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         actor = _MalformedCitationAnswer()
-        scope = await seed_turn_scope(pool)
+        scope = await seed_request_scope(pool)
         graph = build_linear_graph(
             tenant_id="tenant-a",
-            current_turn_id=scope.turn_id,
+            current_request_id=scope.request_id,
             request_context=scope.context,
             retriever=_Retriever(),
             ranker=_Ranker(),
@@ -549,7 +549,7 @@ async def test_malformed_inline_references_do_not_fallback_to_structured_citatio
             {
                 "query": "hello",
                 "conversation_id": "c1",
-                "client_request_id": None,
+                "request_id": "request-1",
             }
         )
 

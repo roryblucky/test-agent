@@ -1,3 +1,12 @@
 # Use PostgreSQL as the durable Conversation and checkpoint store
 
-PostgreSQL is authoritative for Tenant-owned Conversations (including their owning Subjects), Messages, and official shared LangGraph checkpoints; each Conversation stores a stable internal `thread_id`, and every history or checkpoint access authorizes its Tenant and Subject ownership first. A user Message defines a Turn, with the same `turn_id` in the user/assistant Messages and LangGraph State, one user Message at Turn creation, one assistant Message after successful finalization, and `durability="sync"` persisting official checkpoints without an application pointer. No public Resume API, application-owned Run, transport Event, heartbeat, claim, lease, execution-epoch journal, or retrieval Artifact store is part of this boundary. Full retrieval chunks remain request-local and untracked. Redis is cache-only and cannot grant access or override PostgreSQL state.
+PostgreSQL is authoritative for Tenant-owned Conversations (including owning
+Subject and fixed runtime mode), Messages, and official shared LangGraph
+checkpoints. Conversation IDs are database-generated UUID primary keys. The
+checkpointer `thread_id` is derived from Tenant plus Conversation and is not
+stored. Every history or checkpoint access authorizes Tenant and Subject first.
+The stable logical `request_id` pairs one user Message with at most one final
+assistant Message; an atomic per-Conversation sequence orders all Messages. No
+Turn identity, Message idempotency key, public Resume API, application-owned Run,
+transport Event, or retrieval Artifact store is part of this boundary. Full
+retrieval chunks and Agent progress remain request-local and untracked.

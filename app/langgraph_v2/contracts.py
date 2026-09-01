@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -29,7 +30,7 @@ class V2QueryRequest(BaseModel):
 
     query: str = Field(min_length=1)
     conversation_id: Annotated[
-        str | None,
+        UUID | None,
         Field(
             validation_alias=AliasChoices("sessionId", "conversation_id", "session_id"),
             serialization_alias="sessionId",

@@ -1,7 +1,7 @@
 {
   "requests": [
-    {"query": "first question", "sessionId": "conversation-1"},
-    {"query": "follow up", "sessionId": "conversation-1"}
+    {"query": "first question", "sessionId": "00000000-0000-0000-0000-000000000001"},
+    {"query": "follow up", "sessionId": "00000000-0000-0000-0000-000000000001"}
   ],
   "second_done": {
     "type": "done",
@@ -25,7 +25,7 @@
       "moderation": {"is_flagged": false, "categories": {}, "reason": null},
       "groundedness": null,
       "clarification": null,
-      "session_id": "conversation-1",
+      "session_id": "00000000-0000-0000-0000-000000000001",
       "metadata": {
         "steps_executed": [
           "query",

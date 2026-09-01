@@ -24,7 +24,7 @@
         "moderation": {"is_flagged": false, "categories": {}, "reason": null},
         "groundedness": {"is_grounded": true, "score": 0.9, "details": "supported"},
         "clarification": null,
-        "session_id": "c1",
+        "session_id": "00000000-0000-0000-0000-000000000001",
         "metadata": {
           "steps_executed": [
             "query", "pre_moderation", "question_refinement", "retrieval",
@@ -85,7 +85,7 @@
             "moderation": {"is_flagged": false, "categories": {}, "reason": null},
             "groundedness": {"is_grounded": true, "score": 0.9, "details": "supported"},
             "clarification": null,
-            "session_id": "c1",
+            "session_id": "00000000-0000-0000-0000-000000000001",
             "metadata": {
                 "steps_executed": [
                     "query",

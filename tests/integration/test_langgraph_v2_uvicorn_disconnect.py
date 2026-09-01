@@ -223,7 +223,7 @@ async def _serve_tcp_forwarding_proxy(upstream_port: int) -> AsyncGenerator[int]
 async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    conversation_id = "uvicorn-disconnect"
+    conversation_id = "00000000-0000-0000-0000-000000000006"
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
     await seed_subject_conversation(
         langgraph_v2_migrated_database_url,

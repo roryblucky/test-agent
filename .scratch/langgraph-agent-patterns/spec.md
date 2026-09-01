@@ -14,7 +14,7 @@ server-side mode configuration. The client cannot select or override the mode.
 Use a fixed LangGraph safety skeleton around a validated dynamic Task DAG,
 PydanticAI actors, registered Tools, Agent Skills, deterministic calculations,
 and publication gates. `agent` is one runtime mode, not a collection of
-Tenant-selected pattern implementations: each Turn derives the execution shape
+Tenant-selected pattern implementations: each request derives the execution shape
 required by its query, and one plan may combine parallel fan-out, multi-hop
 dependencies, map-reduce, and Specialist delegation.
 
@@ -30,7 +30,7 @@ dependencies, map-reduce, and Specialist delegation.
 
 ## Implementation Decisions
 
-- Depend on the Linear Core's request-owned v2 SSE, Conversation/Turn identity,
+- Depend on the Linear Core's request-owned v2 SSE, Conversation/request identity,
   official shared PostgreSQL checkpoints and Tenant isolation. Keep
   `linear` as the initial Tenant default and enable `agent` only through trusted
   Tenant configuration.
@@ -38,12 +38,13 @@ dependencies, map-reduce, and Specialist delegation.
   persistence model. LangGraph State and its official checkpoint are the durable
   execution authority; do not add a `runs` table, Run repository, duplicate
   checkpoint pointer, transport Event journal, or Redis recovery state.
-- Resolve the Tenant's configured mode before starting a Turn. One Tenant has
-  exactly one active mode, so a Conversation never mixes Linear and Agent Turns.
+- Resolve the Tenant's configured mode before starting a request. One Tenant has
+  exactly one active mode, and Conversation persists that mode, so a Conversation
+  never mixes Linear and Agent requests.
   Runtime mode is fixed for the current deployment configuration; config reload
   must reject a mode change.
-- Within an Agent-mode Conversation, plan every Turn independently from that
-  Turn's query and authorized capabilities. Consecutive Turns may use different
+- Within an Agent-mode Conversation, plan every request independently from that
+  request's query and authorized capabilities. Consecutive requests may use different
   execution shapes; do not store a Tenant-level or Conversation-level active
   Agent pattern.
 - Share Query authorization and request-owned streaming mechanics, and inject
@@ -61,7 +62,7 @@ dependencies, map-reduce, and Specialist delegation.
   an outcome must pass through normal assessment and a newly validated plan
   revision.
 - Retrieval, reranking, reduction, calculation, and Specialist work are Task kinds behind one `TaskSpec → TaskOutcome` execution seam. Map-reduce and multi-hop are dependency shapes, not separate runtimes.
-- Schedule each ready frontier with LangGraph fan-out/fan-in and a barrier before progress assessment. Permit at most 32 Tasks, eight-way fan-out, three replans, two eligible retries, a 60-second Task timeout, and a 10-minute Run budget. Anchor the Run budget to the Turn's creation time and checkpoint its fixed deadline; retry never resets it.
+- Schedule each ready frontier with LangGraph fan-out/fan-in and a barrier before progress assessment. Permit at most 32 Tasks, eight-way fan-out, three replans, two eligible retries, a 60-second Task timeout, and a 10-minute execution budget. Anchor that budget to request creation time and checkpoint its fixed deadline; retry never resets it.
 - Keep Run, Task, and Specialist state separate inside LangGraph State. Branches return immutable outcomes; reducers merge stable-ID maps associatively and idempotently. Same ID with different content is a conflict.
 - PydanticAI builds role-configured actors with model abstraction, activated Skill instructions, approved tool bindings, structured outputs, and usage. Planner actors do not execute business Tools.
 - Specialist Agents are one-level, per-invocation subgraphs. They may use restricted read-only PydanticAI Tools, but bindings delegate to the platform Tool Executor for typed outcomes, Evidence, audit, and SSE events.
@@ -86,7 +87,7 @@ dependencies, map-reduce, and Specialist delegation.
 - Verify bounded replanning, Task budgets, one-level Specialist permissions, approved Skill activation, deterministic reducer behavior, retry idempotency, and additive SSE compatibility.
 - Verify that separate Linear-configured and Agent-configured Tenants use the
   same query route and cannot override mode through request input.
-- Verify consecutive Turns in one Agent-mode Conversation can execute different
+- Verify consecutive requests in one Agent-mode Conversation can execute different
   shapes—for example, fan-out/fan-in followed by a combined multi-hop plan.
 - Run the Agent scenarios within the shared 50-concurrent-stream harness using mock dependencies.
 - Add focused unit/property tests for plan compilation, frontier selection, stable-ID reducers, Evidence gates, and registered calculation contracts.

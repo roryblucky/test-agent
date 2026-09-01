@@ -13,7 +13,7 @@ from pydantic_ai import Agent
 
 from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.evidence import Evidence
-from app.langgraph_v2.history import ConversationTurn, to_model_message_history
+from app.langgraph_v2.history import ConversationExchange, to_model_message_history
 from app.langgraph_v2.model_usage import model_usage_payload
 from app.langgraph_v2.stream import await_task_completion
 from app.models.domain import Document
@@ -135,7 +135,7 @@ class AnswerActor(Protocol):
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn],
+        history: Sequence[ConversationExchange],
     ) -> AsyncIterator[AnswerStreamChunk]:
         """Yield final-answer deltas and the complete validated result."""
         ...
@@ -162,7 +162,7 @@ class PydanticAIAnswerActor:
         self,
         query: str,
         documents: list[Document],
-        history: Sequence[ConversationTurn] = (),
+        history: Sequence[ConversationExchange] = (),
     ) -> AsyncIterator[AnswerStreamChunk]:
         """Stream final ``AnswerOutput.answer`` deltas and return its full result.
 
@@ -231,7 +231,7 @@ async def run_answer(
         evidence = [Evidence.model_validate(item) for item in state["ranked_evidence"]]
         documents = [item.document for item in evidence]
         history = [
-            ConversationTurn.model_validate(turn) for turn in state.get("history", [])
+            ConversationExchange.model_validate(exchange) for exchange in state.get("history", [])
         ]
         refined_query = state.get("refined_query")
         answer_query = (

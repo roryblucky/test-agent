@@ -13,7 +13,7 @@ from app.langgraph_v2.answer import (
     run_answer,
 )
 from app.langgraph_v2.evidence import Evidence
-from app.langgraph_v2.history import ConversationTurn
+from app.langgraph_v2.history import ConversationExchange
 from app.models.domain import Document
 
 
@@ -84,7 +84,7 @@ async def test_pydantic_ai_answer_actor_streams_answer_field_deltas_and_final_re
     )
     agent = _FakeStructuredAgent(stream)
     actor = PydanticAIAnswerActor(agent)  # type: ignore[arg-type]
-    history = [ConversationTurn(user="previous", assistant="answer")]
+    history = [ConversationExchange(user="previous", assistant="answer")]
 
     chunks = [
         chunk

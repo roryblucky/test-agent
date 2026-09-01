@@ -9,14 +9,15 @@ index migrations.
 
 Application identifiers are encoded as URL-safe base64 JSON tuples:
 
-- `thread_id` is `("thread", tenant_id, conversation_id)`.
+- `thread_id` is derived as `("thread", tenant_id, conversation_id)` and is not
+  stored on the Conversation.
 - `checkpoint_ns` is the empty string used by the root LangGraph graph.
 
 Query passes the shared official saver directly to LangGraph. PostgreSQL holds
 the official checkpoint state; there is no application checkpoint pointer,
 fenced saver, claim, lease, heartbeat, or execution epoch. This stage exposes
 no Resume or computation-recovery API. Completed finalization writes the
-assistant Message idempotently by Turn.
+assistant Message idempotently by logical request ID.
 
 Checkpoint rows are internal journal state. They do not create application
 Events and are not emitted in the query SSE stream.
