@@ -32,16 +32,10 @@ CREATE TABLE langgraph_v2.messages (
     content TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resume_deadline TIMESTAMPTZ,
     PRIMARY KEY (tenant_id, message_id),
     UNIQUE (tenant_id, idempotency_key),
     CONSTRAINT messages_role_check
         CHECK (role IN ('user', 'assistant')),
-    CONSTRAINT messages_resume_deadline_role_check
-        CHECK (
-            (role = 'user' AND resume_deadline IS NOT NULL)
-            OR (role = 'assistant' AND resume_deadline IS NULL)
-        ),
     CONSTRAINT messages_turn_role_unique
         UNIQUE (tenant_id, conversation_id, turn_id, role),
     FOREIGN KEY (tenant_id, conversation_id)

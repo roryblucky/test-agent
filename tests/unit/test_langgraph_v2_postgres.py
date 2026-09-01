@@ -15,14 +15,12 @@ def test_v2_postgres_config_reads_explicit_bounded_pool_settings() -> None:
             "LANGGRAPH_V2_DATABASE_URL": "postgresql://app:secret@db/v2",
             "LANGGRAPH_V2_DATABASE_POOL_MIN_SIZE": "2",
             "LANGGRAPH_V2_DATABASE_POOL_MAX_SIZE": "12",
-            "LANGGRAPH_V2_RESUME_TTL_SECONDS": "900",
         }
     )
 
     assert config is not None
     assert config.conninfo == "postgresql://app:secret@db/v2"
     assert (config.min_size, config.max_size) == (2, 12)
-    assert config.resume_ttl_seconds == 900
 
 
 def test_v2_postgres_config_is_disabled_without_an_explicit_url() -> None:

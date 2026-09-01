@@ -34,6 +34,7 @@ from app.providers.factory import ProviderFactory
 from app.services.exceptions import TenantNotFoundError
 from app.services.tenant_manager import TenantManager
 from tests.integration.test_langgraph_v2_linear_core import (
+    LinearTenantManager,
     parse_sse,
     persistent_linear_app,
     seed_subject_conversation,
@@ -46,7 +47,7 @@ class _FailingModeration:
         raise RuntimeError("moderation backend unavailable")
 
 
-class _EmptyTenantManager:
+class _EmptyTenantManager(LinearTenantManager):
     def get_providers(self, tenant_id: str):
         assert tenant_id == "tenant-a"
         return SimpleNamespace(

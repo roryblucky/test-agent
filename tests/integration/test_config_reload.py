@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Never
 
 import pytest
 from fastapi import FastAPI
 
 from app.config.config_reloader import ConfigReloader
-from app.config.models import FlowConfig, LLMConfig, TenantConfig
+from app.config.models import (
+    FlowConfig,
+    LangGraphRuntimeMode,
+    LLMConfig,
+    TenantConfig,
+)
 from app.core.http_client_pool import HttpClientPool
 
 
@@ -21,6 +25,13 @@ class FakeTenantManager:
         self.configs = configs
         self.http_pool = http_pool
         self.tenant_ids = [cfg.application_id for cfg in configs]
+
+    def get_tenant_config(self, application_id: str) -> TenantConfig:
+        return next(
+            config
+            for config in self.configs
+            if config.application_id == application_id
+        )
 
 
 def _config(application_id: str) -> TenantConfig:
@@ -39,8 +50,8 @@ async def test_config_reload_swaps_manager_atomically(
 ) -> None:
     """A successful reload replaces the active tenant manager."""
     app = FastAPI()
-    app.state.tenant_manager = SimpleNamespace(tenant_ids=["old-tenant"])
     http_pool = HttpClientPool()
+    app.state.tenant_manager = FakeTenantManager([_config("old-tenant")], http_pool)
 
     def _load_new(_config_path: str | Path) -> list[TenantConfig]:
         return [_config("new-tenant")]
@@ -72,9 +83,9 @@ async def test_config_reload_keeps_old_manager_on_failure(
 ) -> None:
     """A failed reload leaves the previous tenant manager in place."""
     app = FastAPI()
-    old_manager = SimpleNamespace(tenant_ids=["old-tenant"])
-    app.state.tenant_manager = old_manager
     http_pool = HttpClientPool()
+    old_manager = FakeTenantManager([_config("old-tenant")], http_pool)
+    app.state.tenant_manager = old_manager
 
     def _raise(*args: Any, **kwargs: Any) -> Never:
         raise ValueError("invalid config")
@@ -101,3 +112,65 @@ async def test_config_reload_keeps_old_manager_on_failure(
     assert app.state.tenant_manager is old_manager
     assert reloader.reload_count == 0
     assert reloader.last_reload is None
+
+
+@pytest.mark.asyncio
+async def test_config_reload_rejects_runtime_mode_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = FastAPI()
+    http_pool = HttpClientPool()
+    old_manager = FakeTenantManager([_config("tenant-a")], http_pool)
+    app.state.tenant_manager = old_manager
+    changed = _config("tenant-a").model_copy(
+        update={"runtime_mode": LangGraphRuntimeMode.AGENT}
+    )
+
+    def _load_changed(_config_path: str | Path) -> list[TenantConfig]:
+        return [changed]
+
+    monkeypatch.setattr(
+        "app.config.config_reloader.load_config",
+        _load_changed,
+    )
+    monkeypatch.setattr(
+        "app.config.config_reloader.TenantManager",
+        FakeTenantManager,
+    )
+
+    result = await ConfigReloader(app, http_pool).reload("config.json")
+
+    assert result.status == "failed"
+    assert "runtime_mode cannot change" in (result.error or "")
+    assert app.state.tenant_manager is old_manager
+
+
+@pytest.mark.asyncio
+async def test_config_reload_cannot_change_mode_by_removing_and_readding_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = FastAPI()
+    http_pool = HttpClientPool()
+    app.state.tenant_manager = FakeTenantManager([_config("tenant-a")], http_pool)
+    agent_config = _config("tenant-a").model_copy(
+        update={"runtime_mode": LangGraphRuntimeMode.AGENT}
+    )
+    loaded_configs = iter([[], [agent_config]])
+
+    def _load_next(_config_path: str | Path) -> list[TenantConfig]:
+        return next(loaded_configs)
+
+    monkeypatch.setattr("app.config.config_reloader.load_config", _load_next)
+    monkeypatch.setattr(
+        "app.config.config_reloader.TenantManager",
+        FakeTenantManager,
+    )
+    reloader = ConfigReloader(app, http_pool)
+
+    removed = await reloader.reload("config.json")
+    readded = await reloader.reload("config.json")
+
+    assert removed.status == "success"
+    assert readded.status == "failed"
+    assert "runtime_mode cannot change" in (readded.error or "")
+    assert app.state.tenant_manager.tenant_ids == []

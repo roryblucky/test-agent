@@ -12,37 +12,17 @@ Application identifiers are encoded as URL-safe base64 JSON tuples:
 - `thread_id` is `("thread", tenant_id, conversation_id)`.
 - `checkpoint_ns` is the empty string used by the root LangGraph graph.
 
-Query and Resume pass the shared official saver directly to LangGraph. Resume
-authorizes the Tenant, Subject, Conversation, and Turn before reading the
-latest checkpoint, then pins the exact authorized checkpoint ID when execution
-starts. PostgreSQL checkpoint state is authoritative; there is no application
-checkpoint pointer, fenced saver, claim, lease, heartbeat, or execution epoch.
-
-Reads and resumes use `exact_checkpoint_config()` with the checkpoint ID and
-empty namespace returned by the official saver. Completed finalization writes
-the assistant Message idempotently by Turn.
+Query passes the shared official saver directly to LangGraph. PostgreSQL holds
+the official checkpoint state; there is no application checkpoint pointer,
+fenced saver, claim, lease, heartbeat, or execution epoch. This stage exposes
+no Resume or computation-recovery API. Completed finalization writes the
+assistant Message idempotently by Turn.
 
 Checkpoint rows are internal journal state. They do not create application
 Events and are not emitted in the query SSE stream.
 
-## Deployment compatibility boundary
+## First deployment
 
-Migration `0014_drop_run_lifecycle` removes the superseded application `runs`,
-`events`, `phase_results`, and `cancellation_intents` tables. Deploy it in two
-ordered stages across every application instance:
-
-1. Fully deploy the task48 runtime, which no longer reads or writes those
-   tables, and confirm every old instance has stopped.
-2. Upgrade the database through `0014_drop_run_lifecycle`.
-
-Do not run pre-task48 application instances against the 0014 schema, and do not
-mix old and new schema expectations during a rolling deployment. Downgrading
-0014 recreates an empty 0013-compatible journal schema; deleted lifecycle rows
-are intentionally not restored. Conversation, Message, and official LangGraph
-checkpoint data are unaffected by this migration.
-
-Migration `0015_drop_artifacts` removes persisted retrieval chunks. The runtime
-must be deployed first because it carries retrieved and ranked evidence in
-LangGraph `UntrackedValue` channels. If Resume starts after retrieval, the API
-creates a checkpoint that routes execution back through retrieval; provider
-results may therefore change and provider cost may be incurred again.
+There is no deployed or stamped pre-release v2 database to upgrade. Apply the
+current migration head to a fresh database for the first deployment. The
+equivalent complete application DDL is documented in `docs/sql/langgraph_v2.sql`.

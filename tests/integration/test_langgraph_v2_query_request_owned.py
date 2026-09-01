@@ -193,7 +193,6 @@ async def test_query_executes_astream_in_request_and_persists_one_assistant_mess
         "type": "done",
         "data": {"answer": "canonical answer"},
     }
-    assert response.headers["x-thread-id"]
     assert [(message.role, message.content) for message in messages] == [
         ("user", "hello"),
         ("assistant", "canonical answer"),

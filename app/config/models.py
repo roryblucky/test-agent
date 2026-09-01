@@ -7,6 +7,13 @@ from typing import Annotated, Any
 
 from pydantic import AliasChoices, BaseModel, Field
 
+
+class LangGraphRuntimeMode(StrEnum):
+    """Tenant-selected v2 orchestration runtime."""
+
+    LINEAR = "linear"
+    AGENT = "agent"
+
 # ---------------------------------------------------------------------------
 # LLM Config
 # ---------------------------------------------------------------------------
@@ -747,6 +754,14 @@ class TenantConfig(BaseModel):
             serialization_alias="adGroups",
         ),
     ]
+
+    runtime_mode: Annotated[
+        LangGraphRuntimeMode,
+        Field(
+            validation_alias=AliasChoices("runtime_mode", "runtimeMode"),
+            serialization_alias="runtimeMode",
+        ),
+    ] = LangGraphRuntimeMode.LINEAR
 
     llm_config: Annotated[
         LLMConfig,

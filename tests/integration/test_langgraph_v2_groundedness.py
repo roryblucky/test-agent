@@ -425,7 +425,7 @@ async def test_groundedness_actor_setup_failure_is_advisory(
     audit = MockOutputAssessmentAudit()
     app.state.langgraph_v2_output_assessment_audit = audit
     with patch(
-        "app.langgraph_v2.api._resolve_groundedness_actor",
+        "app.langgraph_v2.linear_runtime._resolve_groundedness_actor",
         side_effect=RuntimeError("groundedness model is unavailable"),
     ):
         with TestClient(app) as client:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -11,22 +10,19 @@ from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
     MessageInvariantConflict,
-    ResumeExpired,
     TurnNotFound,
 )
 
 
 @pytest.mark.asyncio
-async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message_time(
+async def test_turn_creation_is_idempotent(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
         langgraph_v2_migrated_database_url, min_size=1, max_size=2
     ) as pool:
         context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
-        repository = ConversationMessageRepository(
-            pool, resume_ttl=timedelta(minutes=5)
-        )
+        repository = ConversationMessageRepository(pool)
         await repository.resolve_conversation(
             context=context,
             conversation_id="session-1",
@@ -49,8 +45,6 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
 
         assert repeated == first
         assert first.turn_id == turn_id
-        original_deadline = first.resume_deadline
-        assert original_deadline - first.created_at == timedelta(minutes=5)
         message = (
             await repository.list_messages(context=context, conversation_id="session-1")
         )[0]
@@ -73,30 +67,12 @@ async def test_turn_creation_is_idempotent_and_resume_deadline_uses_user_message
                 idempotency_key="turn-1:different-key",
             )
 
-        repository_with_longer_ttl = ConversationMessageRepository(
-            pool, resume_ttl=timedelta(minutes=30)
-        )
-        retried_after_config_change = await repository_with_longer_ttl.create_turn(
-            context=context,
-            conversation_id="session-1",
-            turn_id=turn_id,
-            content="hello",
-            idempotency_key="turn-1:user",
-        )
-        turn = await repository_with_longer_ttl.get_turn(
+        turn = await repository.get_turn(
             context=context,
             conversation_id="session-1",
             turn_id=turn_id,
         )
-        assert retried_after_config_change == first
-        assert turn.resume_deadline == original_deadline
-        with pytest.raises(ResumeExpired):
-            await repository.get_turn_for_resume(
-                context=context,
-                conversation_id="session-1",
-                turn_id=turn_id,
-                now=original_deadline + timedelta(seconds=1),
-            )
+        assert turn == first
 
 
 @pytest.mark.asyncio

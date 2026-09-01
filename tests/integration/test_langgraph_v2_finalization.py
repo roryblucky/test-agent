@@ -45,6 +45,7 @@ from app.services.flow_context import FlowContext
 from app.services.tenant_manager import TenantManager
 from tests.integration.langgraph_v2_turn_support import seed_turn_scope
 from tests.integration.test_langgraph_v2_linear_core import (
+    configure_linear_tenant,
     parse_sse,
     seed_subject_conversation,
 )
@@ -299,7 +300,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
 
 
 @pytest.mark.asyncio
-async def test_graph_persists_assistant_before_finalization_checkpoint_completes(
+async def test_graph_finalization_does_not_own_assistant_message_persistence(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     request_context = TrustedRequestContext(
@@ -345,7 +346,7 @@ async def test_graph_persists_assistant_before_finalization_checkpoint_completes
         (message.role, message.content)
         for message in retained
         if message.turn_id == turn_id
-    ] == [("user", "hello"), ("assistant", "grounded answer [1]")]
+    ] == [("user", "hello")]
 
 
 def test_public_v2_sse_matches_final_output_golden(
@@ -373,6 +374,7 @@ def test_public_v2_sse_matches_final_output_golden(
             yield
 
     app = FastAPI(lifespan=lifespan)
+    configure_linear_tenant(app)
     register_v2_routes(
         app,
         enabled=True,
@@ -440,7 +442,7 @@ def test_public_v2_sse_matches_final_output_golden(
     ]
 
 
-def test_terminal_checkpoint_failure_retains_idempotent_assistant_for_resume(
+def test_terminal_checkpoint_failure_does_not_persist_assistant(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = "terminal-checkpoint-failure"
@@ -461,6 +463,7 @@ def test_terminal_checkpoint_failure_retains_idempotent_assistant_for_resume(
             yield
 
     app = FastAPI(lifespan=lifespan)
+    configure_linear_tenant(app)
     register_v2_routes(
         app,
         enabled=True,
@@ -495,4 +498,4 @@ def test_terminal_checkpoint_failure_retains_idempotent_assistant_for_resume(
     assert all(event["type"] != "done" for event in delivered)
     assert delivered[-1]["type"] == "error"
     assert "forced terminal checkpoint failure" in delivered[-1]["data"]
-    assert asyncio.run(read_roles()) == ["user", "assistant"]
+    assert asyncio.run(read_roles()) == ["user"]

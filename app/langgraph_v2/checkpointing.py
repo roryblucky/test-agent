@@ -13,31 +13,14 @@ def thread_id_for(tenant_id: str, conversation_id: str) -> str:
     return _encode_parts("thread", tenant_id, conversation_id)
 
 
-def initial_checkpoint_config(*, thread_id: str, checkpoint_ns: str) -> RunnableConfig:
-    """Build the config used only when creating the first checkpoint."""
+def thread_checkpoint_config(*, thread_id: str, checkpoint_ns: str) -> RunnableConfig:
+    """Build the checkpoint config for one Graph thread invocation."""
     return {
         "configurable": {
             "thread_id": thread_id,
             "checkpoint_ns": checkpoint_ns,
         }
     }
-
-
-def exact_checkpoint_config(
-    *,
-    thread_id: str,
-    checkpoint_ns: str,
-    checkpoint_id: str,
-) -> RunnableConfig:
-    """Build a read/resume config pinned to one application-known checkpoint."""
-    return {
-        "configurable": {
-            "thread_id": thread_id,
-            "checkpoint_ns": checkpoint_ns,
-            "checkpoint_id": checkpoint_id,
-        }
-    }
-
 
 def _encode_parts(*parts: str) -> str:
     payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()

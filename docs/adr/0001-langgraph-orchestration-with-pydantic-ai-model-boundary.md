@@ -1,5 +1,5 @@
 # Use LangGraph for orchestration and PydanticAI for LLM actors
 
-All new orchestration is implemented with self-hosted LangGraph behind FastAPI. LangGraph owns graph state, routing, fan-out/fan-in, map-reduce, replanning, Specialist composition, short-term thread state, human interrupts, checkpoints, and recovery, while preserving a future seam for long-term memory.
+All new orchestration is implemented with self-hosted LangGraph behind FastAPI. LangGraph owns graph state, routing, fan-out/fan-in, map-reduce, replanning, Specialist composition, short-term thread state, and checkpoints, while preserving future seams for long-term memory, human interrupts, and recovery.
 
 PydanticAI constructs the LLM-facing actors with model-provider abstraction, instructions, activated Skills, structured outputs, usage tracking, and approved tool bindings. Planner actors return typed Task DAGs instead of executing business tools. LangGraph schedules top-level Retrieval, Rerank, Reduction, Calculation, and Specialist Tasks; a Specialist may use a restricted read-only PydanticAI toolset internally, but every binding delegates to the platform Tool Executor for typed outcomes, Evidence, audit, and events. Deterministic Calculation remains an explicit LangGraph Task rather than a hidden free-form tool call.

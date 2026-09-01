@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import AsyncIterator, Hashable, Iterable
+from collections.abc import AsyncIterator, Hashable, Iterable, Mapping
 from typing import Annotated, Any, NotRequired, Protocol, TypedDict, cast
 from uuid import UUID
 
@@ -107,30 +107,21 @@ class LinearGraph(Protocol):
 
     async def ainvoke(
         self,
-        graph_input: LinearGraphState | None,
+        graph_input: LinearGraphState,
         /,
         config: RunnableConfig | None = None,
         **kwargs: Any,
     ) -> LinearGraphState:
-        """Invoke a new graph turn or resume one from its checkpoint."""
+        """Invoke one graph Turn."""
         ...
 
     async def aget_state(self, config: RunnableConfig) -> StateSnapshot:
         """Read the current checkpoint state."""
         ...
 
-    async def aupdate_state(
-        self,
-        config: RunnableConfig,
-        values: dict[str, Any],
-        as_node: str,
-    ) -> RunnableConfig:
-        """Create a state checkpoint attributed to one node."""
-        ...
-
     def astream(
         self,
-        graph_input: Any | None,
+        graph_input: Mapping[str, Any],
         /,
         *,
         config: RunnableConfig | None = None,
@@ -421,19 +412,6 @@ def build_linear_graph(
 
     async def finalization_node(state: LinearGraphState) -> LinearGraphStateUpdate:
         events, response = await run_finalization(state)
-        if (
-            message_repository is not None
-            and request_context is not None
-            and current_turn_id is not None
-            and response.answer is not None
-        ):
-            await message_repository.persist_assistant_message(
-                context=request_context,
-                conversation_id=state["conversation_id"],
-                turn_id=current_turn_id,
-                content=response.answer,
-                idempotency_key=f"turn:{current_turn_id}:assistant",
-            )
         _emit_events(events)
         _emit_events(
             (
@@ -519,6 +497,3 @@ def build_linear_graph(
             checkpointer=checkpointer
         ),
     )
-
-
-linear_graph = build_linear_graph()

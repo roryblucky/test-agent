@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Self
 
@@ -13,15 +13,18 @@ from fastapi import FastAPI
 from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerOutput, PydanticAIAnswerActor
-from app.langgraph_v2.api import LinearGraphStream, register_v2_routes
+from app.langgraph_v2.api import GraphStream, register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.checkpointing import initial_checkpoint_config, thread_id_for
+from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
 from app.langgraph_v2.graph import build_linear_graph
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.test_langgraph_v2_linear_core import seed_subject_conversation
+from tests.integration.test_langgraph_v2_linear_core import (
+    configure_linear_tenant,
+    seed_subject_conversation,
+)
 
 
 class _Retriever:
@@ -75,12 +78,14 @@ class _PydanticAgent:
 
 class _TrackedGraph:
     def __init__(self, *, thread_id: str) -> None:
-        self.target: LinearGraphStream | None = None
-        self.config = initial_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
+        self.target: GraphStream | None = None
+        self.config = thread_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
         self.cancelled = asyncio.Event()
         self.closed = asyncio.Event()
 
-    def astream(self, state: object | None, **options: Any) -> AsyncIterator[object]:
+    def astream(
+        self, state: Mapping[str, Any], **options: Any
+    ) -> AsyncIterator[object]:
         async def iterate() -> AsyncIterator[object]:
             assert self.target is not None
             if options.get("config") is None:
@@ -249,7 +254,8 @@ async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
             yield
 
     app = FastAPI(lifespan=lifespan)
-    register_v2_routes(app, enabled=True, graph=tracked_graph)
+    configure_linear_tenant(app)
+    register_v2_routes(app, enabled=True, linear_graph_override=tracked_graph)
 
     async with _serve_uvicorn(app) as upstream_port:
         async with _serve_tcp_forwarding_proxy(upstream_port) as proxy_port:

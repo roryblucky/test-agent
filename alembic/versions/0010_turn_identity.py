@@ -13,8 +13,7 @@ def upgrade() -> None:
     op.execute(
         """
         ALTER TABLE langgraph_v2.messages
-            ADD COLUMN turn_id UUID,
-            ADD COLUMN resume_deadline TIMESTAMPTZ
+            ADD COLUMN turn_id UUID
         """
     )
     # Existing Runs are the only stable identity available before this
@@ -26,24 +25,10 @@ def upgrade() -> None:
         WHERE turn_id IS NULL
         """
     )
-    # Legacy Turns have no reliable deployment TTL history. Expire them at
-    # their existing creation time rather than granting a new resume window.
-    op.execute(
-        """
-        UPDATE langgraph_v2.messages
-        SET resume_deadline = created_at
-        WHERE role = 'user' AND resume_deadline IS NULL
-        """
-    )
     op.execute(
         """
         ALTER TABLE langgraph_v2.messages
             ALTER COLUMN turn_id SET NOT NULL,
-            ADD CONSTRAINT messages_resume_deadline_role_check
-            CHECK (
-                (role = 'user' AND resume_deadline IS NOT NULL)
-                OR (role = 'assistant' AND resume_deadline IS NULL)
-            ),
             ADD CONSTRAINT messages_turn_role_unique
             UNIQUE (tenant_id, conversation_id, turn_id, role)
         """
@@ -56,8 +41,6 @@ def downgrade() -> None:
         """
         ALTER TABLE langgraph_v2.messages
             DROP CONSTRAINT messages_turn_role_unique,
-            DROP CONSTRAINT messages_resume_deadline_role_check,
-            DROP COLUMN resume_deadline,
             DROP COLUMN turn_id
         """
     )

@@ -10,16 +10,16 @@ during migration, but no Flow Engine execution abstraction is reused by v2.
 
 ## Public contract
 
-- Implement only `POST /v2/query/stream` for a new query and
-  `POST /v2/threads/{thread_id}/resume/stream` for explicit request-owned
-  recovery. Do not implement a blocking `/v2/query` endpoint.
+- Implement only `POST /v2/query/stream`. Do not implement a blocking
+  `/v2/query` endpoint or a public Resume endpoint.
 - Preserve the existing request fields, headers, SSE framing, event names and
   final response shape. Additive fields are allowed; existing fields may not be
   removed or retyped.
 - A request begins Graph execution immediately in the receiving FastAPI
   instance. There is no queue, worker, detached runtime or background pickup.
-- Return the stable public `conversation_id`, `thread_id` and `turn_id` needed
-  by the UI. Do not introduce a public `run_id` merely to map to `thread_id`.
+- Return the stable public `conversation_id` and `turn_id` needed by the UI.
+  Keep the checkpointer `thread_id` internal and do not introduce a public
+  `run_id` merely to map to it.
 - The API Gateway supplies trusted Tenant and Subject identity. The application
   must not trust client-overridable identity headers or expose a route that
   bypasses that boundary.
@@ -40,7 +40,7 @@ query
   -> finalization
 ```
 
-- LangGraph owns graph state, node order, streaming, checkpoints and Resume.
+- LangGraph owns graph state, node order, streaming and checkpoints.
 - PydanticAI owns LLM/model interaction, Agent configuration, Skills, Tools and
   structured output.
 - Retrieval, reranking, moderation and groundedness use adapters over the
@@ -66,47 +66,31 @@ query
 ## Conversation, history and authorization
 
 - PostgreSQL `Conversation` is the durable authority for Tenant and Subject
-  ownership. Every query, history and Resume operation authorizes the requested
+  ownership. Every query and history operation authorizes the requested
   Conversation before accessing its Messages or checkpoints.
-- Store the stable LangGraph `thread_id` on the Conversation and resolve Resume
-  through the Tenant/Subject-authorized Conversation; a client-supplied
-  `thread_id` is never sufficient authorization by itself.
-- A user `Message` represents the start of one Turn. Its `created_at` is the
-  fixed Resume TTL anchor:
-
-  ```text
-  resume_deadline = user_message.created_at + configured_resume_ttl
-  ```
-
-  A retry or Resume never extends this deadline.
+- Store the stable LangGraph `thread_id` on the Conversation for internal
+  checkpoint identity; never accept it as public authorization input.
 - Persist the user Message once at Turn creation and the assistant Message once
   after successful finalization. Store the same `turn_id` in Message records and
   LangGraph State and use it for idempotency.
 - History initially uses the configured token-budgeted sliding window. LLM
   context compression is a separate policy to add later.
-- Redis is an optional cache only. Redis loss or eviction cannot grant access,
-  extend TTL or override PostgreSQL/Checkpoint state.
+- Redis is an optional cache only. Redis loss or eviction cannot grant access
+  or override PostgreSQL/Checkpoint state.
 
-## Checkpoint and Resume
+## Checkpoint and disconnect
 
 - Use the official shared PostgreSQL LangGraph checkpointer with a stable,
   server-scoped `thread_id` and `durability="sync"`.
-- The latest durable checkpoint is authoritative for recoverable Graph state.
-  The application does not maintain a duplicate checkpoint pointer.
+- The application does not maintain a duplicate checkpoint pointer or a second
+  execution journal.
 - When the execution-owning SSE disconnects, cancel and await the active Graph
   iterator. Do not continue hidden work.
-- Resume is an explicit new HTTP request. After Conversation/Subject
-  authorization and Turn TTL validation, invoke the same Graph with the same
-  `thread_id` and resume from its latest checkpoint. An incomplete node may run
-  again.
-- Bind the checkpoint state to `turn_id` and reject Resume if the checkpoint is
-  complete, belongs to another Turn, or a newer Turn has started.
-- Resume is computation recovery, not exact SSE token replay and not LangGraph
-  time travel. A partially streamed Answer is discarded; Resume produces a new
-  Answer stream from the durable node boundary.
-- This read-oriented POC accepts the narrow possibility of overlapping old and
-  resumed executions. Strict distributed single-flight/fencing is deferred
-  until write-capable tools or a zero-overlap requirement exists.
+- There is no computation-recovery API in this stage. After disconnect or
+  process failure, the client starts a new Turn and the Graph executes normally.
+- This pre-release repository has no deployed or stamped v2 database. Before
+  the first deployment, superseded v2 schema can therefore be consolidated in
+  its original migration; no pre-release schema upgrade path is supported.
 
 ## Persistence boundary
 
@@ -123,14 +107,9 @@ Remove the application-owned `runs`, transport `events`, generic
 `execution_epoch`, owner-instance, live follower and exact replay machinery.
 Do not replace them with equivalent Redis state.
 
-Provider/model calls may execute again after a node-boundary Resume. This POC
-accepts repeated read/model cost. Any future irreversible side effect must be
-idempotent at its domain boundary.
-
 Retrieved document chunks and raw provider payloads are request-local
 `UntrackedValue` channels. They are not persisted in PostgreSQL checkpoints or
-application tables. Resume from a downstream node first rewinds to retrieval
-so the evidence is fetched and ranked again.
+application tables.
 
 ## Verification
 
@@ -139,25 +118,23 @@ so the evidence is fetched and ranked again.
 - Tests prove low groundedness and flagged post-moderation do not suppress,
   replace or alter the Answer or persisted assistant Message.
 - Real PostgreSQL tests prove Conversation Tenant/Subject authorization,
-  Message-based TTL, stable-thread checkpoint Resume across two application
-  instances, and rejection of complete/stale/wrong-Turn Resume.
+  Message idempotency and official checkpoint persistence.
 - Disconnect tests run through real Uvicorn and the deployment proxy boundary
   and prove the Graph iterator is cancelled and awaited.
 - An opt-in load profile proves 50 simultaneous `/v2/query/stream` requests
   enter execution without application queueing. Capacity admission/rate limiting
   is not part of this slice.
-- Graph node names and State schema must remain backward compatible across a
-  rolling deployment while resumable checkpoints are retained.
 
 ## Deferred
 
-- OpenTelemetry implementation, until separately approved.
 - Admission capacity control and platform rate limiting.
 - Remote cancel, exact SSE replay and historical-checkpoint time-travel APIs.
+- Computation recovery and human-in-the-loop Resume APIs.
 - Strict distributed single-flight/fencing.
 - Agent patterns beyond Linear: fan-out/fan-in, multi-hop, map-reduce,
   supervisor/sub-agent, Skills orchestration and deterministic sandbox tools.
 - LLM history compression, long-term memory and human-in-the-loop.
+- OpenTelemetry instrumentation and exporter configuration.
 - Deletion of the legacy Flow Engine.
 
 ## Ticket status

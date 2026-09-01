@@ -14,7 +14,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from alembic import command
 from app.langgraph_v2.authorization import TrustedRequestContext
-from app.langgraph_v2.checkpointing import initial_checkpoint_config, thread_id_for
+from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
 from app.langgraph_v2.conversation_messages import (
     ConversationMessageRepository,
     ConversationNotFound,
@@ -23,10 +23,10 @@ from app.langgraph_v2.graph import build_linear_graph
 from app.langgraph_v2.migrations import build_alembic_config
 
 
-def test_turn_migration_backfills_user_deadline_from_authoritative_message(
+def test_turn_migration_backfills_identity_from_legacy_run(
     langgraph_v2_test_database_url: str,
 ) -> None:
-    """Expand/backfill preserves old Run identity and expires legacy Turns."""
+    """Expand/backfill preserves old Run identity as the Turn identity."""
     config = build_alembic_config(langgraph_v2_test_database_url)
     command.upgrade(config, "0008_cancellation_intents")
     tenant_id = "tenant-a"
@@ -73,7 +73,7 @@ def test_turn_migration_backfills_user_deadline_from_authoritative_message(
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
         rows = connection.execute(
             """
-            SELECT role, turn_id, resume_deadline, content
+            SELECT role, turn_id, content
             FROM langgraph_v2.messages
             ORDER BY role
             """
@@ -86,13 +86,8 @@ def test_turn_migration_backfills_user_deadline_from_authoritative_message(
               AND table_name = 'messages' AND column_name = 'run_id'
             """
         ).fetchone()
-    assert rows[0] == ("assistant", run_id, None, "answer")
-    assert rows[1] == (
-        "user",
-        run_id,
-        created_at,
-        "question",
-    )
+    assert rows[0] == ("assistant", run_id, "answer")
+    assert rows[1] == ("user", run_id, "question")
     assert run_column is None
     with psycopg.connect(langgraph_v2_test_database_url) as connection:
         assert connection.execute(
@@ -200,9 +195,9 @@ def test_upgrade_from_0013_preserves_conversation_and_checkpoint_but_drops_artif
         connection.execute(
             """INSERT INTO langgraph_v2.messages
             (tenant_id, message_id, conversation_id, turn_id, role, content,
-             idempotency_key, resume_deadline)
+             idempotency_key)
             VALUES (%s, %s, %s, %s, 'user', 'preserved question',
-                    'preserved:user', now() + interval '1 hour')""",
+                    'preserved:user')""",
             (tenant_id, uuid4(), conversation_id, turn_id),
         )
         connection.execute(
@@ -259,7 +254,7 @@ def test_upgrade_from_0013_preserves_conversation_and_checkpoint_but_drops_artif
                     "conversation_id": conversation_id,
                     "client_request_id": None,
                 },
-                config=initial_checkpoint_config(
+                config=thread_checkpoint_config(
                     thread_id=thread_id,
                     checkpoint_ns="",
                 ),
@@ -302,7 +297,7 @@ def test_upgrade_from_0013_preserves_conversation_and_checkpoint_but_drops_artif
         ) as pool:
             saver = AsyncPostgresSaver(cast(Any, pool))
             checkpoint = await saver.aget_tuple(
-                initial_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
+                thread_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
             )
             assert checkpoint is not None
             assert checkpoint.checkpoint["channel_values"]["query"] == (
@@ -442,9 +437,8 @@ def test_artifact_migration_backfills_turn_provenance_and_downgrades(
         connection.execute(
             """INSERT INTO langgraph_v2.messages
             (tenant_id, message_id, conversation_id, turn_id, role, content,
-             idempotency_key, resume_deadline)
-            VALUES (%s, %s, %s, %s, 'user', 'question', 'artifact:user',
-                    now() + interval '1 hour')""",
+             idempotency_key)
+            VALUES (%s, %s, %s, %s, 'user', 'question', 'artifact:user')""",
             (tenant_id, uuid4(), conversation_id, turn_id),
         )
         connection.execute(
@@ -571,11 +565,11 @@ def test_message_turn_migration_restores_transitional_run_identity_on_downgrade(
             """
             INSERT INTO langgraph_v2.messages (
                 tenant_id, message_id, conversation_id, run_id, turn_id, role,
-                content, idempotency_key, resume_deadline
+                content, idempotency_key
             ) VALUES
-                (%s, %s, %s, %s, %s, 'user', 'question', 'rollback:user', %s),
+                (%s, %s, %s, %s, %s, 'user', 'question', 'rollback:user'),
                 (%s, %s, %s, %s, %s, 'assistant', 'answer',
-                 'rollback:assistant', NULL)
+                 'rollback:assistant')
             """,
             (
                 tenant_id,
@@ -583,7 +577,6 @@ def test_message_turn_migration_restores_transitional_run_identity_on_downgrade(
                 conversation_id,
                 user_run_id,
                 turn_id,
-                datetime(2026, 2, 1, tzinfo=UTC),
                 tenant_id,
                 assistant_message_id,
                 conversation_id,
@@ -642,7 +635,7 @@ def test_conversation_authorization_migrates_existing_conversations_forward(
                     "conversation_id": conversation_id,
                     "client_request_id": None,
                 },
-                config=initial_checkpoint_config(
+                config=thread_checkpoint_config(
                     thread_id=expected_thread_id,
                     checkpoint_ns="",
                 ),
@@ -684,7 +677,7 @@ def test_conversation_authorization_migrates_existing_conversations_forward(
             saver = AsyncPostgresSaver(cast(Any, pool))
             await saver.setup()
             checkpoint = await saver.aget_tuple(
-                initial_checkpoint_config(
+                thread_checkpoint_config(
                     thread_id=migrated[1],
                     checkpoint_ns="",
                 )

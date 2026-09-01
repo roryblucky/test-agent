@@ -11,14 +11,31 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Protocol
 
 from fastapi import FastAPI
 
 from app.config.loader import load_config
+from app.config.models import LangGraphRuntimeMode, TenantConfig
 from app.core.http_client_pool import HttpClientPool
 from app.services.tenant_manager import TenantManager
 
 logger = logging.getLogger(__name__)
+
+
+class _TenantModeSource(Protocol):
+    @property
+    def tenant_ids(self) -> list[str]: ...
+
+    def get_tenant_config(self, tenant_id: str) -> TenantConfig: ...
+
+
+def _runtime_modes(manager: _TenantModeSource) -> dict[str, LangGraphRuntimeMode]:
+    """Snapshot configured modes that must remain fixed for this process."""
+    return {
+        tenant_id: manager.get_tenant_config(tenant_id).runtime_mode
+        for tenant_id in manager.tenant_ids
+    }
 
 
 @dataclass
@@ -57,6 +74,7 @@ class ConfigReloader:
         self._lock = asyncio.Lock()
         self._reload_count: int = 0
         self._last_reload: datetime | None = None
+        self._fixed_runtime_modes = _runtime_modes(app.state.tenant_manager)
 
     async def reload(self, config_path: str = "config.json") -> ReloadResult:
         """Attempt to reload configuration.
@@ -76,12 +94,28 @@ class ConfigReloader:
                     len(new_configs),
                     config_path,
                 )
+                for config in new_configs:
+                    previous_mode = self._fixed_runtime_modes.get(
+                        config.application_id
+                    )
+                    if previous_mode is None:
+                        continue
+                    if config.runtime_mode is not previous_mode:
+                        raise ValueError(
+                            "runtime_mode cannot change during config reload: "
+                            f"{config.application_id}"
+                        )
 
                 # 2. Build new manager (may raise on invalid config)
                 new_manager = TenantManager(new_configs, self._http_pool)
 
                 # 3. Atomic swap
                 self._app.state.tenant_manager = new_manager
+                for config in new_configs:
+                    self._fixed_runtime_modes.setdefault(
+                        config.application_id,
+                        config.runtime_mode,
+                    )
 
                 # 4. Record
                 self._reload_count += 1

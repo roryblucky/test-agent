@@ -32,7 +32,7 @@ class RequestOwnedGraph(Protocol):
 
     def astream(
         self,
-        graph_input: Any | None,
+        graph_input: Mapping[str, Any],
         /,
         *,
         config: RunnableConfig | None = None,
@@ -93,18 +93,16 @@ async def _complete_terminal_sink(
 
 async def stream_graph(
     graph: RequestOwnedGraph,
-    graph_input: Any | None,
+    graph_input: Mapping[str, Any],
     *,
     config: RunnableConfig | None = None,
     terminal_sink: Callable[[LiveStreamEvent], Awaitable[None]] | None = None,
 ) -> AsyncGenerator[str]:
     """Yield one legacy-compatible SSE frame for each public graph update.
 
-    ``graph_input`` may be a new graph state or ``None`` when LangGraph should
-    load the state associated with ``config``'s checkpoint thread.  The graph
-    iterator belongs to this request: closing or cancelling this iterator
-    closes the underlying LangGraph iterator before control returns to the
-    caller.
+    The graph iterator belongs to this request: closing or cancelling this
+    iterator closes the underlying LangGraph iterator before control returns
+    to the caller.
     """
     graph_iterator = graph.astream(
         graph_input,

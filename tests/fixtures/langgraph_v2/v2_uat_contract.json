@@ -9,19 +9,9 @@
     "sessionId": "string|null",
     "clientRequestId": "string|null"
   },
-  "resume_request_fields": {
-    "thread_id": "string:path",
-    "expectedTurnId": "uuid:query"
-  },
   "query_response_headers": [
     "x-conversation-id",
-    "x-turn-id",
-    "x-thread-id"
-  ],
-  "resume_response_headers": [
-    "x-conversation-id",
-    "x-turn-id",
-    "x-thread-id"
+    "x-turn-id"
   ],
   "event_names": [
     "step_start",

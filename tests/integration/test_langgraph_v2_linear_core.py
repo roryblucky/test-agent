@@ -2,7 +2,6 @@ import asyncio
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from datetime import timedelta
 from importlib import reload
 from pathlib import Path
 from typing import Any, cast
@@ -15,8 +14,13 @@ from fastapi.testclient import TestClient
 from psycopg_pool import AsyncConnectionPool
 
 from app.api.schemas import QueryResponse
+from app.config.models import FlowConfig, LLMConfig, TenantConfig
 from app.langgraph_v2.answer import AnswerActor
-from app.langgraph_v2.api import LinearGraphStream, register_v2_routes
+from app.langgraph_v2.api import (
+    GraphRuntimeFactory,
+    GraphStream,
+    register_v2_routes,
+)
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_messages import (
@@ -36,6 +40,29 @@ FIXTURE_PATH = (
 UAT_CONTRACT_PATH = (
     Path(__file__).parents[1] / "fixtures" / "langgraph_v2" / "v2_uat_contract.json"
 )
+
+
+class LinearTenantManager:
+    """Minimal trusted Linear-mode configuration used by HTTP tests."""
+
+    def __init__(self) -> None:
+        self._config = TenantConfig(
+            kms_app_name="Tenant A",
+            application_id="tenant-a",
+            ad_groups=[],
+            llm_config=LLMConfig(models={}),
+            flow_config=FlowConfig(),
+        )
+
+    def get_tenant_config(self, tenant_id: str) -> TenantConfig:
+        """Return the fixed test Tenant configuration."""
+        assert tenant_id == "tenant-a"
+        return self._config
+
+
+def configure_linear_tenant(app: FastAPI) -> None:
+    """Install the trusted Linear-mode configuration on a test app."""
+    app.state.tenant_manager = LinearTenantManager()
 
 
 def _wire_fixture(name: str) -> dict[str, Any]:
@@ -94,13 +121,13 @@ def parse_sse(response_text: str) -> list[dict[str, Any]]:
 
 def persistent_linear_app(
     database_url: str,
-    graph: LinearGraphStream | None = None,
-    thread_resume_enabled: bool = False,
+    graph: GraphStream | None = None,
     refinement_actor: QuestionRefinementActor | None = None,
     retriever: Retriever | None = None,
     ranker: Ranker | None = None,
     moderation_provider: ModerationProvider | None = None,
     answer_actor: AnswerActor | None = None,
+    agent_runtime_factory: GraphRuntimeFactory | None = None,
 ) -> FastAPI:
     """Create the test-only Linear Core with its real application database pool."""
 
@@ -113,16 +140,17 @@ def persistent_linear_app(
             yield
 
     app = FastAPI(lifespan=lifespan)
+    configure_linear_tenant(app)
     register_v2_routes(
         app,
         enabled=True,
-        graph=graph,
+        linear_graph_override=graph,
         refinement_actor=refinement_actor,
         retriever=retriever,
         ranker=ranker,
         moderation_provider=moderation_provider,
         answer_actor=answer_actor,
-        thread_resume_enabled=thread_resume_enabled,
+        agent_runtime_factory=agent_runtime_factory,
     )
     return app
 
@@ -438,7 +466,7 @@ def test_request_header_and_generated_conversation_variants(
             )
 
     turn = asyncio.run(read_turn())
-    assert turn.resume_deadline - turn.created_at == timedelta(hours=1)
+    assert turn.turn_id == UUID(generated.headers["x-turn-id"])
     assert parse_sse(generated.text)[-1]["data"]["session_id"] == conversation_id
     assert invalid_client_id.status_code == 422
 
@@ -601,10 +629,7 @@ def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
         for route in enabled_app.routes
         if getattr(route, "path", "").startswith("/v2/")
     }
-    assert enabled_routes == {
-        "/v2/query/stream",
-        "/v2/threads/{thread_id}/resume/stream",
-    }
+    assert enabled_routes == {"/v2/query/stream"}
     assert {
         path for path in enabled_app.openapi()["paths"] if path.startswith("/v2/")
     } == enabled_routes
@@ -618,7 +643,7 @@ def test_main_registers_the_uat_route_set_only_when_a_supported_flag_is_enabled(
     }
 
 
-def test_thread_resume_route_is_default_off() -> None:
+def test_thread_resume_route_is_not_registered() -> None:
     app = FastAPI()
     register_v2_routes(app, enabled=True)
     assert "/v2/threads/{thread_id}/resume/stream" not in {
@@ -648,6 +673,11 @@ def test_query_openapi_preserves_released_camel_case_request_fields() -> None:
     ("method", "path"),
     [
         ("post", "/v2/runs/00000000-0000-0000-0000-000000000001/resume/stream"),
+        (
+            "post",
+            "/v2/threads/thread-a/resume/stream"
+            "?expectedTurnId=00000000-0000-0000-0000-000000000001",
+        ),
         ("get", "/v2/runs/00000000-0000-0000-0000-000000000001/stream"),
         ("post", "/v2/runs/00000000-0000-0000-0000-000000000001/cancel"),
     ],
@@ -679,19 +709,13 @@ def test_removed_run_control_routes_are_404(method: str, path: str) -> None:
     ("path", "json_body"),
     [
         ("/v2/query/stream?afterSequence=3", {"query": "hello"}),
-        (
-            "/v2/threads/thread-a/resume/stream"
-            "?expectedTurnId=00000000-0000-0000-0000-000000000001"
-            "&afterSequence=3",
-            None,
-        ),
     ],
 )
 def test_removed_replay_cursor_is_rejected(
     path: str, json_body: dict[str, str] | None
 ) -> None:
     app = FastAPI()
-    register_v2_routes(app, enabled=True, thread_resume_enabled=True)
+    register_v2_routes(app, enabled=True)
 
     with TestClient(app) as client:
         response = client.post(

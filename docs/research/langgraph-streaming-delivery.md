@@ -2,6 +2,10 @@
 
 Date: 2026-08-29
 
+> Historical research note: the current POC no longer exposes Resume or
+> computation recovery. Resume designs below are retained for a possible future
+> phase and are not current implementation requirements.
+
 ## Question and conclusion
 
 This note evaluates three delivery architectures for a self-hosted FastAPI application:

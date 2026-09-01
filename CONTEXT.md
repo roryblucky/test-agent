@@ -21,7 +21,7 @@ A persistent, user-visible exchange that can contain multiple Runs and be contin
 _Avoid_: Session, thread, chat session
 
 **Turn**:
-One user Message and its resulting assistant Message or recovery identity within a Conversation; distinct from a Run execution.
+One user Message and its resulting assistant Message within a Conversation; distinct from a Run execution.
 
 **Conversation Summary**:
 A versioned compression of earlier Messages within one Conversation, used only to construct model context while the original Messages remain authoritative.

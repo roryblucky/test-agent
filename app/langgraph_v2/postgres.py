@@ -19,7 +19,6 @@ class V2PostgresConfig(BaseModel):
     database_url: str = Field(min_length=1)
     min_size: int = Field(default=1, ge=0)
     max_size: int = Field(default=10, gt=0)
-    resume_ttl_seconds: int = Field(default=3600, gt=0)
 
     @property
     def conninfo(self) -> str:
@@ -48,9 +47,6 @@ class V2PostgresConfig(BaseModel):
                 "min_size": environment.get("LANGGRAPH_V2_DATABASE_POOL_MIN_SIZE", "1"),
                 "max_size": environment.get(
                     "LANGGRAPH_V2_DATABASE_POOL_MAX_SIZE", "10"
-                ),
-                "resume_ttl_seconds": environment.get(
-                    "LANGGRAPH_V2_RESUME_TTL_SECONDS", "3600"
                 ),
             }
         )
@@ -82,9 +78,6 @@ async def postgres_lifespan(
     resolved_config = config or V2PostgresConfig.from_environment()
     app.state.langgraph_v2_postgres_pool = None
     app.state.langgraph_v2_checkpointer = None
-    app.state.langgraph_v2_resume_ttl_seconds = (
-        resolved_config.resume_ttl_seconds if resolved_config is not None else 3600
-    )
     pool: Any | None = None
     try:
         if resolved_config is None:
@@ -113,4 +106,3 @@ async def postgres_lifespan(
         finally:
             app.state.langgraph_v2_postgres_pool = None
             app.state.langgraph_v2_checkpointer = None
-            app.state.langgraph_v2_resume_ttl_seconds = None

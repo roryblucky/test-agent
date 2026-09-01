@@ -60,7 +60,7 @@ async def test_conversation_authorization_persists_subject_and_stable_thread(
 
 
 @pytest.mark.asyncio
-async def test_thread_lookup_and_messages_require_conversation_authorization(
+async def test_messages_require_conversation_authorization(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     async with AsyncConnectionPool(
@@ -86,11 +86,6 @@ async def test_thread_lookup_and_messages_require_conversation_authorization(
         )[0]
 
         assert (
-            await repository.get_conversation_by_thread(
-                context=context, thread_id=conversation.thread_id
-            )
-        ) == conversation
-        assert (
             await repository.get_message(
                 context=context,
                 conversation_id=conversation.conversation_id,
@@ -104,21 +99,6 @@ async def test_thread_lookup_and_messages_require_conversation_authorization(
         other_subject = TrustedRequestContext(
             tenant_id="tenant-a", subject_id="subject-b"
         )
-        with pytest.raises(ConversationNotFound):
-            await repository.get_conversation_by_thread(
-                context=other_subject, thread_id=conversation.thread_id
-            )
-        with pytest.raises(ConversationNotFound):
-            await repository.get_conversation_by_thread(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-b", subject_id="subject-a"
-                ),
-                thread_id=conversation.thread_id,
-            )
-        with pytest.raises(ConversationNotFound):
-            await repository.get_conversation_by_thread(
-                context=context, thread_id="missing-thread"
-            )
         with pytest.raises(ConversationNotFound):
             await repository.get_message(
                 context=other_subject,

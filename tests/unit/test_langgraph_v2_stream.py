@@ -227,45 +227,6 @@ async def test_stream_graph_translates_approved_modes_and_ignores_diagnostics() 
 
 
 @pytest.mark.asyncio
-async def test_stream_graph_accepts_none_as_a_checkpoint_resume_input() -> None:
-    graph = _FakeGraph(
-        _FakeGraphStream(
-            [
-                (
-                    "custom",
-                    {
-                        "type": "step_completed",
-                        "data": {"query": "continued"},
-                    },
-                )
-            ]
-        )
-    )
-
-    frames = [
-        frame
-        async for frame in stream_graph(
-            graph,
-            None,
-            config={"configurable": {"thread_id": "thread-1"}},
-        )
-    ]
-
-    assert _payload(frames[0]) == {
-        "type": "step_completed",
-        "data": {"query": "continued"},
-    }
-    assert graph.inputs == [None]
-    assert graph.options == [
-        {
-            "config": {"configurable": {"thread_id": "thread-1"}},
-            "stream_mode": ["updates", "custom"],
-            "durability": "sync",
-        }
-    ]
-
-
-@pytest.mark.asyncio
 async def test_answer_error_update_does_not_confirm_a_failing_checkpoint() -> None:
     terminal_events: list[Any] = []
     answer_error = {
