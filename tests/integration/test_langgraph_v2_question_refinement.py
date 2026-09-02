@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Sequence
 
 import pytest
-from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.graph import LinearGraphState, build_linear_graph
@@ -18,7 +16,6 @@ from app.models.workflow import ResolvedQuery
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
-    seed_subject_conversation,
 )
 
 
@@ -119,14 +116,6 @@ async def test_pydantic_ai_actor_returns_agent_output() -> None:
 def test_http_query_uses_injected_refinement_actor(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async def seed() -> None:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            await seed_subject_conversation(pool)
-
-    asyncio.run(seed())
-
     class CountingActor:
         calls = 0
 

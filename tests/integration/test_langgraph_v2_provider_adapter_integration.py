@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -37,7 +36,6 @@ from tests.integration.test_langgraph_v2_linear_core import (
     LinearTenantManager,
     parse_sse,
     persistent_linear_app,
-    seed_subject_conversation,
 )
 
 
@@ -233,12 +231,6 @@ def test_tenant_config_limits_reach_v2_retriever_and_ranker(
         def get_tenant_config(self, tenant_id: str) -> TenantConfig:
             return tenant_manager.get_tenant_config(tenant_id)
 
-    asyncio.run(
-        seed_subject_conversation(
-            langgraph_v2_migrated_database_url,
-            "00000000-0000-0000-0000-000000000001",
-        )
-    )
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         refinement_actor=MockQuestionRefinementActor(),

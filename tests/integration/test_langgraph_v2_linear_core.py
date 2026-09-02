@@ -5,18 +5,16 @@ from contextlib import asynccontextmanager, suppress
 from importlib import reload
 from pathlib import Path
 from typing import Any, cast
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import UUID
 
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-from psycopg_pool import AsyncConnectionPool
 
 from app.api.schemas import QueryResponse
 from app.config.models import (
     FlowConfig,
-    LangGraphRuntimeMode,
     LLMConfig,
     TenantConfig,
 )
@@ -26,9 +24,7 @@ from app.langgraph_v2.api import (
     GraphStream,
     register_v2_routes,
 )
-from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.contracts import V2QueryRequest
-from app.langgraph_v2.conversations import ConversationRepository
 from app.langgraph_v2.graph import LinearGraphState
 from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
 from app.langgraph_v2.pre_moderation import ModerationProvider
@@ -199,40 +195,6 @@ async def close_stream_after_first_token(
     return token_frame
 
 
-async def seed_subject_conversation(
-    pool_or_database_url: AsyncConnectionPool[Any] | str,
-    conversation_id: UUID | str = UUID("00000000-0000-0000-0000-000000000001"),
-    *,
-    runtime_mode: LangGraphRuntimeMode = LangGraphRuntimeMode.LINEAR,
-) -> UUID:
-    """Seed the Conversation authorization required by v2 stream tests."""
-    if isinstance(pool_or_database_url, str):
-        async with AsyncConnectionPool(
-            pool_or_database_url, min_size=1, max_size=2
-        ) as pool:
-            return await seed_subject_conversation(
-                pool, conversation_id, runtime_mode=runtime_mode
-            )
-    if isinstance(conversation_id, UUID):
-        resolved_id = conversation_id
-    else:
-        try:
-            resolved_id = UUID(conversation_id)
-        except ValueError:
-            resolved_id = uuid5(NAMESPACE_URL, conversation_id)
-    async with pool_or_database_url.connection() as connection:
-        await connection.execute(
-            """
-            INSERT INTO langgraph_v2.conversations (
-                conversation_id, tenant_id, owner_subject_id, runtime_mode
-            ) VALUES (%s, 'tenant-a', 'subject-a', %s)
-            ON CONFLICT (conversation_id) DO NOTHING
-            """,
-            (resolved_id, runtime_mode.value),
-        )
-    return resolved_id
-
-
 @pytest.mark.asyncio
 async def test_captured_fixture_matches_the_legacy_wire_implementation() -> None:
     fixture = json.loads(FIXTURE_PATH.read_text())
@@ -279,11 +241,6 @@ async def test_captured_legacy_moderation_error_fixture() -> None:
 def test_enabled_linear_core_preserves_the_minimal_stream_contract(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    asyncio.run(
-        seed_subject_conversation(
-            langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000123"
-        )
-    )
     fixture = json.loads(FIXTURE_PATH.read_text())
     app = persistent_linear_app(langgraph_v2_migrated_database_url)
 
@@ -409,12 +366,6 @@ def test_released_uat_contract_fixture_matches_public_http_shapes(
     assert isinstance(request.conversation_id, UUID)
     assert isinstance(request.client_request_id, str)
 
-    asyncio.run(
-        seed_subject_conversation(
-            langgraph_v2_migrated_database_url,
-            "00000000-0000-0000-0000-000000000002",
-        )
-    )
     app = persistent_linear_app(langgraph_v2_migrated_database_url)
     with TestClient(app) as client:
         success = client.post(
@@ -473,28 +424,13 @@ def test_request_header_and_generated_conversation_variants(
     UUID(conversation_id)
     assert repeated.headers["x-request-id"] == generated.headers["x-request-id"]
 
-    async def read_conversation():
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            return await ConversationRepository(pool).get_conversation(
-                context=TrustedRequestContext(
-                    tenant_id="tenant-a", subject_id="subject-a"
-                ),
-                conversation_id=UUID(conversation_id),
-            )
-
-    conversation = asyncio.run(read_conversation())
-    assert conversation.updated_at > conversation.created_at
-
     assert parse_sse(generated.text)[-1]["data"]["session_id"] == conversation_id
     assert invalid_client_id.status_code == 422
 
 
-def test_query_authorizes_existing_conversation_before_streaming(
+def test_unknown_conversation_uuid_starts_a_scoped_thread(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    asyncio.run(seed_subject_conversation(langgraph_v2_migrated_database_url))
     app = persistent_linear_app(langgraph_v2_migrated_database_url)
     with TestClient(app) as client:
         owner = client.post(
@@ -533,18 +469,14 @@ def test_query_authorizes_existing_conversation_before_streaming(
         )
 
     assert owner.status_code == 200
-    assert missing.status_code == 404
-    assert cross_subject.status_code == 404
-    assert missing.json() == cross_subject.json()
+    assert missing.status_code == 200
+    assert cross_subject.status_code == 200
     assert missing_subject.status_code == empty_subject.status_code == 422
 
 
 def test_flagged_query_emits_error_before_finalization(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    asyncio.run(
-        seed_subject_conversation(langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001")
-    )
     app = persistent_linear_app(langgraph_v2_migrated_database_url)
 
     with TestClient(app) as client:
@@ -572,10 +504,6 @@ def test_flagged_query_emits_error_before_finalization(
 async def test_http_adapter_accepts_a_deterministic_graph_fake(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
-
     class DeterministicGraphFake:
         def __init__(self) -> None:
             self.received_state: LinearGraphState | None = None

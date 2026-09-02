@@ -11,7 +11,6 @@ from httpx import ASGITransport, AsyncClient, Response
 from app.main import ConcurrencyLimiterMiddleware
 from tests.integration.test_langgraph_v2_linear_core import (
     persistent_linear_app,
-    seed_subject_conversation,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -63,12 +62,6 @@ async def test_fifty_warmed_query_streams_enter_graph_without_application_queue(
     headers = {"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
 
     async with app.router.lifespan_context(app):
-        for index in range(concurrency + 1):
-            await seed_subject_conversation(
-                app.state.langgraph_v2_postgres_pool,
-                f"profile-{index}",
-            )
-
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://profile.test",

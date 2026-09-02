@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
-from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.graph import build_linear_graph
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_request_support import seed_request_scope
+from tests.integration.langgraph_v2_request_support import create_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -37,33 +36,30 @@ async def test_ranker_receives_original_documents_and_returns_reordered_evidence
             self.received = [document.id for document in documents]
             return RerankingResult(documents=[documents[1], documents[0]])
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        ranker = Ranker()
-        scope = await seed_request_scope(pool)
-        result = await build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=Retriever(),
-            ranker=ranker,
-        ).ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "request_id": "request-1",
-            }
-        )
+    ranker = Ranker()
+    scope = create_request_scope()
+    result = await build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=Retriever(),
+        ranker=ranker,
+    ).ainvoke(
+        {
+            "query": "hello",
+            "conversation_id": "c1",
+            "request_id": "request-1",
+        }
+    )
 
-        assert ranker.received == ["d1", "d2"]
-        assert "evidence" in result
-        assert "ranked_evidence" in result
-        evidence = result["evidence"]
-        ranked_evidence = result["ranked_evidence"]
-        assert [item.evidence_id for item in ranked_evidence] == [
-            evidence[1].evidence_id,
-            evidence[0].evidence_id,
-        ]
+    assert ranker.received == ["d1", "d2"]
+    assert "evidence" in result
+    assert "ranked_evidence" in result
+    evidence = result["evidence"]
+    ranked_evidence = result["ranked_evidence"]
+    assert [item.evidence_id for item in ranked_evidence] == [
+        evidence[1].evidence_id,
+        evidence[0].evidence_id,
+    ]
 
 
 @pytest.mark.asyncio
@@ -85,22 +81,19 @@ async def test_ranker_rejects_duplicate_document_multiplicity(
             del query
             return RerankingResult(documents=[documents[0], documents[2], documents[2]])
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        scope = await seed_request_scope(pool)
-        result = await build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=DuplicateRetriever(),
-            ranker=InvalidRanker(),
-        ).ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "request_id": "request-1",
-            }
-        )
+    scope = create_request_scope()
+    result = await build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=DuplicateRetriever(),
+        ranker=InvalidRanker(),
+    ).ainvoke(
+        {
+            "query": "hello",
+            "conversation_id": "c1",
+            "request_id": "request-1",
+        }
+    )
 
     assert "halted" in result
     assert result["halted"] is True
@@ -129,22 +122,19 @@ async def test_ranker_preserves_order_for_distinct_documents_with_same_id(
             del query
             return RerankingResult(documents=list(reversed(documents)))
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        scope = await seed_request_scope(pool)
-        result = await build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=DuplicateRetriever(),
-            ranker=ReverseRanker(),
-        ).ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "request_id": "request-1",
-            }
-        )
+    scope = create_request_scope()
+    result = await build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=DuplicateRetriever(),
+        ranker=ReverseRanker(),
+    ).ainvoke(
+        {
+            "query": "hello",
+            "conversation_id": "c1",
+            "request_id": "request-1",
+        }
+    )
 
     assert "halted" in result
     assert result["halted"] is False

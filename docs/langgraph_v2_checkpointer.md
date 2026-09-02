@@ -9,8 +9,10 @@ index migrations.
 
 Application identifiers are encoded as URL-safe base64 JSON tuples:
 
-- `thread_id` is derived as `("thread", tenant_id, conversation_id)` and is not
-  stored on the Conversation.
+- `thread_id` is derived as
+  `("thread", tenant_id, subject_id, runtime_mode, conversation_id)`. The first
+  three values come only from trusted server context; clients cannot supply the
+  internal ID or escape their checkpoint scope.
 - `checkpoint_ns` is the empty string used by the root LangGraph graph.
 
 Query passes the shared official saver directly to LangGraph. PostgreSQL holds
@@ -25,6 +27,10 @@ finalization checkpoints the final assistant Message before `done` is released
 to the client. Model context is projected from complete prior request pairs;
 incomplete failed, halted, or disconnected requests are ignored. There is no
 separate application Message History table.
+
+There is also no application Conversation registry. An unknown valid
+Conversation UUID therefore starts an empty checkpoint thread. Retention and
+explicit checkpoint deletion are deferred; see the recorded TODO.
 
 Checkpoint rows are internal journal state. They do not create application
 Events and are not emitted in the query SSE stream.

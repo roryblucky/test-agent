@@ -61,3 +61,5 @@ through the official PostgreSQL LangGraph checkpointer.
      response-header assertions; durable Message idempotency remains covered by
      the PostgreSQL checkpoint tests.
 - Final review: Spec PASS, Standards PASS, zero unresolved review comments.
+- Task 53 later removed the remaining pre-release Conversation registry; this
+  task remains the historical record of the checkpoint-message migration.

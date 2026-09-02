@@ -3,7 +3,7 @@
 Run the static and full-suite gates with:
 
 ```shell
-uv run ruff check app tests alembic/versions/0017_drop_message_history.py
+uv run ruff check app tests alembic/versions/0018_drop_conversation_registry.py
 uv run pyright --pythonpath .venv/bin/python
 LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms_test_42' \
   PYTHONPATH=. uv run pytest tests

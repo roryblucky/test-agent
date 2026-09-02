@@ -13,9 +13,20 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from app.langgraph_v2.conversation_context import validate_request_identity
 
 
-def thread_id_for(tenant_id: str, conversation_id: str) -> str:
-    """Encode Tenant and Conversation into a collision-free thread ID."""
-    return _encode_parts("thread", tenant_id, conversation_id)
+def thread_id_for(
+    tenant_id: str,
+    subject_id: str,
+    runtime_mode: str,
+    conversation_id: str,
+) -> str:
+    """Encode trusted scope and Conversation into a collision-free thread ID."""
+    return _encode_parts(
+        "thread",
+        tenant_id,
+        subject_id,
+        runtime_mode,
+        conversation_id,
+    )
 
 
 def thread_checkpoint_config(*, thread_id: str, checkpoint_ns: str) -> RunnableConfig:

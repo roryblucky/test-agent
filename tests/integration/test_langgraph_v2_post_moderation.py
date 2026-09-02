@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator, Sequence
 from uuid import UUID, uuid4
 
 import pytest
-from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.authorization import TrustedRequestContext
@@ -16,11 +15,10 @@ from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_request_support import seed_request_scope
+from tests.integration.langgraph_v2_request_support import create_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
-    seed_subject_conversation,
     stream_request,
     v2_stream_endpoint,
 )
@@ -96,9 +94,6 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
     moderation = _FlaggingModeration()
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
@@ -131,20 +126,17 @@ async def test_flagged_answer_persists_original_complete_answer_through_http(
 async def test_safe_answer_passes_post_moderation_unchanged(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        moderation = _SafeModeration()
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            moderation_provider=moderation,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-        )
-        result = await graph.ainvoke(_state())
+    moderation = _SafeModeration()
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        moderation_provider=moderation,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+    )
+    result = await graph.ainvoke(_state())
 
     assert moderation.calls == 2
     assert "answer" in result
@@ -163,24 +155,20 @@ async def test_safe_answer_passes_post_moderation_unchanged(
 async def test_flagged_answer_remains_canonical_through_finalization(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        request_id = uuid4()
-        audit = MockOutputAssessmentAudit()
-        await seed_request_scope(pool, request_id=request_id)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=request_id,
-            output_assessment_audit=audit,
-            moderation_provider=_FlaggingModeration(),
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-        )
-        state = _state()
-        state["request_id"] = str(request_id)
-        result = await graph.ainvoke(state)
+    request_id = uuid4()
+    audit = MockOutputAssessmentAudit()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=request_id,
+        output_assessment_audit=audit,
+        moderation_provider=_FlaggingModeration(),
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+    )
+    state = _state()
+    state["request_id"] = str(request_id)
+    result = await graph.ainvoke(state)
 
     assert "answer" in result
     assert result["answer"] == "generated answer"
@@ -203,20 +191,17 @@ async def test_flagged_answer_remains_canonical_through_finalization(
 async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            moderation_provider=_FailingPostModeration(),
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-        )
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        moderation_provider=_FailingPostModeration(),
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+    )
 
-        result = await graph.ainvoke(_state())
+    result = await graph.ainvoke(_state())
 
     assert "answer" in result
     assert result["answer"] == "generated answer"

@@ -39,14 +39,17 @@ dependencies, map-reduce, and Specialist delegation.
   execution authority; do not add a `runs` table, Run repository, duplicate
   checkpoint pointer, transport Event journal, or Redis recovery state.
 - Resolve the Tenant's configured mode before starting a request. One Tenant has
-  exactly one active mode, and Conversation persists that mode, so a Conversation
-  never mixes Linear and Agent requests.
-  Runtime mode is fixed for the current deployment configuration; config reload
-  must reject a mode change.
+  exactly one active mode. Include that trusted mode in the derived checkpoint
+  `thread_id`, so Linear and Agent state cannot mix even for the same public
+  Conversation UUID. Runtime mode is fixed for the current deployment
+  configuration; config reload must reject a mode change.
 - Within an Agent-mode Conversation, plan every request independently from that
   request's query and authorized capabilities. Consecutive requests may use different
   execution shapes; do not store a Tenant-level or Conversation-level active
   Agent pattern.
+- Across Agent requests, inherit only checkpointed `conversation_messages`.
+  Reset the new request's plan, Tasks, Evidence, answer, errors, deadline, and
+  every other Agent-local field before execution.
 - Share Query authorization and request-owned streaming mechanics, and inject
   the same official checkpointer. Keep each Graph's builder and execution policy
   inside that Graph's own module rather than adding Agent branches to the Linear

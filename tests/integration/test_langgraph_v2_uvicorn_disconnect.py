@@ -12,6 +12,7 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic_ai.usage import RunUsage
 
+from app.config.models import LangGraphRuntimeMode
 from app.langgraph_v2.answer import AnswerOutput, PydanticAIAnswerActor
 from app.langgraph_v2.api import GraphStream, register_v2_routes
 from app.langgraph_v2.authorization import TrustedRequestContext
@@ -23,7 +24,6 @@ from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
 from tests.integration.test_langgraph_v2_linear_core import (
     configure_linear_tenant,
-    seed_subject_conversation,
 )
 
 
@@ -225,16 +225,17 @@ async def test_real_tcp_disconnect_cancels_and_awaits_graph_and_pydantic_stream(
 ) -> None:
     conversation_id = "00000000-0000-0000-0000-000000000006"
     context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url,
-        conversation_id,
-    )
     model_stream = _BlockingPydanticStream()
     answer_actor = PydanticAIAnswerActor(
         _PydanticAgent(model_stream)  # type: ignore[arg-type]
     )
     tracked_graph = _TrackedGraph(
-        thread_id=thread_id_for(context.tenant_id, conversation_id)
+        thread_id=thread_id_for(
+            context.tenant_id,
+            context.subject_id,
+            LangGraphRuntimeMode.LINEAR.value,
+            conversation_id,
+        )
     )
 
     @asynccontextmanager

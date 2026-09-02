@@ -16,7 +16,6 @@ from app.langgraph_v2.stream import GraphStreamCleanupError
 from tests.integration.test_langgraph_v2_linear_core import (
     close_stream_after_first_token,
     persistent_linear_app,
-    seed_subject_conversation,
     stream_request,
     v2_stream_endpoint,
 )
@@ -165,9 +164,6 @@ class _BlockingAnswerActor:
 async def test_query_executes_request_owned_astream_and_emits_done(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
     graph = _CompletedGraph()
     app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
 
@@ -195,9 +191,6 @@ async def test_query_executes_request_owned_astream_and_emits_done(
 async def test_query_retry_reuses_client_request_id_header(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url, _RetryCompletedGraph()
     )
@@ -224,10 +217,6 @@ async def test_query_retry_reuses_client_request_id_header(
 async def test_closing_query_sse_closes_graph_without_persisting_a_run(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
-
     class BlockingStream:
         def __init__(self) -> None:
             self.started = asyncio.Event()
@@ -280,9 +269,6 @@ async def test_closing_query_sse_closes_graph_without_persisting_a_run(
 async def test_query_yields_answer_delta_before_graph_completion(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
     graph = _RealtimeGraph()
     app = persistent_linear_app(langgraph_v2_migrated_database_url, graph)
 
@@ -309,7 +295,6 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = UUID("00000000-0000-0000-0000-000000000022")
-    await seed_subject_conversation(langgraph_v2_migrated_database_url, conversation_id)
     answer_actor = _BlockingAnswerActor()
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
@@ -349,10 +334,6 @@ async def test_closing_query_after_answer_token_closes_answer_stream_and_persist
 async def test_graph_close_failure_is_reported_after_request_cleanup(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
-
     class FailingCloseStream:
         def __init__(self) -> None:
             self.started = asyncio.Event()
@@ -401,10 +382,6 @@ async def test_graph_close_failure_is_reported_after_request_cleanup(
 async def test_graph_close_failure_without_primary_error_is_reported(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    await seed_subject_conversation(
-        langgraph_v2_migrated_database_url, "00000000-0000-0000-0000-000000000001"
-    )
-
     class FailingCloseStream:
         def __aiter__(self) -> AsyncIterator[Any]:
             return self

@@ -17,7 +17,7 @@ during migration, but no Flow Engine execution abstraction is reused by v2.
   removed or retyped.
 - A request begins Graph execution immediately in the receiving FastAPI
   instance. There is no queue, worker, detached runtime or background pickup.
-- Return the database-generated public `conversation_id` and stable logical
+- Return the application-generated public `conversation_id` and stable logical
   `request_id` needed by the UI.
   Keep the checkpointer `thread_id` internal and do not introduce a public
   `run_id` merely to map to it.
@@ -64,16 +64,17 @@ query
   metadata, but they must not affect the Answer.
 - Never emit chain-of-thought.
 
-## Conversation context and authorization
+## Conversation context and isolation
 
-- PostgreSQL `Conversation` is the durable authority for Tenant and Subject
-  ownership, fixed runtime mode, and lifecycle. Every query authorizes the
-  requested Conversation before accessing its checkpoints.
-- An accepted query refreshes the Conversation's `updated_at` activity time.
-- Persist the Conversation's fixed `runtime_mode`. Derive LangGraph `thread_id`
-  from Tenant plus Conversation UUID; never store or accept it as authorization
-  input.
-- Do not maintain an application Message History table. Store only one user
+- Do not maintain an application Conversation registry or Message History. When
+  `conversation_id` is absent, generate a UUID in the application and return it;
+  any client-supplied valid UUID identifies a thread and an unknown UUID starts
+  from empty checkpoint state.
+- Resolve runtime mode from trusted Tenant configuration on every request.
+  Derive LangGraph `thread_id` collision-free from trusted Tenant, Subject,
+  runtime mode, and Conversation UUID. Never accept these trusted scope values
+  or the internal `thread_id` from the request body.
+- Store only one user
   Message and at most one final assistant Message per stable logical
   `request_id` in checkpointed Graph state using `add_messages`. Stable Message
   IDs are derived from request ID plus role; internal Agent and Tool messages do
@@ -104,7 +105,6 @@ query
 
 Keep only records with independent product value:
 
-- the minimal Conversation ownership and lifecycle registry;
 - checkpointed Conversation context Messages;
 - LangGraph PostgreSQL checkpoints;
 - lightweight document/source citation metadata needed by the final response;
@@ -126,9 +126,9 @@ application tables.
   contract, including a real-time Answer stream and unchanged `done.answer`.
 - Tests prove low groundedness and flagged post-moderation do not suppress,
   replace or alter the Answer or final checkpointed assistant Message.
-- Real PostgreSQL tests prove Conversation Tenant/Subject authorization, fixed
-  runtime mode, request-paired checkpoint Message idempotency, incomplete
-  request exclusion, and official checkpoint persistence across multiple turns.
+- Real PostgreSQL tests prove Tenant/Subject/runtime-mode checkpoint isolation,
+  request-paired Message idempotency, incomplete request exclusion, and official
+  checkpoint persistence across multiple turns.
 - Disconnect tests run through real Uvicorn and the deployment proxy boundary
   and prove the Graph iterator is cancelled and awaited.
 - An opt-in load profile proves 50 simultaneous `/v2/query/stream` requests

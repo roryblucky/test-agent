@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator, Sequence
 from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from psycopg_pool import AsyncConnectionPool
 from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.answer import AnswerCitation, AnswerResult, AnswerStreamChunk
@@ -22,11 +20,10 @@ from app.langgraph_v2.output_assessments import MockOutputAssessmentAudit
 from app.langgraph_v2.reranking import RerankingResult
 from app.langgraph_v2.retrieval import RetrievalResult
 from app.models.domain import Document
-from tests.integration.langgraph_v2_request_support import seed_request_scope
+from tests.integration.langgraph_v2_request_support import create_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
-    seed_subject_conversation,
 )
 
 
@@ -109,29 +106,25 @@ class _FailingAssessmentAudit:
 async def test_low_groundedness_is_advisory_on_each_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        evaluator = _Groundedness()
-        audit = MockOutputAssessmentAudit()
-        request_id = uuid4()
-        await seed_request_scope(pool, request_id=request_id)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=request_id,
-            output_assessment_audit=audit,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-            groundedness_actor=evaluator,
-        )
-        state: LinearGraphState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "request_id": str(request_id),
-        }
-        first = await graph.ainvoke(state)
-        second = await graph.ainvoke(state)
+    evaluator = _Groundedness()
+    audit = MockOutputAssessmentAudit()
+    request_id = uuid4()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=request_id,
+        output_assessment_audit=audit,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+        groundedness_actor=evaluator,
+    )
+    state: LinearGraphState = {
+        "query": "hello",
+        "conversation_id": "c1",
+        "request_id": str(request_id),
+    }
+    first = await graph.ainvoke(state)
+    second = await graph.ainvoke(state)
 
     assert evaluator.calls == 2
     assert "answer" in first
@@ -165,12 +158,6 @@ def test_low_groundedness_preserves_http_tokens_done_and_assistant_message(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = "00000000-0000-0000-0000-000000000004"
-    asyncio.run(
-        seed_subject_conversation(
-            langgraph_v2_migrated_database_url,
-            conversation_id,
-        )
-    )
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         retriever=_Retriever(),
@@ -213,12 +200,6 @@ def test_new_request_does_not_inherit_prior_groundedness_when_evaluation_fails(
             )
 
     conversation_id = "00000000-0000-0000-0000-000000000005"
-    asyncio.run(
-        seed_subject_conversation(
-            langgraph_v2_migrated_database_url,
-            conversation_id,
-        )
-    )
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         retriever=_Retriever(),
@@ -278,29 +259,25 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
             self.calls += 1
             raise RuntimeError("evaluator unavailable")
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        evaluator = Failing()
-        audit = MockOutputAssessmentAudit()
-        request_id = uuid4()
-        await seed_request_scope(pool, request_id=request_id)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=request_id,
-            output_assessment_audit=audit,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-            groundedness_actor=evaluator,
-        )
-        state: LinearGraphState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "request_id": str(request_id),
-        }
-        first = await graph.ainvoke(state)
-        second = await graph.ainvoke(state)
+    evaluator = Failing()
+    audit = MockOutputAssessmentAudit()
+    request_id = uuid4()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=request_id,
+        output_assessment_audit=audit,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+        groundedness_actor=evaluator,
+    )
+    state: LinearGraphState = {
+        "query": "hello",
+        "conversation_id": "c1",
+        "request_id": str(request_id),
+    }
+    first = await graph.ainvoke(state)
+    second = await graph.ainvoke(state)
 
     assert evaluator.calls == 2
     assert "groundedness_error" in first
@@ -329,25 +306,22 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
 async def test_groundedness_uses_only_cited_documents(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_UncitedAnswer(),
-            groundedness_actor=_EmptyDocumentGroundedness(),
-        )
-        result = await graph.ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "request_id": "request-1",
-            }
-        )
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_UncitedAnswer(),
+        groundedness_actor=_EmptyDocumentGroundedness(),
+    )
+    result = await graph.ainvoke(
+        {
+            "query": "hello",
+            "conversation_id": "c1",
+            "request_id": "request-1",
+        }
+    )
 
     assert "groundedness" in result
     groundedness = result["groundedness"]
@@ -366,25 +340,22 @@ async def test_groundedness_rejects_out_of_range_scores(
             del answer, documents
             return GroundednessAssessment(is_grounded=True, score=2.0)
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-            groundedness_actor=InvalidScore(),
-        )
-        result = await graph.ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "request_id": "request-1",
-            }
-        )
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+        groundedness_actor=InvalidScore(),
+    )
+    result = await graph.ainvoke(
+        {
+            "query": "hello",
+            "conversation_id": "c1",
+            "request_id": "request-1",
+        }
+    )
 
     assert result.get("groundedness") is None
     assert "groundedness_error" in result
@@ -451,27 +422,24 @@ async def test_groundedness_actor_setup_failure_is_advisory(
 async def test_assessment_audit_failure_does_not_gate_answer(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            output_assessment_audit=_FailingAssessmentAudit(),
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_Answer(),
-            groundedness_actor=_Groundedness(),
-        )
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        output_assessment_audit=_FailingAssessmentAudit(),
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_Answer(),
+        groundedness_actor=_Groundedness(),
+    )
 
-        result = await graph.ainvoke(
-            LinearGraphState(
-                query="hello",
-                conversation_id="c1",
-                request_id="request-1",
-            )
+    result = await graph.ainvoke(
+        LinearGraphState(
+            query="hello",
+            conversation_id="c1",
+            request_id="request-1",
         )
+    )
 
     assert "answer" in result
     assert result["answer"] == "answer [1]"

@@ -1,7 +1,7 @@
 -- LangGraph Linear Core PostgreSQL bootstrap DDL.
 --
 -- This file represents the schema at Alembic revision
--- 0017_drop_history. It is intended for a new, empty PostgreSQL
+-- 0018_drop_registry. It is intended for a new, empty PostgreSQL
 -- database. Existing databases should continue to use Alembic migrations.
 --
 -- The public checkpoint tables match langgraph-checkpoint-postgres 3.1.2.
@@ -11,20 +11,6 @@
 BEGIN;
 
 CREATE SCHEMA langgraph_v2;
-
-CREATE TABLE langgraph_v2.conversations (
-    conversation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id TEXT NOT NULL,
-    owner_subject_id TEXT NOT NULL,
-    runtime_mode TEXT NOT NULL
-        CONSTRAINT conversations_runtime_mode_check
-        CHECK (runtime_mode IN ('linear', 'agent')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX conversations_owner_idx
-    ON langgraph_v2.conversations (tenant_id, owner_subject_id);
 
 -- Official LangGraph PostgreSQL checkpointer tables intentionally remain in
 -- the public schema because AsyncPostgresSaver uses these unqualified names.
@@ -89,6 +75,6 @@ CREATE TABLE public.alembic_version (
 );
 
 INSERT INTO public.alembic_version (version_num)
-VALUES ('0017_drop_history');
+VALUES ('0018_drop_registry');
 
 COMMIT;

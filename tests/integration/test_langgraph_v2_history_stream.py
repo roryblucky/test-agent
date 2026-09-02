@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import asyncio
-
 # Public-stream coverage complements the pure selector unit tests.
 import json
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import AnswerResult, AnswerStreamChunk
 from app.langgraph_v2.checkpointing import (
@@ -28,7 +25,6 @@ from app.models.domain import Document
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
-    seed_subject_conversation,
 )
 
 _FIXTURE_PATH = (
@@ -92,13 +88,6 @@ def test_three_public_turns_restore_complete_checkpoint_context(
 ) -> None:
     conversation_id = "00000000-0000-0000-0000-000000000021"
 
-    async def seed() -> None:
-        async with AsyncConnectionPool(
-            langgraph_v2_migrated_database_url, min_size=1, max_size=2
-        ) as pool:
-            await seed_subject_conversation(pool, conversation_id)
-
-    asyncio.run(seed())
     refinement = _RefinementActor()
     answer = _AnswerActor()
     app = persistent_linear_app(
@@ -125,6 +114,27 @@ def test_three_public_turns_restore_complete_checkpoint_context(
             json={"query": "third reference", "sessionId": conversation_id},
             headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
         )
+        assert client.portal is not None
+        isolated_messages = [
+            client.portal.call(
+                read_conversation_messages,
+                app.state.langgraph_v2_checkpointer,
+                thread_checkpoint_config(
+                    thread_id=thread_id_for(
+                        tenant_id,
+                        subject_id,
+                        runtime_mode,
+                        conversation_id,
+                    ),
+                    checkpoint_ns="",
+                ),
+            )
+            for tenant_id, subject_id, runtime_mode in (
+                ("tenant-b", "subject-a", "linear"),
+                ("tenant-a", "subject-b", "linear"),
+                ("tenant-a", "subject-a", "agent"),
+            )
+        ]
 
     expected_history = [
         ConversationExchange(user="first question", assistant="answer for first question")
@@ -139,6 +149,7 @@ def test_three_public_turns_restore_complete_checkpoint_context(
         ConversationExchange(user="follow up", assistant="answer for follow up"),
     ]
     assert first.status_code == second.status_code == third.status_code == 200
+    assert isolated_messages == [[], [], []]
     assert refinement.histories == [[], expected_history, second_history]
     assert answer.histories == [[], expected_history, second_history]
     second_done = parse_sse(second.text)[-1]
@@ -150,9 +161,6 @@ def test_halted_request_is_not_used_as_later_model_context(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = "00000000-0000-0000-0000-000000000023"
-    asyncio.run(
-        seed_subject_conversation(langgraph_v2_migrated_database_url, conversation_id)
-    )
     refinement = _RefinementActor()
     answer = _AnswerActor()
     app = persistent_linear_app(
@@ -186,9 +194,6 @@ def test_client_request_id_retry_and_conflict_are_explicit(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     conversation_id = "00000000-0000-0000-0000-000000000024"
-    asyncio.run(
-        seed_subject_conversation(langgraph_v2_migrated_database_url, conversation_id)
-    )
     app = persistent_linear_app(
         langgraph_v2_migrated_database_url,
         refinement_actor=_RefinementActor(),
@@ -211,7 +216,9 @@ def test_client_request_id_retry_and_conflict_are_explicit(
             read_conversation_messages,
             app.state.langgraph_v2_checkpointer,
             thread_checkpoint_config(
-                thread_id=thread_id_for("tenant-a", conversation_id),
+                thread_id=thread_id_for(
+                    "tenant-a", "subject-a", "linear", conversation_id
+                ),
                 checkpoint_ns="",
             ),
         )

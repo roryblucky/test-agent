@@ -8,7 +8,6 @@ import pytest
 from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
-from psycopg_pool import AsyncConnectionPool
 
 from app.langgraph_v2.answer import (
     AnswerCitation,
@@ -24,7 +23,7 @@ from app.models.domain import Document
 from app.models.workflow import AggregatedEvidence
 from app.services.citation_extractor import build_citations
 from app.services.events import EventEmitter
-from tests.integration.langgraph_v2_request_support import seed_request_scope
+from tests.integration.langgraph_v2_request_support import create_request_scope
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -197,26 +196,23 @@ class _MalformedCitationAnswer:
 async def test_answer_receives_ranked_documents_on_each_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        actor = _AnswerActor()
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
-        )
-        state: LinearGraphState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "request_id": "request-1",
-        }
+    actor = _AnswerActor()
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=actor,
+    )
+    state: LinearGraphState = {
+        "query": "hello",
+        "conversation_id": "c1",
+        "request_id": "request-1",
+    }
 
-        first = await graph.ainvoke(state)
-        second = await graph.ainvoke(state)
+    first = await graph.ainvoke(state)
+    second = await graph.ainvoke(state)
 
     assert actor.calls == 2
     assert "answer" in first
@@ -230,27 +226,24 @@ async def test_answer_receives_ranked_documents_on_each_execution(
 async def test_compiled_graph_projects_answer_deltas_through_custom_stream(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            checkpointer=MemorySaver(),
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=_StreamingAnswerActor(),
-        )
-        state: LinearGraphState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "request_id": "request-1",
-        }
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        checkpointer=MemorySaver(),
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=_StreamingAnswerActor(),
+    )
+    state: LinearGraphState = {
+        "query": "hello",
+        "conversation_id": "c1",
+        "request_id": "request-1",
+    }
 
-        config: RunnableConfig = {"configurable": {"thread_id": "ticket34-stream"}}
-        frames = [frame async for frame in stream_graph(graph, state, config=config)]
-        result = await graph.aget_state(config)
+    config: RunnableConfig = {"configurable": {"thread_id": "ticket34-stream"}}
+    frames = [frame async for frame in stream_graph(graph, state, config=config)]
+    result = await graph.aget_state(config)
 
     events = [parse_sse(frame)[0] for frame in frames]
     token_events = [event for event in events if event["type"] == "token"]
@@ -375,25 +368,22 @@ def test_new_request_does_not_inherit_answer_when_answer_actor_is_unavailable(
 async def test_answer_citation_subresult_is_bound_on_each_execution(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        actor = _CitingAnswer()
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
-        )
-        state: LinearGraphState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "request_id": "request-1",
-        }
-        first = await graph.ainvoke(state)
-        second = await graph.ainvoke(state)
+    actor = _CitingAnswer()
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=actor,
+    )
+    state: LinearGraphState = {
+        "query": "hello",
+        "conversation_id": "c1",
+        "request_id": "request-1",
+    }
+    first = await graph.ainvoke(state)
+    second = await graph.ainvoke(state)
 
     assert actor.calls == 2
     assert "citations" in first
@@ -409,24 +399,21 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
 async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_indices(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        actor = _InlineCitationAnswer()
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
-        )
-        state: LinearGraphState = {
-            "query": "hello",
-            "conversation_id": "c1",
-            "request_id": "request-1",
-        }
-        result = await graph.ainvoke(state)
+    actor = _InlineCitationAnswer()
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=actor,
+    )
+    state: LinearGraphState = {
+        "query": "hello",
+        "conversation_id": "c1",
+        "request_id": "request-1",
+    }
+    result = await graph.ainvoke(state)
 
     assert actor.calls == 1
     assert "citations" in result
@@ -495,25 +482,22 @@ async def test_inline_citation_uses_reranked_evidence_position(
             del query
             return RerankingResult(documents=list(reversed(documents)))
 
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        actor = _RankedInlineAnswer()
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=TwoRetriever(),
-            ranker=ReverseRanker(),
-            answer_actor=actor,
-        )
-        result = await graph.ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "request_id": "request-1",
-            }
-        )
+    actor = _RankedInlineAnswer()
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=TwoRetriever(),
+        ranker=ReverseRanker(),
+        answer_actor=actor,
+    )
+    result = await graph.ainvoke(
+        {
+            "query": "hello",
+            "conversation_id": "c1",
+            "request_id": "request-1",
+        }
+    )
 
     assert actor.calls == 1
     assert "ranked_evidence" in result
@@ -527,25 +511,22 @@ async def test_inline_citation_uses_reranked_evidence_position(
 async def test_malformed_inline_references_do_not_fallback_to_structured_citations(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    async with AsyncConnectionPool(
-        langgraph_v2_migrated_database_url, min_size=1, max_size=2
-    ) as pool:
-        actor = _MalformedCitationAnswer()
-        scope = await seed_request_scope(pool)
-        graph = build_linear_graph(
-            tenant_id="tenant-a",
-            current_request_id=scope.request_id,
-            retriever=_Retriever(),
-            ranker=_Ranker(),
-            answer_actor=actor,
-        )
-        result = await graph.ainvoke(
-            {
-                "query": "hello",
-                "conversation_id": "c1",
-                "request_id": "request-1",
-            }
-        )
+    actor = _MalformedCitationAnswer()
+    scope = create_request_scope()
+    graph = build_linear_graph(
+        tenant_id="tenant-a",
+        current_request_id=scope.request_id,
+        retriever=_Retriever(),
+        ranker=_Ranker(),
+        answer_actor=actor,
+    )
+    result = await graph.ainvoke(
+        {
+            "query": "hello",
+            "conversation_id": "c1",
+            "request_id": "request-1",
+        }
+    )
 
     assert actor.calls == 1
     assert "citations" in result

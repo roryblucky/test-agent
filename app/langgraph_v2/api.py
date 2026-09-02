@@ -18,7 +18,6 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from psycopg_pool import AsyncConnectionPool
 from starlette.requests import ClientDisconnect
 from starlette.types import Receive, Scope, Send
 
@@ -40,11 +39,6 @@ from app.langgraph_v2.contracts import (
 from app.langgraph_v2.conversation_context import (
     DEFAULT_HISTORY_TOKEN_BUDGET,
     RequestIdentityConflict,
-)
-from app.langgraph_v2.conversations import (
-    ConversationModeConflict,
-    ConversationNotFound,
-    ConversationRepository,
 )
 from app.langgraph_v2.groundedness import GroundednessActor
 from app.langgraph_v2.linear_runtime import LinearGraphOverrides, build_linear_runtime
@@ -229,13 +223,6 @@ def _reject_removed_replay_query_parameters(request: Request) -> None:
         )
 
 
-def _conversation_repository(
-    pool: AsyncConnectionPool[Any],
-) -> ConversationRepository:
-    """Build the Tenant-scoped Conversation registry."""
-    return ConversationRepository(pool)
-
-
 class GraphRuntimeAdapter(Protocol):
     """One Tenant runtime behind the shared v2 request lifecycle."""
 
@@ -263,7 +250,6 @@ class GraphRuntimeFactory(Protocol):
         self,
         *,
         app: FastAPI,
-        pool: AsyncConnectionPool[Any],
         request_context: TrustedRequestContext,
         checkpointer: BaseCheckpointSaver[Any],
     ) -> GraphRuntimeAdapter:
@@ -316,7 +302,6 @@ def _tenant_runtime_mode(app: FastAPI, tenant_id: str) -> LangGraphRuntimeMode:
 def _resolve_graph_runtime(
     app: FastAPI,
     *,
-    pool: AsyncConnectionPool[Any],
     request_context: TrustedRequestContext,
     checkpointer: BaseCheckpointSaver[Any],
     runtime_mode: LangGraphRuntimeMode,
@@ -337,7 +322,6 @@ def _resolve_graph_runtime(
         raise HTTPException(status_code=503, detail="Agent runtime is not configured")
     runtime = agent_runtime_factory(
         app=app,
-        pool=pool,
         request_context=request_context,
         checkpointer=checkpointer,
     )
@@ -382,20 +366,8 @@ def create_v2_router(
                 detail="LangGraph v2 checkpointer is not configured",
             )
         checkpointer = cast(BaseCheckpointSaver[Any], configured_checkpointer)
-        configured_pool = getattr(
-            http_request.app.state,
-            "langgraph_v2_postgres_pool",
-            None,
-        )
-        if configured_pool is None:
-            raise HTTPException(
-                status_code=500, detail="LangGraph v2 PostgreSQL is not configured"
-            )
-        pool = cast(AsyncConnectionPool[Any], configured_pool)
-        conversation_repository = _conversation_repository(pool)
         runtime = _resolve_graph_runtime(
             http_request.app,
-            pool=pool,
             request_context=request_context,
             checkpointer=checkpointer,
             runtime_mode=runtime_mode,
@@ -403,26 +375,15 @@ def create_v2_router(
             linear_overrides=overrides,
             agent_runtime_factory=agent_runtime_factory,
         )
-        try:
-            if payload.conversation_id is None:
-                conversation = await conversation_repository.create_conversation(
-                    context=request_context,
-                    runtime_mode=runtime_mode,
-                )
-            else:
-                conversation = await conversation_repository.get_conversation(
-                    context=request_context,
-                    conversation_id=payload.conversation_id,
-                    runtime_mode=runtime_mode,
-                )
-        except (ConversationNotFound, ConversationModeConflict) as error:
-            raise HTTPException(
-                status_code=404, detail="Conversation not found"
-            ) from error
-        conversation_id = str(conversation.conversation_id)
+        conversation_id = str(payload.conversation_id or uuid.uuid4())
         request_id = payload.client_request_id or str(uuid.uuid4())
         graph_config = thread_checkpoint_config(
-            thread_id=thread_id_for(tenant_id, conversation_id),
+            thread_id=thread_id_for(
+                tenant_id,
+                request_context.subject_id,
+                runtime_mode.value,
+                conversation_id,
+            ),
             checkpoint_ns="",
         )
         try:
@@ -437,11 +398,6 @@ def create_v2_router(
                 status_code=409,
                 detail="clientRequestId was already used for a different query",
             ) from error
-        await conversation_repository.touch_conversation(
-            context=request_context,
-            conversation_id=conversation.conversation_id,
-        )
-
         async def create_graph_stream() -> AsyncGenerator[str]:
             selected_graph = runtime.build_graph(request_id=request_id)
             state = _initial_graph_state(

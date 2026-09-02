@@ -9,7 +9,9 @@ The isolation boundary for an organization's data, configuration, credentials, c
 _Avoid_: App, workspace, account
 
 **Subject**:
-The authenticated security principal identity within a Tenant, supplied by the trusted authentication boundary and used to authorize Conversation access; distinct from the User, the person and domain actor.
+The authenticated security principal identity within a Tenant, supplied by the
+trusted authentication boundary and used to scope checkpoint access; distinct
+from the User, the person and domain actor.
 _Avoid_: User, caller, client identity
 
 **User**:
@@ -17,7 +19,9 @@ A person within a Tenant who owns or participates in Conversations and initiates
 _Avoid_: Caller, operator
 
 **Conversation**:
-A persistent, user-visible exchange that can contain multiple Runs and be continued over time.
+A user-visible exchange identified by an opaque UUID that can contain multiple
+Runs and be continued through checkpointed short-term state. The current Core
+does not persist a product Conversation registry or History.
 _Avoid_: Session, thread, chat session
 
 **Request**:
