@@ -1,4 +1,10 @@
-from app.langgraph_v2.checkpointing import thread_id_for
+from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
+
+
+def test_thread_checkpoint_config_only_sets_thread_id() -> None:
+    assert thread_checkpoint_config(thread_id="thread-1") == {
+        "configurable": {"thread_id": "thread-1"}
+    }
 
 
 def test_thread_id_is_collision_free_across_trusted_scope_parts() -> None:

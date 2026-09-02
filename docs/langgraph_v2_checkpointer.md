@@ -13,7 +13,11 @@ Application identifiers are encoded as URL-safe base64 JSON tuples:
   `("thread", tenant_id, subject_id, runtime_mode, conversation_id)`. The first
   three values come only from trusted server context; clients cannot supply the
   internal ID or escape their checkpoint scope.
-- `checkpoint_ns` is the empty string used by the root LangGraph graph.
+
+The application supplies only `thread_id` in the checkpoint configuration.
+`checkpoint_ns` remains part of the official checkpointer schema and is used
+internally by LangGraph for root Graph and Subgraph checkpoint namespaces; the
+Query API does not set or control it.
 
 Query passes the shared official saver directly to LangGraph. PostgreSQL holds
 the official checkpoint state; there is no application checkpoint pointer,

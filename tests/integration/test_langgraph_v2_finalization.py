@@ -429,7 +429,6 @@ def test_terminal_checkpoint_failure_does_not_persist_assistant(
                 thread_id=thread_id_for(
                     "tenant-a", "subject-a", "linear", conversation_id
                 ),
-                checkpoint_ns="",
             ),
         )
 

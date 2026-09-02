@@ -79,7 +79,7 @@ class _PydanticAgent:
 class _TrackedGraph:
     def __init__(self, *, thread_id: str) -> None:
         self.target: GraphStream | None = None
-        self.config = thread_checkpoint_config(thread_id=thread_id, checkpoint_ns="")
+        self.config = thread_checkpoint_config(thread_id=thread_id)
         self.cancelled = asyncio.Event()
         self.closed = asyncio.Event()
 

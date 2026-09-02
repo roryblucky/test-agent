@@ -384,7 +384,6 @@ def create_v2_router(
                 runtime_mode.value,
                 conversation_id,
             ),
-            checkpoint_ns="",
         )
         try:
             await validate_checkpoint_request_identity(

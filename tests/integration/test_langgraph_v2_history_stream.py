@@ -126,7 +126,6 @@ def test_three_public_turns_restore_complete_checkpoint_context(
                         runtime_mode,
                         conversation_id,
                     ),
-                    checkpoint_ns="",
                 ),
             )
             for tenant_id, subject_id, runtime_mode in (
@@ -219,7 +218,6 @@ def test_client_request_id_retry_and_conflict_are_explicit(
                 thread_id=thread_id_for(
                     "tenant-a", "subject-a", "linear", conversation_id
                 ),
-                checkpoint_ns="",
             ),
         )
         conflict = client.post(

@@ -29,14 +29,9 @@ def thread_id_for(
     )
 
 
-def thread_checkpoint_config(*, thread_id: str, checkpoint_ns: str) -> RunnableConfig:
+def thread_checkpoint_config(*, thread_id: str) -> RunnableConfig:
     """Build the checkpoint config for one Graph thread invocation."""
-    return {
-        "configurable": {
-            "thread_id": thread_id,
-            "checkpoint_ns": checkpoint_ns,
-        }
-    }
+    return {"configurable": {"thread_id": thread_id}}
 
 
 async def read_conversation_messages(
