@@ -9,6 +9,7 @@ from typing import Any, Protocol, Self
 
 from fastapi import FastAPI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field, model_validator
 
@@ -63,7 +64,26 @@ class Checkpointer(Protocol):
         ...
 
 
-CheckpointerFactory = Callable[[Any], Checkpointer]
+class CheckpointerFactory(Protocol):
+    """Construct the official saver with the required strict serializer."""
+
+    def __call__(
+        self,
+        conn: Any,
+        *,
+        serde: JsonPlusSerializer,
+    ) -> Checkpointer:
+        """Return one initialized checkpoint saver."""
+        ...
+
+
+def strict_checkpoint_serializer() -> JsonPlusSerializer:
+    """Build the only serializer admitted at the shared checkpoint boundary."""
+    return JsonPlusSerializer(
+        pickle_fallback=False,
+        allowed_json_modules=None,
+        allowed_msgpack_modules=None,
+    )
 
 
 @asynccontextmanager
@@ -95,7 +115,7 @@ async def postgres_lifespan(
             raise RuntimeError("PostgreSQL pool factory returned no pool")
         await pool.open(wait=True)
         app.state.langgraph_v2_postgres_pool = pool
-        checkpointer = checkpointer_factory(pool)
+        checkpointer = checkpointer_factory(pool, serde=strict_checkpoint_serializer())
         await checkpointer.setup()
         app.state.langgraph_v2_checkpointer = checkpointer
         yield

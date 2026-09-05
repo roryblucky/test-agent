@@ -28,6 +28,7 @@ from app.langgraph_v2.authorization import (
     get_trusted_request_context,
 )
 from app.langgraph_v2.checkpointing import (
+    CheckpointStateAdapter,
     thread_checkpoint_config,
     thread_id_for,
     validate_checkpoint_request_identity,
@@ -231,6 +232,11 @@ class GraphRuntimeAdapter(Protocol):
         """Return the trusted Tenant mode implemented by this adapter."""
         ...
 
+    @property
+    def checkpoint_state_adapter(self) -> CheckpointStateAdapter:
+        """Validate this runtime's persisted channels before application use."""
+        ...
+
     def build_graph(self, *, request_id: str) -> RequestOwnedGraph:
         """Build the Graph that executes a logical request."""
         ...
@@ -391,6 +397,7 @@ def create_v2_router(
                 graph_config,
                 request_id=request_id,
                 query=payload.query,
+                state_adapter=runtime.checkpoint_state_adapter,
             )
         except RequestIdentityConflict as error:
             raise HTTPException(

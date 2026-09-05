@@ -23,7 +23,11 @@ from langgraph.graph.message import (  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.types import StateSnapshot
 
 from app.langgraph_v2.answer import AnswerActor, run_answer
-from app.langgraph_v2.contracts import LinearQueryResponse, LiveStreamEvent
+from app.langgraph_v2.checkpointing import (
+    CheckpointStateAdapter,
+    LinearCheckpointStateAdapter,
+)
+from app.langgraph_v2.contracts import LiveStreamEvent
 from app.langgraph_v2.conversation_context import (
     DEFAULT_HISTORY_TOKEN_BUDGET,
     ConversationExchange,
@@ -48,8 +52,6 @@ from app.langgraph_v2.question_refinement import (
 )
 from app.langgraph_v2.reranking import MockRanker, Ranker, run_reranking
 from app.langgraph_v2.retrieval import MockRetriever, Retriever, run_retrieval
-from app.models.domain import GroundednessResult
-from app.models.workflow import CitationReference
 
 
 class LinearGraphState(TypedDict):
@@ -71,14 +73,14 @@ class LinearGraphState(TypedDict):
     ranked_evidence: NotRequired[Annotated[list[Evidence], UntrackedValue]]
     answer: NotRequired[str | None]
     answer_usage: NotRequired[dict[str, Any]]
-    citations: NotRequired[list[CitationReference]]
+    citations: NotRequired[list[dict[str, Any]]]
     answer_error: NotRequired[str | None]
-    groundedness: NotRequired[GroundednessResult | None]
+    groundedness: NotRequired[dict[str, Any] | None]
     groundedness_usage: NotRequired[dict[str, Any]]
     groundedness_error: NotRequired[str | None]
     post_moderation: NotRequired[dict[str, Any] | None]
     post_moderation_error: NotRequired[str | None]
-    final_response: NotRequired[LinearQueryResponse | None]
+    final_response: NotRequired[dict[str, Any] | None]
 
 
 class LinearGraphStateUpdate(TypedDict, total=False):
@@ -97,14 +99,14 @@ class LinearGraphStateUpdate(TypedDict, total=False):
     ranked_evidence: list[Evidence]
     answer: str | None
     answer_usage: dict[str, Any]
-    citations: list[CitationReference]
+    citations: list[dict[str, Any]]
     answer_error: str | None
-    groundedness: GroundednessResult | None
+    groundedness: dict[str, Any] | None
     groundedness_usage: dict[str, Any]
     groundedness_error: str | None
     post_moderation: dict[str, Any] | None
     post_moderation_error: str | None
-    final_response: LinearQueryResponse | None
+    final_response: dict[str, Any] | None
 
 
 class LinearGraph(Protocol):
@@ -232,16 +234,19 @@ def build_linear_graph(
     ranker: Ranker | None = None,
     answer_actor: AnswerActor | None = None,
     groundedness_actor: GroundednessActor | None = None,
+    checkpoint_state_adapter: CheckpointStateAdapter | None = None,
 ) -> LinearGraph:
     """Compile the deterministic ingress-to-finalization Linear Graph."""
     if answer_actor is not None and tenant_id is None:
         raise ValueError("tenant_id is required with answer_actor")
+    state_adapter = checkpoint_state_adapter or LinearCheckpointStateAdapter()
 
     builder: StateGraph[LinearGraphState, None, LinearGraphState, LinearGraphState] = (
         StateGraph(LinearGraphState)
     )
 
     async def query_node(state: LinearGraphState) -> LinearGraphStateUpdate:
+        state_adapter.validate_checkpoint_state(state)
         return await _query(
             state,
             history_token_budget=history_token_budget,
@@ -341,7 +346,9 @@ def build_linear_graph(
             if result is not None:
                 update["answer"] = result.answer
                 update["answer_usage"] = result.usage
-                update["citations"] = result.citations
+                update["citations"] = [
+                    citation.model_dump(mode="json") for citation in result.citations
+                ]
             if error is not None:
                 update["answer_error"] = error
             return update
@@ -365,7 +372,7 @@ def build_linear_graph(
                 )
                 _emit_events(events)
                 return {
-                    "groundedness": result,
+                    "groundedness": result.model_dump(mode="json") if result else None,
                     "groundedness_usage": usage,
                     "groundedness_error": error,
                 }
@@ -410,7 +417,7 @@ def build_linear_graph(
             )
         )
         update: LinearGraphStateUpdate = {
-            "final_response": response,
+            "final_response": response.model_dump(mode="json"),
         }
         if response.answer is not None:
             update["conversation_messages"] = [

@@ -11,6 +11,10 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.config.models import LangGraphRuntimeMode
 from app.langgraph_v2.answer import AnswerActor, build_answer_actor
+from app.langgraph_v2.checkpointing import (
+    CheckpointStateAdapter,
+    LinearCheckpointStateAdapter,
+)
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.graph import LinearGraph, build_linear_graph
 from app.langgraph_v2.groundedness import (
@@ -80,6 +84,11 @@ class LinearGraphRuntimeAdapter:
     def runtime_mode(self) -> LangGraphRuntimeMode:
         """Identify this adapter as the Linear runtime."""
         return LangGraphRuntimeMode.LINEAR
+
+    @property
+    def checkpoint_state_adapter(self) -> CheckpointStateAdapter:
+        """Return the validator for every persisted Linear state channel."""
+        return LinearCheckpointStateAdapter()
 
     def build_graph(self, *, request_id: str) -> RequestOwnedGraph:
         """Build the request-owned Linear Graph for one request."""
@@ -265,4 +274,5 @@ def _build_graph(
         moderation_provider=dependencies.moderation_provider,
         answer_actor=dependencies.answer_actor,
         groundedness_actor=dependencies.groundedness_actor,
+        checkpoint_state_adapter=LinearCheckpointStateAdapter(),
     )

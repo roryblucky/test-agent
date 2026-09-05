@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.config.models import (
@@ -59,6 +60,10 @@ class _AgentRuntime:
     def runtime_mode(self) -> LangGraphRuntimeMode:
         return LangGraphRuntimeMode.AGENT
 
+    @property
+    def checkpoint_state_adapter(self) -> _EmptyCheckpointStateAdapter:
+        return _EmptyCheckpointStateAdapter()
+
     def build_graph(self, *, request_id: str) -> RequestOwnedGraph:
         del request_id
         return self.graph
@@ -70,6 +75,17 @@ class _AgentRuntime:
     ) -> Mapping[str, Any]:
         del payload
         return {}
+
+
+class _EmptyCheckpointStateAdapter:
+    def validate_checkpoint_state(
+        self,
+        channel_values: Mapping[str, object],
+    ) -> list[BaseMessage]:
+        if channel_values:
+            raise TypeError("test Agent checkpoint state is invalid")
+        return []
+
 
 class _AgentRuntimeFactory:
     def __init__(self, runtime: _AgentRuntime) -> None:

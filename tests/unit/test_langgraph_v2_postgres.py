@@ -4,9 +4,15 @@ from typing import Any
 
 import pytest
 from fastapi import FastAPI
+from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from pydantic import ValidationError
 
-from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
+from app.langgraph_v2.postgres import (
+    V2PostgresConfig,
+    postgres_lifespan,
+    strict_checkpoint_serializer,
+)
 
 
 def test_v2_postgres_config_reads_explicit_bounded_pool_settings() -> None:
@@ -49,8 +55,8 @@ async def test_postgres_lifespan_opens_and_closes_the_configured_pool() -> None:
         pools.append(pool)
         return pool
 
-    def checkpointer_factory(pool: Any) -> FakeCheckpointer:
-        checkpointer = FakeCheckpointer(pool)
+    def checkpointer_factory(conn: Any, **_kwargs: Any) -> FakeCheckpointer:
+        checkpointer = FakeCheckpointer(conn)
         checkpointers.append(checkpointer)
         return checkpointer
 
@@ -83,6 +89,54 @@ async def test_postgres_lifespan_opens_and_closes_the_configured_pool() -> None:
     assert app.state.langgraph_v2_checkpointer is None
 
 
+def test_strict_checkpoint_serializer_round_trips_json_and_messages() -> None:
+    serializer = strict_checkpoint_serializer()
+
+    json_value = {"nested": ["value", {"count": 2}]}
+    message = HumanMessage(content="saved conversation")
+
+    assert isinstance(serializer, JsonPlusSerializer)
+    assert serializer.loads_typed(serializer.dumps_typed(json_value)) == json_value
+    restored_message = serializer.loads_typed(serializer.dumps_typed(message))
+    assert isinstance(restored_message, HumanMessage)
+    assert restored_message.text == message.text
+
+
+def test_strict_checkpoint_serializer_rejects_pickle_payloads() -> None:
+    serializer = strict_checkpoint_serializer()
+
+    with pytest.raises(NotImplementedError, match="Unknown serialization type: pickle"):
+        serializer.loads_typed(("pickle", b"not a pickle"))
+
+
+@pytest.mark.asyncio
+async def test_postgres_lifespan_injects_the_explicit_strict_serializer() -> None:
+    app = FastAPI()
+    observed: list[JsonPlusSerializer] = []
+
+    def pool_factory(**kwargs: Any) -> FakeAsyncPool:
+        return FakeAsyncPool(**kwargs)
+
+    def checkpointer_factory(
+        conn: Any,
+        *,
+        serde: JsonPlusSerializer,
+    ) -> FakeCheckpointer:
+        observed.append(serde)
+        return FakeCheckpointer(conn)
+
+    async with postgres_lifespan(
+        app,
+        config=V2PostgresConfig(database_url="postgresql://app:secret@db/v2"),
+        pool_factory=pool_factory,
+        checkpointer_factory=checkpointer_factory,
+    ):
+        pass
+
+    assert len(observed) == 1
+    assert observed[0].pickle_fallback is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["pool_open", "checkpointer_setup"])
 async def test_postgres_startup_failure_closes_all_started_resources(
@@ -94,7 +148,8 @@ async def test_postgres_startup_failure_closes_all_started_resources(
     def pool_factory(**kwargs: Any) -> FailingAsyncPool:
         return pool
 
-    def checkpointer_factory(pool: Any) -> FailingCheckpointer:
+    def checkpointer_factory(conn: Any, **_kwargs: Any) -> FailingCheckpointer:
+        del conn
         return FailingCheckpointer(fail_setup=failure == "checkpointer_setup")
 
     with pytest.raises(RuntimeError, match="startup failed"):

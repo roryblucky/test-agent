@@ -390,9 +390,9 @@ async def test_answer_citation_subresult_is_bound_on_each_execution(
     assert "citations" in second
     assert first["citations"] == second["citations"]
     assert "citations" in first
-    assert first["citations"][0].evidence_id
+    assert first["citations"][0]["evidence_id"]
     assert "citations" in first
-    assert first["citations"][0].quoted_text == "hello"
+    assert first["citations"][0]["quoted_text"] == "hello"
 
 
 @pytest.mark.asyncio
@@ -417,9 +417,9 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
 
     assert actor.calls == 1
     assert "citations" in result
-    assert [citation.index for citation in result["citations"]] == [1]
+    assert [citation["index"] for citation in result["citations"]] == [1]
     assert "citations" in result
-    assert result["citations"][0].evidence_id
+    assert result["citations"][0]["evidence_id"]
     citation_fixture = json.loads(
         (
             Path(__file__).parents[1]
@@ -428,7 +428,7 @@ async def test_answer_inline_citations_map_ranked_documents_and_ignore_unknown_i
             / "v1_citations_wire.json"
         ).read_text()
     )
-    citation_data = result["citations"][0].model_dump(mode="json")
+    citation_data = result["citations"][0]
     legacy_citations, _ = await build_citations(
         "Supported claim [1].",
         [
@@ -503,7 +503,8 @@ async def test_inline_citation_uses_reranked_evidence_position(
     assert "ranked_evidence" in result
     assert "citations" in result
     assert (
-        result["citations"][0].evidence_id == result["ranked_evidence"][0].evidence_id
+        result["citations"][0]["evidence_id"]
+        == result["ranked_evidence"][0].evidence_id
     )
 
 

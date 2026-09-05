@@ -135,11 +135,11 @@ async def test_low_groundedness_is_advisory_on_each_execution(
     assert first["groundedness"] == second["groundedness"]
     first_groundedness = first["groundedness"]
     assert first_groundedness is not None
-    assert first_groundedness.score == 0.2
+    assert first_groundedness["score"] == 0.2
     assert "final_response" in first
     first_response = first["final_response"]
     assert first_response is not None
-    assert first_response.answer == "answer [1]"
+    assert first_response["answer"] == "answer [1]"
     groundedness_records = [
         record for record in audit.records if record.assessment_type == "groundedness"
     ]
@@ -290,7 +290,7 @@ async def test_groundedness_failure_is_explicit_on_each_execution(
     assert "final_response" in first
     first_response = first["final_response"]
     assert first_response is not None
-    assert first_response.answer == "answer [1]"
+    assert first_response["answer"] == "answer [1]"
     groundedness_records = [
         record for record in audit.records if record.assessment_type == "groundedness"
     ]
@@ -326,7 +326,7 @@ async def test_groundedness_uses_only_cited_documents(
     assert "groundedness" in result
     groundedness = result["groundedness"]
     assert groundedness is not None
-    assert groundedness.score == 0.0
+    assert groundedness["score"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -446,7 +446,7 @@ async def test_assessment_audit_failure_does_not_gate_answer(
     assert "final_response" in result
     final_response = result["final_response"]
     assert final_response is not None
-    assert final_response.answer == "answer [1]"
+    assert final_response["answer"] == "answer [1]"
 
 
 @pytest.mark.asyncio

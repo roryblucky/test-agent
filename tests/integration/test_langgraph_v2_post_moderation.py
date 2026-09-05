@@ -148,7 +148,7 @@ async def test_safe_answer_passes_post_moderation_unchanged(
     assert "final_response" in result
     final_response = result["final_response"]
     assert final_response is not None
-    assert final_response.answer == "generated answer"
+    assert final_response["answer"] == "generated answer"
 
 
 @pytest.mark.asyncio
@@ -175,7 +175,7 @@ async def test_flagged_answer_remains_canonical_through_finalization(
     assert "final_response" in result
     final_response = result["final_response"]
     assert final_response is not None
-    assert final_response.answer == "generated answer"
+    assert final_response["answer"] == "generated answer"
     assert "post_moderation" in result
     post_moderation = result["post_moderation"]
     assert post_moderation is not None
@@ -210,4 +210,4 @@ async def test_post_moderation_failure_is_advisory_and_reaches_finalization(
     assert "final_response" in result
     final_response = result["final_response"]
     assert final_response is not None
-    assert final_response.answer == "generated answer"
+    assert final_response["answer"] == "generated answer"

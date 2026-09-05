@@ -241,7 +241,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     assert "final_response" in result
     final_response = result["final_response"]
     assert final_response is not None
-    done = final_response.model_dump(by_alias=True)
+    done = final_response
     assert done["session_id"] == "00000000-0000-0000-0000-000000000001"
     assert done["answer"] == "grounded answer [1]"
     assert done["documents"][0]["id"] == "d1"
@@ -293,7 +293,7 @@ async def test_final_payload_preserves_documents_moderation_usage_and_session(
     stable_done = json.loads(json.dumps(done))
     stable_done["citations"][0]["evidence_id"] = "__artifact_id__"
     assert stable_done == expected["event"]["data"]
-    assert final_response.model_dump(by_alias=True) == done
+    assert final_response == done
     assert answer.calls == 1
     assert moderation.calls == 2
 
