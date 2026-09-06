@@ -10,12 +10,20 @@ from fastapi import FastAPI
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic_ai import Agent
 
-from app.agents.query_understanding import create_query_understanding_agent
-from app.config.models import LangGraphRuntimeMode
+from app.agents.coordinator import PydanticAICoordinatorActor, create_coordinator_agent
+from app.agents.query_understanding import (
+    DEFAULT_INSTRUCTIONS,
+    create_query_understanding_agent,
+)
+from app.config.models import AgentResearchConfig, LangGraphRuntimeMode
 from app.langgraph_v2.agent_graph import (
+    CoordinatorActor,
+    CoordinatorInput,
+    Finish,
     QueryUnderstandingActor,
     build_agent_graph,
 )
+from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import (
     AgentCheckpointStateAdapter,
@@ -56,6 +64,8 @@ class AgentGraphRuntimeAdapter:
 
     checkpointer: BaseCheckpointSaver[Any]
     query_understanding_actor: QueryUnderstandingActor
+    coordinator_actor: CoordinatorActor
+    intent_policies: Mapping[str, AgentIntentPolicy]
     moderation_provider: ModerationProvider
 
     @property
@@ -69,11 +79,13 @@ class AgentGraphRuntimeAdapter:
         return AgentCheckpointStateAdapter()
 
     def build_graph(self, *, request_id: str) -> RequestOwnedGraph:
-        """Build the request-owned clarification graph."""
+        """Build the request-owned Agent graph."""
         del request_id
         return build_agent_graph(
             self.checkpointer,
             query_understanding_actor=self.query_understanding_actor,
+            coordinator_actor=self.coordinator_actor,
+            intent_policies=self.intent_policies,
             moderation_provider=self.moderation_provider,
             checkpoint_state_adapter=AgentCheckpointStateAdapter(),
         )
@@ -94,10 +106,20 @@ def build_agent_runtime(
     request_context: TrustedRequestContext,
     checkpointer: BaseCheckpointSaver[Any],
     query_understanding_actor: QueryUnderstandingActor | None = None,
+    coordinator_actor: CoordinatorActor | None = None,
+    intent_policies: Mapping[str, AgentIntentPolicy] | None = None,
     moderation_provider: ModerationProvider | None = None,
 ) -> AgentGraphRuntimeAdapter:
     """Build one Agent runtime from trusted Tenant configuration and dependencies."""
+    policies = (
+        intent_policies
+        if intent_policies is not None
+        else _resolve_intent_policies(app, request_context.tenant_id)
+    )
     actor = query_understanding_actor or _resolve_query_understanding_actor(
+        app, request_context.tenant_id, policies
+    )
+    coordinator = coordinator_actor or _resolve_coordinator_actor(
         app, request_context.tenant_id
     )
     moderation = moderation_provider or getattr(
@@ -106,6 +128,8 @@ def build_agent_runtime(
     return AgentGraphRuntimeAdapter(
         checkpointer=checkpointer,
         query_understanding_actor=actor,
+        coordinator_actor=coordinator,
+        intent_policies=policies,
         moderation_provider=moderation or MockModerationProvider(),
     )
 
@@ -113,6 +137,7 @@ def build_agent_runtime(
 def _resolve_query_understanding_actor(
     app: FastAPI,
     tenant_id: str,
+    intent_policies: Mapping[str, AgentIntentPolicy],
 ) -> QueryUnderstandingActor:
     configured = getattr(app.state, "langgraph_v2_query_understanding_actor", None)
     if configured is not None:
@@ -120,6 +145,76 @@ def _resolve_query_understanding_actor(
     manager = getattr(app.state, "tenant_manager", None)
     if manager is None or not hasattr(manager, "get_model_registry"):
         raise RuntimeError("Agent Query Understanding actor is not configured")
-    return PydanticAIQueryUnderstandingActor(
-        create_query_understanding_agent(manager.get_model_registry(tenant_id))
+    config = _agent_research_config(app, tenant_id)
+    if config is None:
+        raise RuntimeError("Agent Research config is not configured")
+    intent_catalog = "\n".join(
+        f"- {policy.intent}: {policy.description}"
+        for policy in intent_policies.values()
     )
+    return PydanticAIQueryUnderstandingActor(
+        create_query_understanding_agent(
+            manager.get_model_registry(tenant_id),
+            model_name=config.query_understanding_model,
+            instructions=f"{DEFAULT_INSTRUCTIONS}\n<intent_catalog>\n{intent_catalog}\n</intent_catalog>",
+        )
+    )
+
+
+def _resolve_coordinator_actor(app: FastAPI, tenant_id: str) -> CoordinatorActor:
+    configured = getattr(app.state, "langgraph_v2_coordinator_actor", None)
+    if configured is not None:
+        return configured
+    manager = getattr(app.state, "tenant_manager", None)
+    if manager is None or not hasattr(manager, "get_model_registry"):
+        return _UnavailableCoordinatorActor()
+    config = _agent_research_config(app, tenant_id)
+    if config is None:
+        return _UnavailableCoordinatorActor()
+    return PydanticAICoordinatorActor(
+        create_coordinator_agent(
+            manager.get_model_registry(tenant_id), model_name=config.coordinator_model
+        )
+    )
+
+
+def _resolve_intent_policies(
+    app: FastAPI,
+    tenant_id: str,
+) -> Mapping[str, AgentIntentPolicy]:
+    config = _agent_research_config(app, tenant_id)
+    if config is None:
+        return {}
+    return {
+        policy.intent: AgentIntentPolicy(
+            intent=policy.intent,
+            description=policy.description,
+            specialist_descriptors=tuple(
+                SpecialistDescriptor(
+                    id=descriptor.id,
+                    description=descriptor.description,
+                )
+                for descriptor in policy.specialist_descriptors
+            ),
+        )
+        for policy in config.intents
+    }
+
+
+def _agent_research_config(
+    app: FastAPI,
+    tenant_id: str,
+) -> AgentResearchConfig | None:
+    manager = getattr(app.state, "tenant_manager", None)
+    if manager is None or not hasattr(manager, "get_tenant_config"):
+        return None
+    return manager.get_tenant_config(tenant_id).agent_research_config
+
+
+@dataclass(frozen=True)
+class _UnavailableCoordinatorActor:
+    """Delay missing Coordinator configuration until research reaches it."""
+
+    async def decide(self, input: CoordinatorInput) -> Finish:
+        del input
+        raise RuntimeError("Agent Coordinator actor is not configured")

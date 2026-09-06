@@ -12,11 +12,16 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from app.langgraph_v2.agent_scope import ResearchScope
 from app.langgraph_v2.contracts import V2QueryResponse
 from app.langgraph_v2.conversation_context import validate_request_identity
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.models.domain import GroundednessResult
-from app.models.workflow import CitationReference, QueryUnderstandingClarification
+from app.models.workflow import (
+    CitationReference,
+    IntentResult,
+    QueryUnderstandingClarification,
+)
 
 
 class CheckpointStateAdapter(Protocol):
@@ -124,12 +129,14 @@ class LinearCheckpointStateAdapter:
 
 
 class AgentCheckpointStateAdapter:
-    """Strict projection for the clarification-only Agent Graph state."""
+    """Strict projection for owned Agent Graph state."""
 
     _string_channels = frozenset({"query", "conversation_id", "request_id"})
-    _nullable_string_channels = frozenset({"answer", "standalone_query"})
+    _nullable_string_channels = frozenset(
+        {"answer", "standalone_query", "completion_status", "termination_reason"}
+    )
     _nullable_json_object_channels = frozenset(
-        {"clarification", "final_response"}
+        {"clarification", "intent", "research_scope", "final_response"}
     )
 
     def validate_checkpoint_state(
@@ -160,6 +167,16 @@ class AgentCheckpointStateAdapter:
             channel_values.get("clarification"),
             model=QueryUnderstandingClarification,
             channel="clarification",
+        )
+        _validate_optional_model(
+            channel_values.get("intent"),
+            model=IntentResult,
+            channel="intent",
+        )
+        _validate_optional_model(
+            channel_values.get("research_scope"),
+            model=ResearchScope,
+            channel="research_scope",
         )
         _validate_optional_model(
             channel_values.get("final_response"),
@@ -221,6 +238,8 @@ def _validate_optional_model(
         V2QueryResponse
         | GroundednessResult
         | ModerationDecision
+        | IntentResult
+        | ResearchScope
         | QueryUnderstandingClarification
     ],
     channel: str,
@@ -237,6 +256,8 @@ def _validate_model(
         | V2QueryResponse
         | GroundednessResult
         | ModerationDecision
+        | IntentResult
+        | ResearchScope
         | QueryUnderstandingClarification
     ],
     channel: str,

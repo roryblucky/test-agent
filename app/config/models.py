@@ -396,6 +396,57 @@ class AgentConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class AgentResearchSpecialistConfig(BaseModel):
+    """Trusted prompt-visible Specialist descriptor for Agent Research."""
+
+    id: str
+    description: str
+
+
+class AgentResearchIntentConfig(BaseModel):
+    """Trusted Agent Research policy for one selectable Business Intent."""
+
+    intent: str
+    description: str
+    specialist_descriptors: Annotated[
+        list[AgentResearchSpecialistConfig],
+        Field(
+            validation_alias=AliasChoices(
+                "specialist_descriptors", "specialistDescriptors"
+            ),
+            serialization_alias="specialistDescriptors",
+        ),
+    ] = Field(default_factory=list[AgentResearchSpecialistConfig])
+
+    model_config = {"populate_by_name": True}
+
+
+class AgentResearchConfig(BaseModel):
+    """Tenant-controlled profiles and Intent policy for Agent Research."""
+
+    query_understanding_model: Annotated[
+        str,
+        Field(
+            validation_alias=AliasChoices(
+                "query_understanding_model", "queryUnderstandingModel"
+            ),
+            serialization_alias="queryUnderstandingModel",
+        ),
+    ] = "intent"
+    coordinator_model: Annotated[
+        str,
+        Field(
+            validation_alias=AliasChoices("coordinator_model", "coordinatorModel"),
+            serialization_alias="coordinatorModel",
+        ),
+    ] = "coordinator"
+    intents: list[AgentResearchIntentConfig] = Field(
+        default_factory=list[AgentResearchIntentConfig]
+    )
+
+    model_config = {"populate_by_name": True}
+
+
 class FlowStep(BaseModel):
     """A single step in the flow pipeline.
 
@@ -824,6 +875,15 @@ class TenantConfig(BaseModel):
         Field(
             validation_alias=AliasChoices("tool_runtime_config", "toolRuntimeConfig"),
             serialization_alias="toolRuntimeConfig",
+        ),
+    ] = None
+    agent_research_config: Annotated[
+        AgentResearchConfig | None,
+        Field(
+            validation_alias=AliasChoices(
+                "agent_research_config", "agentResearchConfig"
+            ),
+            serialization_alias="agentResearchConfig",
         ),
     ] = None
     domain_config: Annotated[

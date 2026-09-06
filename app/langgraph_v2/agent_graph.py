@@ -1,9 +1,9 @@
-"""Clarification-first Agent Graph behind the shared v2 request lifecycle."""
+"""First bounded Agent Research path behind shared v2 request lifecycle."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Annotated, Any, NotRequired, Protocol, TypedDict, cast
+from collections.abc import Mapping, Sequence
+from typing import Annotated, Any, Literal, NotRequired, Protocol, TypedDict, cast
 
 from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -16,7 +16,18 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.graph.message import (  # pyright: ignore[reportMissingTypeStubs]
     add_messages,
 )
+from pydantic import BaseModel, ConfigDict
 
+from app.langgraph_v2.agent_completion import (
+    IncompleteResearch,
+    insufficient_evidence_answer,
+)
+from app.langgraph_v2.agent_scope import (
+    AgentIntentPolicy,
+    ResearchScope,
+    SpecialistDescriptor,
+    resolve_research_scope,
+)
 from app.langgraph_v2.checkpointing import AgentCheckpointStateAdapter
 from app.langgraph_v2.contracts import LiveStreamEvent, V2QueryResponse
 from app.langgraph_v2.conversation_context import (
@@ -29,6 +40,7 @@ from app.langgraph_v2.conversation_context import (
 from app.langgraph_v2.pre_moderation import ModerationProvider, run_pre_moderation
 from app.langgraph_v2.stream import RequestOwnedGraph
 from app.models.workflow import (
+    IntentResult,
     QueryUnderstandingClarification,
     QueryUnderstandingOutput,
 )
@@ -46,8 +58,34 @@ class QueryUnderstandingActor(Protocol):
         ...
 
 
+class Finish(BaseModel):
+    """Coordinator choice to end research without a business payload."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["finish"]
+
+
+class CoordinatorInput(BaseModel):
+    """Only prompt-visible input permitted for the initial Coordinator call."""
+
+    model_config = ConfigDict(frozen=True)
+
+    standalone_query: str
+    intent: str
+    specialist_descriptors: tuple[SpecialistDescriptor, ...]
+
+
+class CoordinatorActor(Protocol):
+    """Propose one bounded Coordinator decision."""
+
+    async def decide(self, input: CoordinatorInput) -> Finish:
+        """Return the typed Coordinator decision."""
+        ...
+
+
 class AgentGraphState(TypedDict):
-    """Persisted state currently needed by the clarification path only."""
+    """Persisted state needed by clarification and Finish-first paths."""
 
     query: str
     conversation_id: str
@@ -55,8 +93,12 @@ class AgentGraphState(TypedDict):
     conversation_messages: NotRequired[Annotated[list[BaseMessage], add_messages]]
     halted: NotRequired[bool]
     standalone_query: NotRequired[str | None]
+    intent: NotRequired[dict[str, Any] | None]
+    research_scope: NotRequired[dict[str, Any] | None]
     clarification: NotRequired[dict[str, Any] | None]
     answer: NotRequired[str | None]
+    completion_status: NotRequired[str | None]
+    termination_reason: NotRequired[str | None]
     final_response: NotRequired[dict[str, Any] | None]
 
 
@@ -66,8 +108,12 @@ class AgentGraphStateUpdate(TypedDict, total=False):
     conversation_messages: list[BaseMessage]
     halted: bool
     standalone_query: str | None
+    intent: dict[str, Any] | None
+    research_scope: dict[str, Any] | None
     clarification: dict[str, Any] | None
     answer: str | None
+    completion_status: str | None
+    termination_reason: str | None
     final_response: dict[str, Any] | None
 
 
@@ -92,11 +138,13 @@ def build_agent_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     *,
     query_understanding_actor: QueryUnderstandingActor,
+    coordinator_actor: CoordinatorActor,
+    intent_policies: Mapping[str, AgentIntentPolicy],
     moderation_provider: ModerationProvider,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     checkpoint_state_adapter: AgentCheckpointStateAdapter | None = None,
 ) -> RequestOwnedGraph:
-    """Compile the first Agent path: clarification or a closed future seam."""
+    """Compile clarification plus first legal Coordinator Finish path."""
     state_adapter = checkpoint_state_adapter or AgentCheckpointStateAdapter()
     builder: StateGraph[AgentGraphState, None, AgentGraphState, AgentGraphState] = (
         StateGraph(AgentGraphState)
@@ -112,8 +160,12 @@ def build_agent_graph(
             ),
             "halted": False,
             "standalone_query": None,
+            "intent": None,
+            "research_scope": None,
             "clarification": None,
             "answer": None,
+            "completion_status": None,
+            "termination_reason": None,
             "final_response": None,
         }
 
@@ -143,37 +195,95 @@ def build_agent_graph(
                 ),
             )
         )
-        if clarification is None:
-            raise RuntimeError("Agent research execution is not available")
+        if clarification is not None:
+            return {
+                "standalone_query": result.resolved_query.standalone_query,
+                "clarification": clarification.model_dump(mode="json"),
+                "answer": _clarification_answer(clarification),
+            }
+        standalone_query = result.resolved_query.standalone_query.strip()
+        if not standalone_query:
+            raise ValueError("Query Understanding standalone query must not be blank")
         return {
-            "standalone_query": result.resolved_query.standalone_query,
-            "clarification": clarification.model_dump(mode="json"),
-            "answer": _clarification_answer(clarification),
+            "standalone_query": standalone_query,
+            "intent": result.intent.model_dump(mode="json"),
+        }
+
+    async def resolve_scope(state: AgentGraphState) -> AgentGraphStateUpdate:
+        intent_value = state.get("intent")
+        if not isinstance(intent_value, dict):
+            raise TypeError("Agent Intent is invalid")
+        intent = IntentResult.model_validate(intent_value)
+        scope = resolve_research_scope(intent, intent_policies)
+        return {"research_scope": scope.model_dump(mode="json")}
+
+    async def coordinator(state: AgentGraphState) -> AgentGraphStateUpdate:
+        standalone_query = state.get("standalone_query")
+        scope_value = state.get("research_scope")
+        if not isinstance(standalone_query, str):
+            raise TypeError("Agent standalone query is invalid")
+        if not isinstance(scope_value, dict):
+            raise TypeError("Agent Research Scope is invalid")
+        scope = ResearchScope.model_validate(scope_value)
+        decision = await coordinator_actor.decide(
+            CoordinatorInput(
+                standalone_query=standalone_query,
+                intent=scope.intent,
+                specialist_descriptors=scope.specialist_descriptors,
+            )
+        )
+        Finish.model_validate(decision)
+        _emit(
+            (
+                LiveStreamEvent(type="step_start", step="coordinator"),
+                LiveStreamEvent(type="step_completed", step="coordinator"),
+            )
+        )
+        return {}
+
+    async def research_completion(state: AgentGraphState) -> AgentGraphStateUpdate:
+        del state
+        completion = IncompleteResearch(insufficient_evidence=True)
+        return {
+            "answer": insufficient_evidence_answer(completion),
+            "completion_status": "incomplete",
+            "termination_reason": "insufficient_evidence",
         }
 
     async def finalize_state(state: AgentGraphState) -> AgentGraphStateUpdate:
-        clarification_value = state.get("clarification")
         answer = state.get("answer")
-        if not isinstance(clarification_value, dict):
-            raise TypeError("Agent clarification is invalid")
         if not isinstance(answer, str):
-            raise TypeError("Agent clarification answer is invalid")
-        clarification = QueryUnderstandingClarification.model_validate(
-            clarification_value
+            raise TypeError("Agent final answer is invalid")
+        clarification_value = state.get("clarification")
+        clarification = (
+            QueryUnderstandingClarification.model_validate(clarification_value)
+            if isinstance(clarification_value, dict)
+            else None
         )
+        metadata: dict[str, Any] = {
+            "steps_executed": [
+                "initializer",
+                "pre_moderation",
+                "query_understanding",
+            ]
+        }
+        if clarification is None:
+            completion_status = state.get("completion_status")
+            termination_reason = state.get("termination_reason")
+            if completion_status != "incomplete" or termination_reason != "insufficient_evidence":
+                raise TypeError("Agent research completion is invalid")
+            metadata["steps_executed"].extend(
+                ["resolve_scope", "coordinator", "research_completion"]
+            )
+            metadata["completion_status"] = completion_status
+            metadata["termination_reason"] = termination_reason
+        metadata["steps_executed"].append("finalize_state")
         response = V2QueryResponse(
             query=state["query"],
             answer=answer,
             clarification=clarification,
             conversation_id=state["conversation_id"],
-            metadata={
-                "steps_executed": [
-                    "initializer",
-                    "pre_moderation",
-                    "query_understanding",
-                    "finalize_state",
-                ]
-            },
+            metadata=metadata,
             citations=[],
         )
         return {
@@ -202,9 +312,15 @@ def build_agent_graph(
     def next_after_pre_moderation(state: AgentGraphState) -> str:
         return "end" if state.get("halted", False) else "query_understanding"
 
+    def next_after_query_understanding(state: AgentGraphState) -> str:
+        return "finalize_state" if state.get("clarification") is not None else "resolve_scope"
+
     builder.add_node("initializer", initializer)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("pre_moderation", pre_moderation)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("query_understanding", query_understanding)  # pyright: ignore[reportUnknownMemberType]
+    builder.add_node("resolve_scope", resolve_scope)  # pyright: ignore[reportUnknownMemberType]
+    builder.add_node("coordinator", coordinator)  # pyright: ignore[reportUnknownMemberType]
+    builder.add_node("research_completion", research_completion)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("finalize_state", finalize_state)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("publish", publish)  # pyright: ignore[reportUnknownMemberType]
     builder.add_edge(START, "initializer")
@@ -214,7 +330,14 @@ def build_agent_graph(
         next_after_pre_moderation,
         {"query_understanding": "query_understanding", "end": END},
     )
-    builder.add_edge("query_understanding", "finalize_state")
+    builder.add_conditional_edges(
+        "query_understanding",
+        next_after_query_understanding,
+        {"resolve_scope": "resolve_scope", "finalize_state": "finalize_state"},
+    )
+    builder.add_edge("resolve_scope", "coordinator")
+    builder.add_edge("coordinator", "research_completion")
+    builder.add_edge("research_completion", "finalize_state")
     builder.add_edge("finalize_state", "publish")
     builder.add_edge("publish", END)
     return cast(
