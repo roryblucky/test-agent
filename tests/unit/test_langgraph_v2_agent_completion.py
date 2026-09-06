@@ -30,3 +30,22 @@ def test_incomplete_research_prepends_escaped_data_gap_disclosure() -> None:
     )
     assert answer.endswith("Published report.")
     assert "[click](https://evil.test)" not in answer
+
+
+def test_incomplete_research_collapses_newlines_and_escapes_blockquotes() -> None:
+    answer = render_incomplete_research(
+        "Published report.",
+        IncompleteResearch(
+            insufficient_evidence=False,
+            data_gaps=(
+                DataGapView(
+                    requested_coverage="> unavailable\nsource",
+                    reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                    observed_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+                ),
+            ),
+        ),
+    )
+
+    assert "- \\> unavailable source" in answer
+    assert "\nsource" not in answer

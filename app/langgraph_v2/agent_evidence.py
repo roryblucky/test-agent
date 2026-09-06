@@ -20,18 +20,39 @@ from app.models.workflow import CitationReference
 _EVIDENCE_MARKER = re.compile(r"\[\[E:([1-9][0-9]*)\]\]")
 _MARKER_LIKE = re.compile(r"\[\[\s*E\s*:")
 _TOOL_RETURN_MAX_BYTES = 4 * 1024
-_DATA_GAP_TEXT_MAX_BYTES = 256
-_IDENTIFIER_MAX_ASCII_CHARACTERS = 64
+DATA_GAP_TEXT_MAX_BYTES = 256
+DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS = 64
 TOOL_TIMEOUT_SECONDS = 20
 _UNUSABLE_COVERAGE = "Requested coverage could not be safely projected."
 
 
-def _within_utf8_limit(value: str, *, limit: int) -> bool:
-    return len(value.encode("utf-8")) <= limit
+def require_data_gap_text(value: str, *, label: str) -> str:
+    """Return a Data Gap text field only when it fits its shared byte bound."""
+    if len(value.encode("utf-8")) > DATA_GAP_TEXT_MAX_BYTES:
+        raise ValueError(f"{label} exceeds {DATA_GAP_TEXT_MAX_BYTES} UTF-8 bytes")
+    return value
 
 
-def _is_ascii_identifier(value: str) -> bool:
-    return bool(value) and value.isascii() and len(value) <= _IDENTIFIER_MAX_ASCII_CHARACTERS
+def require_data_gap_identifier(value: str, *, label: str) -> str:
+    """Return an opaque Data Gap identifier only when it fits its shared bound."""
+    if (
+        not value
+        or not value.isascii()
+        or len(value) > DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS
+    ):
+        raise ValueError(
+            f"{label} must contain at most "
+            f"{DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS} ASCII characters"
+        )
+    return value
+
+
+def _is_projectable_data_gap_text(value: str) -> bool:
+    try:
+        require_data_gap_text(value, label="Data Gap text")
+    except ValueError:
+        return False
+    return bool(value)
 
 
 class ToolUnavailableReason(StrEnum):
@@ -75,9 +96,7 @@ class DataGapView(BaseModel):
     @field_validator("requested_coverage")
     @classmethod
     def _validate_coverage(cls, value: str) -> str:
-        if not _within_utf8_limit(value, limit=_DATA_GAP_TEXT_MAX_BYTES):
-            raise ValueError("Data Gap coverage exceeds 256 UTF-8 bytes")
-        return value
+        return require_data_gap_text(value, label="Data Gap coverage")
 
 
 class ToolUnavailabilityRecord(BaseModel):
@@ -100,25 +119,19 @@ class ToolUnavailabilityRecord(BaseModel):
     @field_validator("id", "tool_id")
     @classmethod
     def _validate_identifier(cls, value: str) -> str:
-        if not _is_ascii_identifier(value):
-            raise ValueError("Data Gap identifier must be at most 64 ASCII characters")
-        return value
+        return require_data_gap_identifier(value, label="Data Gap identifier")
 
     @field_validator("source")
     @classmethod
     def _validate_source(cls, value: str | None) -> str | None:
-        if value is not None and not _within_utf8_limit(
-            value, limit=_DATA_GAP_TEXT_MAX_BYTES
-        ):
-            raise ValueError("Data Gap source exceeds 256 UTF-8 bytes")
+        if value is not None:
+            require_data_gap_text(value, label="Data Gap source")
         return value
 
     @field_validator("requested_coverage")
     @classmethod
     def _validate_requested_coverage(cls, value: str) -> str:
-        if not _within_utf8_limit(value, limit=_DATA_GAP_TEXT_MAX_BYTES):
-            raise ValueError("Data Gap coverage exceeds 256 UTF-8 bytes")
-        return value
+        return require_data_gap_text(value, label="Data Gap coverage")
 
 
 @dataclass(frozen=True)
@@ -191,11 +204,6 @@ def _bounded_unavailable(
     reason: ToolUnavailableReason,
     requested_coverage: str,
 ) -> ToolUnavailable:
-    if not _within_utf8_limit(requested_coverage, limit=_DATA_GAP_TEXT_MAX_BYTES):
-        return ToolUnavailable(
-            reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
-            requested_coverage=_UNUSABLE_COVERAGE,
-        )
     unavailable = ToolUnavailable(
         reason=reason,
         requested_coverage=requested_coverage,
@@ -223,6 +231,8 @@ def _unavailability_record(
     observed_at = now()
     if observed_at.tzinfo is None:
         raise ValueError("Tool observation time must be timezone-aware")
+    coverage_is_safe = _is_projectable_data_gap_text(unavailable.requested_coverage)
+    source_is_safe = source is None or _is_projectable_data_gap_text(source)
     return ToolUnavailabilityRecord(
         id=f"unavailable_{uuid4().hex}",
         tenant_id=context.tenant_id,
@@ -231,10 +241,16 @@ def _unavailability_record(
         attempt=context.attempt,
         tool_call_id=tool_call_id,
         tool_id=tool_id,
-        source=source,
+        source=source if source_is_safe else None,
         observed_at=observed_at.astimezone(UTC),
-        reason=unavailable.reason,
-        requested_coverage=unavailable.requested_coverage,
+        reason=(
+            unavailable.reason
+            if coverage_is_safe and source_is_safe
+            else ToolUnavailableReason.RESPONSE_UNUSABLE
+        ),
+        requested_coverage=(
+            unavailable.requested_coverage if coverage_is_safe else _UNUSABLE_COVERAGE
+        ),
     )
 
 
@@ -257,8 +273,7 @@ def bind_evidence_tool(
     now: Callable[[], datetime] = _utc_now,
 ) -> Callable[..., Awaitable[ToolReturn[dict[str, str] | ToolUnavailable]]]:
     """Bind one frozen Scope-limited Evidence reader for a Specialist run."""
-    if not _is_ascii_identifier(tool_id):
-        raise ValueError("Evidence Tool identifier must be at most 64 ASCII characters")
+    require_data_gap_identifier(tool_id, label="Evidence Tool identifier")
     expected_types = tuple(item.exception_type for item in expected_unavailability)
     if len(set(expected_types)) != len(expected_types):
         raise ValueError("Expected Tool unavailability registration conflicts")
@@ -276,7 +291,7 @@ def bind_evidence_tool(
         query: str,
         run_context: RunContext[None],
     ) -> ToolReturn[dict[str, str] | ToolUnavailable]:
-        source_is_safe = _within_utf8_limit(source, limit=_DATA_GAP_TEXT_MAX_BYTES)
+        source_is_safe = _is_projectable_data_gap_text(source)
         unavailable = _bounded_unavailable(
             reason=(
                 reason

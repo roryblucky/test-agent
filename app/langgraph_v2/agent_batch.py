@@ -23,6 +23,8 @@ from app.langgraph_v2.agent_evidence import (
     ToolUnavailabilityRecord,
     ToolUnavailableReason,
     bind_evidence_tool,
+    require_data_gap_identifier,
+    require_data_gap_text,
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
@@ -32,22 +34,6 @@ from app.langgraph_v2.agent_skills import (
 )
 
 _SPECIALIST_FINDING_MAX_BYTES = 16 * 1024
-_DATA_GAP_MAX_BYTES = 256
-_IDENTIFIER_MAX_ASCII_CHARACTERS = 64
-
-
-def _require_utf8_limit(value: str, *, limit: int, label: str) -> str:
-    if len(value.encode("utf-8")) > limit:
-        raise ValueError(f"{label} exceeds {limit} UTF-8 bytes")
-    return value
-
-
-def _require_ascii_identifier(value: str, *, label: str) -> str:
-    if len(value) > _IDENTIFIER_MAX_ASCII_CHARACTERS or not value.isascii():
-        raise ValueError(
-            f"{label} must contain at most {_IDENTIFIER_MAX_ASCII_CHARACTERS} ASCII characters"
-        )
-    return value
 
 
 class StructuredOutputInvalid(ValueError):
@@ -125,16 +111,14 @@ class GapProvenance(BaseModel):
     @field_validator("unavailability_id", "tool_id")
     @classmethod
     def _validate_identifier(cls, value: str) -> str:
-        return _require_ascii_identifier(value, label="Data Gap identifier")
+        return require_data_gap_identifier(value, label="Data Gap identifier")
 
     @field_validator("source")
     @classmethod
     def _validate_source(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return _require_utf8_limit(
-            value, limit=_DATA_GAP_MAX_BYTES, label="Data Gap source"
-        )
+        return require_data_gap_text(value, label="Data Gap source")
 
     @field_validator("observed_at")
     @classmethod
@@ -156,9 +140,7 @@ class DataGap(BaseModel):
     @field_validator("requested_coverage")
     @classmethod
     def _validate_requested_coverage(cls, value: str) -> str:
-        return _require_utf8_limit(
-            value, limit=_DATA_GAP_MAX_BYTES, label="Data Gap coverage"
-        )
+        return require_data_gap_text(value, label="Data Gap coverage")
 
     def view(self) -> DataGapView:
         """Return the sole projection allowed outside accepted state."""

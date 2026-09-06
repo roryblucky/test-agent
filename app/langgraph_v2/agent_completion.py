@@ -8,7 +8,7 @@ INSUFFICIENT_EVIDENCE_DISCLOSURE = (
     "Incomplete research: no eligible Evidence was available."
 )
 DATA_GAP_DISCLOSURE = "Incomplete research: requested data was unavailable:"
-_MARKDOWN_ESCAPED_CHARACTERS = frozenset("\\`*_{}[]<>()#+-.!|")
+_MARKDOWN_ESCAPED_CHARACTERS = frozenset("\\`*_{}[]<>()#+-.!|~")
 
 
 class IncompleteResearch(BaseModel):
@@ -35,7 +35,7 @@ def insufficient_evidence_answer(completion: IncompleteResearch) -> str:
 def _escape_markdown(value: str) -> str:
     return "".join(
         f"\\{character}" if character in _MARKDOWN_ESCAPED_CHARACTERS else character
-        for character in value
+        for character in " ".join(value.split())
     )
 
 

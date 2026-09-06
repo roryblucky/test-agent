@@ -265,9 +265,7 @@ async def test_evidence_tool_projects_oversized_success_as_unavailable() -> None
 
 
 @pytest.mark.asyncio
-async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize_gap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize_gap() -> None:
     class SourceUnreachable(Exception):
         pass
 
@@ -295,7 +293,6 @@ async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize
         del source, query
         raise SourceUnreachable()
 
-    monkeypatch.setattr(agent_evidence, "_DATA_GAP_TEXT_MAX_BYTES", 4 * 1024)
     tool = bind_evidence_tool(
         provider,
         context=context,
@@ -334,11 +331,10 @@ async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize
             separators=(",", ":"),
         ).encode("utf-8")
     ) == 4 * 1024 + 1
-    unusable = ToolUnavailable(
+    assert too_large.return_value == ToolUnavailable(
         reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
         requested_coverage="Requested coverage could not be safely projected.",
     )
-    assert too_large.return_value == unusable
 
 
 @pytest.mark.asyncio
@@ -386,17 +382,17 @@ async def test_unavailable_binding_projects_coverage_and_source_boundaries() -> 
         reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
         requested_coverage=exact_coverage,
     )
-    unusable = ToolUnavailable(
-        reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
-        requested_coverage="Requested coverage could not be safely projected.",
+    assert oversize_coverage_return.return_value == ToolUnavailable(
+        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+        requested_coverage=oversize_coverage,
     )
-    assert oversize_coverage_return.return_value == unusable
     assert oversize_source_return.return_value == ToolUnavailable(
         reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
         requested_coverage=exact_coverage,
     )
     assert capture.unavailability[0].requested_coverage == exact_coverage
     assert capture.unavailability[0].source == exact_source
+    assert capture.unavailability[1].reason is ToolUnavailableReason.RESPONSE_UNUSABLE
     assert (
         capture.unavailability[1].requested_coverage
         == "Requested coverage could not be safely projected."
