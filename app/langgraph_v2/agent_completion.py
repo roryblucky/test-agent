@@ -6,6 +6,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.langgraph_v2.agent_batch import normalize_task_objective
 from app.langgraph_v2.agent_evidence import DataGapView
+from app.langgraph_v2.agent_termination import (
+    CALCULATION_STATE_LIMIT,
+    COORDINATION_INVALID,
+    COORDINATION_LIMIT,
+    COORDINATOR_CONTEXT_LIMIT,
+    PREPARED_SYNTHESIS_LIMIT,
+    STRUCTURAL_REASON_ORDER,
+    TASK_LIMIT,
+    StructuralReason,
+)
 
 INSUFFICIENT_EVIDENCE_DISCLOSURE = (
     "Incomplete research: no eligible Evidence was available."
@@ -13,12 +23,21 @@ INSUFFICIENT_EVIDENCE_DISCLOSURE = (
 DATA_GAP_DISCLOSURE = "Incomplete research: requested data was unavailable:"
 TASK_FAILURE_DISCLOSURE = "Incomplete research: one requested task could not complete."
 STRUCTURAL_LIMIT_DISCLOSURES = {
-    "task_limit": "Incomplete research: the Task limit ended further work.",
-    "coordination_limit": "Incomplete research: the Coordination limit ended further work.",
-    "coordinator_context_limit": "Incomplete research: the Coordinator context limit ended further work.",
-    "coordination_invalid": "Incomplete research: the Coordinator could not produce a valid next decision.",
+    TASK_LIMIT: "Incomplete research: the Task limit ended further work.",
+    COORDINATION_LIMIT: "Incomplete research: the Coordination limit ended further work.",
+    COORDINATOR_CONTEXT_LIMIT: "Incomplete research: the Coordinator context limit ended further work.",
+    COORDINATION_INVALID: "Incomplete research: the Coordinator could not produce a valid next decision.",
+    CALCULATION_STATE_LIMIT: "Incomplete research: the Calculation state limit ended further work.",
+    PREPARED_SYNTHESIS_LIMIT: "Incomplete research: the prepared Synthesis limit ended further work.",
 }
 _MARKDOWN_ESCAPED_CHARACTERS = frozenset("\\`*_{}[]<>()#+-.!|~")
+
+CompletionTerminationReason = Literal[
+    "partial_results",
+    "execution_limit",
+    "partial_results_and_execution_limit",
+    "insufficient_evidence",
+]
 
 
 class IncompleteResearch(BaseModel):
@@ -30,19 +49,28 @@ class IncompleteResearch(BaseModel):
     data_gaps: tuple[DataGapView, ...] = ()
     task_failures: int = Field(default=0, ge=0)
     failed_task_objectives: tuple[str, ...] = ()
-    structural_reason: Literal[
-        "task_limit",
-        "coordination_limit",
-        "coordinator_context_limit",
-        "coordination_invalid",
-    ] | None = None
+    structural_reasons: tuple[StructuralReason, ...] = ()
 
     @field_validator("failed_task_objectives")
     @classmethod
-    def _validate_failed_task_objectives(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def _validate_failed_task_objectives(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
         """Require disclosure to reuse the accepted canonical Task objective."""
         if any(normalize_task_objective(objective) != objective for objective in value):
             raise ValueError("Failed Task objective is not canonical")
+        return value
+
+    @field_validator("structural_reasons")
+    @classmethod
+    def _validate_structural_reasons(
+        cls, value: tuple[StructuralReason, ...]
+    ) -> tuple[StructuralReason, ...]:
+        if (
+            len(set(value)) != len(value)
+            or tuple(sorted(value, key=STRUCTURAL_REASON_ORDER.__getitem__)) != value
+        ):
+            raise ValueError("Structural reasons are not canonically ordered")
         return value
 
     @property
@@ -58,7 +86,22 @@ class IncompleteResearch(BaseModel):
     @property
     def has_structural_limit(self) -> bool:
         """Expose a deterministic bound that ended further coordination."""
-        return self.structural_reason is not None
+        return bool(self.structural_reasons)
+
+
+def completion_termination_reason(
+    completion: IncompleteResearch,
+) -> CompletionTerminationReason:
+    """Classify incomplete output without discarding any accepted causes."""
+    if completion.has_structural_limit:
+        return (
+            "partial_results_and_execution_limit"
+            if completion.has_data_gaps or completion.has_task_failures
+            else "execution_limit"
+        )
+    if completion.has_data_gaps or completion.has_task_failures:
+        return "partial_results"
+    return "insufficient_evidence"
 
 
 def insufficient_evidence_answer(completion: IncompleteResearch) -> str:
@@ -94,8 +137,9 @@ def render_incomplete_research(answer: str, completion: IncompleteResearch) -> s
                 for objective in completion.failed_task_objectives
             )
         )
-    if completion.structural_reason is not None:
-        lines.append(STRUCTURAL_LIMIT_DISCLOSURES[completion.structural_reason])
+    lines.extend(
+        STRUCTURAL_LIMIT_DISCLOSURES[reason] for reason in completion.structural_reasons
+    )
     if completion.insufficient_evidence:
         lines.append(INSUFFICIENT_EVIDENCE_DISCLOSURE)
     block = "\n".join(lines)

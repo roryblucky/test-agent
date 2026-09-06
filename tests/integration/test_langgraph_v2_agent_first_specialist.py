@@ -1,9 +1,11 @@
 """Public first bounded Specialist Task coverage."""
 
 import asyncio
+import hashlib
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import date
+from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID
 
@@ -23,6 +25,7 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 from app.agents.specialist import PydanticAISpecialistActor
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
 from app.langgraph_v2.agent_batch import (
+    CalculationToolRegistration,
     DispatchBatch,
     EvidenceToolRegistration,
     SpecialistActor,
@@ -58,6 +61,14 @@ from app.langgraph_v2.agent_skills import (
 )
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.calculations import (
+    CalculationExecutionContext,
+    CalculationExecutor,
+    CalculationMethod,
+    CalculationRequest,
+    PriceObservation,
+    TrustedPriceSeries,
+)
 from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_context import ConversationExchange
@@ -1240,6 +1251,228 @@ def test_concurrent_mixed_batch_is_atomically_accepted_in_manifest_order(
     assert reverse == forward
 
 
+def test_calculation_aliases_are_independent_of_specialist_completion_order(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    evidence_bodies = tuple(f"Price series {index}." for index in range(8))
+    executor = CalculationExecutor(
+        tuple(
+            TrustedPriceSeries(
+                ref=f"series-{index}",
+                instrument_id="AAPL",
+                currency="USD",
+                unit="price",
+                observations=(
+                    PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
+                    PriceObservation(
+                        as_of=date(2026, 1, 3), value=Decimal(101 + index)
+                    ),
+                ),
+                evidence_refs=(f"evidence-{index}",),
+                evidence_hashes=(
+                    hashlib.sha256(evidence_bodies[index].encode("utf-8")).hexdigest(),
+                ),
+            )
+            for index in range(8)
+        )
+    )
+
+    class _ConcurrentCalculationSpecialist:
+        def __init__(self, *, reverse_completion: bool) -> None:
+            self.reverse_completion = reverse_completion
+            self.inputs: list[SpecialistTaskInput] = []
+            self.all_entered = asyncio.Event()
+
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del usage, usage_limits
+            index = int(input.objective.removesuffix(".").rsplit(" ", 1)[1])
+            self.inputs.append(input)
+            if len(self.inputs) == 8:
+                self.all_entered.set()
+            await asyncio.wait_for(self.all_entered.wait(), timeout=1)
+            delay = index if self.reverse_completion else 7 - index
+            await asyncio.sleep(delay / 1000)
+            calculation_context = CalculationExecutionContext(
+                tenant_id="tenant-a",
+                request_id="calculation-order-request",
+                task_id=input.task_id,
+                attempt=1,
+                tool_id="calculator",
+            )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(
+                    summary=f"Finding for market dimension {index}.",
+                    evidence_ids=(f"evidence-{index}",),
+                ),
+                calculations=tuple(
+                    executor.execute(
+                        CalculationRequest(
+                            method=method,
+                            version="v1",
+                            series_ref=f"series-{index}",
+                        ),
+                        context=calculation_context,
+                    )
+                    for method in (
+                        CalculationMethod.PERIOD_RETURN,
+                        CalculationMethod.MAXIMUM_DRAWDOWN,
+                    )
+                ),
+                evidence=(
+                    EvidenceEnvelope(
+                        id=f"evidence-{index}",
+                        tenant_id="tenant-a",
+                        request_id="calculation-order-request",
+                        task_id=input.task_id,
+                        source="filing",
+                        source_url="https://example.test/filing",
+                        title=f"Price series {index}",
+                        body=evidence_bodies[index],
+                        excerpt=evidence_bodies[index],
+                        as_of_date=date(2026, 9, 6),
+                    ),
+                ),
+            )
+
+    class _CalculationSynthesis:
+        def __init__(self) -> None:
+            self.prepared: PreparedSynthesis | None = None
+
+        async def synthesize(
+            self, prepared: PreparedSynthesis
+        ) -> FinancialResearchReport:
+            self.prepared = prepared
+            return FinancialResearchReport(
+                markdown_report="First [[C:1]], last [[C:16]]. [[E:1]]"
+            )
+
+    def run_batch(
+        *, reverse_completion: bool, conversation_id: str
+    ) -> tuple[dict[str, object], tuple[str, ...], str]:
+        coordinator = _ConcurrentBatchCoordinator()
+        specialist = _ConcurrentCalculationSpecialist(
+            reverse_completion=reverse_completion
+        )
+        synthesis = _CalculationSynthesis()
+
+        def factory(
+            tools: tuple[object, ...],
+            tool_capture: object,
+            skill_invocation: object,
+        ) -> _ConcurrentCalculationSpecialist:
+            del tools, tool_capture, skill_invocation
+            return specialist
+
+        policy = AgentIntentPolicy(
+            intent="market_outlook",
+            description="Assess market conditions.",
+            allowed_tool_ids=frozenset({"calculator"}),
+            specialist_descriptors=(
+                SpecialistDescriptor(id="market-data", description="Market data"),
+            ),
+            as_of_date=date(2026, 9, 6),
+        )
+        registry = SpecialistRegistry(
+            registrations=(
+                SpecialistRegistration(
+                    id="market-data",
+                    actor_factory=factory,
+                    allowed_tool_ids=frozenset({"calculator"}),
+                ),
+            ),
+            tenant_eligible_ids=frozenset({"market-data"}),
+            calculation_tool_registrations=(
+                CalculationToolRegistration(id="calculator", executor=executor),
+            ),
+            tenant_eligible_tool_ids=frozenset({"calculator"}),
+        )
+
+        def app_factory(
+            *,
+            app: FastAPI,
+            request_context: TrustedRequestContext,
+            checkpointer: BaseCheckpointSaver[Any],
+        ) -> GraphRuntimeAdapter:
+            return build_agent_runtime(
+                app,
+                request_context=request_context,
+                checkpointer=checkpointer,
+                query_understanding_actor=_UnderstandingActor(),
+                coordinator_actor=coordinator,
+                specialist_registry=registry,
+                intent_policies={policy.intent: policy},
+                synthesis_actor=synthesis,
+            )
+
+        app = persistent_linear_app(
+            langgraph_v2_migrated_database_url,
+            agent_runtime_factory=app_factory,
+        )
+        app.state.tenant_manager = _TenantManager()
+        with TestClient(app) as client:
+            response = client.post(
+                "/v2/query/stream",
+                json={
+                    "query": "What about it?",
+                    "sessionId": conversation_id,
+                    "clientRequestId": "calculation-order-request",
+                },
+                headers=_TENANT_HEADERS,
+            )
+            checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+        done = [event for event in parse_sse(response.text) if event["type"] == "done"]
+        assert response.status_code == 200
+        assert len(done) == 1
+        assert coordinator.calls == 2
+        assert len(specialist.inputs) == 8
+        assert checkpoint is not None
+        assert synthesis.prepared is not None
+        accepted = next(
+            iter(checkpoint.checkpoint["channel_values"]["accepted_batches"].values())
+        )
+        artifacts = synthesis.prepared.calculation_artifacts
+        assert tuple(item.alias for item in synthesis.prepared.calculations) == tuple(
+            f"C:{index}" for index in range(1, 17)
+        )
+        first, last = artifacts[0], artifacts[-1]
+        first_rendered = (
+            f"{first.formatted_value} ({first.method.value.replace('_', ' ')}; "
+            f"{first.unit}; {first.currency}; {first.period_start} to "
+            f"{first.period_end}; assumptions: {'; '.join(first.assumptions)})"
+        )
+        last_rendered = (
+            f"{last.formatted_value} ({last.method.value.replace('_', ' ')}; "
+            f"{last.unit}; {last.currency}; {last.period_start} to "
+            f"{last.period_end}; assumptions: {'; '.join(last.assumptions)})"
+        )
+        assert done[0]["data"]["answer"] == (
+            f"First {first_rendered}, last {last_rendered}. [[E:1]]"
+        )
+        return (
+            accepted,
+            tuple(artifact.id for artifact in artifacts),
+            done[0]["data"]["answer"],
+        )
+
+    forward = run_batch(
+        reverse_completion=False,
+        conversation_id="00000000-0000-0000-0000-000000000a11",
+    )
+    reverse = run_batch(
+        reverse_completion=True,
+        conversation_id="00000000-0000-0000-0000-000000000a12",
+    )
+
+    assert reverse == forward
+
+
 def test_batch_barrier_checkpoint_failure_never_half_accepts_a_mixed_batch(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -1296,6 +1529,209 @@ def test_batch_barrier_checkpoint_failure_never_half_accepts_a_mixed_batch(
         "active_batch",
         "staged_contributions",
     } <= barrier_channels
+
+
+def test_calculation_state_overflow_rejects_the_active_batch_atomically(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class _FourBatchCoordinator:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def decide(self, input: CoordinatorInput) -> DispatchBatch:
+            del input
+            self.calls += 1
+            assert self.calls <= 4
+            return DispatchBatch(
+                kind="dispatch",
+                tasks=tuple(
+                    TaskProposal(
+                        specialist_id="market-data",
+                        objective=f"Calculate series {index}.",
+                    )
+                    for index in range(8)
+                ),
+            )
+
+    provisional_series = TrustedPriceSeries(
+        ref="series-0",
+        instrument_id="AAPL",
+        currency="USD",
+        unit="price",
+        observations=(
+            PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
+            PriceObservation(as_of=date(2026, 1, 3), value=Decimal("110")),
+        ),
+        evidence_refs=("evidence",),
+        evidence_hashes=(hashlib.sha256(b"Calculation evidence.").hexdigest(),),
+    )
+    provisional_executor = CalculationExecutor((provisional_series,))
+    provisional_artifact = provisional_executor.execute(
+        CalculationRequest(
+            method=CalculationMethod.PERIOD_RETURN,
+            version="v1",
+            series_ref="series-0",
+        ),
+        context=CalculationExecutionContext(
+            tenant_id="tenant-a",
+            request_id="calculation-overflow-request",
+            task_id=f"task_{'a' * 32}",
+            attempt=1,
+            tool_id="calculator",
+        ),
+    )
+    padded_evidence_ref = "x" * (
+        4 * 1024 - provisional_artifact.canonical_json_size() + len("evidence")
+    )
+    executor = CalculationExecutor(
+        tuple(
+            TrustedPriceSeries(
+                ref=f"series-{index}",
+                instrument_id="AAPL",
+                currency="USD",
+                unit="price",
+                observations=provisional_series.observations,
+                evidence_refs=(padded_evidence_ref,),
+                evidence_hashes=(hashlib.sha256(b"Calculation evidence.").hexdigest(),),
+            )
+            for index in range(8)
+        )
+    )
+
+    class _CalculationSpecialist:
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del usage, usage_limits
+            calculations = tuple(
+                executor.execute(
+                    CalculationRequest(
+                        method=CalculationMethod.PERIOD_RETURN,
+                        version="v1",
+                        series_ref=f"series-{index}",
+                    ),
+                    context=CalculationExecutionContext(
+                        tenant_id="tenant-a",
+                        request_id="calculation-overflow-request",
+                        task_id=input.task_id,
+                        attempt=1,
+                        tool_id="calculator",
+                    ),
+                )
+                for index in range(8)
+            )
+            assert all(
+                artifact.canonical_json_size() == 4 * 1024 for artifact in calculations
+            )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(
+                    summary=input.objective,
+                    evidence_ids=(padded_evidence_ref,),
+                ),
+                calculations=calculations,
+                evidence=(
+                    EvidenceEnvelope(
+                        id=padded_evidence_ref,
+                        tenant_id="tenant-a",
+                        request_id="calculation-overflow-request",
+                        task_id=input.task_id,
+                        source="filing",
+                        source_url="https://example.test/filing",
+                        title="Calculation evidence",
+                        body="Calculation evidence.",
+                        excerpt="Calculation evidence.",
+                        as_of_date=date(2026, 9, 6),
+                    ),
+                ),
+            )
+
+    coordinator = _FourBatchCoordinator()
+    specialist = _CalculationSpecialist()
+
+    def factory(
+        tools: tuple[object, ...],
+        tool_capture: object,
+        skill_invocation: object,
+    ) -> _CalculationSpecialist:
+        del tools, tool_capture, skill_invocation
+        return specialist
+
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        allowed_tool_ids=frozenset({"calculator"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=factory,
+                allowed_tool_ids=frozenset({"calculator"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        calculation_tool_registrations=(
+            CalculationToolRegistration(id="calculator", executor=executor),
+        ),
+        tenant_eligible_tool_ids=frozenset({"calculator"}),
+    )
+
+    def app_factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=coordinator,
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+            synthesis_actor=_Synthesis(),
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000a13"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=app_factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "What about it?",
+                "sessionId": conversation_id,
+                "clientRequestId": "calculation-overflow-request",
+            },
+            headers=_TENANT_HEADERS,
+        )
+        checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+    events = parse_sse(response.text)
+    assert response.status_code == 200
+    done = [event for event in events if event["type"] == "done"]
+    assert len(done) == 1
+    assert done[0]["data"]["metadata"]["termination_reason"] == "execution_limit"
+    assert "Calculation state limit ended further work." in done[0]["data"]["answer"]
+    assert "prepared Synthesis limit ended further work." in done[0]["data"]["answer"]
+    assert coordinator.calls == 4
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    assert len(state["accepted_batches"]) == 3
+    assert state["active_batch"] is None
+    assert state["staged_contributions"] == {}
+    assert state["coordination_stop_reason"] == "calculation_state_limit"
 
 
 def test_fatal_specialist_failure_keeps_sibling_contributions_unaccepted(

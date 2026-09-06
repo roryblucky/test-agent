@@ -27,6 +27,12 @@ from app.langgraph_v2.agent_batch import (
 )
 from app.langgraph_v2.agent_evidence import DataGapView
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
+from app.langgraph_v2.agent_termination import (
+    COORDINATION_INVALID,
+    COORDINATION_LIMIT,
+    TASK_LIMIT,
+    CoordinationStopReason,
+)
 
 MAX_COORDINATION_DECISIONS = 5
 MAX_DISPATCH_ROUNDS = 4
@@ -40,12 +46,7 @@ _EMPTY_CONTEXT_JSON = b"[]"
 _EMPTY_CONTEXT_JSON_BYTES = len(_EMPTY_CONTEXT_JSON)
 _EMPTY_CONTEXT_JSON_SHA256 = hashlib.sha256(_EMPTY_CONTEXT_JSON).hexdigest()
 
-StructuralStopReason = Literal[
-    "task_limit",
-    "coordination_limit",
-    "coordinator_context_limit",
-    "coordination_invalid",
-]
+StructuralStopReason = CoordinationStopReason
 
 
 class CoordinationCandidateRejected(ValueError):
@@ -117,7 +118,9 @@ class CoordinationTask(BaseModel):
     id: str
     objective: str
     specialist_id: str
-    context_task_ids: tuple[str, ...] = Field(max_length=MAX_TASK_CONTEXT_RESULTS, default=())
+    context_task_ids: tuple[str, ...] = Field(
+        max_length=MAX_TASK_CONTEXT_RESULTS, default=()
+    )
     context_json_bytes: int = Field(ge=0)
     context_json_sha256: str = Field(min_length=64, max_length=64)
 
@@ -131,7 +134,9 @@ class CoordinationRound(BaseModel):
     revision: int = Field(ge=1, le=MAX_COORDINATION_DECISIONS)
     kind: Literal["dispatch", "finish"]
     batch_id: str | None = None
-    tasks: tuple[CoordinationTask, ...] = Field(max_length=MAX_DISPATCH_BATCH_TASKS, default=())
+    tasks: tuple[CoordinationTask, ...] = Field(
+        max_length=MAX_DISPATCH_BATCH_TASKS, default=()
+    )
 
     @model_validator(mode="after")
     def _validate_decision_shape(self) -> CoordinationRound:
@@ -161,9 +166,9 @@ class CoordinationStopped:
 def _canonical_json_bytes(value: object) -> int:
     """Measure a deterministic JSON-native projection without lossy truncation."""
     return len(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
     )
 
 
@@ -176,7 +181,9 @@ def _round_id(*, request_id: str, revision: int) -> str:
     return f"round_{hashlib.sha256(canonical).hexdigest()[:32]}"
 
 
-def _ordered_rounds(rounds: Sequence[CoordinationRound]) -> tuple[CoordinationRound, ...]:
+def _ordered_rounds(
+    rounds: Sequence[CoordinationRound],
+) -> tuple[CoordinationRound, ...]:
     """Return a contiguous immutable revision sequence or fail closed."""
     ordered = tuple(sorted(rounds, key=lambda round_: round_.revision))
     if tuple(round_.revision for round_ in ordered) != tuple(
@@ -217,7 +224,9 @@ def validate_coordination_rounds(
                 round=round_.revision,
                 dispatch_order=dispatch_order,
             ):
-                raise CoordinationInvariantError("Coordination Round Task identity is invalid")
+                raise CoordinationInvariantError(
+                    "Coordination Round Task identity is invalid"
+                )
             try:
                 canonical_objective = normalize_task_objective(task.objective)
             except ValueError as error:
@@ -276,10 +285,11 @@ def _prior_projection(
                 evidence_ids=outcome.result.evidence_ids,
                 data_gaps=tuple(gap.view() for gap in outcome.result.data_gaps),
             )
-            if _canonical_json_bytes(view.model_dump(mode="json")) > MAX_COORDINATOR_RESULT_BYTES:
-                raise CoordinationContextLimitExceeded(
-                    "coordinator_context_limit"
-                )
+            if (
+                _canonical_json_bytes(view.model_dump(mode="json"))
+                > MAX_COORDINATOR_RESULT_BYTES
+            ):
+                raise CoordinationContextLimitExceeded("coordinator_context_limit")
             projected.append(view)
     return tuple(projected), tuple(failed_tasks)
 
@@ -328,9 +338,8 @@ def _select_context(
 ) -> tuple[tuple[PriorResultView, ...], int, str]:
     """Resolve one Task's explicit earlier successful Result references."""
     selected_ids = frozenset(context_task_ids)
-    if (
-        len(context_task_ids) > MAX_TASK_CONTEXT_RESULTS
-        or len(selected_ids) != len(context_task_ids)
+    if len(context_task_ids) > MAX_TASK_CONTEXT_RESULTS or len(selected_ids) != len(
+        context_task_ids
     ):
         raise error_type("Task context is invalid")
     by_task_id = {result.task_id: result for result in prior_results}
@@ -499,9 +508,9 @@ async def decide_coordination_round(
 
 def _stopped_reason(rejection: str) -> StructuralStopReason:
     """Map rejected model structure to a safe, deterministic terminal reason."""
-    if rejection in {"task_limit", "coordination_limit"}:
+    if rejection in {TASK_LIMIT, COORDINATION_LIMIT}:
         return cast(StructuralStopReason, rejection)
-    return "coordination_invalid"
+    return COORDINATION_INVALID
 
 
 def validate_active_batch_coordination_round(
@@ -553,9 +562,6 @@ def materialize_specialist_context(
         prior_results=_prior_results(earlier_rounds, accepted_batches),
         error_type=CoordinationInvariantError,
     )
-    if (
-        size != task.context_json_bytes
-        or digest != task.context_json_sha256
-    ):
+    if size != task.context_json_bytes or digest != task.context_json_sha256:
         raise CoordinationInvariantError("Specialist context changed after validation")
     return selected

@@ -1,8 +1,10 @@
 """Public Evidence cache and report-gate coverage for Agent research."""
 
 import asyncio
+import hashlib
 import json
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import pytest
 from pydantic_ai import RunContext
@@ -16,6 +18,7 @@ from app.langgraph_v2.agent_evidence import (
     EvidenceInvocationContext,
     ExpectedToolUnavailability,
     FinancialResearchReport,
+    PreparedCalculation,
     RequestEvidenceCatalog,
     SpecialistToolCapture,
     ToolUnavailable,
@@ -23,6 +26,15 @@ from app.langgraph_v2.agent_evidence import (
     bind_evidence_tool,
     prepare_synthesis,
     publish_report,
+)
+from app.langgraph_v2.calculations import (
+    CalculationArtifactInvalid,
+    CalculationExecutionContext,
+    CalculationExecutor,
+    CalculationMethod,
+    CalculationRequest,
+    PriceObservation,
+    TrustedPriceSeries,
 )
 
 
@@ -142,9 +154,7 @@ async def test_concurrent_identical_evidence_bodies_are_counted_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_siblings_converge_on_the_same_evidence_id_and_body() -> (
-    None
-):
+async def test_concurrent_siblings_converge_on_the_same_evidence_id_and_body() -> None:
     catalog = RequestEvidenceCatalog()
     first_context = _context()
     second_context = first_context.model_copy(update={"task_id": "task-2"})
@@ -239,6 +249,251 @@ def test_only_accepted_referenced_evidence_is_prepared_and_published() -> None:
     assert published.citations[0].source == "filing"
 
 
+def test_synthesis_receives_value_free_calculation_aliases_and_code_renders_them() -> (
+    None
+):
+    catalog = RequestEvidenceCatalog()
+    catalog.accept_referenced(
+        (_evidence(),), finding_evidence_ids=("evidence-1",), context=_context()
+    )
+    provisional_executor = CalculationExecutor(
+        (
+            TrustedPriceSeries(
+                ref="apple-series",
+                instrument_id="AAPL",
+                currency="USD",
+                unit="price",
+                observations=(
+                    PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
+                    PriceObservation(as_of=date(2026, 1, 3), value=Decimal("110")),
+                ),
+                evidence_refs=("evidence-1",),
+                evidence_hashes=(hashlib.sha256(b"Apple revenue grew.").hexdigest(),),
+            ),
+        )
+    )
+    artifact = provisional_executor.execute(
+        CalculationRequest(
+            method=CalculationMethod.PERIOD_RETURN,
+            version="v1",
+            series_ref="apple-series",
+        ),
+        context=CalculationExecutionContext(
+            tenant_id="tenant-a",
+            request_id="request-1",
+            task_id="task-1",
+            attempt=1,
+            tool_id="calculator",
+        ),
+    )
+    prepared = prepare_synthesis(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        accepted_evidence_ids=("evidence-1",),
+        catalog=catalog,
+        tenant_id="tenant-a",
+        request_id="request-1",
+        accepted_calculations=(artifact,),
+    )
+    published = publish_report(
+        FinancialResearchReport(markdown_report="The return was [[C:1]]. [[E:1]]"),
+        prepared,
+    )
+
+    prompt = json.dumps(prepared.model_dump(mode="json"), sort_keys=True)
+    assert prepared.calculations[0].alias == "C:1"
+    assert "canonical_value" not in prompt
+    assert artifact.id not in prompt
+    assert "10.0000%" not in prompt
+    assert "[[C:1]]" not in published.answer
+    assert "10.0000% (period return; percent; USD; 2026-01-02 to 2026-01-03" in (
+        published.answer
+    )
+    assert [citation.evidence_id for citation in published.citations] == ["evidence-1"]
+    with pytest.raises(ValueError, match="Calculation marker is not eligible"):
+        publish_report(
+            FinancialResearchReport(markdown_report="[[C:2]] [[E:1]]"), prepared
+        )
+    foreign_artifact = provisional_executor.execute(
+        CalculationRequest(
+            method=CalculationMethod.PERIOD_RETURN,
+            version="v1",
+            series_ref="apple-series",
+        ),
+        context=CalculationExecutionContext(
+            tenant_id="tenant-b",
+            request_id="request-1",
+            task_id="task-1",
+            attempt=1,
+            tool_id="calculator",
+        ),
+    )
+    with pytest.raises(CalculationArtifactInvalid, match="provenance is invalid"):
+        prepare_synthesis(
+            standalone_query="Apple outlook",
+            intent="market_outlook",
+            accepted_evidence_ids=("evidence-1",),
+            catalog=catalog,
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_calculations=(foreign_artifact,),
+        )
+
+
+def test_prepared_calculations_enforce_exact_projection_count_and_size_limits() -> None:
+    catalog = RequestEvidenceCatalog()
+    catalog.accept_referenced(
+        (_evidence(),), finding_evidence_ids=("evidence-1",), context=_context()
+    )
+    executor = CalculationExecutor(
+        (
+            TrustedPriceSeries(
+                ref="apple-series",
+                instrument_id="AAPL",
+                currency="USD",
+                unit="price",
+                observations=(
+                    PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
+                    PriceObservation(as_of=date(2026, 1, 3), value=Decimal("110")),
+                ),
+                evidence_refs=("evidence-1",),
+                evidence_hashes=(hashlib.sha256(b"Apple revenue grew.").hexdigest(),),
+            ),
+        )
+    )
+    artifact = executor.execute(
+        CalculationRequest(
+            method=CalculationMethod.PERIOD_RETURN,
+            version="v1",
+            series_ref="apple-series",
+        ),
+        context=CalculationExecutionContext(
+            tenant_id="tenant-a",
+            request_id="request-1",
+            task_id="task-1",
+            attempt=1,
+        ),
+    )
+    projection = PreparedCalculation(
+        alias="C:32",
+        method=artifact.method,
+        unit=artifact.unit,
+        currency=artifact.currency,
+        period_start=artifact.period_start,
+        period_end=artifact.period_end,
+        as_of_date=artifact.as_of_date,
+        assumptions=artifact.assumptions,
+    )
+    padded_currency = "x" * (2 * 1024 - projection.canonical_json_size() + len("USD"))
+    executor = CalculationExecutor(
+        tuple(
+            TrustedPriceSeries(
+                ref=f"apple-series-{index:02}",
+                instrument_id="AAPL",
+                currency=padded_currency,
+                unit="price",
+                observations=(
+                    PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
+                    PriceObservation(as_of=date(2026, 1, 3), value=Decimal("110")),
+                ),
+                evidence_refs=("evidence-1",),
+                evidence_hashes=(hashlib.sha256(b"Apple revenue grew.").hexdigest(),),
+            )
+            for index in range(34)
+        )
+    )
+    context = CalculationExecutionContext(
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task-1",
+        attempt=1,
+    )
+    at_count_limit = tuple(
+        executor.execute(
+            CalculationRequest(
+                method=CalculationMethod.PERIOD_RETURN,
+                version="v1",
+                series_ref=f"apple-series-{index:02}",
+            ),
+            context=context,
+        )
+        for index in range(32)
+    )
+
+    prepared = prepare_synthesis(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        accepted_evidence_ids=("evidence-1",),
+        catalog=catalog,
+        tenant_id="tenant-a",
+        request_id="request-1",
+        accepted_calculations=at_count_limit,
+    )
+
+    assert len(prepared.calculations) == 32
+    assert prepared.calculations[-1].canonical_json_size() == 2 * 1024
+    with pytest.raises(ValueError, match="Prepared Calculation count exceeds 32"):
+        prepare_synthesis(
+            standalone_query="Apple outlook",
+            intent="market_outlook",
+            accepted_evidence_ids=("evidence-1",),
+            catalog=catalog,
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_calculations=(
+                *at_count_limit,
+                executor.execute(
+                    CalculationRequest(
+                        method=CalculationMethod.PERIOD_RETURN,
+                        version="v1",
+                        series_ref="apple-series-32",
+                    ),
+                    context=context,
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="Prepared Calculation exceeds 2KiB"):
+        prepare_synthesis(
+            standalone_query="Apple outlook",
+            intent="market_outlook",
+            accepted_evidence_ids=("evidence-1",),
+            catalog=catalog,
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_calculations=(
+                CalculationExecutor(
+                    (
+                        TrustedPriceSeries(
+                            ref="over-limit-series",
+                            instrument_id="AAPL",
+                            currency=padded_currency + "xx",
+                            unit="price",
+                            observations=(
+                                PriceObservation(
+                                    as_of=date(2026, 1, 2), value=Decimal("100")
+                                ),
+                                PriceObservation(
+                                    as_of=date(2026, 1, 3), value=Decimal("110")
+                                ),
+                            ),
+                            evidence_refs=("evidence-1",),
+                            evidence_hashes=(
+                                hashlib.sha256(b"Apple revenue grew.").hexdigest(),
+                            ),
+                        ),
+                    )
+                ).execute(
+                    CalculationRequest(
+                        method=CalculationMethod.PERIOD_RETURN,
+                        version="v1",
+                        series_ref="over-limit-series",
+                    ),
+                    context=context,
+                ),
+            ),
+        )
+
+
 def test_evidence_cache_is_idempotent_but_conflicts_and_unaccepted_ids_fail_closed() -> (
     None
 ):
@@ -315,7 +570,9 @@ def test_evidence_cache_keeps_orphans_diagnostic_only() -> None:
         )
 
 
-def test_referenced_evidence_is_ineligible_without_checkpointed_accepted_state() -> None:
+def test_referenced_evidence_is_ineligible_without_checkpointed_accepted_state() -> (
+    None
+):
     catalog = RequestEvidenceCatalog()
     catalog.accept_referenced(
         (_evidence(),),

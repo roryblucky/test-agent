@@ -1,5 +1,6 @@
 """Public first-batch validation and acceptance coverage."""
 
+import hashlib
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -17,6 +18,7 @@ from app.langgraph_v2.agent_batch import (
     AcceptedTask,
     ActiveBatch,
     BatchContribution,
+    CalculationToolRegistration,
     DataGap,
     DispatchBatch,
     EvidenceToolRegistration,
@@ -38,6 +40,7 @@ from app.langgraph_v2.agent_batch import (
     normalize_task_objective,
     promote_batch,
     validate_active_batch_manifest,
+    validate_promoted_calculation_contribution,
 )
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
@@ -53,6 +56,15 @@ from app.langgraph_v2.agent_skills import (
     SkillPin,
     SkillRegistration,
     SpecialistSkillRegistry,
+)
+from app.langgraph_v2.calculations import (
+    CalculationArtifactInvalid,
+    CalculationExecutionContext,
+    CalculationExecutor,
+    CalculationMethod,
+    CalculationRequest,
+    PriceObservation,
+    TrustedPriceSeries,
 )
 from app.langgraph_v2.specialist_retry import (
     SpecialistExecutionDiagnostics,
@@ -553,6 +565,147 @@ def test_barrier_rejects_contributions_staged_under_another_task_identity() -> N
         )
 
 
+def test_calculation_contribution_enforces_eight_items_and_idempotent_ids() -> None:
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    executor = CalculationExecutor(
+        (
+            TrustedPriceSeries(
+                ref="apple-series",
+                instrument_id="AAPL",
+                currency="USD",
+                unit="price",
+                observations=(
+                    PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
+                    PriceObservation(as_of=date(2026, 1, 3), value=Decimal("110")),
+                ),
+                evidence_refs=("evidence-1",),
+                evidence_hashes=(hashlib.sha256(b"Apple price evidence.").hexdigest(),),
+            ),
+        )
+    )
+    artifact = executor.execute(
+        CalculationRequest(
+            method=CalculationMethod.PERIOD_RETURN,
+            version="v1",
+            series_ref="apple-series",
+        ),
+        context=CalculationExecutionContext(
+            tenant_id="tenant-a",
+            request_id="request-1",
+            task_id=batch.task_ids[0],
+            attempt=1,
+        ),
+    )
+    contribution = BatchContribution(
+        batch_id=batch.id,
+        task_id=batch.task_ids[0],
+        attempt=1,
+        outcome=TaskSucceeded(
+            task_id=batch.task_ids[0],
+            result=SpecialistResult(
+                summary="calculated",
+                evidence_ids=("evidence-1",),
+            ),
+        ),
+        calculations=(artifact,) * 8,
+    )
+
+    accepted = promote_batch(batch, {contribution.task_id: contribution})
+
+    assert accepted.calculations == (artifact,)
+    catalog = RequestEvidenceCatalog()
+    catalog.accept_referenced(
+        (
+            EvidenceEnvelope(
+                id="evidence-1",
+                tenant_id="tenant-a",
+                request_id="request-1",
+                task_id=contribution.task_id,
+                source="filing",
+                source_url="https://example.test/filing",
+                title="Price evidence",
+                body="Apple price evidence.",
+                excerpt="Apple price evidence.",
+                as_of_date=date(2026, 9, 6),
+            ),
+        ),
+        finding_evidence_ids=("evidence-1",),
+        context=_context(task_id=contribution.task_id),
+    )
+    barrier_registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", allowed_tool_ids=frozenset({"calculator"})
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        calculation_tool_registrations=(
+            CalculationToolRegistration(id="calculator", executor=executor),
+        ),
+        tenant_eligible_tool_ids=frozenset({"calculator"}),
+    )
+
+    def validate_at_barrier(item: BatchContribution) -> None:
+        validate_promoted_calculation_contribution(
+            item,
+            task=batch.tasks[0],
+            tenant_id="tenant-a",
+            request_id="request-1",
+            registry=barrier_registry,
+            scope_descriptors=(
+                SpecialistDescriptor(id="market-data", description="Market data"),
+            ),
+            scope_tool_ids=frozenset({"calculator"}),
+            catalog=catalog,
+        )
+
+    with pytest.raises(CalculationArtifactInvalid, match="provenance is invalid"):
+        promote_batch(
+            batch,
+            {
+                contribution.task_id: contribution.model_copy(
+                    update={
+                        "calculations": (
+                            artifact.model_copy(update={"tenant_id": "tenant-b"}),
+                        )
+                    }
+                )
+            },
+            calculation_validator=validate_at_barrier,
+        )
+    with pytest.raises(
+        ValueError, match="Calculation Artifact Evidence membership is invalid"
+    ):
+        promote_batch(
+            batch,
+            {
+                contribution.task_id: contribution.model_copy(
+                    update={
+                        "outcome": TaskSucceeded(
+                            task_id=contribution.task_id,
+                            result=SpecialistResult(summary="calculated"),
+                        )
+                    }
+                )
+            },
+        )
+    with pytest.raises(ValidationError):
+        BatchContribution(
+            batch_id=batch.id,
+            task_id=batch.task_ids[0],
+            attempt=1,
+            outcome=contribution.outcome,
+            calculations=(artifact,) * 9,
+        )
+
+
 @pytest.mark.parametrize("size", [16 * 1024, 16 * 1024 + 1])
 def test_specialist_finding_canonical_size_has_exact_boundary(size: int) -> None:
     summary = "x" * (size - len('{"evidence_ids":[],"summary":""}'))
@@ -853,6 +1006,129 @@ async def test_execute_specialist_feeds_validation_failure_to_a_fresh_attempt() 
         "output limits."
     )
     assert diagnostics.failed_attempts[0].messages == (failed_message,)
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_promotes_only_the_accepted_attempt_calculations() -> (
+    None
+):
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    executor = CalculationExecutor(
+        (
+            TrustedPriceSeries(
+                ref="apple-series",
+                instrument_id="AAPL",
+                currency="USD",
+                unit="price",
+                observations=(
+                    PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
+                    PriceObservation(as_of=date(2026, 1, 3), value=Decimal("110")),
+                ),
+                evidence_refs=("evidence-1",),
+                evidence_hashes=(hashlib.sha256(b"Apple price evidence.").hexdigest(),),
+            ),
+        )
+    )
+    actor_count = 0
+
+    class _RetryingCalculationActor:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del usage, usage_limits
+            calculation = executor.execute(
+                CalculationRequest(
+                    method=CalculationMethod.PERIOD_RETURN,
+                    version="v1",
+                    series_ref="apple-series",
+                ),
+                context=CalculationExecutionContext(
+                    tenant_id="tenant-a",
+                    request_id="request-1",
+                    task_id=input.task_id,
+                    attempt=self.attempt,
+                    tool_id="calculator",
+                ),
+            )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(
+                    summary="x" * (16 * 1024) if self.attempt == 1 else "accepted",
+                    evidence_ids=() if self.attempt == 1 else ("evidence-1",),
+                ),
+                calculations=(calculation,),
+                evidence=(
+                    EvidenceEnvelope(
+                        id="evidence-1",
+                        tenant_id="tenant-a",
+                        request_id="request-1",
+                        task_id=input.task_id,
+                        source="filing",
+                        source_url="https://example.test/filing",
+                        title="Price evidence",
+                        body="Apple price evidence.",
+                        excerpt="Apple price evidence.",
+                        as_of_date=date(2026, 1, 3),
+                    ),
+                )
+                if self.attempt == 2
+                else (),
+            )
+
+    def factory(
+        tools: tuple[object, ...],
+        tool_capture: object,
+        skill_invocation: object,
+    ) -> _RetryingCalculationActor:
+        nonlocal actor_count
+        del tools, tool_capture, skill_invocation
+        actor_count += 1
+        return _RetryingCalculationActor(actor_count)
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=factory,
+                allowed_tool_ids=frozenset({"calculator"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        calculation_tool_registrations=(
+            CalculationToolRegistration(id="calculator", executor=executor),
+        ),
+        tenant_eligible_tool_ids=frozenset({"calculator"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id).model_copy(
+            update={"allowed_tool_ids": frozenset({"calculator"})}
+        ),
+        catalog=RequestEvidenceCatalog(),
+    )
+
+    assert actor_count == 2
+    assert contribution.attempt == 2
+    assert len(contribution.calculations) == 1
+    assert contribution.calculations[0].attempt == 2
 
 
 @pytest.mark.asyncio

@@ -16,8 +16,10 @@ SYNTHESIS_MAX_TOKENS = 4000
 SYNTHESIS_INSTRUCTIONS = """\
 Write one Markdown report grounded exclusively in the supplied Evidence excerpts.
 Every factual claim must cite its positional Evidence with exactly [[E:n]], where n
-is the one-based item position in the prepared Evidence list. Do not cite absent
-Evidence or use Tools, retries, or external knowledge.
+is the one-based item position in the prepared Evidence list. For an eligible
+Calculation, use exactly its supplied [[C:n]] alias; never retype or infer a
+numerical value. Do not cite absent Evidence or use Tools, retries, or external
+knowledge.
 """
 
 

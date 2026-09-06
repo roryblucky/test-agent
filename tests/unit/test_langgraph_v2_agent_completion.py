@@ -6,6 +6,7 @@ import pytest
 
 from app.langgraph_v2.agent_completion import (
     IncompleteResearch,
+    completion_termination_reason,
     render_incomplete_research,
 )
 from app.langgraph_v2.agent_evidence import DataGapView, ToolUnavailableReason
@@ -83,4 +84,28 @@ def test_task_failure_disclosure_reuses_the_canonical_accepted_objective() -> No
             insufficient_evidence=False,
             task_failures=1,
             failed_task_objectives=("Café\nanalysis",),
+        )
+
+
+def test_structural_reasons_are_ordered_and_preserved_in_completion() -> None:
+    completion = IncompleteResearch(
+        insufficient_evidence=False,
+        structural_reasons=(
+            "calculation_state_limit",
+            "prepared_synthesis_limit",
+        ),
+    )
+
+    assert completion_termination_reason(completion) == "execution_limit"
+    assert render_incomplete_research("", completion) == (
+        "Incomplete research: the Calculation state limit ended further work.\n"
+        "Incomplete research: the prepared Synthesis limit ended further work."
+    )
+    with pytest.raises(ValueError, match="canonically ordered"):
+        IncompleteResearch(
+            insufficient_evidence=False,
+            structural_reasons=(
+                "prepared_synthesis_limit",
+                "calculation_state_limit",
+            ),
         )

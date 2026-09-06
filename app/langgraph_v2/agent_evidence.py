@@ -17,10 +17,18 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import RunContext, ToolReturn
 
+from app.langgraph_v2.calculations import (
+    CalculationArtifact,
+    CalculationArtifactInvalid,
+    accepted_calculation_artifacts,
+    require_calculation_evidence_support,
+)
 from app.models.workflow import CitationReference
 
 _EVIDENCE_MARKER = re.compile(r"\[\[E:([1-9][0-9]*)\]\]")
 _MARKER_LIKE = re.compile(r"\[\[\s*E\s*:")
+_CALCULATION_MARKER = re.compile(r"\[\[C:([1-9][0-9]*)\]\]")
+_CALCULATION_MARKER_LIKE = re.compile(r"\[\[\s*C\s*:")
 _TOOL_RETURN_MAX_BYTES = 4 * 1024
 _EVIDENCE_BODY_MAX_BYTES = 16 * 1024
 _REQUEST_EVIDENCE_BODY_MAX_BYTES = 8 * 1024 * 1024
@@ -28,6 +36,12 @@ DATA_GAP_TEXT_MAX_BYTES = 256
 DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS = 64
 TOOL_TIMEOUT_SECONDS = 20
 _UNUSABLE_COVERAGE = "Requested coverage could not be safely projected."
+_MAX_PREPARED_CALCULATIONS = 32
+_MAX_PREPARED_CALCULATION_BYTES = 2 * 1024
+
+
+class PreparedSynthesisLimitExceeded(ValueError):
+    """Stop before a bounded Synthesis projection would exceed its limits."""
 
 
 def require_data_gap_text(value: str, *, label: str) -> str:
@@ -183,6 +197,9 @@ class SpecialistToolCapture:
     evidence: list[EvidenceEnvelope] = field(default_factory=list[EvidenceEnvelope])
     unavailability: list[ToolUnavailabilityRecord] = field(
         default_factory=list[ToolUnavailabilityRecord]
+    )
+    calculations: list[CalculationArtifact] = field(
+        default_factory=list[CalculationArtifact]
     )
 
 
@@ -510,6 +527,32 @@ class PreparedEvidence(BaseModel):
     excerpt: str
 
 
+class PreparedCalculation(BaseModel):
+    """Value-free Calculation projection permitted in a Synthesis prompt."""
+
+    model_config = ConfigDict(frozen=True)
+
+    alias: str
+    method: str
+    unit: str
+    currency: str
+    period_start: date
+    period_end: date
+    as_of_date: date
+    assumptions: tuple[str, ...]
+
+    def canonical_json_size(self) -> int:
+        """Measure the exact bounded prompt projection."""
+        return len(
+            json.dumps(
+                self.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+
 class PreparedSynthesis(BaseModel):
     """Frozen bounded business input for one Synthesis invocation."""
 
@@ -519,6 +562,13 @@ class PreparedSynthesis(BaseModel):
     intent: str
     evidence: tuple[PreparedEvidence, ...]
     data_gaps: tuple[DataGapView, ...] = ()
+    calculations: tuple[PreparedCalculation, ...] = Field(
+        max_length=_MAX_PREPARED_CALCULATIONS,
+        default=(),
+    )
+    calculation_artifacts: tuple[CalculationArtifact, ...] = Field(
+        default=(), exclude=True, repr=False
+    )
 
 
 class FinancialResearchReport(BaseModel):
@@ -549,8 +599,20 @@ def prepare_synthesis(
     as_of_date: date | None = None,
     max_evidence_age_days: int = 7,
     data_gaps: tuple[DataGapView, ...] = (),
+    accepted_calculations: tuple[CalculationArtifact, ...] = (),
 ) -> PreparedSynthesis:
     """Build the sole bounded Evidence projection Synthesis may receive."""
+    resolved_evidence = tuple(
+        catalog.resolve(
+            evidence_id,
+            tenant_id=tenant_id,
+            request_id=request_id,
+            accepted_evidence_ids=accepted_evidence_ids,
+            as_of_date=as_of_date,
+            max_evidence_age_days=max_evidence_age_days,
+        )
+        for evidence_id in accepted_evidence_ids
+    )
     evidence = tuple(
         PreparedEvidence(
             id=item.id,
@@ -559,23 +621,49 @@ def prepare_synthesis(
             title=item.title,
             excerpt=item.excerpt,
         )
-        for item in (
-            catalog.resolve(
-                evidence_id,
-                tenant_id=tenant_id,
-                request_id=request_id,
-                accepted_evidence_ids=accepted_evidence_ids,
-                as_of_date=as_of_date,
-                max_evidence_age_days=max_evidence_age_days,
-            )
-            for evidence_id in accepted_evidence_ids
-        )
+        for item in resolved_evidence
     )
+    artifacts = accepted_calculation_artifacts(accepted_calculations)
+    if any(
+        artifact.tenant_id != tenant_id or artifact.request_id != request_id
+        for artifact in artifacts
+    ):
+        raise CalculationArtifactInvalid("Calculation Artifact provenance is invalid")
+    evidence_hashes_by_id = {
+        item.id: hashlib.sha256(item.body.encode("utf-8")).hexdigest()
+        for item in resolved_evidence
+    }
+    for artifact in artifacts:
+        require_calculation_evidence_support(
+            artifact, evidence_hashes_by_id=evidence_hashes_by_id
+        )
+    if len(artifacts) > _MAX_PREPARED_CALCULATIONS:
+        raise PreparedSynthesisLimitExceeded("Prepared Calculation count exceeds 32")
+    calculations = tuple(
+        PreparedCalculation(
+            alias=f"C:{index}",
+            method=artifact.method,
+            unit=artifact.unit,
+            currency=artifact.currency,
+            period_start=artifact.period_start,
+            period_end=artifact.period_end,
+            as_of_date=artifact.as_of_date,
+            assumptions=artifact.assumptions,
+        )
+        for index, artifact in enumerate(artifacts, start=1)
+    )
+    if any(
+        calculation.canonical_json_size() > _MAX_PREPARED_CALCULATION_BYTES
+        for calculation in calculations
+    ):
+        raise PreparedSynthesisLimitExceeded("Prepared Calculation exceeds 2KiB")
     return PreparedSynthesis(
         standalone_query=standalone_query,
         intent=intent,
         evidence=evidence,
         data_gaps=data_gaps,
+        calculations=calculations,
+        calculation_artifacts=artifacts,
     )
 
 
@@ -584,8 +672,22 @@ def publish_report(
     prepared: PreparedSynthesis,
 ) -> PublishedReport:
     """Validate every Evidence marker and derive public citations in code."""
-    markers = _EVIDENCE_MARKER.findall(candidate.markdown_report)
-    marker_text = _EVIDENCE_MARKER.sub("", candidate.markdown_report)
+    calculation_markers = _CALCULATION_MARKER.findall(candidate.markdown_report)
+    calculation_marker_text = _CALCULATION_MARKER.sub("", candidate.markdown_report)
+    if _CALCULATION_MARKER_LIKE.search(calculation_marker_text):
+        raise ValueError("Calculation marker is invalid")
+    for marker in calculation_markers:
+        index = int(marker)
+        if index > len(prepared.calculation_artifacts):
+            raise ValueError("Calculation marker is not eligible")
+    answer = _CALCULATION_MARKER.sub(
+        lambda match: _render_calculation(
+            prepared.calculation_artifacts[int(match.group(1)) - 1]
+        ),
+        candidate.markdown_report,
+    )
+    markers = _EVIDENCE_MARKER.findall(answer)
+    marker_text = _EVIDENCE_MARKER.sub("", answer)
     if _MARKER_LIKE.search(marker_text) or not markers:
         raise ValueError("Evidence marker is invalid")
     citations: list[CitationReference] = []
@@ -604,4 +706,15 @@ def publish_report(
                 snippet=evidence.excerpt,
             )
         )
-    return PublishedReport(answer=candidate.markdown_report, citations=tuple(citations))
+    return PublishedReport(answer=answer, citations=tuple(citations))
+
+
+def _render_calculation(artifact: CalculationArtifact) -> str:
+    """Render one trusted value with the concise interpretation disclosure."""
+    method = artifact.method.value.replace("_", " ")
+    period = f"{artifact.period_start.isoformat()} to {artifact.period_end.isoformat()}"
+    assumptions = "; ".join(artifact.assumptions)
+    return (
+        f"{artifact.formatted_value} ({method}; {artifact.unit}; {artifact.currency}; "
+        f"{period}; assumptions: {assumptions})"
+    )

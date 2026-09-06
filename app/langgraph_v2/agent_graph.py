@@ -29,9 +29,11 @@ from app.langgraph_v2.agent_batch import (
     execute_specialist,
     promote_batch,
     validate_active_batch_manifest,
+    validate_promoted_calculation_contribution,
 )
 from app.langgraph_v2.agent_completion import (
     IncompleteResearch,
+    completion_termination_reason,
     insufficient_evidence_answer,
     render_incomplete_research,
 )
@@ -54,6 +56,7 @@ from app.langgraph_v2.agent_evidence import (
     EvidenceInvocationContext,
     FinancialResearchReport,
     PreparedSynthesis,
+    PreparedSynthesisLimitExceeded,
     RequestEvidenceCatalog,
     prepare_synthesis,
     publish_report,
@@ -62,6 +65,17 @@ from app.langgraph_v2.agent_scope import (
     AgentIntentPolicy,
     ResearchScope,
     resolve_research_scope,
+)
+from app.langgraph_v2.agent_termination import (
+    CALCULATION_STATE_LIMIT,
+    COORDINATION_STOP_REASONS,
+    COORDINATOR_CONTEXT_LIMIT,
+    PREPARED_SYNTHESIS_LIMIT,
+)
+from app.langgraph_v2.calculations import (
+    CalculationArtifact,
+    CalculationStateLimitExceeded,
+    accepted_calculation_artifacts,
 )
 from app.langgraph_v2.checkpointing import AgentCheckpointStateAdapter
 from app.langgraph_v2.contracts import LiveStreamEvent, V2QueryResponse
@@ -340,7 +354,7 @@ def build_agent_graph(
         except CoordinationContextLimitExceeded:
             return {
                 "coordination_finished": True,
-                "coordination_stop_reason": "coordinator_context_limit",
+                "coordination_stop_reason": COORDINATOR_CONTEXT_LIMIT,
             }
         _emit((LiveStreamEvent(type="step_start", step="coordinator"),))
         decision = await decide_coordination_round(
@@ -451,6 +465,10 @@ def build_agent_graph(
         if not isinstance(active_value, dict):
             raise TypeError("Agent batch state is invalid")
         active_batch = _active_batch_load(active_value)
+        scope_value = state.get("research_scope")
+        if not isinstance(scope_value, dict):
+            raise TypeError("Agent Research Scope is invalid")
+        scope = ResearchScope.model_validate(scope_value)
         validate_active_batch_coordination_round(
             active_batch,
             rounds=_coordination_rounds(state),
@@ -459,7 +477,41 @@ def build_agent_graph(
             task_id: BatchContribution.model_validate(value)
             for task_id, value in staged_value.items()
         }
-        accepted = promote_batch(active_batch, contributions)
+        tasks_by_id = {task.id: task for task in active_batch.tasks}
+        accepted = promote_batch(
+            active_batch,
+            contributions,
+            calculation_validator=lambda contribution: (
+                validate_promoted_calculation_contribution(
+                    contribution,
+                    task=tasks_by_id[contribution.task_id],
+                    tenant_id=tenant_id,
+                    request_id=state["request_id"],
+                    registry=specialist_registry,
+                    scope_descriptors=scope.specialist_descriptors,
+                    scope_tool_ids=scope.allowed_tool_ids,
+                    catalog=catalog,
+                )
+            ),
+        )
+        try:
+            accepted_calculation_artifacts(
+                (
+                    *(
+                        artifact
+                        for prior in _accepted_batches(state).values()
+                        for artifact in prior.calculations
+                    ),
+                    *accepted.calculations,
+                )
+            )
+        except CalculationStateLimitExceeded:
+            return {
+                "staged_contributions": cast(Any, Overwrite({})),
+                "active_batch": None,
+                "coordination_finished": True,
+                "coordination_stop_reason": CALCULATION_STATE_LIMIT,
+            }
         return {
             "accepted_batches": {accepted.id: accepted.model_dump(mode="json")},
             "staged_contributions": cast(Any, Overwrite({})),
@@ -473,18 +525,12 @@ def build_agent_graph(
             data_gaps=_accepted_data_gap_views(state),
             task_failures=_accepted_task_failure_count(state),
             failed_task_objectives=_accepted_failed_task_objectives(state),
-            structural_reason=stop_reason,
+            structural_reasons=(stop_reason,) if stop_reason is not None else (),
         )
         return {
             "answer": insufficient_evidence_answer(completion),
             "completion_status": "incomplete",
-            "termination_reason": (
-                stop_reason
-                if stop_reason is not None
-                else "partial_results"
-                if completion.has_data_gaps or completion.has_task_failures
-                else "insufficient_evidence"
-            ),
+            "termination_reason": completion_termination_reason(completion),
         }
 
     async def synthesis(state: AgentGraphState) -> AgentGraphStateUpdate:
@@ -498,17 +544,36 @@ def build_agent_graph(
         evidence_ids = _accepted_evidence_ids(state)
         data_gaps = _accepted_data_gap_views(state)
         stop_reason = _coordination_stop_reason(state)
-        prepared = prepare_synthesis(
-            standalone_query=standalone_query,
-            intent=scope.intent,
-            accepted_evidence_ids=evidence_ids,
-            catalog=catalog,
-            tenant_id=tenant_id,
-            request_id=state["request_id"],
-            as_of_date=scope.as_of_date,
-            max_evidence_age_days=scope.max_evidence_age_days,
-            data_gaps=data_gaps,
-        )
+        try:
+            prepared = prepare_synthesis(
+                standalone_query=standalone_query,
+                intent=scope.intent,
+                accepted_evidence_ids=evidence_ids,
+                catalog=catalog,
+                tenant_id=tenant_id,
+                request_id=state["request_id"],
+                as_of_date=scope.as_of_date,
+                max_evidence_age_days=scope.max_evidence_age_days,
+                data_gaps=data_gaps,
+                accepted_calculations=_accepted_calculations(state),
+            )
+        except PreparedSynthesisLimitExceeded:
+            completion = IncompleteResearch(
+                insufficient_evidence=False,
+                data_gaps=data_gaps,
+                task_failures=_accepted_task_failure_count(state),
+                failed_task_objectives=_accepted_failed_task_objectives(state),
+                structural_reasons=tuple(
+                    reason
+                    for reason in (stop_reason, PREPARED_SYNTHESIS_LIMIT)
+                    if reason is not None
+                ),
+            )
+            return {
+                "answer": render_incomplete_research("", completion),
+                "completion_status": "incomplete",
+                "termination_reason": completion_termination_reason(completion),
+            }
         candidate = await synthesis_actor.synthesize(prepared)
         published = publish_report(candidate, prepared)
         completion = (
@@ -517,7 +582,7 @@ def build_agent_graph(
                 data_gaps=data_gaps,
                 task_failures=_accepted_task_failure_count(state),
                 failed_task_objectives=_accepted_failed_task_objectives(state),
-                structural_reason=stop_reason,
+                structural_reasons=(stop_reason,) if stop_reason is not None else (),
             )
             if data_gaps
             or _accepted_task_failure_count(state)
@@ -533,9 +598,7 @@ def build_agent_graph(
             "citations": [item.model_dump(mode="json") for item in published.citations],
             "completion_status": "incomplete" if completion is not None else "complete",
             "termination_reason": (
-                stop_reason
-                if stop_reason is not None
-                else "partial_results"
+                completion_termination_reason(completion)
                 if completion is not None
                 else "evidence_backed"
             ),
@@ -565,10 +628,8 @@ def build_agent_graph(
                 if termination_reason not in {
                     "insufficient_evidence",
                     "partial_results",
-                    "task_limit",
-                    "coordination_limit",
-                    "coordinator_context_limit",
-                    "coordination_invalid",
+                    "execution_limit",
+                    "partial_results_and_execution_limit",
                 }:
                     raise TypeError("Agent research completion is invalid")
             elif (
@@ -669,6 +730,12 @@ def build_agent_graph(
             )
         return "synthesis" if _accepted_evidence_ids(state) else "research_completion"
 
+    def next_after_batch_barrier(state: AgentGraphState) -> str:
+        """Avoid another Coordinator decision when calculation state hit its cap."""
+        if state.get("coordination_finished") is not True:
+            return "coordinator"
+        return "synthesis" if _accepted_evidence_ids(state) else "research_completion"
+
     builder.add_node("initializer", initializer)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("pre_moderation", pre_moderation)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("query_understanding", query_understanding)  # pyright: ignore[reportUnknownMemberType]
@@ -702,7 +769,15 @@ def build_agent_graph(
         },
     )
     builder.add_edge("execute_specialist_task", "batch_barrier")
-    builder.add_edge("batch_barrier", "coordinator")
+    builder.add_conditional_edges(
+        "batch_barrier",
+        next_after_batch_barrier,
+        {
+            "coordinator": "coordinator",
+            "research_completion": "research_completion",
+            "synthesis": "synthesis",
+        },
+    )
     builder.add_edge("research_completion", "finalize_state")
     builder.add_edge("synthesis", "finalize_state")
     builder.add_edge("finalize_state", "publish")
@@ -788,14 +863,21 @@ def _coordination_stop_reason(
     value = state.get("coordination_stop_reason")
     if value is None:
         return None
-    if value not in {
-        "task_limit",
-        "coordination_limit",
-        "coordinator_context_limit",
-        "coordination_invalid",
-    }:
+    if value not in COORDINATION_STOP_REASONS:
         raise CoordinationInvariantError("Coordination stop reason is invalid")
     return cast(StructuralStopReason, value)
+
+
+def _accepted_calculations(state: AgentGraphState) -> tuple[CalculationArtifact, ...]:
+    """Return unique Artifacts in Round, manifest Task, then Artifact ID order."""
+    ordered: list[CalculationArtifact] = []
+    for round_, accepted in _accepted_round_batches(state):
+        by_task: dict[str, list[CalculationArtifact]] = {}
+        for artifact in accepted.calculations:
+            by_task.setdefault(artifact.task_id, []).append(artifact)
+        for task in round_.tasks:
+            ordered.extend(sorted(by_task.get(task.id, ()), key=lambda item: item.id))
+    return accepted_calculation_artifacts(tuple(ordered))
 
 
 def _accepted_batches(state: AgentGraphState) -> dict[str, AcceptedBatch]:
@@ -814,11 +896,30 @@ def _accepted_round_batches(
 ) -> tuple[tuple[CoordinationRound, AcceptedBatch], ...]:
     """Pair every dispatch manifest with its exact accepted batch outcomes."""
     accepted_batches = _accepted_batches(state)
+    overflow_terminal = (
+        state.get("coordination_stop_reason") == CALCULATION_STATE_LIMIT
+        and state.get("coordination_finished") is True
+        and state.get("active_batch") is None
+        and state.get("staged_contributions") == {}
+    )
+    dispatch_rounds = tuple(
+        round_ for round_ in _coordination_rounds(state) if round_.kind == "dispatch"
+    )
+    missing_batch_rounds = tuple(
+        round_
+        for round_ in dispatch_rounds
+        if round_.batch_id is None or round_.batch_id not in accepted_batches
+    )
+    if overflow_terminal:
+        if not dispatch_rounds or missing_batch_rounds != (dispatch_rounds[-1],):
+            raise CoordinationInvariantError("Calculation overflow state is invalid")
+    elif missing_batch_rounds:
+        raise CoordinationInvariantError("Accepted Batch is missing")
     ordered: list[tuple[CoordinationRound, AcceptedBatch]] = []
-    for round_ in _coordination_rounds(state):
-        if round_.kind != "dispatch":
-            continue
+    for round_ in dispatch_rounds:
         if round_.batch_id is None or round_.batch_id not in accepted_batches:
+            if overflow_terminal:
+                continue
             raise CoordinationInvariantError("Accepted Batch is missing")
         accepted = accepted_batches[round_.batch_id]
         if {outcome.task_id for outcome in accepted.outcomes} != {

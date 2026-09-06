@@ -18,6 +18,7 @@ from app.langgraph_v2.agent_coordination import (
     validate_coordination_rounds,
 )
 from app.langgraph_v2.agent_scope import ResearchScope
+from app.langgraph_v2.agent_termination import COORDINATION_STOP_REASONS
 from app.langgraph_v2.contracts import V2QueryResponse
 from app.langgraph_v2.conversation_context import validate_request_identity
 from app.langgraph_v2.pre_moderation import ModerationDecision
@@ -186,12 +187,7 @@ class AgentCheckpointStateAdapter:
         ):
             raise TypeError("checkpoint coordination_finished is invalid")
         stop_reason = channel_values.get("coordination_stop_reason")
-        if stop_reason is not None and stop_reason not in {
-            "task_limit",
-            "coordination_limit",
-            "coordinator_context_limit",
-            "coordination_invalid",
-        }:
+        if stop_reason is not None and stop_reason not in COORDINATION_STOP_REASONS:
             raise TypeError("checkpoint coordination_stop_reason is invalid")
         for channel in self._nullable_json_object_channels:
             if channel in channel_values and channel_values[channel] is not None:

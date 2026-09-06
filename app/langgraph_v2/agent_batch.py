@@ -38,6 +38,16 @@ from app.langgraph_v2.agent_skills import (
     SkillPin,
     SpecialistSkillRegistry,
 )
+from app.langgraph_v2.calculations import (
+    MAX_CALCULATIONS_PER_CONTRIBUTION,
+    CalculationArtifact,
+    CalculationArtifactInvalid,
+    CalculationExecutionContext,
+    CalculationExecutor,
+    accepted_calculation_artifacts,
+    bind_calculation_tool,
+    require_calculation_evidence_support,
+)
 from app.langgraph_v2.specialist_retry import (
     SPECIALIST_MAX_ATTEMPTS,
     RetryDisposition,
@@ -67,7 +77,9 @@ def normalize_task_objective(value: str) -> str:
     """Return one canonical, bounded single-line Task objective."""
     normalized = unicodedata.normalize("NFC", value)
     single_line = "".join(
-        " " if character in "\r\n" or unicodedata.category(character).startswith("C") else character
+        " "
+        if character in "\r\n" or unicodedata.category(character).startswith("C")
+        else character
         for character in normalized
     )
     canonical = " ".join(single_line.split())
@@ -231,6 +243,7 @@ class SpecialistAttempt(BaseModel):
     finding: SpecialistFindingDraft
     evidence: tuple[EvidenceEnvelope, ...] = ()
     unavailability: tuple[ToolUnavailabilityRecord, ...] = ()
+    calculations: tuple[CalculationArtifact, ...] = ()
     skill_pins: tuple[SkillPin, ...] = ()
     messages: tuple[ModelMessage, ...] = ()
 
@@ -285,6 +298,49 @@ def _derive_data_gaps(
             records_by_id.values(), key=lambda item: (item.tool_id, item.tool_call_id)
         )
     )
+
+
+def _validate_attempt_calculations(
+    calculations: tuple[CalculationArtifact, ...],
+    *,
+    context: EvidenceInvocationContext,
+    registry: SpecialistRegistry,
+    registration: SpecialistRegistration,
+    support: tuple[EvidenceEnvelope, ...],
+) -> tuple[CalculationArtifact, ...]:
+    """Accept only current registered Calculator Artifacts after final output gates."""
+    effective_ids = registry.effective_tool_ids(
+        registration, scope_tool_ids=context.allowed_tool_ids
+    )
+    registered = {tool.id: tool for tool in registry.calculation_tool_registrations}
+    support_by_id = {item.id: item for item in support}
+    support_hashes_by_id = {
+        evidence_id: hashlib.sha256(evidence.body.encode("utf-8")).hexdigest()
+        for evidence_id, evidence in support_by_id.items()
+    }
+    if len(calculations) > MAX_CALCULATIONS_PER_CONTRIBUTION:
+        raise CalculationArtifactInvalid("Calculation contribution exceeds 8 Artifacts")
+    for artifact in calculations:
+        tool_id = artifact.execution_record.tool_id
+        tool = registered.get(tool_id)
+        if (
+            tool is None
+            or tool_id not in effective_ids
+            or artifact.tenant_id != context.tenant_id
+            or artifact.request_id != context.request_id
+            or artifact.task_id != context.task_id
+            or artifact.attempt != context.attempt
+        ):
+            raise CalculationArtifactInvalid(
+                "Calculation Artifact provenance is invalid"
+            )
+        tool.executor.require_reproducible(artifact)
+        artifact.require_canonical_size()
+        require_calculation_evidence_support(
+            artifact,
+            evidence_hashes_by_id=support_hashes_by_id,
+        )
+    return accepted_calculation_artifacts(calculations)
 
 
 class TaskSucceeded(BaseModel):
@@ -372,6 +428,10 @@ class BatchContribution(BaseModel):
     outcome: TaskOutcome
     usage: SpecialistUsage = Field(default_factory=SpecialistUsage)
     skill_pins: tuple[SkillPin, ...] = ()
+    calculations: tuple[CalculationArtifact, ...] = Field(
+        max_length=MAX_CALCULATIONS_PER_CONTRIBUTION,
+        default=(),
+    )
 
 
 class TaskSkillPins(BaseModel):
@@ -392,6 +452,7 @@ class AcceptedBatch(BaseModel):
     outcomes: tuple[TaskOutcome, ...]
     usage: SpecialistUsage = Field(default_factory=SpecialistUsage)
     skill_pins: tuple[TaskSkillPins, ...] = ()
+    calculations: tuple[CalculationArtifact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -473,6 +534,14 @@ class EvidenceToolRegistration:
 
 
 @dataclass(frozen=True)
+class CalculationToolRegistration:
+    """One registered deterministic Calculator and its trusted inputs."""
+
+    id: str
+    executor: CalculationExecutor
+
+
+@dataclass(frozen=True)
 class SpecialistRegistration:
     """Typed code registration for one Specialist actor."""
 
@@ -490,6 +559,7 @@ class SpecialistRegistry:
     registrations: Sequence[SpecialistRegistration]
     tenant_eligible_ids: frozenset[str]
     tool_registrations: Sequence[EvidenceToolRegistration] = ()
+    calculation_tool_registrations: Sequence[CalculationToolRegistration] = ()
     tenant_eligible_tool_ids: frozenset[str] = frozenset()
     skill_registry: SpecialistSkillRegistry | None = None
 
@@ -518,7 +588,13 @@ class SpecialistRegistry:
         scope_tool_ids: frozenset[str],
     ) -> frozenset[str]:
         """Freeze registered, Tenant, Scope, and Specialist Tool authority."""
-        registered_ids = frozenset(tool.id for tool in self.tool_registrations)
+        registered_ids = frozenset(
+            tool.id
+            for tool in (
+                *self.tool_registrations,
+                *self.calculation_tool_registrations,
+            )
+        )
         return (
             registered_ids
             & self.tenant_eligible_tool_ids
@@ -561,11 +637,32 @@ class SpecialistRegistry:
         actor_factory = registration.actor_factory
         if actor_factory is None:
             raise AssertionError("Specialist actor factory is required")
-        registered = {tool.id: tool for tool in self.tool_registrations}
+        evidence_tools = {tool.id: tool for tool in self.tool_registrations}
+        calculation_tools = {
+            tool.id: tool for tool in self.calculation_tool_registrations
+        }
+        if set(evidence_tools) & set(calculation_tools):
+            raise ValueError("Specialist Tool registration conflicts")
         tool_capture = SpecialistToolCapture()
         tools: list[SpecialistTool] = []
         for tool_id in sorted(effective_ids):
-            tool = registered[tool_id]
+            calculation = calculation_tools.get(tool_id)
+            if calculation is not None:
+                binding = bind_calculation_tool(
+                    calculation.executor,
+                    context=CalculationExecutionContext(
+                        tenant_id=context.tenant_id,
+                        request_id=context.request_id,
+                        task_id=context.task_id,
+                        attempt=context.attempt,
+                    ),
+                    tool_id=tool_id,
+                    capture=tool_capture.calculations,
+                )
+                binding.__name__ = tool_id
+                tools.append(binding)
+                continue
+            tool = evidence_tools[tool_id]
 
             def report_tool_status(
                 status: ToolTelemetryStatus,
@@ -631,9 +728,7 @@ def accept_initial_dispatch(
     """Validate a first Dispatch before assigning graph-owned Task identities."""
     proposals = tuple(decision.tasks)
     if not 1 <= len(proposals) <= MAX_DISPATCH_BATCH_TASKS:
-        raise ValueError(
-            f"Dispatch Batch exceeds {MAX_DISPATCH_BATCH_TASKS} Tasks"
-    )
+        raise ValueError(f"Dispatch Batch exceeds {MAX_DISPATCH_BATCH_TASKS} Tasks")
     for proposal in proposals:
         normalize_task_objective(proposal.objective)
         if proposal.context_task_ids:
@@ -722,6 +817,52 @@ def validate_active_batch_manifest(
         ):
             raise ValueError("Active Batch Task context is invalid")
         registry.resolve(task.specialist_id, scope_descriptors=scope_descriptors)
+
+
+def validate_promoted_calculation_contribution(
+    contribution: BatchContribution,
+    *,
+    task: AcceptedTask,
+    tenant_id: str,
+    request_id: str,
+    registry: SpecialistRegistry,
+    scope_descriptors: Sequence[SpecialistDescriptor],
+    scope_tool_ids: frozenset[str],
+    catalog: RequestEvidenceCatalog,
+) -> None:
+    """Revalidate a staged Artifact against trusted barrier-time dependencies."""
+    if not contribution.calculations:
+        return
+    if not isinstance(contribution.outcome, TaskSucceeded):
+        raise CalculationArtifactInvalid(
+            "Failed Task contribution cannot contain Calculation Artifacts"
+        )
+    registration = registry.resolve(
+        task.specialist_id, scope_descriptors=scope_descriptors
+    )
+    context = EvidenceInvocationContext(
+        tenant_id=tenant_id,
+        request_id=request_id,
+        task_id=task.id,
+        attempt=contribution.attempt,
+        allowed_tool_ids=scope_tool_ids,
+    )
+    support = tuple(
+        catalog.resolve(
+            evidence_id,
+            tenant_id=tenant_id,
+            request_id=request_id,
+            accepted_evidence_ids=contribution.outcome.result.evidence_ids,
+        )
+        for evidence_id in contribution.outcome.result.evidence_ids
+    )
+    _validate_attempt_calculations(
+        contribution.calculations,
+        context=context,
+        registry=registry,
+        registration=registration,
+        support=support,
+    )
 
 
 async def execute_specialist(
@@ -829,9 +970,7 @@ async def execute_specialist(
             raise failure.error
 
         cumulative_tool_attempts += _tool_attempt_count(attempt.messages)
-        attempt_cost_usd, attempt_cost_is_complete = _message_cost_usd(
-            attempt.messages
-        )
+        attempt_cost_usd, attempt_cost_is_complete = _message_cost_usd(attempt.messages)
         cumulative_cost_usd += attempt_cost_usd
         cumulative_cost_is_complete = (
             cumulative_cost_is_complete and attempt_cost_is_complete
@@ -871,8 +1010,9 @@ async def execute_specialist(
             continue
 
         if catalog is None:
-            if attempt.evidence or draft.evidence_ids:
+            if attempt.evidence or draft.evidence_ids or attempt.calculations:
                 raise ValueError("Evidence cache is not configured")
+            calculations = ()
         else:
             try:
                 catalog.accept_referenced(
@@ -890,6 +1030,22 @@ async def execute_specialist(
                     "Reference only Evidence IDs returned by this Specialist run."
                 )
                 continue
+            support = tuple(
+                catalog.resolve(
+                    evidence_id,
+                    tenant_id=attempt_context.tenant_id,
+                    request_id=attempt_context.request_id,
+                    accepted_evidence_ids=draft.evidence_ids,
+                )
+                for evidence_id in draft.evidence_ids
+            )
+            calculations = _validate_attempt_calculations(
+                attempt.calculations,
+                context=attempt_context,
+                registry=registry,
+                registration=registration,
+                support=support,
+            )
         return BatchContribution(
             batch_id=batch_id,
             task_id=task.id,
@@ -902,6 +1058,7 @@ async def execute_specialist(
                 cost_is_complete=cumulative_cost_is_complete,
             ),
             skill_pins=attempt.skill_pins,
+            calculations=calculations,
         )
     raise AssertionError("Specialist attempts did not reach a terminal outcome")
 
@@ -936,11 +1093,16 @@ def _message_cost_usd(messages: Sequence[object]) -> tuple[float, bool]:
 def promote_batch(
     batch: ActiveBatch,
     contributions: Mapping[str, BatchContribution],
+    *,
+    calculation_validator: Callable[[BatchContribution], None] | None = None,
 ) -> AcceptedBatch:
     """Validate exact manifest membership before atomically promoting a batch."""
     if set(contributions) != set(batch.task_ids):
         raise ValueError("Batch contribution manifest is invalid")
-    if any(task_id != contribution.task_id for task_id, contribution in contributions.items()):
+    if any(
+        task_id != contribution.task_id
+        for task_id, contribution in contributions.items()
+    ):
         raise ValueError("Batch contribution manifest is invalid")
     ordered = tuple(contributions[task_id] for task_id in batch.task_ids)
     if any(
@@ -951,6 +1113,39 @@ def promote_batch(
         for contribution in ordered
     ):
         raise ValueError("Batch contribution manifest is invalid")
+    for contribution in ordered:
+        if len(contribution.calculations) > MAX_CALCULATIONS_PER_CONTRIBUTION:
+            raise CalculationArtifactInvalid(
+                "Calculation contribution exceeds 8 Artifacts"
+            )
+        if isinstance(contribution.outcome, TaskFailed) and contribution.calculations:
+            raise CalculationArtifactInvalid(
+                "Failed Task contribution cannot contain Calculation Artifacts"
+            )
+        if isinstance(contribution.outcome, TaskSucceeded) and any(
+            not set(artifact.evidence_refs)
+            <= set(contribution.outcome.result.evidence_ids)
+            for artifact in contribution.calculations
+        ):
+            raise CalculationArtifactInvalid(
+                "Calculation Artifact Evidence membership is invalid"
+            )
+        for artifact in contribution.calculations:
+            if (
+                artifact.task_id != contribution.task_id
+                or artifact.attempt != contribution.attempt
+            ):
+                raise CalculationArtifactInvalid(
+                    "Calculation Artifact contribution provenance is invalid"
+                )
+        if calculation_validator is not None:
+            calculation_validator(contribution)
+    all_calculations = tuple(
+        artifact
+        for contribution in ordered
+        for artifact in sorted(contribution.calculations, key=lambda item: item.id)
+    )
+    calculations = accepted_calculation_artifacts(all_calculations)
     usage = SpecialistUsage()
     for contribution in ordered:
         usage = usage.add(contribution.usage)
@@ -963,4 +1158,5 @@ def promote_batch(
             for item in ordered
             if item.skill_pins
         ),
+        calculations=calculations,
     )

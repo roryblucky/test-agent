@@ -89,8 +89,7 @@ class PydanticAISpecialistActor:
                 "task_id": input.task_id,
                 "objective": input.objective,
                 "context_results": [
-                    result.model_dump(mode="json")
-                    for result in input.context_results
+                    result.model_dump(mode="json") for result in input.context_results
                 ],
                 "validation_feedback": input.validation_feedback,
                 "skill_summaries": [
@@ -104,6 +103,7 @@ class PydanticAISpecialistActor:
         async with self._lock:
             first_evidence = len(self.tool_capture.evidence)
             first_unavailability = len(self.tool_capture.unavailability)
+            first_calculation = len(self.tool_capture.calculations)
             try:
                 with capture_run_messages() as messages:
                     try:
@@ -172,13 +172,16 @@ class PydanticAISpecialistActor:
                 unavailability = tuple(
                     self.tool_capture.unavailability[first_unavailability:]
                 )
+                calculations = tuple(self.tool_capture.calculations[first_calculation:])
             finally:
                 del self.tool_capture.evidence[first_evidence:]
                 del self.tool_capture.unavailability[first_unavailability:]
+                del self.tool_capture.calculations[first_calculation:]
         return SpecialistAttempt(
             finding=result.output,
             evidence=evidence,
             unavailability=unavailability,
+            calculations=calculations,
             skill_pins=(
                 self.skill_invocation.pins if self.skill_invocation is not None else ()
             ),
@@ -340,6 +343,5 @@ def _count_limit_exhausted(
         limits.tool_calls_limit is not None
         and tool_calls_before_latest_response is not None
         and tool_calls > 0
-        and tool_calls_before_latest_response + tool_calls
-        > limits.tool_calls_limit
+        and tool_calls_before_latest_response + tool_calls > limits.tool_calls_limit
     )
