@@ -6,6 +6,7 @@ from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     FinancialResearchReport,
     RequestEvidenceCatalog,
+    bind_evidence_tool,
     prepare_synthesis,
     publish_report,
 )
@@ -115,6 +116,35 @@ def test_evidence_cache_rejects_cross_scope_provenance(
             request_id="request-1",
             task_id="task-1",
         )
+
+
+@pytest.mark.asyncio
+async def test_evidence_tool_freezes_source_before_provider_access() -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        calls.append((source, query))
+        return _evidence()
+
+    tool = bind_evidence_tool(
+        provider,
+        allowed_sources=frozenset({"filing"}),
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task-1",
+    )
+
+    returned = await tool("filing", "Apple revenue")
+
+    assert returned.return_value == {
+        "evidence_id": "evidence-1",
+        "excerpt": "Apple revenue grew.",
+    }
+    assert returned.metadata == _evidence()
+    assert calls == [("filing", "Apple revenue")]
+    with pytest.raises(ValueError, match="Evidence source is not eligible"):
+        await tool("private", "Apple revenue")
+    assert calls == [("filing", "Apple revenue")]
 
 
 @pytest.mark.parametrize("markdown", ["Apple grew. [[E:x]]", "Apple grew. [[E:2]]"])

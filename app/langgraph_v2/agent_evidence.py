@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic_ai import ToolReturn
 
 from app.models.workflow import CitationReference
 
@@ -27,6 +28,39 @@ class EvidenceEnvelope(BaseModel):
     title: str = Field(min_length=1)
     body: str = Field(min_length=1)
     excerpt: str = Field(min_length=1, max_length=4096)
+
+
+EvidenceProvider = Callable[[str, str], Awaitable[EvidenceEnvelope]]
+
+
+def bind_evidence_tool(
+    provider: EvidenceProvider,
+    *,
+    allowed_sources: frozenset[str],
+    tenant_id: str,
+    request_id: str,
+    task_id: str,
+) -> Callable[[str, str], Awaitable[ToolReturn[dict[str, str]]]]:
+    """Bind one frozen Scope-limited Evidence reader for a Specialist run."""
+
+    async def read_evidence(source: str, query: str) -> ToolReturn[dict[str, str]]:
+        """Fetch one source only when its trusted Scope permits it."""
+        if source not in allowed_sources:
+            raise ValueError("Evidence source is not eligible")
+        evidence = await provider(source, query)
+        if (
+            evidence.source != source
+            or evidence.tenant_id != tenant_id
+            or evidence.request_id != request_id
+            or evidence.task_id != task_id
+        ):
+            raise ValueError("Evidence provenance is not eligible")
+        return ToolReturn(
+            return_value={"evidence_id": evidence.id, "excerpt": evidence.excerpt},
+            metadata=evidence,
+        )
+
+    return read_evidence
 
 
 @dataclass
