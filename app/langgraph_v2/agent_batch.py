@@ -6,15 +6,20 @@ import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.langgraph_v2.agent_evidence import (
+    DataGapView,
     EvidenceEnvelope,
     EvidenceInvocationContext,
     EvidenceProvider,
+    ExpectedToolUnavailability,
     RequestEvidenceCatalog,
+    ToolUnavailabilityRecord,
+    ToolUnavailableReason,
     bind_evidence_tool,
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
@@ -25,6 +30,22 @@ from app.langgraph_v2.agent_skills import (
 )
 
 _SPECIALIST_FINDING_MAX_BYTES = 16 * 1024
+_DATA_GAP_MAX_BYTES = 256
+_IDENTIFIER_MAX_ASCII_CHARACTERS = 64
+
+
+def _require_utf8_limit(value: str, *, limit: int, label: str) -> str:
+    if len(value.encode("utf-8")) > limit:
+        raise ValueError(f"{label} exceeds {limit} UTF-8 bytes")
+    return value
+
+
+def _require_ascii_identifier(value: str, *, label: str) -> str:
+    if len(value) > _IDENTIFIER_MAX_ASCII_CHARACTERS or not value.isascii():
+        raise ValueError(
+            f"{label} must contain at most {_IDENTIFIER_MAX_ASCII_CHARACTERS} ASCII characters"
+        )
+    return value
 
 
 class StructuredOutputInvalid(ValueError):
@@ -86,6 +107,64 @@ class SpecialistResult(BaseModel):
 
     summary: str
     evidence_ids: tuple[str, ...] = Field(max_length=16, default=())
+    data_gaps: tuple[DataGap, ...] = Field(max_length=8, default=())
+
+
+class GapProvenance(BaseModel):
+    """Internal retained identity for one accepted unavailable Tool outcome."""
+
+    model_config = ConfigDict(frozen=True)
+
+    unavailability_id: str = Field(min_length=1)
+    tool_id: str = Field(min_length=1)
+    source: str | None = None
+    observed_at: datetime
+
+    @field_validator("unavailability_id", "tool_id")
+    @classmethod
+    def _validate_identifier(cls, value: str) -> str:
+        return _require_ascii_identifier(value, label="Data Gap identifier")
+
+    @field_validator("source")
+    @classmethod
+    def _validate_source(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _require_utf8_limit(
+            value, limit=_DATA_GAP_MAX_BYTES, label="Data Gap source"
+        )
+
+    @field_validator("observed_at")
+    @classmethod
+    def _validate_observed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+            raise ValueError("Data Gap observation time must be normalized UTC")
+        return value.astimezone(UTC)
+
+
+class DataGap(BaseModel):
+    """Canonical accepted unavailable-data record derived only by code."""
+
+    model_config = ConfigDict(frozen=True)
+
+    requested_coverage: str = Field(min_length=1)
+    reason: ToolUnavailableReason
+    provenance: GapProvenance
+
+    @field_validator("requested_coverage")
+    @classmethod
+    def _validate_requested_coverage(cls, value: str) -> str:
+        return _require_utf8_limit(
+            value, limit=_DATA_GAP_MAX_BYTES, label="Data Gap coverage"
+        )
+
+    def view(self) -> DataGapView:
+        """Return the sole projection allowed outside accepted state."""
+        return DataGapView(
+            requested_coverage=self.requested_coverage,
+            reason=self.reason,
+            observed_at=self.provenance.observed_at,
+        )
 
 
 class SpecialistAttempt(BaseModel):
@@ -95,7 +174,53 @@ class SpecialistAttempt(BaseModel):
 
     finding: SpecialistFindingDraft
     evidence: tuple[EvidenceEnvelope, ...] = ()
+    unavailability: tuple[ToolUnavailabilityRecord, ...] = ()
     skill_pins: tuple[SkillPin, ...] = ()
+
+
+def _derive_data_gaps(
+    records: tuple[ToolUnavailabilityRecord, ...],
+    *,
+    context: EvidenceInvocationContext,
+    effective_tool_ids: frozenset[str],
+) -> tuple[DataGap, ...]:
+    """Promote only current trusted binding records into canonical Data Gaps."""
+    records_by_id: dict[str, ToolUnavailabilityRecord] = {}
+    for record in records:
+        if (
+            record.tenant_id != context.tenant_id
+            or record.request_id != context.request_id
+            or record.task_id != context.task_id
+            or record.tool_id not in effective_tool_ids
+            or (
+                record.source is not None
+                and record.source not in context.allowed_sources
+            )
+        ):
+            raise ValueError("Data Gap provenance is not eligible")
+        if record.attempt != context.attempt:
+            raise ValueError("Data Gap provenance is stale")
+        existing = records_by_id.get(record.id)
+        if existing is not None:
+            if existing != record:
+                raise ValueError("Data Gap provenance conflicts")
+            continue
+        records_by_id[record.id] = record
+    return tuple(
+        DataGap(
+            requested_coverage=record.requested_coverage,
+            reason=record.reason,
+            provenance=GapProvenance(
+                unavailability_id=record.id,
+                tool_id=record.tool_id,
+                source=record.source,
+                observed_at=record.observed_at,
+            ),
+        )
+        for record in sorted(
+            records_by_id.values(), key=lambda item: (item.tool_id, item.tool_call_id)
+        )
+    )
 
 
 class TaskSucceeded(BaseModel):
@@ -181,6 +306,7 @@ class SpecialistActorFactory(Protocol):
         tools: tuple[SpecialistTool, ...],
         returned_evidence: list[EvidenceEnvelope],
         skill_invocation: SkillInvocation | None,
+        returned_unavailability: list[ToolUnavailabilityRecord],
     ) -> SpecialistActor:
         """Return an actor limited to exactly the supplied Tool bindings."""
         ...
@@ -194,6 +320,7 @@ class EvidenceToolRegistration:
     provider: EvidenceProvider
     allowed_sources: frozenset[str]
     allowed_queries: frozenset[str] = frozenset()
+    expected_unavailability: tuple[ExpectedToolUnavailability, ...] = ()
     audit: ToolTelemetry | None = None
 
 
@@ -288,6 +415,7 @@ class SpecialistRegistry:
             raise AssertionError("Specialist actor factory is required")
         registered = {tool.id: tool for tool in self.tool_registrations}
         returned_evidence: list[EvidenceEnvelope] = []
+        returned_unavailability: list[ToolUnavailabilityRecord] = []
         tools: list[SpecialistTool] = []
         for tool_id in sorted(effective_ids):
             tool = registered[tool_id]
@@ -318,14 +446,23 @@ class SpecialistRegistry:
                     }
                 ),
                 returned_evidence=returned_evidence,
+                returned_unavailability=returned_unavailability,
                 telemetry=report_tool_status,
+                tool_id=tool_id,
+                expected_unavailability=tool.expected_unavailability,
             )
             binding.__name__ = tool_id
             tools.append(binding)
         if has_skill_activation:
             assert skill_invocation is not None
             tools.append(skill_invocation.activation_tool())
-        return actor_factory(tuple(tools), returned_evidence, skill_invocation)
+        return actor_factory(
+            tuple(tools),
+            returned_evidence,
+            skill_invocation,
+            returned_unavailability,
+        )
+
 
 @dataclass(frozen=True)
 class SpecialistTaskInput:
@@ -401,6 +538,14 @@ async def execute_specialist(
             finding_evidence_ids=draft.evidence_ids,
             context=context,
         )
+    data_gaps = _derive_data_gaps(
+        attempt.unavailability,
+        context=context,
+        effective_tool_ids=registry.effective_tool_ids(
+            registration,
+            scope_tool_ids=context.allowed_tool_ids,
+        ),
+    )
     return BatchContribution(
         batch_id=batch_id,
         task_id=task.id,
@@ -410,6 +555,7 @@ async def execute_specialist(
             result=SpecialistResult(
                 summary=draft.summary,
                 evidence_ids=draft.evidence_ids,
+                data_gaps=data_gaps,
             ),
         ),
         skill_pins=attempt.skill_pins,

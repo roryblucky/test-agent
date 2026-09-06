@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from app.agents.specialist import PydanticAISpecialistActor
@@ -29,7 +29,12 @@ from app.langgraph_v2.agent_batch import (
 )
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
+    ExpectedToolUnavailability,
     FinancialResearchReport,
+    PreparedSynthesis,
+    ToolUnavailabilityRecord,
+    ToolUnavailable,
+    ToolUnavailableReason,
 )
 from app.langgraph_v2.agent_graph import CoordinatorInput, Finish
 from app.langgraph_v2.agent_runtime import build_agent_runtime
@@ -115,12 +120,13 @@ def _evidence_specialist_factory(
     tools: tuple[Callable[..., object], ...],
     returned_evidence: list[EvidenceEnvelope],
     skill_invocation: SkillInvocation | None,
+    returned_unavailability: list[ToolUnavailabilityRecord],
 ) -> SpecialistActor:
     return _specialist_factory(
         query="Apple revenue",
         summary="Apple revenue grew.",
         evidence_id="evidence-1",
-    )(tools, returned_evidence, skill_invocation)
+    )(tools, returned_evidence, skill_invocation, returned_unavailability)
 
 
 def _specialist_factory(
@@ -130,6 +136,7 @@ def _specialist_factory(
         tools: tuple[Callable[..., object], ...],
         returned_evidence: list[EvidenceEnvelope],
         skill_invocation: SkillInvocation | None,
+        returned_unavailability: list[ToolUnavailabilityRecord],
     ) -> PydanticAISpecialistActor:
         calls = 0
 
@@ -168,6 +175,7 @@ def _specialist_factory(
             ),
             returned_evidence=returned_evidence,
             skill_invocation=skill_invocation,
+            returned_unavailability=returned_unavailability,
         )
 
     return build
@@ -177,6 +185,7 @@ def _skill_specialist_factory(
     tools: tuple[Callable[..., object], ...],
     returned_evidence: list[EvidenceEnvelope],
     skill_invocation: SkillInvocation | None,
+    returned_unavailability: list[ToolUnavailabilityRecord],
 ) -> PydanticAISpecialistActor:
     assert skill_invocation is not None
     calls = 0
@@ -234,6 +243,7 @@ def _skill_specialist_factory(
         ),
         returned_evidence=returned_evidence,
         skill_invocation=skill_invocation,
+        returned_unavailability=returned_unavailability,
     )
 
 
@@ -455,7 +465,8 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
     assert any(
         event["type"] == "progress"
         and event.get("step") == "tool"
-        and event.get("data") == {
+        and event.get("data")
+        == {
             "task_id": "task_90fff3e68e9a59d229d7982b65c5fe8b",
             "tool_id": "filing_reader",
             "status": "completed",
@@ -476,6 +487,205 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
         )
     assert "BODY-SENTINEL" not in persisted_text
     assert "RAW-PROVIDER-SENTINEL" not in persisted_text
+
+
+def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplete(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class SourceUnreachable(Exception):
+        pass
+
+    provider_calls = 0
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        nonlocal provider_calls
+        provider_calls += 1
+        if provider_calls == 1:
+            raise SourceUnreachable("provider payload must not persist")
+        return await _evidence_provider(source, query)
+
+    def specialist_factory(
+        tools: tuple[Callable[..., object], ...],
+        returned_evidence: list[EvidenceEnvelope],
+        skill_invocation: SkillInvocation | None,
+        returned_unavailability: list[ToolUnavailabilityRecord],
+    ) -> PydanticAISpecialistActor:
+        del skill_invocation
+        model_calls = 0
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal model_calls
+            model_calls += 1
+            if model_calls == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="filing_reader",
+                            tool_call_id="call-1",
+                            args={"source": "filing", "query": "Apple revenue"},
+                        )
+                    ]
+                )
+            if model_calls == 2:
+                tool_returns = [
+                    part
+                    for message in messages
+                    if isinstance(message, ModelRequest)
+                    for part in message.parts
+                    if part.part_kind == "tool-return"
+                ]
+                assert tool_returns[0].content == ToolUnavailable(
+                    reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                    requested_coverage="Apple revenue",
+                )
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="filing_reader",
+                            tool_call_id="call-2",
+                            args={"source": "filing", "query": "Apple revenue"},
+                        )
+                    ]
+                )
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=info.output_tools[0].name,
+                        args={
+                            "summary": "Apple revenue grew.",
+                            "evidence_ids": ["evidence-1"],
+                        },
+                    )
+                ]
+            )
+
+        return PydanticAISpecialistActor(
+            Agent(
+                FunctionModel(model),
+                output_type=SpecialistFindingDraft,
+                tools=tools,
+                retries=0,
+                tool_retries=0,
+                output_retries=0,
+                end_strategy="early",
+            ),
+            returned_evidence=returned_evidence,
+            returned_unavailability=returned_unavailability,
+        )
+
+    class PartialSynthesis:
+        prepared: PreparedSynthesis | None = None
+
+        async def synthesize(
+            self, prepared: PreparedSynthesis
+        ) -> FinancialResearchReport:
+            self.prepared = prepared
+            return FinancialResearchReport(
+                markdown_report="Apple revenue grew. [[E:1]]"
+            )
+
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        allowed_tool_ids=frozenset({"filing_reader"}),
+        allowed_sources=frozenset({"filing"}),
+        allowed_queries=frozenset({"Apple revenue"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=specialist_factory,
+                allowed_tool_ids=frozenset({"filing_reader"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple revenue"}),
+                expected_unavailability=(
+                    ExpectedToolUnavailability(
+                        exception_type=SourceUnreachable,
+                        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                    ),
+                ),
+            ),
+        ),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+    )
+    synthesis = PartialSynthesis()
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=_Coordinator(),
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+            synthesis_actor=synthesis,
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000086"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "What about it?",
+                "sessionId": conversation_id,
+                "clientRequestId": "request-1",
+            },
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+        assert client.portal is not None
+        checkpoint = client.portal.call(
+            lambda: app.state.langgraph_v2_checkpointer.aget_tuple(
+                thread_checkpoint_config(
+                    thread_id=thread_id_for(
+                        "tenant-a", "subject-a", "agent", conversation_id
+                    )
+                )
+            )
+        )
+
+    done = [event for event in parse_sse(response.text) if event["type"] == "done"]
+    assert response.status_code == 200
+    assert provider_calls == 2
+    assert done[0]["data"]["metadata"]["completion_status"] == "incomplete"
+    assert done[0]["data"]["metadata"]["termination_reason"] == "partial_results"
+    assert done[0]["data"]["answer"] == (
+        "Apple revenue grew. [[E:1]]\n\n"
+        "Incomplete research: one or more requested data sources were unavailable."
+    )
+    assert synthesis.prepared is not None
+    assert synthesis.prepared.data_gaps[0].model_dump() == {
+        "requested_coverage": "Apple revenue",
+        "reason": ToolUnavailableReason.SOURCE_UNREACHABLE,
+        "observed_at": synthesis.prepared.data_gaps[0].observed_at,
+    }
+    assert checkpoint is not None
+    checkpoint_text = repr(checkpoint.checkpoint["channel_values"])
+    assert "unavailable_" in checkpoint_text
+    assert "filing_reader" in checkpoint_text
+    assert "provider payload must not persist" not in checkpoint_text
 
 
 def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
@@ -591,8 +801,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
     assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
     assert "FULL-SKILL-REFERENCE-SENTINEL" not in repr(state)
     assert all(
-        "filing-analysis" not in input.model_dump_json()
-        for input in coordinator.inputs
+        "filing-analysis" not in input.model_dump_json() for input in coordinator.inputs
     )
 
 

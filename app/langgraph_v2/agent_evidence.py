@@ -2,20 +2,85 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime
+from enum import StrEnum
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic_ai import ToolReturn
+from pydantic_ai import RunContext, ToolReturn
 
 from app.models.workflow import CitationReference
 
 _EVIDENCE_MARKER = re.compile(r"\[\[E:([1-9][0-9]*)\]\]")
 _MARKER_LIKE = re.compile(r"\[\[\s*E\s*:")
 _TOOL_RETURN_MAX_BYTES = 4 * 1024
+TOOL_TIMEOUT_SECONDS = 20
+_UNUSABLE_COVERAGE = "Requested coverage could not be safely projected."
+
+
+class ToolUnavailableReason(StrEnum):
+    """Closed model-visible reasons for expected Tool unavailability."""
+
+    SOURCE_UNREACHABLE = "source_unreachable"
+    COVERAGE_NOT_SUPPORTED = "coverage_not_supported"
+    STALE_ONLY = "stale_only"
+    CALL_TIMEOUT = "call_timeout"
+    RESPONSE_UNUSABLE = "response_unusable"
+
+
+class ToolUnavailable(BaseModel):
+    """Bounded expected inability returned to the active Specialist."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: str = "tool_unavailable"
+    reason: ToolUnavailableReason
+    requested_coverage: str = Field(min_length=1)
+
+
+class DataGapView(BaseModel):
+    """Safe Data Gap projection for actor prompts and publication."""
+
+    model_config = ConfigDict(frozen=True)
+
+    requested_coverage: str
+    reason: ToolUnavailableReason
+    observed_at: datetime
+
+
+class ToolUnavailabilityRecord(BaseModel):
+    """App-only provenance for one expected unavailable Tool outcome."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    tenant_id: str
+    request_id: str
+    task_id: str
+    attempt: int
+    tool_call_id: str
+    tool_id: str
+    source: str | None
+    observed_at: datetime
+    reason: ToolUnavailableReason
+    requested_coverage: str
+
+
+@dataclass(frozen=True)
+class ExpectedToolUnavailability:
+    """One explicitly registered provider failure that may become data."""
+
+    exception_type: type[Exception]
+    reason: ToolUnavailableReason
+
+
+class _ProviderTimeoutEscaped(Exception):
+    """Keep a provider-raised timeout distinct from binding-owned timeout."""
 
 
 class EvidenceEnvelope(BaseModel):
@@ -44,6 +109,7 @@ class EvidenceInvocationContext(BaseModel):
     tenant_id: str = Field(min_length=1)
     request_id: str = Field(min_length=1)
     task_id: str = Field(min_length=1)
+    attempt: int = Field(default=1, ge=1)
     allowed_tool_ids: frozenset[str] = frozenset()
     allowed_sources: frozenset[str] = frozenset()
     allowed_queries: frozenset[str] = frozenset()
@@ -52,9 +118,62 @@ class EvidenceInvocationContext(BaseModel):
 EvidenceProvider = Callable[[str, str], Awaitable[EvidenceEnvelope]]
 
 
-def _same_canonical_evidence(
-    left: EvidenceEnvelope, right: EvidenceEnvelope
-) -> bool:
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _tool_return_size(value: object) -> int:
+    return len(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _bounded_unavailable(
+    *,
+    reason: ToolUnavailableReason,
+    requested_coverage: str,
+) -> ToolUnavailable:
+    unavailable = ToolUnavailable(
+        reason=reason,
+        requested_coverage=requested_coverage,
+    )
+    if _tool_return_size(unavailable.model_dump(mode="json")) <= _TOOL_RETURN_MAX_BYTES:
+        return unavailable
+    return ToolUnavailable(
+        reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
+        requested_coverage=_UNUSABLE_COVERAGE,
+    )
+
+
+def _unavailability_record(
+    *,
+    context: EvidenceInvocationContext,
+    run_context: RunContext[None],
+    tool_id: str,
+    source: str,
+    unavailable: ToolUnavailable,
+    now: Callable[[], datetime],
+) -> ToolUnavailabilityRecord:
+    tool_call_id = run_context.tool_call_id
+    if not tool_call_id or run_context.tool_name != tool_id:
+        raise ValueError("Tool call identity is not eligible")
+    observed_at = now()
+    if observed_at.tzinfo is None:
+        raise ValueError("Tool observation time must be timezone-aware")
+    return ToolUnavailabilityRecord(
+        id=f"unavailable_{uuid4().hex}",
+        tenant_id=context.tenant_id,
+        request_id=context.request_id,
+        task_id=context.task_id,
+        attempt=context.attempt,
+        tool_call_id=tool_call_id,
+        tool_id=tool_id,
+        source=source,
+        observed_at=observed_at.astimezone(UTC),
+        reason=unavailable.reason,
+        requested_coverage=unavailable.requested_coverage,
+    )
+
+
+def _same_canonical_evidence(left: EvidenceEnvelope, right: EvidenceEnvelope) -> bool:
     """Compare accepted Evidence while excluding noncanonical provider payload."""
     excluded = {"raw_provider_payload"}
     return left.model_dump(exclude=excluded) == right.model_dump(exclude=excluded)
@@ -65,11 +184,26 @@ def bind_evidence_tool(
     *,
     context: EvidenceInvocationContext,
     returned_evidence: list[EvidenceEnvelope] | None = None,
+    returned_unavailability: list[ToolUnavailabilityRecord] | None = None,
     telemetry: Callable[[str], None] | None = None,
-) -> Callable[[str, str], Awaitable[ToolReturn[dict[str, str]]]]:
+    tool_id: str = "read_evidence",
+    expected_unavailability: tuple[ExpectedToolUnavailability, ...] = (),
+    now: Callable[[], datetime] = _utc_now,
+) -> Callable[..., Awaitable[ToolReturn[dict[str, str] | ToolUnavailable]]]:
     """Bind one frozen Scope-limited Evidence reader for a Specialist run."""
+    expected_types = tuple(item.exception_type for item in expected_unavailability)
+    if len(set(expected_types)) != len(expected_types):
+        raise ValueError("Expected Tool unavailability registration conflicts")
 
-    async def read_evidence(source: str, query: str) -> ToolReturn[dict[str, str]]:
+    async def provider_result(source: str, query: str) -> EvidenceEnvelope:
+        try:
+            return await provider(source, query)
+        except TimeoutError as error:
+            raise _ProviderTimeoutEscaped from error
+
+    async def read_evidence(
+        run_context: RunContext[None], source: str, query: str
+    ) -> ToolReturn[dict[str, str] | ToolUnavailable]:
         """Fetch one source only when its trusted Scope permits it."""
         if source not in context.allowed_sources:
             if telemetry is not None:
@@ -82,7 +216,9 @@ def bind_evidence_tool(
         if telemetry is not None:
             telemetry("started")
         try:
-            evidence = await provider(source, query)
+            evidence = await asyncio.wait_for(
+                provider_result(source, query), timeout=TOOL_TIMEOUT_SECONDS
+            )
             if (
                 evidence.source != source
                 or evidence.tenant_id != context.tenant_id
@@ -91,17 +227,76 @@ def bind_evidence_tool(
             ):
                 raise ValueError("Evidence provenance is not eligible")
             return_value = {"evidence_id": evidence.id, "excerpt": evidence.excerpt}
-            if (
-                len(json.dumps(return_value, separators=(",", ":")).encode())
-                > _TOOL_RETURN_MAX_BYTES
-            ):
-                raise ValueError("Evidence Tool return exceeds 4 KiB")
+            if _tool_return_size(return_value) > _TOOL_RETURN_MAX_BYTES:
+                unavailable = _bounded_unavailable(
+                    reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
+                    requested_coverage=query,
+                )
+                record = _unavailability_record(
+                    context=context,
+                    run_context=run_context,
+                    tool_id=tool_id,
+                    source=source,
+                    unavailable=unavailable,
+                    now=now,
+                )
+                if returned_unavailability is not None:
+                    returned_unavailability.append(record)
+                if telemetry is not None:
+                    telemetry("unavailable")
+                return ToolReturn(return_value=unavailable, metadata=record)
             if returned_evidence is not None:
                 returned_evidence.append(evidence)
-        except BaseException:
+        except _ProviderTimeoutEscaped as error:
+            cause = error.__cause__
+            assert isinstance(cause, TimeoutError)
+            raise cause
+        except TimeoutError:
+            unavailable = _bounded_unavailable(
+                reason=ToolUnavailableReason.CALL_TIMEOUT,
+                requested_coverage=query,
+            )
+            record = _unavailability_record(
+                context=context,
+                run_context=run_context,
+                tool_id=tool_id,
+                source=source,
+                unavailable=unavailable,
+                now=now,
+            )
+            if returned_unavailability is not None:
+                returned_unavailability.append(record)
             if telemetry is not None:
-                telemetry("failed")
-            raise
+                telemetry("unavailable")
+            return ToolReturn(return_value=unavailable, metadata=record)
+        except expected_types as error:
+            expected = next(
+                (
+                    item
+                    for item in expected_unavailability
+                    if type(error) is item.exception_type
+                ),
+                None,
+            )
+            if expected is None:
+                raise
+            unavailable = _bounded_unavailable(
+                reason=expected.reason,
+                requested_coverage=query,
+            )
+            record = _unavailability_record(
+                context=context,
+                run_context=run_context,
+                tool_id=tool_id,
+                source=source,
+                unavailable=unavailable,
+                now=now,
+            )
+            if returned_unavailability is not None:
+                returned_unavailability.append(record)
+            if telemetry is not None:
+                telemetry("unavailable")
+            return ToolReturn(return_value=unavailable, metadata=record)
         if telemetry is not None:
             telemetry("completed")
         return ToolReturn(return_value=return_value, metadata=evidence)
@@ -202,6 +397,7 @@ class PreparedSynthesis(BaseModel):
     standalone_query: str
     intent: str
     evidence: tuple[PreparedEvidence, ...]
+    data_gaps: tuple[DataGapView, ...] = ()
 
 
 class FinancialResearchReport(BaseModel):
@@ -231,6 +427,7 @@ def prepare_synthesis(
     request_id: str,
     as_of_date: date | None = None,
     max_evidence_age_days: int = 7,
+    data_gaps: tuple[DataGapView, ...] = (),
 ) -> PreparedSynthesis:
     """Build the sole bounded Evidence projection Synthesis may receive."""
     evidence = tuple(
@@ -256,6 +453,7 @@ def prepare_synthesis(
         standalone_query=standalone_query,
         intent=intent,
         evidence=evidence,
+        data_gaps=data_gaps,
     )
 
 

@@ -32,9 +32,11 @@ from app.langgraph_v2.agent_batch import (
 )
 from app.langgraph_v2.agent_completion import (
     IncompleteResearch,
+    append_data_gap_disclosure,
     insufficient_evidence_answer,
 )
 from app.langgraph_v2.agent_evidence import (
+    DataGapView,
     EvidenceInvocationContext,
     FinancialResearchReport,
     PreparedSynthesis,
@@ -312,11 +314,7 @@ def build_agent_graph(
                 specialist_descriptors=scope.specialist_descriptors,
             )
         )
-        _emit(
-            (
-                LiveStreamEvent(type="step_completed", step="coordinator"),
-            )
-        )
+        _emit((LiveStreamEvent(type="step_completed", step="coordinator"),))
         if isinstance(decision, Finish):
             return {}
         if state.get("accepted_batches"):
@@ -394,12 +392,18 @@ def build_agent_graph(
         }
 
     async def research_completion(state: AgentGraphState) -> AgentGraphStateUpdate:
-        del state
-        completion = IncompleteResearch(insufficient_evidence=True)
+        completion = IncompleteResearch(
+            insufficient_evidence=True,
+            has_data_gaps=bool(_accepted_data_gap_views(state)),
+        )
         return {
             "answer": insufficient_evidence_answer(completion),
             "completion_status": "incomplete",
-            "termination_reason": "insufficient_evidence",
+            "termination_reason": (
+                "partial_results"
+                if completion.has_data_gaps
+                else "insufficient_evidence"
+            ),
         }
 
     async def synthesis(state: AgentGraphState) -> AgentGraphStateUpdate:
@@ -411,6 +415,7 @@ def build_agent_graph(
             raise TypeError("Agent Synthesis input is invalid")
         scope = ResearchScope.model_validate(scope_value)
         evidence_ids = _accepted_evidence_ids(state)
+        data_gaps = _accepted_data_gap_views(state)
         prepared = prepare_synthesis(
             standalone_query=standalone_query,
             intent=scope.intent,
@@ -420,14 +425,23 @@ def build_agent_graph(
             request_id=state["request_id"],
             as_of_date=scope.as_of_date,
             max_evidence_age_days=scope.max_evidence_age_days,
+            data_gaps=data_gaps,
         )
         candidate = await synthesis_actor.synthesize(prepared)
         published = publish_report(candidate, prepared)
+        completion = IncompleteResearch(
+            insufficient_evidence=False,
+            has_data_gaps=bool(data_gaps),
+        )
         return {
-            "answer": published.answer,
+            "answer": append_data_gap_disclosure(published.answer, completion),
             "citations": [item.model_dump(mode="json") for item in published.citations],
-            "completion_status": "complete",
-            "termination_reason": "evidence_backed",
+            "completion_status": "incomplete"
+            if completion.has_data_gaps
+            else "complete",
+            "termination_reason": (
+                "partial_results" if completion.has_data_gaps else "evidence_backed"
+            ),
         }
 
     async def finalize_state(state: AgentGraphState) -> AgentGraphStateUpdate:
@@ -451,7 +465,10 @@ def build_agent_graph(
             completion_status = state.get("completion_status")
             termination_reason = state.get("termination_reason")
             if completion_status == "incomplete":
-                if termination_reason != "insufficient_evidence":
+                if termination_reason not in {
+                    "insufficient_evidence",
+                    "partial_results",
+                }:
                     raise TypeError("Agent research completion is invalid")
             elif (
                 completion_status != "complete"
@@ -576,6 +593,17 @@ def _accepted_evidence_ids(state: AgentGraphState) -> tuple[str, ...]:
         for outcome in accepted.outcomes:
             evidence_ids.extend(outcome.result.evidence_ids)
     return tuple(evidence_ids)
+
+
+def _accepted_data_gap_views(state: AgentGraphState) -> tuple[DataGapView, ...]:
+    """Return safe Data Gap projections in deterministic accepted-state order."""
+    accepted_batches = state.get("accepted_batches", {})
+    return tuple(
+        gap.view()
+        for raw_batch in accepted_batches.values()
+        for outcome in AcceptedBatch.model_validate(raw_batch).outcomes
+        for gap in outcome.result.data_gaps
+    )
 
 
 def _active_batch_dump(batch: ActiveBatch) -> dict[str, Any]:

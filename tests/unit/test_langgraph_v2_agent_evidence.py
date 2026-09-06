@@ -1,14 +1,24 @@
 """Public Evidence cache and report-gate coverage for Agent research."""
 
-from datetime import date
+import asyncio
+import json
+from datetime import UTC, date, datetime
 
 import pytest
+from pydantic_ai import RunContext
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
 
+import app.langgraph_v2.agent_evidence as agent_evidence
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
+    ExpectedToolUnavailability,
     FinancialResearchReport,
     RequestEvidenceCatalog,
+    ToolUnavailabilityRecord,
+    ToolUnavailable,
+    ToolUnavailableReason,
     bind_evidence_tool,
     prepare_synthesis,
     publish_report,
@@ -45,6 +55,67 @@ def _evidence(
         "as_of_date": date(2026, 9, 6),
     }
     return EvidenceEnvelope.model_validate({**values, **overrides})
+
+
+def _tool_context(
+    *, tool_call_id: str = "call-1", tool_name: str = "read_evidence"
+) -> RunContext[None]:
+    return RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+    )
+
+
+@pytest.mark.asyncio
+async def test_expected_tool_unavailability_becomes_bounded_model_data() -> None:
+    class SourceUnreachable(Exception):
+        pass
+
+    records: list[ToolUnavailabilityRecord] = []
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise SourceUnreachable("provider details must not escape")
+
+    tool = bind_evidence_tool(
+        provider,
+        context=_context(),
+        tool_id="filing-reader",
+        expected_unavailability=(
+            ExpectedToolUnavailability(
+                exception_type=SourceUnreachable,
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+            ),
+        ),
+        returned_unavailability=records,
+        now=lambda: datetime(2026, 9, 6, 12, tzinfo=UTC),
+    )
+
+    returned = await tool(
+        _tool_context(tool_name="filing-reader"), "filing", "Apple revenue"
+    )
+
+    assert returned.return_value == ToolUnavailable(
+        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+        requested_coverage="Apple revenue",
+    )
+    assert len(records) == 1
+    assert records[0].model_dump() == {
+        "id": records[0].id,
+        "tenant_id": "tenant-a",
+        "request_id": "request-1",
+        "task_id": "task-1",
+        "attempt": 1,
+        "tool_call_id": "call-1",
+        "tool_id": "filing-reader",
+        "source": "filing",
+        "observed_at": datetime(2026, 9, 6, 12, tzinfo=UTC),
+        "reason": ToolUnavailableReason.SOURCE_UNREACHABLE,
+        "requested_coverage": "Apple revenue",
+    }
 
 
 def test_only_accepted_referenced_evidence_is_prepared_and_published() -> None:
@@ -156,7 +227,7 @@ async def test_evidence_tool_freezes_source_before_provider_access() -> None:
         context=_context(),
     )
 
-    returned = await tool("filing", "Apple revenue")
+    returned = await tool(_tool_context(), "filing", "Apple revenue")
 
     assert returned.return_value == {
         "evidence_id": "evidence-1",
@@ -165,15 +236,14 @@ async def test_evidence_tool_freezes_source_before_provider_access() -> None:
     assert returned.metadata == _evidence()
     assert calls == [("filing", "Apple revenue")]
     with pytest.raises(ValueError, match="Evidence source is not eligible"):
-        await tool("private", "Apple revenue")
+        await tool(_tool_context(), "private", "Apple revenue")
     assert calls == [("filing", "Apple revenue")]
 
 
 @pytest.mark.asyncio
-async def test_evidence_tool_rejects_unicode_return_over_4_kib_before_metadata_capture() -> (
-    None
-):
+async def test_evidence_tool_projects_oversized_success_as_unavailable() -> None:
     returned_evidence: list[EvidenceEnvelope] = []
+    returned_unavailability: list[ToolUnavailabilityRecord] = []
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         del source, query
@@ -183,11 +253,129 @@ async def test_evidence_tool_rejects_unicode_return_over_4_kib_before_metadata_c
         provider,
         context=_context(),
         returned_evidence=returned_evidence,
+        returned_unavailability=returned_unavailability,
     )
 
-    with pytest.raises(ValueError, match="Evidence Tool return exceeds 4 KiB"):
-        await tool("filing", "Apple revenue")
+    returned = await tool(_tool_context(), "filing", "Apple revenue")
+
+    assert returned.return_value == ToolUnavailable(
+        reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
+        requested_coverage="Apple revenue",
+    )
     assert returned_evidence == []
+    assert len(returned_unavailability) == 1
+
+
+@pytest.mark.asyncio
+async def test_unavailable_return_accepts_exactly_4_kib_and_sanitizes_one_byte_more() -> (
+    None
+):
+    class SourceUnreachable(Exception):
+        pass
+
+    template = ToolUnavailable(
+        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+        requested_coverage="x",
+    )
+    exact_coverage = "x" * (
+        4 * 1024
+        - len(
+            json.dumps(
+                template.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        + 1
+    )
+    too_large_coverage = f"{exact_coverage}x"
+    context = _context().model_copy(
+        update={"allowed_queries": frozenset({exact_coverage, too_large_coverage})}
+    )
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise SourceUnreachable()
+
+    tool = bind_evidence_tool(
+        provider,
+        context=context,
+        expected_unavailability=(
+            ExpectedToolUnavailability(
+                exception_type=SourceUnreachable,
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+            ),
+        ),
+    )
+
+    exact = await tool(_tool_context(), "filing", exact_coverage)
+    too_large = await tool(
+        _tool_context(tool_call_id="call-2"), "filing", too_large_coverage
+    )
+
+    assert isinstance(exact.return_value, ToolUnavailable)
+    assert exact.return_value.reason is ToolUnavailableReason.SOURCE_UNREACHABLE
+    assert (
+        len(
+            json.dumps(
+                exact.return_value.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        == 4 * 1024
+    )
+    assert too_large.return_value == ToolUnavailable(
+        reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
+        requested_coverage="Requested coverage could not be safely projected.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_and_provider_timeout_fail_closed() -> None:
+    async def unknown_provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise RuntimeError("unknown provider failure")
+
+    unknown_tool = bind_evidence_tool(unknown_provider, context=_context())
+    with pytest.raises(RuntimeError, match="unknown provider failure"):
+        await unknown_tool(_tool_context(), "filing", "Apple revenue")
+
+    async def timeout_provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise TimeoutError("provider timeout is not binding-owned")
+
+    timeout_tool = bind_evidence_tool(timeout_provider, context=_context())
+    with pytest.raises(TimeoutError, match="provider timeout is not binding-owned"):
+        await timeout_tool(_tool_context(), "filing", "Apple revenue")
+
+
+@pytest.mark.asyncio
+async def test_binding_owned_timeout_becomes_call_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[ToolUnavailabilityRecord] = []
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        await asyncio.sleep(1)
+        raise AssertionError("binding timeout must cancel the provider")
+
+    assert agent_evidence.TOOL_TIMEOUT_SECONDS == 20
+    monkeypatch.setattr(agent_evidence, "TOOL_TIMEOUT_SECONDS", 0.001)
+    tool = bind_evidence_tool(
+        provider,
+        context=_context(),
+        returned_unavailability=records,
+    )
+
+    returned = await tool(_tool_context(), "filing", "Apple revenue")
+
+    assert returned.return_value == ToolUnavailable(
+        reason=ToolUnavailableReason.CALL_TIMEOUT,
+        requested_coverage="Apple revenue",
+    )
+    assert records[0].reason is ToolUnavailableReason.CALL_TIMEOUT
 
 
 @pytest.mark.parametrize(

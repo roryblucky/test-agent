@@ -1,16 +1,21 @@
 """Public first-batch validation and acceptance coverage."""
 
 from collections.abc import Awaitable, Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import cast
 
 import pytest
 from pydantic import ValidationError
+from pydantic_ai import RunContext
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
 
 from app.langgraph_v2.agent_batch import (
     BatchContribution,
+    DataGap,
     DispatchBatch,
     EvidenceToolRegistration,
+    GapProvenance,
     SpecialistAttempt,
     SpecialistFindingDraft,
     SpecialistRegistration,
@@ -24,7 +29,12 @@ from app.langgraph_v2.agent_batch import (
     execute_specialist,
     promote_batch,
 )
-from app.langgraph_v2.agent_evidence import EvidenceEnvelope, EvidenceInvocationContext
+from app.langgraph_v2.agent_evidence import (
+    EvidenceEnvelope,
+    EvidenceInvocationContext,
+    ToolUnavailabilityRecord,
+    ToolUnavailableReason,
+)
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
     SkillInvocation,
@@ -39,13 +49,19 @@ class _Specialist:
         self,
         finding: SpecialistFindingDraft | None = None,
         skill_pins: tuple[SkillPin, ...] = (),
+        unavailability: tuple[ToolUnavailabilityRecord, ...] = (),
     ) -> None:
         self.finding = finding or SpecialistFindingDraft(summary="No-tool finding")
         self.skill_pins = skill_pins
+        self.unavailability = unavailability
 
     async def run(self, input: object) -> SpecialistAttempt:
         del input
-        return SpecialistAttempt(finding=self.finding, skill_pins=self.skill_pins)
+        return SpecialistAttempt(
+            finding=self.finding,
+            skill_pins=self.skill_pins,
+            unavailability=self.unavailability,
+        )
 
 
 def _context(*, task_id: str = "task-1") -> EvidenceInvocationContext:
@@ -56,6 +72,16 @@ def _context(*, task_id: str = "task-1") -> EvidenceInvocationContext:
         allowed_tool_ids=frozenset({"filing-tool", "unregistered"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple"}),
+    )
+
+
+def _tool_context(*, tool_name: str) -> RunContext[None]:
+    return RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        tool_call_id="call-1",
+        tool_name=tool_name,
     )
 
 
@@ -72,6 +98,61 @@ def _registry(
             ),
         ),
         tenant_eligible_ids=tenant_eligible_ids,
+    )
+
+
+def _unavailability_record(
+    *, task_id: str, **overrides: object
+) -> ToolUnavailabilityRecord:
+    values: dict[str, object] = {
+        "id": "unavailable-1",
+        "tenant_id": "tenant-a",
+        "request_id": "request-1",
+        "task_id": task_id,
+        "attempt": 1,
+        "tool_call_id": "call-1",
+        "tool_id": "filing-tool",
+        "source": "filing",
+        "observed_at": datetime(2026, 9, 6, 12, tzinfo=UTC),
+        "reason": ToolUnavailableReason.SOURCE_UNREACHABLE,
+        "requested_coverage": "Apple revenue",
+    }
+    return ToolUnavailabilityRecord.model_validate({**values, **overrides})
+
+
+def _gap_registry(
+    records: tuple[ToolUnavailabilityRecord, ...],
+) -> SpecialistRegistry:
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise AssertionError("Direct Specialist actor must not call the binding")
+
+    def factory(
+        tools: tuple[object, ...],
+        returned_evidence: object,
+        skill_invocation: object,
+        returned_unavailability: object,
+    ) -> _Specialist:
+        del tools, returned_evidence, skill_invocation, returned_unavailability
+        return _Specialist(unavailability=records)
+
+    return SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=factory,
+                allowed_tool_ids=frozenset({"filing-tool"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing-tool",
+                provider=provider,
+                allowed_sources=frozenset({"filing"}),
+            ),
+        ),
+        tenant_eligible_tool_ids=frozenset({"filing-tool"}),
     )
 
 
@@ -321,11 +402,131 @@ async def test_execute_specialist_persists_only_activated_skill_pins() -> None:
     accepted = promote_batch(batch, {contribution.task_id: contribution})
 
     assert contribution.skill_pins == (pin,)
-    assert accepted.skill_pins == (TaskSkillPins(task_id=batch.tasks[0].id, pins=(pin,)),)
+    assert accepted.skill_pins == (
+        TaskSkillPins(task_id=batch.tasks[0].id, pins=(pin,)),
+    )
 
 
 @pytest.mark.asyncio
-async def test_registry_freezes_tool_and_source_intersection_before_provider_access() -> None:
+async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record() -> (
+    None
+):
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=scope_descriptors,
+    )
+    record = _unavailability_record(task_id=batch.tasks[0].id)
+    registry = _gap_registry((record, record))
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+    )
+
+    gap = contribution.outcome.result.data_gaps[0]
+    assert gap.requested_coverage == "Apple revenue"
+    assert gap.reason is ToolUnavailableReason.SOURCE_UNREACHABLE
+    assert gap.provenance.unavailability_id == "unavailable-1"
+    assert gap.provenance.tool_id == "filing-tool"
+    assert len(contribution.outcome.result.data_gaps) == 1
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"tenant_id": "tenant-b"}, "not eligible"),
+        ({"request_id": "request-2"}, "not eligible"),
+        ({"task_id": "task-2"}, "not eligible"),
+        ({"attempt": 2}, "stale"),
+        ({"tool_id": "unregistered"}, "not eligible"),
+        ({"source": "private"}, "not eligible"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_specialist_rejects_ineligible_data_gap_provenance(
+    overrides: dict[str, object], message: str
+) -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=scope_descriptors,
+    )
+    record_values = {"task_id": batch.tasks[0].id, **overrides}
+    record_task_id = record_values.pop("task_id")
+    assert isinstance(record_task_id, str)
+    record = _unavailability_record(
+        task_id=record_task_id, **record_values
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await execute_specialist(
+            batch.tasks[0],
+            batch_id=batch.id,
+            registry=_gap_registry((record,)),
+            scope_descriptors=scope_descriptors,
+            context=_context(task_id=batch.tasks[0].id),
+        )
+
+
+def test_data_gap_enforces_bounds_and_hides_internal_provenance() -> None:
+    exact = DataGap(
+        requested_coverage="🐍" * 64,
+        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+        provenance=GapProvenance(
+            unavailability_id="u" * 64,
+            tool_id="t" * 64,
+            source="🐍" * 64,
+            observed_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+        ),
+    )
+
+    assert exact.view().model_dump() == {
+        "requested_coverage": "🐍" * 64,
+        "reason": ToolUnavailableReason.SOURCE_UNREACHABLE,
+        "observed_at": datetime(2026, 9, 6, 12, tzinfo=UTC),
+    }
+    with pytest.raises(ValidationError, match="Data Gap coverage"):
+        DataGap(
+            requested_coverage="🐍" * 65,
+            reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+            provenance=exact.provenance,
+        )
+    with pytest.raises(ValidationError, match="Data Gap identifier"):
+        GapProvenance(
+            unavailability_id="u" * 65,
+            tool_id="tool",
+            observed_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+        )
+    with pytest.raises(ValidationError, match="Data Gap source"):
+        GapProvenance(
+            unavailability_id="gap",
+            tool_id="tool",
+            source="🐍" * 65,
+            observed_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+        )
+    with pytest.raises(ValidationError):
+        SpecialistResult(
+            summary="Too many gaps",
+            data_gaps=tuple(exact.model_copy() for _ in range(9)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_freezes_tool_and_source_intersection_before_provider_access() -> (
+    None
+):
     calls: list[tuple[str, str]] = []
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
@@ -355,8 +556,9 @@ async def test_registry_freezes_tool_and_source_intersection_before_provider_acc
         tools: tuple[object, ...],
         returned_evidence: object,
         skill_invocation: object,
+        returned_unavailability: object,
     ) -> _Specialist:
-        del returned_evidence, skill_invocation
+        del returned_evidence, skill_invocation, returned_unavailability
         captured.extend(tools)
         return _Specialist()
 
@@ -394,16 +596,14 @@ async def test_registry_freezes_tool_and_source_intersection_before_provider_acc
 
     assert isinstance(actor, _Specialist)
     assert len(captured) == 1
-    tool = cast(
-        Callable[[str, str], Awaitable[object]], captured[0]
-    )
+    tool = cast(Callable[[RunContext[None], str, str], Awaitable[object]], captured[0])
     with pytest.raises(ValueError, match="Evidence source is not eligible"):
-        await tool("private", "Apple")
+        await tool(_tool_context(tool_name="filing-tool"), "private", "Apple")
     assert calls == []
     with pytest.raises(ValueError, match="Evidence query is not eligible"):
-        await tool("filing", "Broad query")
+        await tool(_tool_context(tool_name="filing-tool"), "filing", "Broad query")
     assert calls == []
-    await tool("filing", "Apple")
+    await tool(_tool_context(tool_name="filing-tool"), "filing", "Apple")
     assert calls == [("filing", "Apple")]
     assert audit == [
         ("filing-tool", "rejected"),
@@ -420,8 +620,9 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
         tools: tuple[object, ...],
         returned_evidence: object,
         skill_invocation: object,
+        returned_unavailability: object,
     ) -> _Specialist:
-        del returned_evidence, skill_invocation
+        del returned_evidence, skill_invocation, returned_unavailability
         captured.append(tools)
         return _Specialist()
 
@@ -452,14 +653,10 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
     assert captured == [()]
 
 
-def test_registry_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> (
-    None
-):
+def test_registry_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> None:
     direct_actor = _Specialist()
     registry = SpecialistRegistry(
-        registrations=(
-            SpecialistRegistration(id="market-data", actor=direct_actor),
-        ),
+        registrations=(SpecialistRegistration(id="market-data", actor=direct_actor),),
         tenant_eligible_ids=frozenset({"market-data"}),
         skill_registry=SpecialistSkillRegistry(
             registrations=(
@@ -503,8 +700,9 @@ def test_registry_binds_skill_activation_without_expanding_frozen_business_tools
         tools: tuple[Callable[..., object], ...],
         returned_evidence: list[EvidenceEnvelope],
         skill_invocation: SkillInvocation | None,
+        returned_unavailability: object,
     ) -> _Specialist:
-        del returned_evidence
+        del returned_evidence, returned_unavailability
         assert skill_invocation is not None
         captured_tools.extend(tools)
         captured_invocation.append(skill_invocation)
@@ -566,7 +764,9 @@ def test_registry_binds_skill_activation_without_expanding_frozen_business_tools
         "shared-skill",
         "market-skill",
     ]
-    assert invocation.activate("shared-skill").instructions == "SHARED-FULL-INSTRUCTIONS"
+    assert (
+        invocation.activate("shared-skill").instructions == "SHARED-FULL-INSTRUCTIONS"
+    )
 
 
 def _tool_name(tool: Callable[..., object]) -> str:

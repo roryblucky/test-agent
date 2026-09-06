@@ -1,5 +1,6 @@
 """No-Tool Specialist PydanticAI actor coverage."""
 
+import asyncio
 from datetime import date
 from typing import cast
 
@@ -28,6 +29,10 @@ from app.langgraph_v2.agent_batch import SpecialistFindingDraft, SpecialistTaskI
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
+    ExpectedToolUnavailability,
+    ToolUnavailabilityRecord,
+    ToolUnavailable,
+    ToolUnavailableReason,
     bind_evidence_tool,
 )
 from app.langgraph_v2.agent_skills import (
@@ -261,7 +266,7 @@ async def test_specialist_function_model_has_one_request_and_structured_trace() 
     assert captures[0][1].model_settings == {
         "max_tokens": SPECIALIST_MAX_TOKENS,
         "timeout": SPECIALIST_TIMEOUT_SECONDS,
-        "parallel_tool_calls": False,
+        "parallel_tool_calls": True,
     }
     assert len(messages) == 3
     assert isinstance(messages[1], ModelResponse)
@@ -362,20 +367,30 @@ async def test_specialist_accepts_tool_metadata_only_after_terminal_finding() ->
 
 
 @pytest.mark.asyncio
-async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
+async def test_specialist_keeps_expected_unavailability_after_a_fallback() -> None:
+    class SourceUnreachable(Exception):
+        pass
+
     returned_evidence: list[EvidenceEnvelope] = []
+    returned_unavailability: list[ToolUnavailabilityRecord] = []
+    provider_calls = 0
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
+        nonlocal provider_calls
+        provider_calls += 1
+        assert (source, query) == ("filing", "Apple revenue")
+        if provider_calls == 1:
+            raise SourceUnreachable()
         return EvidenceEnvelope(
             id="evidence-1",
             tenant_id="tenant-a",
             request_id="request-1",
             task_id="task-1",
-            source=source,
+            source="filing",
             source_url="https://example.test/filing",
             title="Annual filing",
             body="BODY-SENTINEL",
-            excerpt=query,
+            excerpt="Apple revenue grew.",
             as_of_date=date(2026, 9, 6),
         )
 
@@ -383,6 +398,224 @@ async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
         provider,
         context=_context(),
         returned_evidence=returned_evidence,
+        returned_unavailability=returned_unavailability,
+        expected_unavailability=(
+            ExpectedToolUnavailability(
+                exception_type=SourceUnreachable,
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+            ),
+        ),
+    )
+    model_calls = 0
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="read_evidence",
+                        tool_call_id="call-1",
+                        args={"source": "filing", "query": "Apple revenue"},
+                    )
+                ]
+            )
+        tool_returns = [
+            part
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        if model_calls == 2:
+            assert tool_returns[0].content == ToolUnavailable(
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                requested_coverage="Apple revenue",
+            )
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="read_evidence",
+                        tool_call_id="call-2",
+                        args={"source": "filing", "query": "Apple revenue"},
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={
+                        "summary": "Apple revenue grew.",
+                        "evidence_ids": ["evidence-1"],
+                    },
+                )
+            ]
+        )
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(tool,),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        ),
+        returned_evidence=returned_evidence,
+        returned_unavailability=returned_unavailability,
+    )
+
+    attempt = await actor.run(
+        SpecialistTaskInput(task_id="task-1", objective="Assess Apple revenue.")
+    )
+
+    assert provider_calls == 2
+    assert attempt.finding.evidence_ids == ("evidence-1",)
+    assert len(attempt.unavailability) == 1
+    assert attempt.unavailability[0].reason is ToolUnavailableReason.SOURCE_UNREACHABLE
+    assert returned_evidence == []
+    assert returned_unavailability == []
+
+
+@pytest.mark.asyncio
+async def test_specialist_parallel_tool_calls_keep_a_successful_sibling() -> None:
+    class SourceUnreachable(Exception):
+        pass
+
+    sibling_started = asyncio.Event()
+    returned_evidence: list[EvidenceEnvelope] = []
+    returned_unavailability: list[ToolUnavailabilityRecord] = []
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        assert source == "filing"
+        if query == "unavailable coverage":
+            await sibling_started.wait()
+            raise SourceUnreachable()
+        assert query == "fallback coverage"
+        sibling_started.set()
+        return EvidenceEnvelope(
+            id="evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            task_id="task-1",
+            source="filing",
+            source_url="https://example.test/filing",
+            title="Annual filing",
+            body="BODY-SENTINEL",
+            excerpt="Fallback evidence succeeded.",
+            as_of_date=date(2026, 9, 6),
+        )
+
+    tool = bind_evidence_tool(
+        provider,
+        context=_context().model_copy(
+            update={
+                "allowed_queries": frozenset(
+                    {"unavailable coverage", "fallback coverage"}
+                )
+            }
+        ),
+        returned_evidence=returned_evidence,
+        returned_unavailability=returned_unavailability,
+        expected_unavailability=(
+            ExpectedToolUnavailability(
+                exception_type=SourceUnreachable,
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+            ),
+        ),
+    )
+    model_calls = 0
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="read_evidence",
+                        tool_call_id="call-unavailable",
+                        args={"source": "filing", "query": "unavailable coverage"},
+                    ),
+                    ToolCallPart(
+                        tool_name="read_evidence",
+                        tool_call_id="call-fallback",
+                        args={"source": "filing", "query": "fallback coverage"},
+                    ),
+                ]
+            )
+        tool_returns = [
+            part
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        assert len(tool_returns) == 2
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={
+                        "summary": "Fallback evidence succeeded.",
+                        "evidence_ids": ["evidence-1"],
+                    },
+                )
+            ]
+        )
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(tool,),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        ),
+        returned_evidence=returned_evidence,
+        returned_unavailability=returned_unavailability,
+    )
+
+    attempt = await asyncio.wait_for(
+        actor.run(SpecialistTaskInput(task_id="task-1", objective="Assess.")),
+        timeout=1,
+    )
+
+    assert attempt.finding.evidence_ids == ("evidence-1",)
+    assert [item.id for item in attempt.evidence] == ["evidence-1"]
+    assert [item.reason for item in attempt.unavailability] == [
+        ToolUnavailableReason.SOURCE_UNREACHABLE
+    ]
+
+
+@pytest.mark.asyncio
+async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
+    class SourceUnreachable(Exception):
+        pass
+
+    returned_evidence: list[EvidenceEnvelope] = []
+    returned_unavailability: list[ToolUnavailabilityRecord] = []
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise SourceUnreachable()
+
+    tool = bind_evidence_tool(
+        provider,
+        context=_context(),
+        returned_evidence=returned_evidence,
+        returned_unavailability=returned_unavailability,
+        expected_unavailability=(
+            ExpectedToolUnavailability(
+                exception_type=SourceUnreachable,
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+            ),
+        ),
     )
     calls = 0
 
@@ -412,9 +645,11 @@ async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
             end_strategy="early",
         ),
         returned_evidence=returned_evidence,
+        returned_unavailability=returned_unavailability,
     )
 
     with pytest.raises(Exception):
         await actor.run(SpecialistTaskInput(task_id="task-1", objective="Assess."))
 
     assert actor.returned_evidence == []
+    assert actor.returned_unavailability == []
