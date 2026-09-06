@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, cast
 
-from app.langgraph_v2.contracts import LinearQueryResponse, LiveStreamEvent
+from app.langgraph_v2.contracts import LiveStreamEvent, V2QueryResponse
 from app.langgraph_v2.evidence import Evidence
 from app.models.domain import Document
 
@@ -87,11 +87,11 @@ def _build_response(
     state: Mapping[str, Any],
     *,
     documents: list[Document],
-) -> LinearQueryResponse:
+) -> V2QueryResponse:
     """Build the shared final response and aggregate current-request model usage."""
     answer = state.get("answer")
     has_answer = isinstance(answer, str)
-    response = LinearQueryResponse(
+    response = V2QueryResponse(
         query=state["query"],
         conversation_id=state["conversation_id"],
         metadata={"steps_executed": _steps(state)},
@@ -104,7 +104,7 @@ def _build_response(
         groundedness=state.get("groundedness"),
         citations=state.get("citations", []),
     )
-    normalized = response.model_dump(mode="json")
+    normalized = response.model_dump(mode="json", by_alias=True)
     usages: list[Mapping[str, Any]] = [
         state.get("answer_usage", {}),
         state.get("refinement_usage", {}),
@@ -115,12 +115,12 @@ def _build_response(
     usage = _combine_usage(usages)
     if usage is not None:
         normalized["metadata"]["usage"] = usage
-    return LinearQueryResponse.model_validate(normalized)
+    return V2QueryResponse.model_validate(normalized)
 
 
 async def run_finalization(
     state: Mapping[str, Any],
-) -> tuple[list[LiveStreamEvent], LinearQueryResponse]:
+) -> tuple[list[LiveStreamEvent], V2QueryResponse]:
     """Assemble the response from request-local ranked evidence."""
     documents = (
         [
@@ -147,7 +147,7 @@ async def run_finalization(
 
 def finalize_in_memory(
     state: Mapping[str, Any],
-) -> tuple[list[LiveStreamEvent], LinearQueryResponse]:
+) -> tuple[list[LiveStreamEvent], V2QueryResponse]:
     """Assemble the same response shape for a non-persistent graph."""
     documents = [
         Evidence.model_validate(item).document

@@ -9,7 +9,7 @@ from uuid import UUID
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from app.models.domain import GroundednessResult
-from app.models.workflow import CitationReference
+from app.models.workflow import CitationReference, QueryUnderstandingClarification
 
 LinearEventType = Literal[
     "step_start",
@@ -48,8 +48,8 @@ class V2QueryRequest(BaseModel):
     ] = None
 
 
-class LinearQueryResponse(BaseModel):
-    """Minimal v1-shaped final response emitted by the Linear Graph."""
+class V2QueryResponse(BaseModel):
+    """Minimal v1-shaped final response emitted by either v2 runtime."""
 
     query: str
     refined_query: str | None = None
@@ -58,8 +58,14 @@ class LinearQueryResponse(BaseModel):
     documents: list[Any] = Field(default_factory=list)
     moderation: dict[str, Any] | None = None
     groundedness: GroundednessResult | None = None
-    clarification: None = None
-    conversation_id: str = Field(serialization_alias="session_id")
+    clarification: QueryUnderstandingClarification | None = None
+    conversation_id: Annotated[
+        str,
+        Field(
+            validation_alias=AliasChoices("conversation_id", "session_id"),
+            serialization_alias="session_id",
+        ),
+    ]
     metadata: dict[str, Any] = Field(default_factory=dict)
     citations: list[CitationReference] = Field(default_factory=list[CitationReference])
 

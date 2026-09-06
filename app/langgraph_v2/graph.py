@@ -417,7 +417,7 @@ def build_linear_graph(
             )
         )
         update: LinearGraphStateUpdate = {
-            "final_response": response.model_dump(mode="json"),
+            "final_response": response.model_dump(mode="json", by_alias=True),
         }
         if response.answer is not None:
             update["conversation_messages"] = [

@@ -12,11 +12,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from app.langgraph_v2.contracts import LinearQueryResponse
+from app.langgraph_v2.contracts import V2QueryResponse
 from app.langgraph_v2.conversation_context import validate_request_identity
 from app.langgraph_v2.pre_moderation import ModerationDecision
 from app.models.domain import GroundednessResult
-from app.models.workflow import CitationReference
+from app.models.workflow import CitationReference, QueryUnderstandingClarification
 
 
 class CheckpointStateAdapter(Protocol):
@@ -108,12 +108,64 @@ class LinearCheckpointStateAdapter:
         )
         _validate_optional_model(
             channel_values.get("final_response"),
-            model=LinearQueryResponse,
+            model=V2QueryResponse,
             channel="final_response",
         )
         for citation in cast(list[object], channel_values.get("citations", [])):
             _validate_model(citation, model=CitationReference, channel="citations")
 
+        raw_messages = channel_values.get("conversation_messages", [])
+        if not isinstance(raw_messages, list) or not all(
+            isinstance(message, HumanMessage | AIMessage)
+            for message in cast(list[object], raw_messages)
+        ):
+            raise TypeError("checkpoint conversation_messages are invalid")
+        return cast(list[BaseMessage], raw_messages)
+
+
+class AgentCheckpointStateAdapter:
+    """Strict projection for the clarification-only Agent Graph state."""
+
+    _string_channels = frozenset({"query", "conversation_id", "request_id"})
+    _nullable_string_channels = frozenset({"answer", "standalone_query"})
+    _nullable_json_object_channels = frozenset(
+        {"clarification", "final_response"}
+    )
+
+    def validate_checkpoint_state(
+        self,
+        channel_values: Mapping[str, object],
+    ) -> list[BaseMessage]:
+        """Validate every currently owned Agent channel before projection."""
+        for channel in self._string_channels:
+            if channel in channel_values and not isinstance(
+                channel_values[channel], str
+            ):
+                raise TypeError(f"checkpoint {channel} is invalid")
+        for channel in self._nullable_string_channels:
+            if (
+                channel in channel_values
+                and channel_values[channel] is not None
+                and not isinstance(channel_values[channel], str)
+            ):
+                raise TypeError(f"checkpoint {channel} is invalid")
+        if "halted" in channel_values and not isinstance(
+            channel_values["halted"], bool
+        ):
+            raise TypeError("checkpoint halted is invalid")
+        for channel in self._nullable_json_object_channels:
+            if channel in channel_values and channel_values[channel] is not None:
+                _validate_json_object(channel_values[channel], channel=channel)
+        _validate_optional_model(
+            channel_values.get("clarification"),
+            model=QueryUnderstandingClarification,
+            channel="clarification",
+        )
+        _validate_optional_model(
+            channel_values.get("final_response"),
+            model=V2QueryResponse,
+            channel="final_response",
+        )
         raw_messages = channel_values.get("conversation_messages", [])
         if not isinstance(raw_messages, list) or not all(
             isinstance(message, HumanMessage | AIMessage)
@@ -165,7 +217,12 @@ def _validate_json_array(value: object, *, channel: str) -> None:
 def _validate_optional_model(
     value: object,
     *,
-    model: type[LinearQueryResponse | GroundednessResult | ModerationDecision],
+    model: type[
+        V2QueryResponse
+        | GroundednessResult
+        | ModerationDecision
+        | QueryUnderstandingClarification
+    ],
     channel: str,
 ) -> None:
     if value is not None:
@@ -176,7 +233,11 @@ def _validate_model(
     value: object,
     *,
     model: type[
-        CitationReference | LinearQueryResponse | GroundednessResult | ModerationDecision
+        CitationReference
+        | V2QueryResponse
+        | GroundednessResult
+        | ModerationDecision
+        | QueryUnderstandingClarification
     ],
     channel: str,
 ) -> None:

@@ -18,6 +18,7 @@ from app.config.loader import load_config
 from app.core.audit_middleware import AuditMiddleware
 from app.core.http_client_pool import HttpClientPool
 from app.core.rate_limit_middleware import TenantRateLimitMiddleware
+from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.postgres import postgres_lifespan
 from app.services.tenant_manager import TenantManager
@@ -173,4 +174,5 @@ register_v2_routes(
         os.environ.get("LANGGRAPH_V2_UAT_ENABLED") == "1"
         or os.environ.get("LANGGRAPH_V2_LINEAR_CORE_ENABLED") == "1"
     ),
+    agent_runtime_factory=build_agent_runtime,
 )

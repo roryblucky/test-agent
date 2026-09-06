@@ -8,6 +8,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
 
 from app.langgraph_v2.checkpointing import (
+    AgentCheckpointStateAdapter,
     LinearCheckpointStateAdapter,
     thread_checkpoint_config,
     thread_id_for,
@@ -72,6 +73,18 @@ def test_linear_checkpoint_adapter_accepts_all_owned_channels() -> None:
         LinearCheckpointStateAdapter().validate_checkpoint_state(channel_values)
         == messages
     )
+
+
+def test_agent_checkpoint_adapter_rejects_malformed_clarification() -> None:
+    with pytest.raises(TypeError, match="checkpoint clarification is invalid"):
+        AgentCheckpointStateAdapter().validate_checkpoint_state(
+            {
+                "clarification": {
+                    "scope": "query_resolution",
+                    "questions": "not a question list",
+                }
+            }
+        )
 
 
 @pytest.mark.parametrize(
