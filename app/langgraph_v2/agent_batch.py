@@ -49,7 +49,7 @@ class SpecialistFindingDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     summary: str = Field(min_length=1)
-    evidence_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = Field(max_length=16, default=())
 
     def canonical_json_size(self) -> int:
         """Return canonical UTF-8 size used by the acceptance boundary."""
@@ -73,7 +73,7 @@ class SpecialistResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     summary: str
-    evidence_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[str, ...] = Field(max_length=16, default=())
 
 
 class TaskSucceeded(BaseModel):

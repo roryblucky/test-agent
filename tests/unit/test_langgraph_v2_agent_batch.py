@@ -197,6 +197,14 @@ def test_specialist_finding_canonical_size_has_exact_boundary(size: int) -> None
             finding.require_canonical_size()
 
 
+def test_specialist_finding_rejects_more_than_16_evidence_ids() -> None:
+    with pytest.raises(ValidationError):
+        SpecialistFindingDraft(
+            summary="Too many references",
+            evidence_ids=tuple(f"evidence-{index}" for index in range(17)),
+        )
+
+
 @pytest.mark.asyncio
 async def test_execute_specialist_enforces_the_16_kib_boundary_before_contribution() -> None:
     scope_descriptors = (
