@@ -14,25 +14,31 @@ from app.langgraph_v2.agent_batch import (
     TaskProposal,
     TaskSucceeded,
     accept_initial_dispatch,
+    execute_specialist,
     promote_batch,
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 
 
 class _Specialist:
+    def __init__(self, finding: SpecialistFindingDraft | None = None) -> None:
+        self.finding = finding or SpecialistFindingDraft(summary="No-tool finding")
+
     async def run(self, input: object) -> SpecialistFindingDraft:
         del input
-        return SpecialistFindingDraft(summary="No-tool finding")
+        return self.finding
 
 
 def _registry(
-    *, tenant_eligible_ids: frozenset[str] = frozenset({"market-data"})
+    *,
+    tenant_eligible_ids: frozenset[str] = frozenset({"market-data"}),
+    finding: SpecialistFindingDraft | None = None,
 ) -> SpecialistRegistry:
     return SpecialistRegistry(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
-                actor=_Specialist(),
+                actor=_Specialist(finding),
             ),
         ),
         tenant_eligible_ids=tenant_eligible_ids,
@@ -189,3 +195,38 @@ def test_specialist_finding_canonical_size_has_exact_boundary(size: int) -> None
     else:
         with pytest.raises(StructuredOutputInvalid, match="Specialist finding exceeds 16 KiB"):
             finding.require_canonical_size()
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_enforces_the_16_kib_boundary_before_contribution() -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=scope_descriptors,
+    )
+    exact = SpecialistFindingDraft(
+        summary="x" * (16 * 1024 - len('{"evidence_ids":[],"summary":""}'))
+    )
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=_registry(finding=exact),
+        scope_descriptors=scope_descriptors,
+    )
+
+    assert contribution.outcome.result.summary == exact.summary
+
+    too_large = SpecialistFindingDraft(summary=f"{exact.summary}x")
+    with pytest.raises(
+        StructuredOutputInvalid, match="Specialist finding exceeds 16 KiB"
+    ):
+        await execute_specialist(
+            batch.tasks[0],
+            batch_id=batch.id,
+            registry=_registry(finding=too_large),
+            scope_descriptors=scope_descriptors,
+        )

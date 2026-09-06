@@ -16,3 +16,7 @@
 - [x] Specialist 首次调用关闭隐藏 Tool/output retry，使用显式 end strategy，单次模型请求超时 60 秒，`max_tokens` 为 2000。
 - [x] Specialist Result 的 canonical JSON 上限为 16 KiB；测试覆盖恰好 16 KiB 与多 1 byte，超限在生成 contribution 前作为 structured-output-invalid 拒绝。
 - [x] 使用 PydanticAI 的基础 `TestModel`/`FunctionModel`、actor override 与 `ALLOW_MODEL_REQUESTS=False`；每次 invocation 独立 capture，并分别断言 output schema、`new_messages`、usage 和精确的一请求轨迹。
+
+## Comments
+
+- Sol-high combined review (Standards + Spec): Standards had no findings. Resolved Spec P1 by allowing the Coordinator prompt to return `Dispatch` or `Finish`; resolved Spec P2 by capturing TestModel/FunctionModel actor runs with exact three-message, one-request traces; resolved Spec P2 by exercising both 16 KiB boundary cases through `execute_specialist`. Verified after the fixes with Ruff, Pyright, and `pytest tests -q` (280 passed, 1 skipped). Unresolved review comments: 0.

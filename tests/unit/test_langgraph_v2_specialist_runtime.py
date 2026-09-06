@@ -2,7 +2,7 @@
 
 import pydantic_ai.models as models
 import pytest
-from pydantic_ai import Agent
+from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
@@ -23,11 +23,12 @@ def disable_real_model_requests(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_no_tool_specialist_returns_one_structured_finding() -> None:
+    model = TestModel(
+        call_tools=[],
+        custom_output_args={"summary": "No-tool finding", "evidence_ids": []},
+    )
     agent = Agent(
-        TestModel(
-            call_tools=[],
-            custom_output_args={"summary": "No-tool finding", "evidence_ids": []},
-        ),
+        model,
         output_type=SpecialistFindingDraft,
         tools=(),
         retries=0,
@@ -37,11 +38,17 @@ async def test_no_tool_specialist_returns_one_structured_finding() -> None:
     )
     actor = PydanticAISpecialistActor(agent)
 
-    finding = await actor.run(
-        SpecialistTaskInput(task_id="task-1", objective="Assess market outlook.")
-    )
+    with capture_run_messages() as messages:
+        finding = await actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess market outlook.")
+        )
 
     assert finding == SpecialistFindingDraft(summary="No-tool finding")
+    assert len(messages) == 3
+    assert isinstance(messages[1], ModelResponse)
+    assert messages[1].usage.requests == 1
+    assert model.last_model_request_parameters is not None
+    assert model.last_model_request_parameters.function_tools == []
     assert SPECIALIST_TIMEOUT_SECONDS == 60
     assert SPECIALIST_MAX_TOKENS == 2000
 
@@ -61,18 +68,26 @@ async def test_specialist_function_model_has_one_request_and_structured_trace() 
             ]
         )
 
-    result = await Agent(
-        FunctionModel(model),
-        output_type=SpecialistFindingDraft,
-        tools=(),
-        retries=0,
-        tool_retries=0,
-        output_retries=0,
-        end_strategy="early",
-    ).run("Assess market outlook.")
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    with capture_run_messages() as messages:
+        finding = await actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess market outlook.")
+        )
 
-    assert result.output == SpecialistFindingDraft(summary="No-tool finding")
+    assert finding == SpecialistFindingDraft(summary="No-tool finding")
     assert len(captures) == 1
     assert captures[0][1].function_tools == []
-    assert result.usage().requests == 1
-    assert len(result.new_messages()) == 3
+    assert captures[0][1].model_settings == {"max_tokens": SPECIALIST_MAX_TOKENS}
+    assert len(messages) == 3
+    assert isinstance(messages[1], ModelResponse)
+    assert messages[1].usage.requests == 1
