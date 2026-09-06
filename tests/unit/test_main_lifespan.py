@@ -30,6 +30,26 @@ class _HttpPool(_AsyncCloseTracker):
 
 
 @pytest.mark.asyncio
+async def test_lifespan_checks_the_pinned_pydantic_ai_version_before_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def require_version() -> None:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("PydanticAI version is not pinned")
+
+    monkeypatch.setattr(main_module, "require_pinned_pydantic_ai_version", require_version)
+
+    with pytest.raises(RuntimeError, match="not pinned"):
+        async with main_module.lifespan(FastAPI()):
+            pass
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("raise_from_body", [False, True])
 async def test_lifespan_always_closes_bigquery_assessment_audit(
     monkeypatch: pytest.MonkeyPatch,

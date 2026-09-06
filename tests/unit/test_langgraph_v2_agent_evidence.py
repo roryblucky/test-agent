@@ -11,6 +11,7 @@ from pydantic_ai.usage import RunUsage
 
 import app.langgraph_v2.agent_evidence as agent_evidence
 from app.langgraph_v2.agent_evidence import (
+    EvidenceCacheCapacityExceeded,
     EvidenceEnvelope,
     EvidenceInvocationContext,
     ExpectedToolUnavailability,
@@ -118,6 +119,28 @@ async def test_expected_tool_unavailability_becomes_bounded_model_data() -> None
     }
 
 
+@pytest.mark.asyncio
+async def test_concurrent_identical_evidence_bodies_are_counted_once() -> None:
+    catalog = RequestEvidenceCatalog()
+
+    await asyncio.gather(
+        asyncio.to_thread(
+            catalog.accept_referenced,
+            (_evidence(id="evidence-1", body="same body"),),
+            finding_evidence_ids=("evidence-1",),
+            context=_context(),
+        ),
+        asyncio.to_thread(
+            catalog.accept_referenced,
+            (_evidence(id="evidence-2", body="same body"),),
+            finding_evidence_ids=("evidence-2",),
+            context=_context(),
+        ),
+    )
+
+    assert catalog.cached_body_bytes == len(b"same body")
+
+
 def test_only_accepted_referenced_evidence_is_prepared_and_published() -> None:
     catalog = RequestEvidenceCatalog()
     catalog.accept_referenced(
@@ -193,6 +216,58 @@ def test_evidence_cache_ignores_noncanonical_raw_payload_for_idempotence() -> No
     assert accepted.body == first.body
 
 
+def test_evidence_cache_keeps_orphans_diagnostic_only() -> None:
+    catalog = RequestEvidenceCatalog()
+    catalog.accept_referenced(
+        (_evidence(), _evidence(id="orphan-1", body="diagnostic only")),
+        finding_evidence_ids=("evidence-1",),
+        context=_context(),
+    )
+
+    assert (
+        catalog.resolve("evidence-1", tenant_id="tenant-a", request_id="request-1").body
+        == "Apple revenue grew."
+    )
+    with pytest.raises(ValueError, match="Evidence is not accepted"):
+        catalog.resolve("orphan-1", tenant_id="tenant-a", request_id="request-1")
+
+
+def test_evidence_cache_rejects_exact_item_and_total_capacity_overflow() -> None:
+    catalog = RequestEvidenceCatalog()
+    exact_body = "x" * (16 * 1024)
+    catalog.accept_referenced(
+        (_evidence(body=exact_body),),
+        finding_evidence_ids=("evidence-1",),
+        context=_context(),
+    )
+    with pytest.raises(EvidenceCacheCapacityExceeded):
+        catalog.accept_referenced(
+            (_evidence(id="too-large", body=f"{exact_body}x"),),
+            finding_evidence_ids=("too-large",),
+            context=_context(),
+        )
+
+    full_catalog = RequestEvidenceCatalog()
+    bodies = tuple(
+        _evidence(
+            id=f"evidence-{index}",
+            body=f"{index:04d}" + "x" * (16 * 1024 - 4),
+        )
+        for index in range(512)
+    )
+    full_catalog.accept_referenced(
+        bodies,
+        finding_evidence_ids=tuple(item.id for item in bodies),
+        context=_context(),
+    )
+    with pytest.raises(EvidenceCacheCapacityExceeded):
+        full_catalog.accept_referenced(
+            (_evidence(id="one-too-many", body="y"),),
+            finding_evidence_ids=("one-too-many",),
+            context=_context(),
+        )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -265,7 +340,9 @@ async def test_evidence_tool_projects_oversized_success_as_unavailable() -> None
 
 
 @pytest.mark.asyncio
-async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize_gap() -> None:
+async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize_gap() -> (
+    None
+):
     class SourceUnreachable(Exception):
         pass
 
@@ -314,23 +391,29 @@ async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize
         requested_coverage=exact_coverage,
     )
     assert isinstance(exact.return_value, ToolUnavailable)
-    assert len(
-        json.dumps(
-            exact.return_value.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ) == 4 * 1024
-    assert len(
-        json.dumps(
-            ToolUnavailable(
-                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-                requested_coverage=too_large_coverage,
-            ).model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ) == 4 * 1024 + 1
+    assert (
+        len(
+            json.dumps(
+                exact.return_value.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        == 4 * 1024
+    )
+    assert (
+        len(
+            json.dumps(
+                ToolUnavailable(
+                    reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                    requested_coverage=too_large_coverage,
+                ).model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        == 4 * 1024 + 1
+    )
     assert too_large.return_value == ToolUnavailable(
         reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
         requested_coverage="Requested coverage could not be safely projected.",
@@ -426,9 +509,7 @@ async def test_unavailable_binding_rejects_oversize_tool_id() -> None:
         ),
     )
 
-    await tool(
-        _tool_context(tool_name=exact_tool_id), "filing", "Apple revenue"
-    )
+    await tool(_tool_context(tool_name=exact_tool_id), "filing", "Apple revenue")
 
     assert capture.unavailability[0].tool_id == exact_tool_id
     with pytest.raises(ValueError, match="Tool identifier"):

@@ -1,6 +1,6 @@
 """Deterministic conservative research-completion values."""
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.langgraph_v2.agent_evidence import DataGapView
 
@@ -8,6 +8,7 @@ INSUFFICIENT_EVIDENCE_DISCLOSURE = (
     "Incomplete research: no eligible Evidence was available."
 )
 DATA_GAP_DISCLOSURE = "Incomplete research: requested data was unavailable:"
+TASK_FAILURE_DISCLOSURE = "Incomplete research: one requested task could not complete."
 _MARKDOWN_ESCAPED_CHARACTERS = frozenset("\\`*_{}[]<>()#+-.!|~")
 
 
@@ -18,11 +19,17 @@ class IncompleteResearch(BaseModel):
 
     insufficient_evidence: bool
     data_gaps: tuple[DataGapView, ...] = ()
+    task_failures: int = Field(default=0, ge=0)
 
     @property
     def has_data_gaps(self) -> bool:
         """Expose the sole partial-result signal used by terminal routing."""
         return bool(self.data_gaps)
+
+    @property
+    def has_task_failures(self) -> bool:
+        """Expose expected Task inability as a separate partial-result signal."""
+        return self.task_failures > 0
 
 
 def insufficient_evidence_answer(completion: IncompleteResearch) -> str:
@@ -50,6 +57,8 @@ def render_incomplete_research(answer: str, completion: IncompleteResearch) -> s
                 for gap in completion.data_gaps
             )
         )
+    if completion.has_task_failures:
+        lines.append(TASK_FAILURE_DISCLOSURE)
     if completion.insufficient_evidence:
         lines.append(INSUFFICIENT_EVIDENCE_DISCLOSURE)
     block = "\n".join(lines)

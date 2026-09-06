@@ -10,8 +10,10 @@ from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.agents.specialist import PydanticAISpecialistActor
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
@@ -49,6 +51,12 @@ from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
 from app.langgraph_v2.conversation_context import ConversationExchange
+from app.langgraph_v2.specialist_retry import (
+    SpecialistFailureFacts,
+    SpecialistInvocationFailure,
+    SpecialistModelBoundary,
+    specialist_usage_limits,
+)
 from app.models.workflow import IntentResult, QueryUnderstandingOutput, ResolvedQuery
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
@@ -92,10 +100,46 @@ class _Specialist:
     def __init__(self) -> None:
         self.inputs: list[SpecialistTaskInput] = []
 
-    async def run(self, input: SpecialistTaskInput) -> SpecialistAttempt:
+    async def run(
+        self,
+        input: SpecialistTaskInput,
+        *,
+        usage: RunUsage | None = None,
+        usage_limits: UsageLimits | None = None,
+    ) -> SpecialistAttempt:
+        del usage, usage_limits
         self.inputs.append(input)
         return SpecialistAttempt(
             finding=SpecialistFindingDraft(summary="No-tool market finding")
+        )
+
+
+class _RetryExhaustedSpecialist:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(
+        self,
+        input: SpecialistTaskInput,
+        *,
+        usage: RunUsage | None = None,
+        usage_limits: UsageLimits | None = None,
+    ) -> SpecialistAttempt:
+        del input, usage_limits
+        assert usage is not None
+        self.calls += 1
+        usage.incr(RunUsage(requests=1))
+        raise SpecialistInvocationFailure(
+            ModelHTTPError(429, "specialist"),
+            facts=SpecialistFailureFacts(
+                boundary=SpecialistModelBoundary.AZURE_OPENAI,
+                at_model_request_boundary=True,
+                terminal_output_tool_rejected=False,
+                count_limit_exhausted=False,
+                unreturned_model_requests=0,
+                usage_limits=specialist_usage_limits(),
+            ),
+            messages=("retry-diagnostic",),
         )
 
 
@@ -360,6 +404,88 @@ def test_first_no_tool_specialist_is_accepted_before_conservative_done(
     assert len(state["accepted_batches"]) == 1
 
 
+def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    coordinator = _Coordinator()
+    specialist = _RetryExhaustedSpecialist()
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=coordinator,
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000088"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "What about it?", "sessionId": conversation_id},
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+        assert client.portal is not None
+        checkpoint = client.portal.call(
+            lambda: app.state.langgraph_v2_checkpointer.aget_tuple(
+                thread_checkpoint_config(
+                    thread_id=thread_id_for(
+                        "tenant-a", "subject-a", "agent", conversation_id
+                    )
+                )
+            )
+        )
+
+    done = [event for event in parse_sse(response.text) if event["type"] == "done"]
+    assert response.status_code == 200
+    assert specialist.calls == 3
+    assert len(done) == 1
+    assert done[0]["data"]["metadata"]["termination_reason"] == "partial_results"
+    assert "one requested task could not complete" in done[0]["data"]["answer"]
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    accepted = next(iter(state["accepted_batches"].values()))
+    assert accepted["outcomes"][0]["kind"] == "failed"
+    assert accepted["outcomes"][0]["task_id"].startswith("task_")
+    assert accepted["usage"] == {
+        "model_requests": 3,
+        "completed_tool_calls": 0,
+        "tool_attempts": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.0,
+        "cost_is_complete": True,
+    }
+    assert done[0]["data"]["metadata"]["specialist_usage"] == accepted["usage"]
+
+
 def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -460,7 +586,8 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
     assert any(
         event["type"] == "progress"
         and event.get("step") == "tool"
-        and event.get("data") == {
+        and event.get("data")
+        == {
             "task_id": "task_90fff3e68e9a59d229d7982b65c5fe8b",
             "tool_id": "filing_reader",
             "status": "completed",
@@ -793,8 +920,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
     assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
     assert "FULL-SKILL-REFERENCE-SENTINEL" not in repr(state)
     assert all(
-        "filing-analysis" not in input.model_dump_json()
-        for input in coordinator.inputs
+        "filing-analysis" not in input.model_dump_json() for input in coordinator.inputs
     )
 
 

@@ -39,6 +39,7 @@ from app.langgraph_v2.conversation_context import (
     to_model_message_history,
 )
 from app.langgraph_v2.pre_moderation import MockModerationProvider, ModerationProvider
+from app.langgraph_v2.specialist_retry import require_pinned_pydantic_ai_version
 from app.langgraph_v2.stream import RequestOwnedGraph
 from app.models.workflow import QueryUnderstandingOutput
 
@@ -124,6 +125,7 @@ def build_agent_runtime(
     synthesis_actor: SynthesisActor | None = None,
 ) -> AgentGraphRuntimeAdapter:
     """Build one Agent runtime from trusted Tenant configuration and dependencies."""
+    require_pinned_pydantic_ai_version()
     policies = (
         intent_policies
         if intent_policies is not None

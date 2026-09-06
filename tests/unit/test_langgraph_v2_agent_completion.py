@@ -49,3 +49,17 @@ def test_incomplete_research_collapses_newlines_and_escapes_blockquotes() -> Non
 
     assert "- \\> unavailable source" in answer
     assert "\nsource" not in answer
+
+
+def test_incomplete_research_discloses_expected_task_failure() -> None:
+    answer = render_incomplete_research(
+        "Published report.",
+        IncompleteResearch(
+            insufficient_evidence=False,
+            task_failures=1,
+        ),
+    )
+
+    assert answer.startswith(
+        "Incomplete research: one requested task could not complete.\n\n"
+    )

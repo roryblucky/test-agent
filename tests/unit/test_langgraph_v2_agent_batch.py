@@ -2,13 +2,16 @@
 
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import cast
 
 import pytest
 from pydantic import ValidationError
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import IncompleteToolCall, ModelHTTPError
+from pydantic_ai.messages import ModelRequest, ModelResponse
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.usage import RunUsage
+from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.langgraph_v2.agent_batch import (
     BatchContribution,
@@ -21,7 +24,10 @@ from app.langgraph_v2.agent_batch import (
     SpecialistRegistration,
     SpecialistRegistry,
     SpecialistResult,
+    SpecialistTaskInput,
+    SpecialistUsage,
     StructuredOutputInvalid,
+    TaskFailed,
     TaskProposal,
     TaskSkillPins,
     TaskSucceeded,
@@ -32,6 +38,7 @@ from app.langgraph_v2.agent_batch import (
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
+    RequestEvidenceCatalog,
     SpecialistToolCapture,
     ToolUnavailabilityRecord,
     ToolUnavailableReason,
@@ -43,6 +50,13 @@ from app.langgraph_v2.agent_skills import (
     SkillRegistration,
     SpecialistSkillRegistry,
 )
+from app.langgraph_v2.specialist_retry import (
+    SpecialistExecutionDiagnostics,
+    SpecialistFailureFacts,
+    SpecialistInvocationFailure,
+    SpecialistModelBoundary,
+    specialist_usage_limits,
+)
 
 
 class _Specialist:
@@ -51,17 +65,27 @@ class _Specialist:
         finding: SpecialistFindingDraft | None = None,
         skill_pins: tuple[SkillPin, ...] = (),
         unavailability: tuple[ToolUnavailabilityRecord, ...] = (),
+        evidence: tuple[EvidenceEnvelope, ...] = (),
     ) -> None:
         self.finding = finding or SpecialistFindingDraft(summary="No-tool finding")
         self.skill_pins = skill_pins
         self.unavailability = unavailability
+        self.evidence = evidence
 
-    async def run(self, input: object) -> SpecialistAttempt:
+    async def run(
+        self,
+        input: object,
+        *,
+        usage: RunUsage | None = None,
+        usage_limits: UsageLimits | None = None,
+    ) -> SpecialistAttempt:
         del input
+        del usage, usage_limits
         return SpecialistAttempt(
             finding=self.finding,
             skill_pins=self.skill_pins,
             unavailability=self.unavailability,
+            evidence=self.evidence,
         )
 
 
@@ -126,6 +150,8 @@ def _gap_registry(
     *,
     finding: SpecialistFindingDraft | None = None,
 ) -> SpecialistRegistry:
+    actor_attempt = 0
+
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         del source, query
         raise AssertionError("Direct Specialist actor must not call the binding")
@@ -135,8 +161,18 @@ def _gap_registry(
         tool_capture: object,
         skill_invocation: object,
     ) -> _Specialist:
+        nonlocal actor_attempt
         del tools, tool_capture, skill_invocation
-        return _Specialist(finding=finding, unavailability=records)
+        actor_attempt += 1
+        attempt_records = (
+            tuple(
+                record.model_copy(update={"attempt": actor_attempt})
+                for record in records
+            )
+            if all(record.attempt == 1 for record in records)
+            else records
+        )
+        return _Specialist(finding=finding, unavailability=attempt_records)
 
     return SpecialistRegistry(
         registrations=(
@@ -168,6 +204,21 @@ def _dispatch(*, context_task_ids: tuple[str, ...] = ()) -> DispatchBatch:
                 context_task_ids=context_task_ids,
             ),
         ),
+    )
+
+
+def _retry_failure(*, messages: tuple[object, ...] = ()) -> SpecialistInvocationFailure:
+    return SpecialistInvocationFailure(
+        ModelHTTPError(429, "specialist"),
+        facts=SpecialistFailureFacts(
+            boundary=SpecialistModelBoundary.AZURE_OPENAI,
+            at_model_request_boundary=True,
+            terminal_output_tool_rejected=False,
+            count_limit_exhausted=False,
+            unreturned_model_requests=0,
+            usage_limits=specialist_usage_limits(),
+        ),
+        messages=messages,
     )
 
 
@@ -348,8 +399,12 @@ def test_specialist_result_canonical_size_includes_data_gaps() -> None:
 
     assert exact.canonical_json_size() == 16 * 1024
     exact.require_canonical_size()
-    with pytest.raises(StructuredOutputInvalid, match="Specialist result exceeds 16 KiB"):
-        SpecialistResult(summary=f"{exact.summary}x", data_gaps=(gap,)).require_canonical_size()
+    with pytest.raises(
+        StructuredOutputInvalid, match="Specialist result exceeds 16 KiB"
+    ):
+        SpecialistResult(
+            summary=f"{exact.summary}x", data_gaps=(gap,)
+        ).require_canonical_size()
 
 
 @pytest.mark.asyncio
@@ -377,19 +432,411 @@ async def test_execute_specialist_enforces_the_16_kib_boundary_before_contributi
         context=_context(task_id=batch.tasks[0].id),
     )
 
+    assert isinstance(contribution.outcome, TaskSucceeded)
     assert contribution.outcome.result.summary == exact.summary
 
     too_large = SpecialistFindingDraft(summary=f"{exact.summary}x")
-    with pytest.raises(
-        StructuredOutputInvalid, match="Specialist result exceeds 16 KiB"
-    ):
-        await execute_specialist(
-            batch.tasks[0],
-            batch_id=batch.id,
-            registry=_registry(finding=too_large),
-            scope_descriptors=scope_descriptors,
-            context=_context(task_id=batch.tasks[0].id),
+    failed = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=_registry(finding=too_large),
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+    )
+
+    assert failed.attempt == 3
+    assert failed.outcome == TaskFailed(task_id=batch.tasks[0].id)
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_retries_fresh_actors_and_keeps_only_last_attempt() -> (
+    None
+):
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    build_count = 0
+
+    class _RetryingActor:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del input
+            assert usage is not None
+            assert usage_limits == specialist_usage_limits()
+            usage.incr(RunUsage(requests=4, tool_calls=2))
+            if self.attempt == 1:
+                raise _retry_failure(messages=("abandoned-message",))
+            return SpecialistAttempt(finding=SpecialistFindingDraft(summary="accepted"))
+
+    def factory(
+        tools: tuple[object, ...],
+        tool_capture: object,
+        skill_invocation: object,
+    ) -> _RetryingActor:
+        nonlocal build_count
+        del tools, tool_capture, skill_invocation
+        build_count += 1
+        return _RetryingActor(build_count)
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(id="market-data", actor_factory=factory),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+    diagnostics = SpecialistExecutionDiagnostics()
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+        diagnostics=diagnostics,
+    )
+
+    assert build_count == 2
+    assert contribution.attempt == 2
+    assert contribution.outcome == TaskSucceeded(
+        task_id=batch.tasks[0].id,
+        result=SpecialistResult(summary="accepted"),
+    )
+    assert contribution.usage.model_requests == 8
+    assert contribution.usage.completed_tool_calls == 4
+    assert diagnostics.failed_attempts[0].messages == ("abandoned-message",)
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_returns_task_failed_after_third_retry() -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    build_count = 0
+
+    class _AlwaysRetryingActor:
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del input, usage_limits
+            assert usage is not None
+            usage.incr(RunUsage(requests=1))
+            raise _retry_failure()
+
+    def factory(
+        tools: tuple[object, ...],
+        tool_capture: object,
+        skill_invocation: object,
+    ) -> _AlwaysRetryingActor:
+        nonlocal build_count
+        del tools, tool_capture, skill_invocation
+        build_count += 1
+        return _AlwaysRetryingActor()
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(id="market-data", actor_factory=factory),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+    )
+
+    assert build_count == 3
+    assert contribution.attempt == 3
+    assert contribution.outcome == TaskFailed(task_id=batch.tasks[0].id)
+    assert contribution.usage.model_requests == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_feeds_validation_failure_to_a_fresh_attempt() -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    inputs: list[SpecialistTaskInput] = []
+    failed_message = ModelRequest(parts=[])
+
+    class _ValidationRetryingActor:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del usage, usage_limits
+            inputs.append(input)
+            if self.attempt == 1:
+                return SpecialistAttempt(
+                    finding=SpecialistFindingDraft(summary="x" * (16 * 1024)),
+                    messages=(failed_message,),
+                )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(summary="accepted"),
+            )
+
+    actor_count = 0
+
+    def factory(
+        tools: tuple[object, ...],
+        tool_capture: object,
+        skill_invocation: object,
+    ) -> _ValidationRetryingActor:
+        nonlocal actor_count
+        del tools, tool_capture, skill_invocation
+        actor_count += 1
+        return _ValidationRetryingActor(actor_count)
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(id="market-data", actor_factory=factory),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+    diagnostics = SpecialistExecutionDiagnostics()
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+        diagnostics=diagnostics,
+    )
+
+    assert contribution.attempt == 2
+    assert inputs[0].validation_feedback is None
+    assert inputs[1].validation_feedback == (
+        "Return one valid structured Specialist finding within all stated "
+        "output limits."
+    )
+    assert diagnostics.failed_attempts[0].messages == (failed_message,)
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_feeds_sdk_output_rejection_to_a_fresh_attempt() -> (
+    None
+):
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    inputs: list[SpecialistTaskInput] = []
+
+    class _StructuredOutputRetryingActor:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del usage, usage_limits
+            inputs.append(input)
+            if self.attempt == 1:
+                raise SpecialistInvocationFailure(
+                    IncompleteToolCall("final_result was truncated"),
+                    facts=SpecialistFailureFacts(
+                        boundary=SpecialistModelBoundary.AZURE_OPENAI,
+                        at_model_request_boundary=False,
+                        terminal_output_tool_rejected=True,
+                        count_limit_exhausted=False,
+                        unreturned_model_requests=0,
+                        usage_limits=specialist_usage_limits(),
+                    ),
+                    messages=(),
+                )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(summary="accepted"),
+            )
+
+    actor_count = 0
+
+    def factory(
+        tools: tuple[object, ...],
+        tool_capture: object,
+        skill_invocation: object,
+    ) -> _StructuredOutputRetryingActor:
+        nonlocal actor_count
+        del tools, tool_capture, skill_invocation
+        actor_count += 1
+        return _StructuredOutputRetryingActor(actor_count)
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(id="market-data", actor_factory=factory),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+    )
+
+    assert contribution.attempt == 2
+    assert inputs[1].validation_feedback == (
+        "Return one valid final_result structured Specialist finding."
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_reports_priced_model_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+
+    class _Price:
+        total_price = Decimal("1.25")
+
+    def cost(_response: ModelResponse) -> _Price:
+        return _Price()
+
+    monkeypatch.setattr(ModelResponse, "cost", cost)
+    response = ModelResponse(parts=[], model_name="priced-model")
+
+    class _PricedActor:
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del input, usage_limits
+            assert usage is not None
+            usage.incr(RunUsage(requests=1, input_tokens=4, output_tokens=2))
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(summary="accepted"),
+                messages=(response,),
+            )
+
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=_PricedActor()),),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+    )
+    accepted = promote_batch(batch, {contribution.task_id: contribution})
+
+    assert contribution.usage.cost_usd == 1.25
+    assert contribution.usage.cost_is_complete
+    assert accepted.usage.cost_usd == 1.25
+    assert accepted.usage.cost_is_complete
+    assert SpecialistUsage().add(SpecialistUsage(cost_usd=1.25)).cost_usd == 1.25
+
+
+@pytest.mark.asyncio
+async def test_evidence_cache_overflow_stages_task_failed_without_evidence_ids() -> (
+    None
+):
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    oversized = EvidenceEnvelope(
+        id="evidence-too-large",
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task-placeholder",
+        source="filing",
+        source_url="https://example.test/filing",
+        title="Annual filing",
+        body="x" * (16 * 1024 + 1),
+        excerpt="Too large.",
+        as_of_date=date(2026, 9, 6),
+    )
+    specialist = _Specialist(
+        finding=SpecialistFindingDraft(
+            summary="Oversized evidence",
+            evidence_ids=(oversized.id,),
         )
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+    specialist.evidence = (oversized.model_copy(update={"task_id": batch.tasks[0].id}),)
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        catalog=RequestEvidenceCatalog(),
+        context=_context(task_id=batch.tasks[0].id),
+    )
+
+    assert contribution.attempt == 1
+    assert contribution.outcome == TaskFailed(task_id=batch.tasks[0].id)
 
 
 @pytest.mark.asyncio
@@ -428,7 +875,9 @@ async def test_execute_specialist_persists_only_activated_skill_pins() -> None:
     accepted = promote_batch(batch, {contribution.task_id: contribution})
 
     assert contribution.skill_pins == (pin,)
-    assert accepted.skill_pins == (TaskSkillPins(task_id=batch.tasks[0].id, pins=(pin,)),)
+    assert accepted.skill_pins == (
+        TaskSkillPins(task_id=batch.tasks[0].id, pins=(pin,)),
+    )
 
 
 @pytest.mark.asyncio
@@ -455,6 +904,7 @@ async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record(
         context=_context(task_id=batch.tasks[0].id),
     )
 
+    assert isinstance(contribution.outcome, TaskSucceeded)
     gap = contribution.outcome.result.data_gaps[0]
     assert gap.requested_coverage == "Apple revenue"
     assert gap.reason is ToolUnavailableReason.SOURCE_UNREACHABLE
@@ -498,23 +948,25 @@ async def test_execute_specialist_checks_result_size_after_deriving_data_gaps() 
         context=_context(task_id=batch.tasks[0].id),
     )
 
+    assert isinstance(contribution.outcome, TaskSucceeded)
     assert contribution.outcome.result.canonical_json_size() == 16 * 1024
-    with pytest.raises(StructuredOutputInvalid, match="Specialist result exceeds 16 KiB"):
-        await execute_specialist(
-            batch.tasks[0],
-            batch_id=batch.id,
-            registry=_gap_registry(
-                (record,),
-                finding=SpecialistFindingDraft(summary=f"{exact.summary}x"),
-            ),
-            scope_descriptors=scope_descriptors,
-            context=_context(task_id=batch.tasks[0].id),
-        )
+    failed = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=_gap_registry(
+            (record,),
+            finding=SpecialistFindingDraft(summary=f"{exact.summary}x"),
+        ),
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+    )
+
+    assert failed.attempt == 3
+    assert failed.outcome == TaskFailed(task_id=batch.tasks[0].id)
 
 
 @pytest.mark.asyncio
-async def test_execute_specialist_rejects_conflicting_tool_call_provenance(
-) -> None:
+async def test_execute_specialist_rejects_conflicting_tool_call_provenance() -> None:
     scope_descriptors = (
         SpecialistDescriptor(id="market-data", description="Market data"),
     )
@@ -590,9 +1042,7 @@ async def test_execute_specialist_rejects_ineligible_data_gap_provenance(
     record_values = {"task_id": batch.tasks[0].id, **overrides}
     record_task_id = record_values.pop("task_id")
     assert isinstance(record_task_id, str)
-    record = _unavailability_record(
-        task_id=record_task_id, **record_values
-    )
+    record = _unavailability_record(task_id=record_task_id, **record_values)
 
     with pytest.raises(ValueError, match=message):
         await execute_specialist(
@@ -648,7 +1098,9 @@ def test_data_gap_enforces_bounds_and_hides_internal_provenance() -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_freezes_tool_and_source_intersection_before_provider_access() -> None:
+async def test_registry_freezes_tool_and_source_intersection_before_provider_access() -> (
+    None
+):
     calls: list[tuple[str, str]] = []
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
@@ -773,14 +1225,10 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
     assert captured == [()]
 
 
-def test_registry_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> (
-    None
-):
+def test_registry_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> None:
     direct_actor = _Specialist()
     registry = SpecialistRegistry(
-        registrations=(
-            SpecialistRegistration(id="market-data", actor=direct_actor),
-        ),
+        registrations=(SpecialistRegistration(id="market-data", actor=direct_actor),),
         tenant_eligible_ids=frozenset({"market-data"}),
         skill_registry=SpecialistSkillRegistry(
             registrations=(
@@ -887,7 +1335,9 @@ def test_registry_binds_skill_activation_without_expanding_frozen_business_tools
         "shared-skill",
         "market-skill",
     ]
-    assert invocation.activate("shared-skill").instructions == "SHARED-FULL-INSTRUCTIONS"
+    assert (
+        invocation.activate("shared-skill").instructions == "SHARED-FULL-INSTRUCTIONS"
+    )
 
 
 def _tool_name(tool: Callable[..., object]) -> str:

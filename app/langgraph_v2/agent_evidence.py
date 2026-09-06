@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import threading
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -20,6 +22,8 @@ from app.models.workflow import CitationReference
 _EVIDENCE_MARKER = re.compile(r"\[\[E:([1-9][0-9]*)\]\]")
 _MARKER_LIKE = re.compile(r"\[\[\s*E\s*:")
 _TOOL_RETURN_MAX_BYTES = 4 * 1024
+_EVIDENCE_BODY_MAX_BYTES = 16 * 1024
+_REQUEST_EVIDENCE_BODY_MAX_BYTES = 8 * 1024 * 1024
 DATA_GAP_TEXT_MAX_BYTES = 256
 DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS = 64
 TOOL_TIMEOUT_SECONDS = 20
@@ -164,6 +168,14 @@ class EvidenceEnvelope(BaseModel):
     raw_provider_payload: str | None = None
 
 
+class EvidenceCacheCapacityExceeded(ValueError):
+    """Reject a request-local Evidence write that would exceed a hard cache cap."""
+
+
+class EvidenceReferenceInvalid(ValueError):
+    """Reject a model-authored Evidence ID absent from its terminal Tool output."""
+
+
 @dataclass
 class SpecialistToolCapture:
     """One actor invocation's app-only Evidence and unavailable Tool records."""
@@ -254,9 +266,7 @@ def _unavailability_record(
     )
 
 
-def _same_canonical_evidence(
-    left: EvidenceEnvelope, right: EvidenceEnvelope
-) -> bool:
+def _same_canonical_evidence(left: EvidenceEnvelope, right: EvidenceEnvelope) -> bool:
     """Compare accepted Evidence while excluding noncanonical provider payload."""
     excluded = {"raw_provider_payload"}
     return left.model_dump(exclude=excluded) == right.model_dump(exclude=excluded)
@@ -294,9 +304,7 @@ def bind_evidence_tool(
         source_is_safe = _is_projectable_data_gap_text(source)
         unavailable = _bounded_unavailable(
             reason=(
-                reason
-                if source_is_safe
-                else ToolUnavailableReason.RESPONSE_UNUSABLE
+                reason if source_is_safe else ToolUnavailableReason.RESPONSE_UNUSABLE
             ),
             requested_coverage=query,
         )
@@ -386,11 +394,21 @@ def bind_evidence_tool(
 
 @dataclass
 class RequestEvidenceCatalog:
-    """Hold only Finding-referenced Evidence bodies for one active request."""
+    """Hold request-local Evidence bodies and mark only references publishable."""
 
     _evidence: dict[str, EvidenceEnvelope] = field(
         default_factory=dict[str, EvidenceEnvelope]
     )
+    _accepted_ids: set[str] = field(default_factory=set[str])
+    _body_sizes: dict[str, int] = field(default_factory=dict[str, int])
+    _total_body_bytes: int = 0
+    _lock: Any = field(default_factory=threading.RLock, repr=False)
+
+    @property
+    def cached_body_bytes(self) -> int:
+        """Expose the request-local unique-body footprint for capacity tests."""
+        with self._lock:
+            return self._total_body_bytes
 
     def accept_referenced(
         self,
@@ -399,35 +417,55 @@ class RequestEvidenceCatalog:
         finding_evidence_ids: tuple[str, ...],
         context: EvidenceInvocationContext,
     ) -> None:
-        """Accept exact successful provenance referenced by the terminal Finding."""
+        """Cache returned bodies and mark only Finding references publishable."""
         returned_items = tuple(returned)
-        returned_by_id: dict[str, EvidenceEnvelope] = {}
-        for evidence in returned_items:
-            existing_returned = returned_by_id.get(evidence.id)
-            if existing_returned is not None and not _same_canonical_evidence(
-                existing_returned, evidence
-            ):
-                raise ValueError("Evidence provenance conflicts")
-            returned_by_id[evidence.id] = evidence
-        accepted: list[EvidenceEnvelope] = []
-        for evidence_id in finding_evidence_ids:
-            evidence = returned_by_id.get(evidence_id)
-            if evidence is None:
-                raise ValueError("Evidence provenance is missing")
-            if (
-                evidence.tenant_id != context.tenant_id
-                or evidence.request_id != context.request_id
-                or evidence.task_id != context.task_id
-            ):
-                raise ValueError("Evidence provenance is not eligible")
-            existing = self._evidence.get(evidence.id)
-            if existing is not None and not _same_canonical_evidence(
-                existing, evidence
-            ):
-                raise ValueError("Evidence body conflicts")
-            accepted.append(evidence)
-        for evidence in accepted:
-            self._evidence[evidence.id] = evidence
+        with self._lock:
+            returned_by_id: dict[str, EvidenceEnvelope] = {}
+            for evidence in returned_items:
+                existing_returned = returned_by_id.get(evidence.id)
+                if existing_returned is not None and not _same_canonical_evidence(
+                    existing_returned, evidence
+                ):
+                    raise ValueError("Evidence provenance conflicts")
+                returned_by_id[evidence.id] = evidence
+            for evidence_id in finding_evidence_ids:
+                evidence = returned_by_id.get(evidence_id)
+                if evidence is None:
+                    raise EvidenceReferenceInvalid("Evidence provenance is missing")
+                if (
+                    evidence.tenant_id != context.tenant_id
+                    or evidence.request_id != context.request_id
+                    or evidence.task_id != context.task_id
+                ):
+                    raise ValueError("Evidence provenance is not eligible")
+            for evidence in returned_items:
+                if (
+                    evidence.tenant_id != context.tenant_id
+                    or evidence.request_id != context.request_id
+                    or evidence.task_id != context.task_id
+                ):
+                    raise ValueError("Evidence provenance is not eligible")
+                existing = self._evidence.get(evidence.id)
+                if existing is not None and not _same_canonical_evidence(
+                    existing, evidence
+                ):
+                    raise ValueError("Evidence body conflicts")
+                body_size = len(evidence.body.encode("utf-8"))
+                if body_size > _EVIDENCE_BODY_MAX_BYTES:
+                    raise EvidenceCacheCapacityExceeded("Evidence body exceeds 16 KiB")
+                body_hash = hashlib.sha256(evidence.body.encode("utf-8")).hexdigest()
+                if body_hash not in self._body_sizes:
+                    if (
+                        self._total_body_bytes + body_size
+                        > _REQUEST_EVIDENCE_BODY_MAX_BYTES
+                    ):
+                        raise EvidenceCacheCapacityExceeded(
+                            "Request Evidence cache exceeds 8 MiB"
+                        )
+                    self._body_sizes[body_hash] = body_size
+                    self._total_body_bytes += body_size
+                self._evidence[evidence.id] = evidence
+            self._accepted_ids.update(finding_evidence_ids)
 
     def resolve(
         self,
@@ -439,22 +477,24 @@ class RequestEvidenceCatalog:
         max_evidence_age_days: int | None = None,
     ) -> EvidenceEnvelope:
         """Return only Evidence owned by this active Tenant Request."""
-        evidence = self._evidence.get(evidence_id)
-        if (
-            evidence is None
-            or evidence.tenant_id != tenant_id
-            or evidence.request_id != request_id
-            or (
-                as_of_date is not None
-                and (
-                    evidence.as_of_date > as_of_date
-                    or (as_of_date - evidence.as_of_date).days
-                    > (max_evidence_age_days or 0)
+        with self._lock:
+            evidence = self._evidence.get(evidence_id)
+            if (
+                evidence is None
+                or evidence_id not in self._accepted_ids
+                or evidence.tenant_id != tenant_id
+                or evidence.request_id != request_id
+                or (
+                    as_of_date is not None
+                    and (
+                        evidence.as_of_date > as_of_date
+                        or (as_of_date - evidence.as_of_date).days
+                        > (max_evidence_age_days or 0)
+                    )
                 )
-            )
-        ):
-            raise ValueError("Evidence is not accepted")
-        return evidence
+            ):
+                raise ValueError("Evidence is not accepted")
+            return evidence
 
 
 class PreparedEvidence(BaseModel):

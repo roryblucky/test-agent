@@ -10,12 +10,17 @@ from datetime import UTC, datetime
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic_ai.exceptions import IncompleteToolCall, UnexpectedModelBehavior
+from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.langgraph_v2.agent_evidence import (
     DataGapView,
+    EvidenceCacheCapacityExceeded,
     EvidenceEnvelope,
     EvidenceInvocationContext,
     EvidenceProvider,
+    EvidenceReferenceInvalid,
     ExpectedToolUnavailability,
     RequestEvidenceCatalog,
     SpecialistToolCapture,
@@ -31,6 +36,14 @@ from app.langgraph_v2.agent_skills import (
     SkillInvocation,
     SkillPin,
     SpecialistSkillRegistry,
+)
+from app.langgraph_v2.specialist_retry import (
+    SPECIALIST_MAX_ATTEMPTS,
+    RetryDisposition,
+    SpecialistExecutionDiagnostics,
+    SpecialistInvocationFailure,
+    classify_specialist_failure,
+    specialist_usage_limits,
 )
 
 _SPECIALIST_OUTPUT_MAX_BYTES = 16 * 1024
@@ -173,6 +186,7 @@ class SpecialistAttempt(BaseModel):
     evidence: tuple[EvidenceEnvelope, ...] = ()
     unavailability: tuple[ToolUnavailabilityRecord, ...] = ()
     skill_pins: tuple[SkillPin, ...] = ()
+    messages: tuple[ModelMessage, ...] = ()
 
 
 def _derive_data_gaps(
@@ -237,6 +251,70 @@ class TaskSucceeded(BaseModel):
     result: SpecialistResult
 
 
+class TaskFailed(BaseModel):
+    """Platform-owned expected terminal Task inability without diagnostics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["failed"] = "failed"
+    task_id: str
+
+
+TaskOutcome = TaskSucceeded | TaskFailed
+
+
+class SpecialistUsage(BaseModel):
+    """Graph-owned cumulative Specialist accounting for one Task."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model_requests: int = Field(default=0, ge=0)
+    completed_tool_calls: int = Field(default=0, ge=0)
+    tool_attempts: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_write_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0, ge=0)
+    cost_is_complete: bool = True
+
+    @classmethod
+    def from_run_usage(
+        cls,
+        usage: RunUsage,
+        *,
+        tool_attempts: int,
+        cost_usd: float,
+        cost_is_complete: bool,
+    ) -> SpecialistUsage:
+        """Project usage without inventing cost that the provider did not return."""
+        return cls(
+            model_requests=usage.requests,
+            completed_tool_calls=usage.tool_calls,
+            tool_attempts=tool_attempts,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cost_usd=cost_usd,
+            cost_is_complete=cost_is_complete,
+        )
+
+    def add(self, other: SpecialistUsage) -> SpecialistUsage:
+        """Return a deterministic aggregate without placing usage in an Outcome."""
+        return SpecialistUsage(
+            model_requests=self.model_requests + other.model_requests,
+            completed_tool_calls=self.completed_tool_calls + other.completed_tool_calls,
+            tool_attempts=self.tool_attempts + other.tool_attempts,
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+            cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
+            cost_usd=self.cost_usd + other.cost_usd,
+            cost_is_complete=self.cost_is_complete and other.cost_is_complete,
+        )
+
+
 class BatchContribution(BaseModel):
     """One immutable terminal result staged by a Specialist branch."""
 
@@ -244,8 +322,9 @@ class BatchContribution(BaseModel):
 
     batch_id: str
     task_id: str
-    attempt: Literal[1]
-    outcome: TaskSucceeded
+    attempt: int = Field(ge=1, le=SPECIALIST_MAX_ATTEMPTS)
+    outcome: TaskOutcome
+    usage: SpecialistUsage = Field(default_factory=SpecialistUsage)
     skill_pins: tuple[SkillPin, ...] = ()
 
 
@@ -264,7 +343,8 @@ class AcceptedBatch(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: str
-    outcomes: tuple[TaskSucceeded, ...]
+    outcomes: tuple[TaskOutcome, ...]
+    usage: SpecialistUsage = Field(default_factory=SpecialistUsage)
     skill_pins: tuple[TaskSkillPins, ...] = ()
 
 
@@ -293,7 +373,13 @@ class ActiveBatch:
 class SpecialistActor(Protocol):
     """Execute one bounded Specialist Task without exposing Tools to graph code."""
 
-    async def run(self, input: SpecialistTaskInput) -> SpecialistAttempt:
+    async def run(
+        self,
+        input: SpecialistTaskInput,
+        *,
+        usage: RunUsage | None = None,
+        usage_limits: UsageLimits | None = None,
+    ) -> SpecialistAttempt:
         """Return one terminal finding plus app-only Tool metadata."""
         ...
 
@@ -470,6 +556,7 @@ class SpecialistTaskInput:
 
     task_id: str
     objective: str
+    validation_feedback: str | None = None
 
 
 def accept_initial_dispatch(
@@ -513,55 +600,199 @@ async def execute_specialist(
     context: EvidenceInvocationContext,
     scope_skill_names: frozenset[str] = frozenset(),
     tool_telemetry: ToolTelemetry | None = None,
+    diagnostics: SpecialistExecutionDiagnostics | None = None,
 ) -> BatchContribution:
-    """Run one registered bounded Specialist and stage its terminal outcome."""
+    """Run up to three fresh bounded attempts and stage one terminal Outcome."""
     registration = registry.resolve(
         task.specialist_id, scope_descriptors=scope_descriptors
     )
-    actor = registry.bind_actor(
-        registration,
-        context=context,
-        scope_skill_names=scope_skill_names,
-        tool_telemetry=tool_telemetry,
-    )
-    attempt = await actor.run(
-        SpecialistTaskInput(task_id=task.id, objective=task.objective)
-    )
-    draft = attempt.finding
-    draft.require_canonical_size()
-    if catalog is None:
-        if attempt.evidence:
-            raise ValueError("Evidence cache is not configured")
-    else:
-        catalog.accept_referenced(
-            attempt.evidence,
-            finding_evidence_ids=draft.evidence_ids,
-            context=context,
-        )
-    data_gaps = _derive_data_gaps(
-        attempt.unavailability,
-        context=context,
-        effective_tool_ids=registry.effective_tool_ids(
-            registration,
-            scope_tool_ids=context.allowed_tool_ids,
-        ),
-    )
-    result = SpecialistResult(
-        summary=draft.summary,
-        evidence_ids=draft.evidence_ids,
-        data_gaps=data_gaps,
-    )
-    result.require_canonical_size()
-    return BatchContribution(
-        batch_id=batch_id,
-        task_id=task.id,
-        attempt=1,
-        outcome=TaskSucceeded(
+    cumulative_usage = RunUsage()
+    cumulative_tool_attempts = 0
+    cumulative_cost_usd = 0.0
+    cumulative_cost_is_complete = True
+    usage_limits = specialist_usage_limits()
+    assert usage_limits.request_limit is not None
+    assert usage_limits.tool_calls_limit is not None
+
+    def failed_contribution(attempt_number: int) -> BatchContribution:
+        return BatchContribution(
+            batch_id=batch_id,
             task_id=task.id,
-            result=result,
-        ),
-        skill_pins=attempt.skill_pins,
+            attempt=attempt_number,
+            outcome=TaskFailed(task_id=task.id),
+            usage=SpecialistUsage.from_run_usage(
+                cumulative_usage,
+                tool_attempts=cumulative_tool_attempts,
+                cost_usd=cumulative_cost_usd,
+                cost_is_complete=cumulative_cost_is_complete,
+            ),
+        )
+
+    def record_validation_failure(
+        attempt_number: int,
+        attempt: SpecialistAttempt,
+    ) -> None:
+        if diagnostics is not None:
+            diagnostics.record_failed_attempt(
+                attempt=attempt_number,
+                messages=tuple(attempt.messages),
+            )
+
+    validation_feedback: str | None = None
+    for attempt_number in range(1, SPECIALIST_MAX_ATTEMPTS + 1):
+        attempt_context = context.model_copy(update={"attempt": attempt_number})
+        actor = registry.bind_actor(
+            registration,
+            context=attempt_context,
+            scope_skill_names=scope_skill_names,
+            tool_telemetry=tool_telemetry,
+        )
+        try:
+            attempt = await actor.run(
+                SpecialistTaskInput(
+                    task_id=task.id,
+                    objective=task.objective,
+                    validation_feedback=validation_feedback,
+                ),
+                usage=cumulative_usage,
+                usage_limits=usage_limits,
+            )
+        except SpecialistInvocationFailure as failure:
+            cumulative_tool_attempts += _tool_attempt_count(failure.messages)
+            attempt_cost_usd, attempt_cost_is_complete = _message_cost_usd(
+                failure.messages
+            )
+            cumulative_cost_usd += attempt_cost_usd
+            cumulative_cost_is_complete = (
+                cumulative_cost_is_complete
+                and attempt_cost_is_complete
+                and failure.facts.unreturned_model_requests == 0
+            )
+            if diagnostics is not None:
+                diagnostics.record_failed_attempt(
+                    attempt=attempt_number,
+                    messages=failure.messages,
+                )
+            disposition = classify_specialist_failure(
+                failure.error, facts=failure.facts
+            )
+            if disposition is RetryDisposition.TASK_FAILED:
+                return failed_contribution(attempt_number)
+            if disposition is RetryDisposition.RETRY:
+                if attempt_number == SPECIALIST_MAX_ATTEMPTS:
+                    return failed_contribution(attempt_number)
+                if isinstance(
+                    failure.error, (IncompleteToolCall, UnexpectedModelBehavior)
+                ):
+                    validation_feedback = (
+                        "Return one valid final_result structured Specialist finding."
+                    )
+                continue
+            raise failure.error
+
+        cumulative_tool_attempts += _tool_attempt_count(attempt.messages)
+        attempt_cost_usd, attempt_cost_is_complete = _message_cost_usd(
+            attempt.messages
+        )
+        cumulative_cost_usd += attempt_cost_usd
+        cumulative_cost_is_complete = (
+            cumulative_cost_is_complete and attempt_cost_is_complete
+        )
+
+        if (
+            cumulative_usage.requests > usage_limits.request_limit
+            or cumulative_usage.tool_calls > usage_limits.tool_calls_limit
+        ):
+            return failed_contribution(attempt_number)
+
+        try:
+            draft = attempt.finding
+            draft.require_canonical_size()
+            data_gaps = _derive_data_gaps(
+                attempt.unavailability,
+                context=attempt_context,
+                effective_tool_ids=registry.effective_tool_ids(
+                    registration,
+                    scope_tool_ids=context.allowed_tool_ids,
+                ),
+            )
+            result = SpecialistResult(
+                summary=draft.summary,
+                evidence_ids=draft.evidence_ids,
+                data_gaps=data_gaps,
+            )
+            result.require_canonical_size()
+        except StructuredOutputInvalid:
+            record_validation_failure(attempt_number, attempt)
+            if attempt_number == SPECIALIST_MAX_ATTEMPTS:
+                return failed_contribution(attempt_number)
+            validation_feedback = (
+                "Return one valid structured Specialist finding within all stated "
+                "output limits."
+            )
+            continue
+
+        if catalog is None:
+            if attempt.evidence or draft.evidence_ids:
+                raise ValueError("Evidence cache is not configured")
+        else:
+            try:
+                catalog.accept_referenced(
+                    attempt.evidence,
+                    finding_evidence_ids=draft.evidence_ids,
+                    context=attempt_context,
+                )
+            except EvidenceCacheCapacityExceeded:
+                return failed_contribution(attempt_number)
+            except EvidenceReferenceInvalid:
+                record_validation_failure(attempt_number, attempt)
+                if attempt_number == SPECIALIST_MAX_ATTEMPTS:
+                    return failed_contribution(attempt_number)
+                validation_feedback = (
+                    "Reference only Evidence IDs returned by this Specialist run."
+                )
+                continue
+        return BatchContribution(
+            batch_id=batch_id,
+            task_id=task.id,
+            attempt=attempt_number,
+            outcome=TaskSucceeded(task_id=task.id, result=result),
+            usage=SpecialistUsage.from_run_usage(
+                cumulative_usage,
+                tool_attempts=cumulative_tool_attempts,
+                cost_usd=cumulative_cost_usd,
+                cost_is_complete=cumulative_cost_is_complete,
+            ),
+            skill_pins=attempt.skill_pins,
+        )
+    raise AssertionError("Specialist attempts did not reach a terminal outcome")
+
+
+def _tool_attempt_count(messages: Sequence[object]) -> int:
+    """Count model-issued business Tool calls, excluding structured output."""
+    return sum(
+        isinstance(part, ToolCallPart) and part.tool_name != "final_result"
+        for message in messages
+        if isinstance(message, ModelResponse)
+        for part in message.parts
     )
+
+
+def _message_cost_usd(messages: Sequence[object]) -> tuple[float, bool]:
+    """Sum provider prices and mark accounting partial when pricing is absent."""
+    cost_usd = 0.0
+    is_complete = True
+    for message in messages:
+        if not isinstance(message, ModelResponse):
+            continue
+        if message.model_name is None:
+            is_complete = False
+            continue
+        try:
+            cost_usd += float(message.cost().total_price)
+        except LookupError:
+            is_complete = False
+    return cost_usd, is_complete
 
 
 def promote_batch(
@@ -576,13 +807,17 @@ def promote_batch(
         contribution.batch_id != batch.id
         or contribution.task_id != contribution.outcome.task_id
         or contribution.task_id not in batch.task_ids
-        or contribution.attempt != 1
+        or not 1 <= contribution.attempt <= SPECIALIST_MAX_ATTEMPTS
         for contribution in ordered
     ):
         raise ValueError("Batch contribution manifest is invalid")
+    usage = SpecialistUsage()
+    for contribution in ordered:
+        usage = usage.add(contribution.usage)
     return AcceptedBatch(
         id=batch.id,
         outcomes=tuple(item.outcome for item in ordered),
+        usage=usage,
         skill_pins=tuple(
             TaskSkillPins(task_id=item.task_id, pins=item.skill_pins)
             for item in ordered

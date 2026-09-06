@@ -14,7 +14,7 @@ dependencies = [
     "azure-ai-contentsafety>=1.0.0",
     "aiohttp>=3.10.0",
     "pydantic>=2.12.5",
-    "pydantic-ai>=1.93.0",
+    "pydantic-ai==1.93.0",
     "pydantic-settings>=2.12.0",
     "redis>=7.1.1",
     "opentelemetry-api>=1.24.0",

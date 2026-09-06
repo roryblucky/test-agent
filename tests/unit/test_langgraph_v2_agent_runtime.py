@@ -2,11 +2,14 @@
 
 from typing import Any, cast
 
+import pydantic_ai.models as models
 import pytest
 from fastapi import FastAPI
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
-from pydantic_ai import Agent
+from pydantic_ai import Agent, capture_run_messages
+from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from app.agents.coordinator import (
@@ -85,6 +88,60 @@ async def test_coordinator_runs_real_pydantic_actor_with_fixed_limits() -> None:
     assert decision == Finish(kind="finish")
     assert COORDINATOR_TIMEOUT_SECONDS == 60
     assert COORDINATOR_MAX_TOKENS == 1500
+
+
+@pytest.mark.asyncio
+async def test_coordinator_function_model_captures_one_toolless_overrideable_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
+    calls: list[str] = []
+
+    def finish_response(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> ModelResponse:
+        calls.append("default")
+        assert len(messages) == 1
+        assert info.function_tools == []
+        assert info.model_settings == {"max_tokens": COORDINATOR_MAX_TOKENS}
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name=info.output_tools[0].name, args={"kind": "finish"})]
+        )
+
+    def override_response(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> ModelResponse:
+        calls.append("override")
+        assert len(messages) == 1
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name=info.output_tools[0].name, args={"kind": "finish"})]
+        )
+
+    agent = Agent(
+        FunctionModel(finish_response),
+        output_type=cast(type[Any], CoordinatorDecision),
+        tools=(),
+        retries=0,
+        tool_retries=0,
+        output_retries=0,
+        end_strategy="early",
+    )
+    actor = PydanticAICoordinatorActor(agent)
+    input = CoordinatorInput(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        specialist_descriptors=(),
+    )
+
+    with capture_run_messages() as messages:
+        assert await actor.decide(input) == Finish(kind="finish")
+    with agent.override(model=FunctionModel(override_response)):
+        assert await actor.decide(input) == Finish(kind="finish")
+
+    assert calls == ["default", "override"]
+    assert len(messages) == 3
+    assert isinstance(messages[1], ModelResponse)
+    assert messages[1].usage.requests == 1
 
 
 def test_finish_requires_its_discriminator() -> None:

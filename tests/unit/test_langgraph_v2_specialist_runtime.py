@@ -4,9 +4,11 @@ import asyncio
 from datetime import date
 from typing import cast
 
+import httpx
 import pydantic_ai.models as models
 import pytest
 from pydantic_ai import Agent, capture_run_messages
+from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -15,8 +17,12 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.providers.azure import AzureProvider
+from pydantic_ai.usage import RunUsage
 
+import app.agents.specialist as specialist_module
 import app.langgraph_v2.agent_evidence as agent_evidence
 from app.agents.specialist import (
     SPECIALIST_MAX_TOKENS,
@@ -40,6 +46,14 @@ from app.langgraph_v2.agent_skills import (
     SkillReference,
     SkillRegistration,
     SpecialistSkillRegistry,
+)
+from app.langgraph_v2.specialist_retry import (
+    RetryDisposition,
+    SpecialistInvocationFailure,
+    SpecialistModelBoundary,
+    SpecialistModelRequestTimeout,
+    classify_specialist_failure,
+    specialist_usage_limits,
 )
 
 
@@ -222,6 +236,7 @@ async def test_no_tool_specialist_returns_one_structured_finding() -> None:
         )
 
     assert finding.finding == SpecialistFindingDraft(summary="No-tool finding")
+    assert finding.messages == tuple(messages)
     assert len(messages) == 3
     assert isinstance(messages[1], ModelResponse)
     assert messages[1].usage.requests == 1
@@ -262,6 +277,7 @@ async def test_specialist_function_model_has_one_request_and_structured_trace() 
         )
 
     assert finding.finding == SpecialistFindingDraft(summary="No-tool finding")
+    assert finding.messages == tuple(messages)
     assert len(captures) == 1
     assert captures[0][1].function_tools == []
     assert captures[0][1].model_settings == {
@@ -607,7 +623,7 @@ async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
     calls = 0
 
     def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        del messages
+        del messages, info
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -639,3 +655,265 @@ async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
 
     assert actor.tool_capture.evidence == []
     assert actor.tool_capture.unavailability == []
+
+
+@pytest.mark.asyncio
+async def test_specialist_charges_a_provider_failure_without_a_usage_response() -> None:
+    model_calls = 0
+
+    async def lookup() -> str:
+        return "available"
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name="lookup", args={})])
+        raise ModelHTTPError(429, "function")
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(lookup,),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    usage = RunUsage()
+
+    with pytest.raises(SpecialistInvocationFailure) as raised:
+        await actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess."),
+            usage=usage,
+        )
+
+    assert model_calls == 2
+    assert usage.requests == 2
+    assert raised.value.facts.boundary is SpecialistModelBoundary.UNKNOWN
+    assert classify_specialist_failure(
+        raised.value.error, facts=raised.value.facts
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_specialist_uses_the_active_model_override_for_retry_boundary() -> None:
+    def overridden_model(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> ModelResponse:
+        del messages, info
+        raise ModelHTTPError(429, "function")
+
+    http_client = httpx.AsyncClient()
+    provider = AzureProvider(
+        azure_endpoint="https://example.openai.azure.com",
+        api_version="2024-02-01",
+        api_key="test-key",
+        http_client=http_client,
+    )
+    agent = Agent(
+        OpenAIChatModel("deployment", provider=provider),
+        output_type=SpecialistFindingDraft,
+        retries=0,
+        tool_retries=0,
+        output_retries=0,
+        end_strategy="early",
+    )
+    actor = PydanticAISpecialistActor(agent)
+
+    try:
+        with agent.override(model=FunctionModel(overridden_model)):
+            with pytest.raises(SpecialistInvocationFailure) as raised:
+                await actor.run(
+                    SpecialistTaskInput(task_id="task-1", objective="Assess.")
+                )
+    finally:
+        await http_client.aclose()
+
+    assert raised.value.facts.boundary is SpecialistModelBoundary.UNKNOWN
+    assert classify_specialist_failure(
+        raised.value.error, facts=raised.value.facts
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_specialist_retries_only_its_own_model_request_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def delayed_model(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> ModelResponse:
+        del messages, info
+        await asyncio.sleep(1)
+        raise AssertionError("model deadline should have cancelled this request")
+
+    monkeypatch.setattr(specialist_module, "SPECIALIST_TIMEOUT_SECONDS", 0.01)
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(delayed_model),
+            output_type=SpecialistFindingDraft,
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    usage = RunUsage()
+
+    with pytest.raises(SpecialistInvocationFailure) as raised:
+        await actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess."),
+            usage=usage,
+        )
+
+    assert isinstance(raised.value.error, SpecialistModelRequestTimeout)
+    assert usage.requests == 1
+    assert classify_specialist_failure(
+        raised.value.error, facts=raised.value.facts
+    ) is RetryDisposition.RETRY
+
+
+@pytest.mark.asyncio
+async def test_specialist_preserves_a_provider_timeout_as_fatal() -> None:
+    def provider_timeout(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> ModelResponse:
+        del messages, info
+        raise TimeoutError("provider timeout")
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(provider_timeout),
+            output_type=SpecialistFindingDraft,
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    usage = RunUsage()
+
+    with pytest.raises(SpecialistInvocationFailure) as raised:
+        await actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess."),
+            usage=usage,
+        )
+
+    assert type(raised.value.error) is TimeoutError
+    assert usage.requests == 1
+    assert classify_specialist_failure(
+        raised.value.error, facts=raised.value.facts
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_specialist_only_converts_proven_request_limit_exhaustion() -> None:
+    def unexpected_usage_limit(
+        messages: list[ModelMessage], info: AgentInfo
+    ) -> ModelResponse:
+        del messages, info
+        raise UsageLimitExceeded("unproven")
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(unexpected_usage_limit),
+            output_type=SpecialistFindingDraft,
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    with pytest.raises(SpecialistInvocationFailure) as unexpected:
+        await actor.run(SpecialistTaskInput(task_id="task-1", objective="Assess."))
+
+    assert not unexpected.value.facts.count_limit_exhausted
+    assert classify_specialist_failure(
+        unexpected.value.error, facts=unexpected.value.facts
+    ) is None
+
+    edge_usage = RunUsage(requests=11)
+    with pytest.raises(SpecialistInvocationFailure) as edge:
+        await actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess."),
+            usage=edge_usage,
+        )
+
+    assert edge_usage.requests == 12
+    assert not edge.value.facts.count_limit_exhausted
+    assert edge.value.facts.unreturned_model_requests == 1
+    assert classify_specialist_failure(
+        edge.value.error, facts=edge.value.facts
+    ) is None
+
+    limit_actor = PydanticAISpecialistActor(
+        Agent(
+            TestModel(),
+            output_type=SpecialistFindingDraft,
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    usage = RunUsage(requests=12)
+    with pytest.raises(SpecialistInvocationFailure) as exhausted:
+        await limit_actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess."),
+            usage=usage,
+            usage_limits=specialist_usage_limits(),
+        )
+
+    assert exhausted.value.facts.count_limit_exhausted
+    assert classify_specialist_failure(
+        exhausted.value.error, facts=exhausted.value.facts
+    ) is RetryDisposition.TASK_FAILED
+
+
+@pytest.mark.asyncio
+async def test_specialist_does_not_treat_a_parallel_business_usage_limit_as_a_gate() -> (
+    None
+):
+    async def completed_tool() -> str:
+        return "completed"
+
+    async def business_limit_tool() -> str:
+        raise UsageLimitExceeded("business quota")
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        return ModelResponse(
+            parts=[
+                ToolCallPart(tool_name="completed_tool", args={}),
+                ToolCallPart(tool_name="business_limit_tool", args={}),
+            ]
+        )
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(completed_tool, business_limit_tool),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    usage = RunUsage(tool_calls=6)
+
+    with pytest.raises(SpecialistInvocationFailure) as raised:
+        await actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess."),
+            usage=usage,
+            usage_limits=specialist_usage_limits(),
+        )
+
+    assert usage.tool_calls == 7
+    assert not raised.value.facts.count_limit_exhausted
+    assert classify_specialist_failure(
+        raised.value.error, facts=raised.value.facts
+    ) is None

@@ -193,6 +193,9 @@ def _build_azure_model(
         api_key=azure_cfg.client_secret,
         http_client=http_pool.get("azure"),
     )
+    # The Specialist outer retry owns retry policy and physical-request
+    # accounting; OpenAI SDK transport retries would hide additional requests.
+    provider.client.max_retries = 0
     return OpenAIChatModel(cfg.model_name, provider=provider)
 
 

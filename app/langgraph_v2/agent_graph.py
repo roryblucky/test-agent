@@ -26,6 +26,8 @@ from app.langgraph_v2.agent_batch import (
     BatchContribution,
     DispatchBatch,
     SpecialistRegistry,
+    SpecialistUsage,
+    TaskSucceeded,
     accept_initial_dispatch,
     execute_specialist,
     promote_batch,
@@ -60,6 +62,7 @@ from app.langgraph_v2.conversation_context import (
     select_conversation_context,
 )
 from app.langgraph_v2.pre_moderation import ModerationProvider, run_pre_moderation
+from app.langgraph_v2.specialist_retry import SpecialistExecutionDiagnostics
 from app.langgraph_v2.stream import RequestOwnedGraph
 from app.models.workflow import (
     CitationReference,
@@ -223,6 +226,7 @@ def build_agent_graph(
     """Compile clarification plus first legal Coordinator Finish path."""
     state_adapter = checkpoint_state_adapter or AgentCheckpointStateAdapter()
     catalog = evidence_catalog or RequestEvidenceCatalog()
+    specialist_diagnostics = SpecialistExecutionDiagnostics()
     builder: StateGraph[AgentGraphState, None, AgentGraphState, AgentGraphState] = (
         StateGraph(AgentGraphState)
     )
@@ -314,11 +318,7 @@ def build_agent_graph(
                 specialist_descriptors=scope.specialist_descriptors,
             )
         )
-        _emit(
-            (
-                LiveStreamEvent(type="step_completed", step="coordinator"),
-            )
-        )
+        _emit((LiveStreamEvent(type="step_completed", step="coordinator"),))
         if isinstance(decision, Finish):
             return {}
         if state.get("accepted_batches"):
@@ -361,6 +361,7 @@ def build_agent_graph(
             catalog=catalog,
             context=invocation_context,
             scope_skill_names=scope.allowed_skill_names,
+            diagnostics=specialist_diagnostics,
             tool_telemetry=lambda tool_id, status: _emit(
                 (
                     LiveStreamEvent(
@@ -397,15 +398,16 @@ def build_agent_graph(
 
     async def research_completion(state: AgentGraphState) -> AgentGraphStateUpdate:
         completion = IncompleteResearch(
-            insufficient_evidence=True,
+            insufficient_evidence=not _accepted_evidence_ids(state),
             data_gaps=_accepted_data_gap_views(state),
+            task_failures=_accepted_task_failure_count(state),
         )
         return {
             "answer": insufficient_evidence_answer(completion),
             "completion_status": "incomplete",
             "termination_reason": (
                 "partial_results"
-                if completion.has_data_gaps
+                if completion.has_data_gaps or completion.has_task_failures
                 else "insufficient_evidence"
             ),
         }
@@ -434,8 +436,12 @@ def build_agent_graph(
         candidate = await synthesis_actor.synthesize(prepared)
         published = publish_report(candidate, prepared)
         completion = (
-            IncompleteResearch(insufficient_evidence=False, data_gaps=data_gaps)
-            if data_gaps
+            IncompleteResearch(
+                insufficient_evidence=False,
+                data_gaps=data_gaps,
+                task_failures=_accepted_task_failure_count(state),
+            )
+            if data_gaps or _accepted_task_failure_count(state)
             else None
         )
         return {
@@ -445,9 +451,7 @@ def build_agent_graph(
                 else published.answer
             ),
             "citations": [item.model_dump(mode="json") for item in published.citations],
-            "completion_status": "incomplete"
-            if completion is not None
-            else "complete",
+            "completion_status": "incomplete" if completion is not None else "complete",
             "termination_reason": (
                 "partial_results" if completion is not None else "evidence_backed"
             ),
@@ -489,6 +493,9 @@ def build_agent_graph(
                 metadata["steps_executed"].extend(
                     ["execute_first_specialist", "batch_barrier", "coordinator"]
                 )
+                metadata["specialist_usage"] = _accepted_specialist_usage(
+                    state
+                ).model_dump(mode="json")
             metadata["steps_executed"].append(
                 "synthesis"
                 if completion_status == "complete"
@@ -600,7 +607,8 @@ def _accepted_evidence_ids(state: AgentGraphState) -> tuple[str, ...]:
     for raw_batch in accepted_batches.values():
         accepted = AcceptedBatch.model_validate(raw_batch)
         for outcome in accepted.outcomes:
-            evidence_ids.extend(outcome.result.evidence_ids)
+            if isinstance(outcome, TaskSucceeded):
+                evidence_ids.extend(outcome.result.evidence_ids)
     return tuple(evidence_ids)
 
 
@@ -611,8 +619,27 @@ def _accepted_data_gap_views(state: AgentGraphState) -> tuple[DataGapView, ...]:
         gap.view()
         for raw_batch in accepted_batches.values()
         for outcome in AcceptedBatch.model_validate(raw_batch).outcomes
+        if isinstance(outcome, TaskSucceeded)
         for gap in outcome.result.data_gaps
     )
+
+
+def _accepted_task_failure_count(state: AgentGraphState) -> int:
+    """Count expected failed Tasks without exposing diagnostics to graph prompts."""
+    accepted_batches = state.get("accepted_batches", {})
+    return sum(
+        not isinstance(outcome, TaskSucceeded)
+        for raw_batch in accepted_batches.values()
+        for outcome in AcceptedBatch.model_validate(raw_batch).outcomes
+    )
+
+
+def _accepted_specialist_usage(state: AgentGraphState) -> SpecialistUsage:
+    """Aggregate accepted Task accounting without exposing retry diagnostics."""
+    usage = SpecialistUsage()
+    for raw_batch in state.get("accepted_batches", {}).values():
+        usage = usage.add(AcceptedBatch.model_validate(raw_batch).usage)
+    return usage
 
 
 def _active_batch_dump(batch: ActiveBatch) -> dict[str, Any]:
