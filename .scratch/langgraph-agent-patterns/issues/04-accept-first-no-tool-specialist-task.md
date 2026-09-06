@@ -4,7 +4,7 @@
 
 **Blocked by:** 03: 安全继续 Agent Conversation 并处理 `Finish`-first
 
-**Status:** in-review
+**Status:** done
 
 - [x] 单个合法 `Dispatch` 只能选择已注册且同时满足 Tenant 与 Scope 资格的 Specialist，并包含非空 objective；模型不得提供 tool、skill、limit 或 ID。
 - [x] Graph 根据 Run、Round 与批内顺序生成稳定 Task ID。
@@ -20,3 +20,4 @@
 ## Comments
 
 - Sol-high combined review (Standards + Spec): Standards had no findings. Resolved Spec P1 by allowing the Coordinator prompt to return `Dispatch` or `Finish`; resolved Spec P2 by capturing TestModel/FunctionModel actor runs with exact three-message, one-request traces; resolved Spec P2 by exercising both 16 KiB boundary cases through `execute_specialist`. Verified after the fixes with Ruff, Pyright, and `pytest tests -q` (280 passed, 1 skipped). Unresolved review comments: 0.
+- Sol-high re-review found one remaining Spec P2. Resolved it by asserting the production Specialist factory's schema/retry/end-strategy configuration and `AgentRunResult.new_messages()` alongside the actor capture. Final verification: Ruff, Pyright, and `pytest tests -q` (281 passed, 1 skipped). Unresolved review comments: 0.
