@@ -31,6 +31,7 @@ from app.langgraph_v2.agent_evidence import (
     bind_evidence_tool,
 )
 from app.langgraph_v2.agent_skills import (
+    SkillReference,
     SkillRegistration,
     SpecialistSkillRegistry,
 )
@@ -111,6 +112,12 @@ async def test_specialist_activates_a_summary_before_using_an_existing_tool() ->
                 version="1",
                 description="Read a filing.",
                 instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
+                references=(
+                    SkillReference(
+                        name="filing-guide",
+                        content="FULL-SKILL-REFERENCE-SENTINEL",
+                    ),
+                ),
                 required_tool_ids=frozenset({"read_evidence"}),
             ),
         ),
@@ -147,6 +154,7 @@ async def test_specialist_activates_a_summary_before_using_an_existing_tool() ->
             )
         if calls == 2:
             assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
+            assert "FULL-SKILL-REFERENCE-SENTINEL" in repr(messages)
             return ModelResponse(
                 parts=[ToolCallPart(tool_name="read_evidence", args={})]
             )
@@ -176,7 +184,6 @@ async def test_specialist_activates_a_summary_before_using_an_existing_tool() ->
         SpecialistTaskInput(
             task_id="task-1",
             objective="Assess the filing.",
-            skill_summaries=invocation.summaries,
         )
     )
 

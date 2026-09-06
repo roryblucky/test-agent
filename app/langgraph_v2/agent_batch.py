@@ -21,7 +21,6 @@ from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
     SkillInvocation,
     SkillPin,
-    SkillSummary,
     SpecialistSkillRegistry,
 )
 
@@ -170,7 +169,6 @@ class SpecialistActor(Protocol):
         ...
 
 
-EvidenceTool = Callable[[str, str], object]
 SpecialistTool = Callable[..., object]
 ToolTelemetry = Callable[[str, str], None]
 
@@ -265,14 +263,21 @@ class SpecialistRegistry:
         effective_ids = self.effective_tool_ids(
             registration, scope_tool_ids=context.allowed_tool_ids
         )
-        skill_invocation = self._begin_skill_invocation(
-            registration,
-            scope_skill_names=scope_skill_names,
-            effective_tool_ids=effective_ids,
+        skill_invocation = (
+            self.skill_registry.begin_invocation(
+                specialist_skill_names=registration.allowed_skill_names,
+                scope_skill_names=scope_skill_names,
+                effective_tool_ids=effective_ids,
+            )
+            if self.skill_registry is not None
+            else None
+        )
+        has_skill_activation = bool(
+            skill_invocation is not None and skill_invocation.summaries
         )
         if (
             not effective_ids
-            and skill_invocation is None
+            and not has_skill_activation
             and registration.actor_factory is None
         ):
             if registration.actor is not None:
@@ -317,26 +322,10 @@ class SpecialistRegistry:
             )
             binding.__name__ = tool_id
             tools.append(binding)
-        if skill_invocation is not None and skill_invocation.summaries:
+        if has_skill_activation:
+            assert skill_invocation is not None
             tools.append(skill_invocation.activation_tool())
         return actor_factory(tuple(tools), returned_evidence, skill_invocation)
-
-    def _begin_skill_invocation(
-        self,
-        registration: SpecialistRegistration,
-        *,
-        scope_skill_names: frozenset[str],
-        effective_tool_ids: frozenset[str],
-    ) -> SkillInvocation | None:
-        """Create one invocation-local Skill view from trusted registration."""
-        if self.skill_registry is None:
-            return None
-        return self.skill_registry.begin_invocation(
-            specialist_skill_names=registration.allowed_skill_names,
-            scope_skill_names=scope_skill_names,
-            effective_tool_ids=effective_tool_ids,
-        )
-
 
 @dataclass(frozen=True)
 class SpecialistTaskInput:
@@ -344,7 +333,6 @@ class SpecialistTaskInput:
 
     task_id: str
     objective: str
-    skill_summaries: tuple[SkillSummary, ...] = ()
 
 
 def accept_initial_dispatch(

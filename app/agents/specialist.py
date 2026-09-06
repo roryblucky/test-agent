@@ -47,7 +47,7 @@ class PydanticAISpecialistActor:
         skill_summaries = (
             self.skill_invocation.summaries
             if self.skill_invocation is not None
-            else input.skill_summaries
+            else ()
         )
         prompt = json.dumps(
             {

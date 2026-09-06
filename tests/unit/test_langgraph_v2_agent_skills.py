@@ -2,7 +2,11 @@
 
 import pytest
 
-from app.langgraph_v2.agent_skills import SkillRegistration, SpecialistSkillRegistry
+from app.langgraph_v2.agent_skills import (
+    SkillReference,
+    SkillRegistration,
+    SpecialistSkillRegistry,
+)
 
 
 def _skill(
@@ -102,3 +106,47 @@ def test_activation_rejects_required_tool_outside_frozen_tool_set() -> None:
 
     with pytest.raises(ValueError, match="Skill required Tool is not eligible"):
         invocation.activate("requires-news")
+
+
+def test_activation_returns_references_and_pins_the_complete_skill_definition() -> None:
+    skill = SkillRegistration(
+        name="filing-analysis",
+        version="1",
+        description="Read an eligible filing.",
+        instructions="Use the filing guidance.",
+        required_tool_ids=frozenset({"filing-reader"}),
+        references=(
+            SkillReference(name="filing-guide", content="REFERENCE-SENTINEL"),
+        ),
+    )
+    registry = SpecialistSkillRegistry(
+        registrations=(skill,),
+        tenant_eligible_names=frozenset({skill.name}),
+        shared_skill_names=frozenset({skill.name}),
+    )
+
+    activated = registry.begin_invocation(
+        specialist_skill_names=frozenset(),
+        scope_skill_names=frozenset({skill.name}),
+        effective_tool_ids=frozenset({"filing-reader"}),
+    ).activate(skill.name)
+
+    assert activated.references == skill.references
+    changed_reference = SkillRegistration(
+        name=skill.name,
+        version=skill.version,
+        description=skill.description,
+        instructions=skill.instructions,
+        required_tool_ids=skill.required_tool_ids,
+        references=(SkillReference(name="filing-guide", content="changed"),),
+    )
+    changed_tools = SkillRegistration(
+        name=skill.name,
+        version=skill.version,
+        description=skill.description,
+        instructions=skill.instructions,
+        required_tool_ids=frozenset({"news-reader"}),
+        references=skill.references,
+    )
+    assert skill.pin.content_hash != changed_reference.pin.content_hash
+    assert skill.pin.content_hash != changed_tools.pin.content_hash

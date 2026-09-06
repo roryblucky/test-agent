@@ -36,6 +36,7 @@ from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
     SkillInvocation,
+    SkillReference,
     SkillRegistration,
     SpecialistSkillRegistry,
 )
@@ -200,6 +201,7 @@ def _skill_specialist_factory(
             )
         if calls == 2:
             assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
+            assert "FULL-SKILL-REFERENCE-SENTINEL" in repr(messages)
             return ModelResponse(
                 parts=[
                     ToolCallPart(
@@ -517,6 +519,12 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
                     version="2026.09",
                     description="Read an eligible filing before analysis.",
                     instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
+                    references=(
+                        SkillReference(
+                            name="filing-guide",
+                            content="FULL-SKILL-REFERENCE-SENTINEL",
+                        ),
+                    ),
                     required_tool_ids=frozenset({"filing_reader"}),
                 ),
             ),
@@ -581,6 +589,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
     assert pin["version"] == "2026.09"
     assert len(pin["content_hash"]) == 64
     assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
+    assert "FULL-SKILL-REFERENCE-SENTINEL" not in repr(state)
     assert all(
         "filing-analysis" not in input.model_dump_json()
         for input in coordinator.inputs

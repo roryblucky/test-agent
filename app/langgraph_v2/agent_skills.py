@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -30,6 +31,15 @@ class SkillPin(BaseModel):
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class SkillReference(BaseModel):
+    """One full invocation-local Skill reference document."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
 class ActivatedSkill(BaseModel):
     """Invocation-local full instructions plus their immutable pin."""
 
@@ -37,6 +47,7 @@ class ActivatedSkill(BaseModel):
 
     pin: SkillPin
     instructions: str = Field(min_length=1)
+    references: tuple[SkillReference, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,14 +60,31 @@ class SkillRegistration:
     instructions: str
     required_tool_ids: frozenset[str] = frozenset()
     allowed_tool_ids: frozenset[str] = frozenset()
+    references: tuple[SkillReference, ...] = ()
 
     @property
     def pin(self) -> SkillPin:
         """Return the immutable identity of this exact instruction content."""
+        canonical = json.dumps(
+            {
+                "name": self.name,
+                "version": self.version,
+                "description": self.description,
+                "instructions": self.instructions,
+                "required_tool_ids": sorted(self.required_tool_ids),
+                "allowed_tool_ids": sorted(self.allowed_tool_ids),
+                "references": [
+                    reference.model_dump(mode="json") for reference in self.references
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return SkillPin(
             name=self.name,
             version=self.version,
-            content_hash=hashlib.sha256(self.instructions.encode()).hexdigest(),
+            content_hash=hashlib.sha256(canonical.encode()).hexdigest(),
         )
 
 
@@ -92,7 +120,11 @@ class SkillInvocation:
             raise ValueError("Skill required Tool is not eligible")
         activated = self._activated.get(skill_name)
         if activated is None:
-            activated = ActivatedSkill(pin=skill.pin, instructions=skill.instructions)
+            activated = ActivatedSkill(
+                pin=skill.pin,
+                instructions=skill.instructions,
+                references=skill.references,
+            )
             self._activated[skill_name] = activated
         return activated
 

@@ -452,6 +452,43 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
     assert captured == [()]
 
 
+def test_registry_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> (
+    None
+):
+    direct_actor = _Specialist()
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(id="market-data", actor=direct_actor),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        skill_registry=SpecialistSkillRegistry(
+            registrations=(
+                SkillRegistration(
+                    name="market-skill",
+                    version="1",
+                    description="Market summary",
+                    instructions="MARKET-FULL-INSTRUCTIONS",
+                ),
+            ),
+            tenant_eligible_names=frozenset({"market-skill"}),
+        ),
+    )
+
+    actor = registry.bind_actor(
+        registry.registrations[0],
+        context=_context().model_copy(
+            update={
+                "allowed_tool_ids": frozenset(),
+                "allowed_sources": frozenset(),
+                "allowed_queries": frozenset(),
+            }
+        ),
+        scope_skill_names=frozenset(),
+    )
+
+    assert actor is direct_actor
+
+
 def test_registry_binds_skill_activation_without_expanding_frozen_business_tools() -> (
     None
 ):
