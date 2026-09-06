@@ -124,7 +124,9 @@ async def test_specialist_function_model_has_one_request_and_structured_trace() 
     assert isinstance(messages[1], ModelResponse)
     assert messages[1].usage.requests == 1
 
-    result = await agent.run("Assess market outlook.")
+    with capture_run_messages() as result_messages:
+        result = await agent.run("Assess market outlook.")
     assert result.output == finding
     assert len(result.new_messages()) == 3
     assert result.usage().requests == 1
+    assert len(result_messages) == 3
