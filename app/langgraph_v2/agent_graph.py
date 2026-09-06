@@ -35,6 +35,7 @@ from app.langgraph_v2.agent_completion import (
     insufficient_evidence_answer,
 )
 from app.langgraph_v2.agent_evidence import (
+    EvidenceInvocationContext,
     FinancialResearchReport,
     PreparedSynthesis,
     RequestEvidenceCatalog,
@@ -341,6 +342,14 @@ def build_agent_graph(
         active_batch = _active_batch_load(active_value)
         scope = ResearchScope.model_validate(scope_value)
         task = active_batch.tasks[0]
+        invocation_context = EvidenceInvocationContext(
+            tenant_id=tenant_id,
+            request_id=state["request_id"],
+            task_id=task.id,
+            allowed_tool_ids=scope.allowed_tool_ids,
+            allowed_sources=scope.allowed_sources,
+            allowed_queries=scope.allowed_queries,
+        )
         _emit((LiveStreamEvent(type="step_start", step="specialist"),))
         contribution = await execute_specialist(
             task,
@@ -348,11 +357,7 @@ def build_agent_graph(
             registry=specialist_registry,
             scope_descriptors=scope.specialist_descriptors,
             catalog=catalog,
-            tenant_id=tenant_id,
-            request_id=state["request_id"],
-            scope_tool_ids=scope.allowed_tool_ids,
-            scope_sources=scope.allowed_sources,
-            scope_queries=scope.allowed_queries,
+            context=invocation_context,
             tool_telemetry=lambda tool_id, status: _emit(
                 (
                     LiveStreamEvent(

@@ -36,17 +36,34 @@ class EvidenceEnvelope(BaseModel):
     raw_provider_payload: str | None = None
 
 
+class EvidenceInvocationContext(BaseModel):
+    """Frozen request identity and authority for one Specialist invocation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str = Field(min_length=1)
+    request_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    allowed_tool_ids: frozenset[str] = frozenset()
+    allowed_sources: frozenset[str] = frozenset()
+    allowed_queries: frozenset[str] = frozenset()
+
+
 EvidenceProvider = Callable[[str, str], Awaitable[EvidenceEnvelope]]
+
+
+def _same_canonical_evidence(
+    left: EvidenceEnvelope, right: EvidenceEnvelope
+) -> bool:
+    """Compare accepted Evidence while excluding noncanonical provider payload."""
+    excluded = {"raw_provider_payload"}
+    return left.model_dump(exclude=excluded) == right.model_dump(exclude=excluded)
 
 
 def bind_evidence_tool(
     provider: EvidenceProvider,
     *,
-    allowed_sources: frozenset[str],
-    allowed_queries: frozenset[str] | None = None,
-    tenant_id: str,
-    request_id: str,
-    task_id: str,
+    context: EvidenceInvocationContext,
     returned_evidence: list[EvidenceEnvelope] | None = None,
     telemetry: Callable[[str], None] | None = None,
 ) -> Callable[[str, str], Awaitable[ToolReturn[dict[str, str]]]]:
@@ -54,11 +71,11 @@ def bind_evidence_tool(
 
     async def read_evidence(source: str, query: str) -> ToolReturn[dict[str, str]]:
         """Fetch one source only when its trusted Scope permits it."""
-        if source not in allowed_sources:
+        if source not in context.allowed_sources:
             if telemetry is not None:
                 telemetry("rejected")
             raise ValueError("Evidence source is not eligible")
-        if allowed_queries is not None and query not in allowed_queries:
+        if query not in context.allowed_queries:
             if telemetry is not None:
                 telemetry("rejected")
             raise ValueError("Evidence query is not eligible")
@@ -68,9 +85,9 @@ def bind_evidence_tool(
             evidence = await provider(source, query)
             if (
                 evidence.source != source
-                or evidence.tenant_id != tenant_id
-                or evidence.request_id != request_id
-                or evidence.task_id != task_id
+                or evidence.tenant_id != context.tenant_id
+                or evidence.request_id != context.request_id
+                or evidence.task_id != context.task_id
             ):
                 raise ValueError("Evidence provenance is not eligible")
             return_value = {"evidence_id": evidence.id, "excerpt": evidence.excerpt}
@@ -105,18 +122,18 @@ class RequestEvidenceCatalog:
         returned: Iterable[EvidenceEnvelope],
         *,
         finding_evidence_ids: tuple[str, ...],
-        tenant_id: str,
-        request_id: str,
+        context: EvidenceInvocationContext,
         as_of_date: date | None = None,
         max_evidence_age_days: int | None = None,
-        task_id: str,
     ) -> None:
         """Accept exact successful provenance referenced by the terminal Finding."""
         returned_items = tuple(returned)
         returned_by_id: dict[str, EvidenceEnvelope] = {}
         for evidence in returned_items:
             existing_returned = returned_by_id.get(evidence.id)
-            if existing_returned is not None and existing_returned != evidence:
+            if existing_returned is not None and not _same_canonical_evidence(
+                existing_returned, evidence
+            ):
                 raise ValueError("Evidence provenance conflicts")
             returned_by_id[evidence.id] = evidence
         accepted: list[EvidenceEnvelope] = []
@@ -125,13 +142,15 @@ class RequestEvidenceCatalog:
             if evidence is None:
                 raise ValueError("Evidence provenance is missing")
             if (
-                evidence.tenant_id != tenant_id
-                or evidence.request_id != request_id
-                or evidence.task_id != task_id
+                evidence.tenant_id != context.tenant_id
+                or evidence.request_id != context.request_id
+                or evidence.task_id != context.task_id
             ):
                 raise ValueError("Evidence provenance is not eligible")
             existing = self._evidence.get(evidence.id)
-            if existing is not None and existing != evidence:
+            if existing is not None and not _same_canonical_evidence(
+                existing, evidence
+            ):
                 raise ValueError("Evidence body conflicts")
             accepted.append(evidence)
         for evidence in accepted:

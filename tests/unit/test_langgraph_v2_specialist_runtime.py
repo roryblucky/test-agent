@@ -25,7 +25,22 @@ from app.agents.specialist import (
 )
 from app.core.model_registry import ModelRegistry
 from app.langgraph_v2.agent_batch import SpecialistFindingDraft, SpecialistTaskInput
-from app.langgraph_v2.agent_evidence import EvidenceEnvelope, bind_evidence_tool
+from app.langgraph_v2.agent_evidence import (
+    EvidenceEnvelope,
+    EvidenceInvocationContext,
+    bind_evidence_tool,
+)
+
+
+def _context() -> EvidenceInvocationContext:
+    return EvidenceInvocationContext(
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task-1",
+        allowed_tool_ids=frozenset({"read_evidence"}),
+        allowed_sources=frozenset({"filing"}),
+        allowed_queries=frozenset({"Apple revenue", "excerpt"}),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -182,10 +197,7 @@ async def test_specialist_accepts_tool_metadata_only_after_terminal_finding() ->
 
     tool = bind_evidence_tool(
         provider,
-        allowed_sources=frozenset({"filing"}),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
         returned_evidence=returned_evidence,
     )
 
@@ -269,10 +281,7 @@ async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
 
     tool = bind_evidence_tool(
         provider,
-        allowed_sources=frozenset({"filing"}),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
         returned_evidence=returned_evidence,
     )
     calls = 0

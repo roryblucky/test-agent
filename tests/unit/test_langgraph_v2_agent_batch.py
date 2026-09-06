@@ -23,7 +23,7 @@ from app.langgraph_v2.agent_batch import (
     execute_specialist,
     promote_batch,
 )
-from app.langgraph_v2.agent_evidence import EvidenceEnvelope
+from app.langgraph_v2.agent_evidence import EvidenceEnvelope, EvidenceInvocationContext
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 
 
@@ -34,6 +34,17 @@ class _Specialist:
     async def run(self, input: object) -> SpecialistAttempt:
         del input
         return SpecialistAttempt(finding=self.finding)
+
+
+def _context(*, task_id: str = "task-1") -> EvidenceInvocationContext:
+    return EvidenceInvocationContext(
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id=task_id,
+        allowed_tool_ids=frozenset({"filing-tool", "unregistered"}),
+        allowed_sources=frozenset({"filing"}),
+        allowed_queries=frozenset({"Apple"}),
+    )
 
 
 def _registry(
@@ -244,6 +255,7 @@ async def test_execute_specialist_enforces_the_16_kib_boundary_before_contributi
         batch_id=batch.id,
         registry=_registry(finding=exact),
         scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
     )
 
     assert contribution.outcome.result.summary == exact.summary
@@ -257,6 +269,7 @@ async def test_execute_specialist_enforces_the_16_kib_boundary_before_contributi
             batch_id=batch.id,
             registry=_registry(finding=too_large),
             scope_descriptors=scope_descriptors,
+            context=_context(task_id=batch.tasks[0].id),
         )
 
 
@@ -321,12 +334,7 @@ async def test_registry_freezes_tool_and_source_intersection_before_provider_acc
 
     actor = registry.bind_actor(
         registration,
-        scope_tool_ids=frozenset({"filing-tool", "unregistered"}),
-        scope_sources=frozenset({"filing"}),
-        scope_queries=frozenset({"Apple"}),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
     )
 
     assert isinstance(actor, _Specialist)
@@ -372,12 +380,13 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
     )
     actor = registry.bind_actor(
         registry.registrations[0],
-        scope_tool_ids=frozenset(),
-        scope_sources=frozenset(),
-        scope_queries=frozenset(),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context().model_copy(
+            update={
+                "allowed_tool_ids": frozenset(),
+                "allowed_sources": frozenset(),
+                "allowed_queries": frozenset(),
+            }
+        ),
     )
 
     assert isinstance(actor, _Specialist)

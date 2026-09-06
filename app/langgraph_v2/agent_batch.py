@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
+    EvidenceInvocationContext,
     EvidenceProvider,
     RequestEvidenceCatalog,
     bind_evidence_tool,
@@ -234,17 +235,12 @@ class SpecialistRegistry:
         self,
         registration: SpecialistRegistration,
         *,
-        scope_tool_ids: frozenset[str],
-        scope_sources: frozenset[str],
-        scope_queries: frozenset[str],
-        tenant_id: str,
-        request_id: str,
-        task_id: str,
+        context: EvidenceInvocationContext,
         tool_telemetry: ToolTelemetry | None = None,
     ) -> SpecialistActor:
         """Create one actor with a frozen Scope-narrowed Tool surface."""
         effective_ids = self.effective_tool_ids(
-            registration, scope_tool_ids=scope_tool_ids
+            registration, scope_tool_ids=context.allowed_tool_ids
         )
         if not effective_ids and registration.actor_factory is None:
             if registration.actor is not None:
@@ -275,11 +271,15 @@ class SpecialistRegistry:
 
             binding = bind_evidence_tool(
                 tool.provider,
-                allowed_sources=tool.allowed_sources & scope_sources,
-                allowed_queries=tool.allowed_queries & scope_queries,
-                tenant_id=tenant_id,
-                request_id=request_id,
-                task_id=task_id,
+                context=context.model_copy(
+                    update={
+                        "allowed_tool_ids": frozenset({tool_id}),
+                        "allowed_sources": tool.allowed_sources
+                        & context.allowed_sources,
+                        "allowed_queries": tool.allowed_queries
+                        & context.allowed_queries,
+                    }
+                ),
                 returned_evidence=returned_evidence,
                 telemetry=report_tool_status,
             )
@@ -290,7 +290,7 @@ class SpecialistRegistry:
 
 @dataclass(frozen=True)
 class SpecialistTaskInput:
-    """The only input needed by a first no-Tool Specialist invocation."""
+    """The business input needed by one bounded Specialist invocation."""
 
     task_id: str
     objective: str
@@ -334,25 +334,16 @@ async def execute_specialist(
     registry: SpecialistRegistry,
     scope_descriptors: Sequence[SpecialistDescriptor],
     catalog: RequestEvidenceCatalog | None = None,
-    tenant_id: str | None = None,
-    request_id: str | None = None,
-    scope_tool_ids: frozenset[str] = frozenset(),
-    scope_sources: frozenset[str] = frozenset(),
-    scope_queries: frozenset[str] = frozenset(),
+    context: EvidenceInvocationContext,
     tool_telemetry: ToolTelemetry | None = None,
 ) -> BatchContribution:
-    """Run one registered no-Tool Specialist and stage only its terminal outcome."""
+    """Run one registered bounded Specialist and stage its terminal outcome."""
     registration = registry.resolve(
         task.specialist_id, scope_descriptors=scope_descriptors
     )
     actor = registry.bind_actor(
         registration,
-        scope_tool_ids=scope_tool_ids,
-        scope_sources=scope_sources,
-        scope_queries=scope_queries,
-        tenant_id=tenant_id or "",
-        request_id=request_id or "",
-        task_id=task.id,
+        context=context,
         tool_telemetry=tool_telemetry,
     )
     attempt = await actor.run(
@@ -364,14 +355,10 @@ async def execute_specialist(
         if attempt.evidence:
             raise ValueError("Evidence cache is not configured")
     else:
-        if tenant_id is None or request_id is None:
-            raise ValueError("Evidence cache identity is not configured")
         catalog.accept_referenced(
             attempt.evidence,
             finding_evidence_ids=draft.evidence_ids,
-            tenant_id=tenant_id,
-            request_id=request_id,
-            task_id=task.id,
+            context=context,
         )
     return BatchContribution(
         batch_id=batch_id,

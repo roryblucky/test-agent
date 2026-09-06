@@ -1,4 +1,4 @@
-"""PydanticAI no-Tool Specialist actor for first accepted Task."""
+"""PydanticAI Specialist actor for one bounded accepted Task."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ execution diagnostics. You may call only the supplied Evidence Tools.
 
 @dataclass(frozen=True)
 class PydanticAISpecialistActor:
-    """Run one no-Tool Specialist invocation with fixed actor-local limits."""
+    """Run one bounded Specialist invocation with fixed actor-local limits."""
 
     agent: Agent[None, SpecialistFindingDraft]
     returned_evidence: list[EvidenceEnvelope] = field(

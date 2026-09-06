@@ -1,4 +1,4 @@
-"""Public first no-Tool Specialist Task coverage."""
+"""Public first bounded Specialist Task coverage."""
 
 from collections.abc import Callable, Sequence
 from datetime import date
@@ -18,6 +18,8 @@ from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, Tenan
 from app.langgraph_v2.agent_batch import (
     DispatchBatch,
     EvidenceToolRegistration,
+    SpecialistActor,
+    SpecialistActorFactory,
     SpecialistAttempt,
     SpecialistFindingDraft,
     SpecialistRegistration,
@@ -105,46 +107,76 @@ async def _evidence_provider(source: str, query: str) -> EvidenceEnvelope:
 
 def _evidence_specialist_factory(
     tools: tuple[Callable[..., object], ...], returned_evidence: list[EvidenceEnvelope]
-) -> PydanticAISpecialistActor:
-    calls = 0
+) -> SpecialistActor:
+    return _specialist_factory(
+        query="Apple revenue",
+        summary="Apple revenue grew.",
+        evidence_id="evidence-1",
+    )(tools, returned_evidence)
 
-    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        del messages
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            assert [tool.name for tool in info.function_tools] == ["filing_reader"]
+
+def _specialist_factory(
+    *, query: str, summary: str, evidence_id: str
+) -> SpecialistActorFactory:
+    def build(
+        tools: tuple[Callable[..., object], ...],
+        returned_evidence: list[EvidenceEnvelope],
+    ) -> PydanticAISpecialistActor:
+        calls = 0
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            del messages
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                assert [tool.name for tool in info.function_tools] == ["filing_reader"]
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="filing_reader",
+                            args={"source": "filing", "query": query},
+                        )
+                    ]
+                )
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="filing_reader",
-                        args={"source": "filing", "query": "Apple revenue"},
+                        tool_name=info.output_tools[0].name,
+                        args={"summary": summary, "evidence_ids": [evidence_id]},
                     )
                 ]
             )
-        return ModelResponse(
-            parts=[
-                ToolCallPart(
-                    tool_name=info.output_tools[0].name,
-                    args={
-                        "summary": "Apple revenue grew.",
-                        "evidence_ids": ["evidence-1"],
-                    },
-                )
-            ]
+
+        return PydanticAISpecialistActor(
+            Agent(
+                FunctionModel(model),
+                output_type=SpecialistFindingDraft,
+                tools=tools,
+                retries=0,
+                tool_retries=0,
+                output_retries=0,
+                end_strategy="early",
+            ),
+            returned_evidence=returned_evidence,
         )
 
-    return PydanticAISpecialistActor(
-        Agent(
-            FunctionModel(model),
-            output_type=SpecialistFindingDraft,
-            tools=tools,
-            retries=0,
-            tool_retries=0,
-            output_retries=0,
-            end_strategy="early",
-        ),
-        returned_evidence=returned_evidence,
+    return build
+
+
+async def _empty_evidence_provider(source: str, query: str) -> EvidenceEnvelope:
+    assert (source, query) == ("filing", "Apple litigation")
+    return EvidenceEnvelope(
+        id="evidence-empty-1",
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task_90fff3e68e9a59d229d7982b65c5fe8b",
+        source=source,
+        source_url="https://example.test/filing-search",
+        title="Authoritative filing search",
+        body="No matching records.",
+        excerpt="The authoritative search returned no matching records.",
+        as_of_date=date(2026, 9, 6),
+        raw_provider_payload="[]",
     )
 
 
@@ -152,6 +184,14 @@ class _Synthesis:
     async def synthesize(self, prepared: object) -> FinancialResearchReport:
         del prepared
         return FinancialResearchReport(markdown_report="Apple revenue grew. [[E:1]]")
+
+
+class _EmptySynthesis:
+    async def synthesize(self, prepared: object) -> FinancialResearchReport:
+        del prepared
+        return FinancialResearchReport(
+            markdown_report="No matching filing records were found. [[E:1]]"
+        )
 
 
 class _TenantManager:
@@ -362,6 +402,85 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
         )
     assert "BODY-SENTINEL" not in persisted_text
     assert "RAW-PROVIDER-SENTINEL" not in persisted_text
+
+
+def test_authoritative_empty_result_still_publishes_evidence_backed_report(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        allowed_tool_ids=frozenset({"filing_reader"}),
+        allowed_sources=frozenset({"filing"}),
+        allowed_queries=frozenset({"Apple litigation"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=_specialist_factory(
+                    query="Apple litigation",
+                    summary="The authoritative search returned no matching records.",
+                    evidence_id="evidence-empty-1",
+                ),
+                allowed_tool_ids=frozenset({"filing_reader"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=_empty_evidence_provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple litigation"}),
+            ),
+        ),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=_Coordinator(),
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+            synthesis_actor=_EmptySynthesis(),
+        )
+
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "Are there litigation records?",
+                "sessionId": "00000000-0000-0000-0000-000000000083",
+                "clientRequestId": "request-1",
+            },
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+
+    done = [event for event in parse_sse(response.text) if event["type"] == "done"]
+    assert response.status_code == 200
+    assert done[0]["data"]["metadata"]["completion_status"] == "complete"
+    assert done[0]["data"]["answer"] == (
+        "No matching filing records were found. [[E:1]]"
+    )
+    assert done[0]["data"]["citations"][0]["evidence_id"] == "evidence-empty-1"
 
 
 async def _checkpoint_history(

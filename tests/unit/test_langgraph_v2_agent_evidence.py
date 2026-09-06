@@ -6,12 +6,24 @@ import pytest
 
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
+    EvidenceInvocationContext,
     FinancialResearchReport,
     RequestEvidenceCatalog,
     bind_evidence_tool,
     prepare_synthesis,
     publish_report,
 )
+
+
+def _context() -> EvidenceInvocationContext:
+    return EvidenceInvocationContext(
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task-1",
+        allowed_tool_ids=frozenset({"filing-reader"}),
+        allowed_sources=frozenset({"filing"}),
+        allowed_queries=frozenset({"Apple revenue"}),
+    )
 
 
 def _evidence(
@@ -40,9 +52,7 @@ def test_only_accepted_referenced_evidence_is_prepared_and_published() -> None:
     catalog.accept_referenced(
         (_evidence(), _evidence(id="orphan-1", body="Do not publish.")),
         finding_evidence_ids=("evidence-1",),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
     )
 
     prepared = prepare_synthesis(
@@ -70,24 +80,18 @@ def test_evidence_cache_is_idempotent_but_conflicts_and_unaccepted_ids_fail_clos
     catalog.accept_referenced(
         (_evidence(),),
         finding_evidence_ids=("evidence-1",),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
     )
     catalog.accept_referenced(
         (_evidence(),),
         finding_evidence_ids=("evidence-1",),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
     )
     with pytest.raises(ValueError, match="Evidence body conflicts"):
         catalog.accept_referenced(
             (_evidence(body="Different body."),),
             finding_evidence_ids=("evidence-1",),
-            tenant_id="tenant-a",
-            request_id="request-1",
-            task_id="task-1",
+            context=_context(),
         )
     with pytest.raises(ValueError, match="Evidence is not accepted"):
         prepare_synthesis(
@@ -98,6 +102,24 @@ def test_evidence_cache_is_idempotent_but_conflicts_and_unaccepted_ids_fail_clos
             tenant_id="tenant-a",
             request_id="request-1",
         )
+
+
+def test_evidence_cache_ignores_noncanonical_raw_payload_for_idempotence() -> None:
+    catalog = RequestEvidenceCatalog()
+    first = _evidence(raw_provider_payload="provider-response-a")
+    duplicate = _evidence(raw_provider_payload="provider-response-b")
+
+    for evidence in (first, duplicate):
+        catalog.accept_referenced(
+            (evidence,),
+            finding_evidence_ids=("evidence-1",),
+            context=_context(),
+        )
+
+    accepted = catalog.resolve(
+        "evidence-1", tenant_id="tenant-a", request_id="request-1"
+    )
+    assert accepted.body == first.body
 
 
 @pytest.mark.parametrize(
@@ -117,9 +139,7 @@ def test_evidence_cache_rejects_cross_scope_provenance(
         catalog.accept_referenced(
             (_evidence(**overrides),),
             finding_evidence_ids=("evidence-1",),
-            tenant_id="tenant-a",
-            request_id="request-1",
-            task_id="task-1",
+            context=_context(),
         )
 
 
@@ -133,10 +153,7 @@ async def test_evidence_tool_freezes_source_before_provider_access() -> None:
 
     tool = bind_evidence_tool(
         provider,
-        allowed_sources=frozenset({"filing"}),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
     )
 
     returned = await tool("filing", "Apple revenue")
@@ -164,10 +181,7 @@ async def test_evidence_tool_rejects_unicode_return_over_4_kib_before_metadata_c
 
     tool = bind_evidence_tool(
         provider,
-        allowed_sources=frozenset({"filing"}),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
         returned_evidence=returned_evidence,
     )
 
@@ -187,9 +201,7 @@ def test_report_gate_rejects_malformed_or_unknown_evidence_marker(
     catalog.accept_referenced(
         (_evidence(),),
         finding_evidence_ids=("evidence-1",),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
     )
     prepared = prepare_synthesis(
         standalone_query="Apple outlook",
@@ -211,9 +223,7 @@ def test_evidence_cache_does_not_commit_before_all_references_validate() -> None
         catalog.accept_referenced(
             (_evidence(),),
             finding_evidence_ids=("evidence-1", "missing"),
-            tenant_id="tenant-a",
-            request_id="request-1",
-            task_id="task-1",
+            context=_context(),
         )
 
     with pytest.raises(ValueError, match="Evidence is not accepted"):
@@ -225,9 +235,7 @@ def test_synthesis_rejects_evidence_older_than_scope_freshness_window() -> None:
     catalog.accept_referenced(
         (_evidence(as_of_date=date(2026, 8, 29)),),
         finding_evidence_ids=("evidence-1",),
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-1",
+        context=_context(),
     )
 
     with pytest.raises(ValueError, match="Evidence is not accepted"):
