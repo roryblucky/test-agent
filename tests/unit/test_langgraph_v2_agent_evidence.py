@@ -265,9 +265,9 @@ async def test_evidence_tool_projects_oversized_success_as_unavailable() -> None
 
 
 @pytest.mark.asyncio
-async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize_gap() -> (
-    None
-):
+async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class SourceUnreachable(Exception):
         pass
 
@@ -287,26 +287,6 @@ async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize
         + 1
     )
     too_large_coverage = f"{exact_coverage}x"
-    assert len(
-        json.dumps(
-            ToolUnavailable(
-                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-                requested_coverage=exact_coverage,
-            ).model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ) == 4 * 1024
-    assert len(
-        json.dumps(
-            ToolUnavailable(
-                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-                requested_coverage=too_large_coverage,
-            ).model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ) == 4 * 1024 + 1
     context = _context().model_copy(
         update={"allowed_queries": frozenset({exact_coverage, too_large_coverage})}
     )
@@ -315,6 +295,7 @@ async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize
         del source, query
         raise SourceUnreachable()
 
+    monkeypatch.setattr(agent_evidence, "_DATA_GAP_TEXT_MAX_BYTES", 4 * 1024)
     tool = bind_evidence_tool(
         provider,
         context=context,
@@ -331,12 +312,131 @@ async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize
         _tool_context(tool_call_id="call-2"), "filing", too_large_coverage
     )
 
+    assert exact.return_value == ToolUnavailable(
+        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+        requested_coverage=exact_coverage,
+    )
+    assert isinstance(exact.return_value, ToolUnavailable)
+    assert len(
+        json.dumps(
+            exact.return_value.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) == 4 * 1024
+    assert len(
+        json.dumps(
+            ToolUnavailable(
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                requested_coverage=too_large_coverage,
+            ).model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) == 4 * 1024 + 1
     unusable = ToolUnavailable(
         reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
         requested_coverage="Requested coverage could not be safely projected.",
     )
-    assert exact.return_value == unusable
     assert too_large.return_value == unusable
+
+
+@pytest.mark.asyncio
+async def test_unavailable_binding_projects_coverage_and_source_boundaries() -> None:
+    class SourceUnreachable(Exception):
+        pass
+
+    exact_coverage = "c" * 256
+    oversize_coverage = f"{exact_coverage}c"
+    exact_source = "s" * 256
+    oversize_source = f"{exact_source}s"
+    context = _context().model_copy(
+        update={
+            "allowed_sources": frozenset({exact_source, oversize_source}),
+            "allowed_queries": frozenset({exact_coverage, oversize_coverage}),
+        }
+    )
+    capture = SpecialistToolCapture()
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise SourceUnreachable()
+
+    tool = bind_evidence_tool(
+        provider,
+        context=context,
+        capture=capture,
+        expected_unavailability=(
+            ExpectedToolUnavailability(
+                exception_type=SourceUnreachable,
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+            ),
+        ),
+    )
+
+    exact = await tool(_tool_context(), exact_source, exact_coverage)
+    oversize_coverage_return = await tool(
+        _tool_context(tool_call_id="call-2"), exact_source, oversize_coverage
+    )
+    oversize_source_return = await tool(
+        _tool_context(tool_call_id="call-3"), oversize_source, exact_coverage
+    )
+
+    assert exact.return_value == ToolUnavailable(
+        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+        requested_coverage=exact_coverage,
+    )
+    unusable = ToolUnavailable(
+        reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
+        requested_coverage="Requested coverage could not be safely projected.",
+    )
+    assert oversize_coverage_return.return_value == unusable
+    assert oversize_source_return.return_value == ToolUnavailable(
+        reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
+        requested_coverage=exact_coverage,
+    )
+    assert capture.unavailability[0].requested_coverage == exact_coverage
+    assert capture.unavailability[0].source == exact_source
+    assert (
+        capture.unavailability[1].requested_coverage
+        == "Requested coverage could not be safely projected."
+    )
+    assert capture.unavailability[1].source == exact_source
+    assert capture.unavailability[2].requested_coverage == exact_coverage
+    assert capture.unavailability[2].source is None
+
+
+@pytest.mark.asyncio
+async def test_unavailable_binding_rejects_oversize_tool_id() -> None:
+    class SourceUnreachable(Exception):
+        pass
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise SourceUnreachable()
+
+    exact_tool_id = "t" * 64
+    capture = SpecialistToolCapture()
+    tool = bind_evidence_tool(
+        provider,
+        context=_context(),
+        capture=capture,
+        tool_id=exact_tool_id,
+        expected_unavailability=(
+            ExpectedToolUnavailability(
+                exception_type=SourceUnreachable,
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+            ),
+        ),
+    )
+
+    await tool(
+        _tool_context(tool_name=exact_tool_id), "filing", "Apple revenue"
+    )
+
+    assert capture.unavailability[0].tool_id == exact_tool_id
+    with pytest.raises(ValueError, match="Tool identifier"):
+        bind_evidence_tool(provider, context=_context(), tool_id=f"{exact_tool_id}t")
 
 
 @pytest.mark.asyncio

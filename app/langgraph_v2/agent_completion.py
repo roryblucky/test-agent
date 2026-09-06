@@ -8,6 +8,7 @@ INSUFFICIENT_EVIDENCE_DISCLOSURE = (
     "Incomplete research: no eligible Evidence was available."
 )
 DATA_GAP_DISCLOSURE = "Incomplete research: requested data was unavailable:"
+_MARKDOWN_ESCAPED_CHARACTERS = frozenset("\\`*_{}[]<>()#+-.!|")
 
 
 class IncompleteResearch(BaseModel):
@@ -28,14 +29,30 @@ def insufficient_evidence_answer(completion: IncompleteResearch) -> str:
     """Render the sole fixed disclosure for a zero-Evidence completion."""
     if not completion.insufficient_evidence:
         raise ValueError("Incomplete Research requires a completion signal")
-    return render_incomplete_research(INSUFFICIENT_EVIDENCE_DISCLOSURE, completion)
+    return render_incomplete_research("", completion)
+
+
+def _escape_markdown(value: str) -> str:
+    return "".join(
+        f"\\{character}" if character in _MARKDOWN_ESCAPED_CHARACTERS else character
+        for character in value
+    )
 
 
 def render_incomplete_research(answer: str, completion: IncompleteResearch) -> str:
     """Render code-owned incompleteness and its bounded missing coverage labels."""
-    if not completion.has_data_gaps:
-        return answer
-    coverage = "\n".join(
-        f"- {gap.requested_coverage}" for gap in completion.data_gaps
-    )
-    return f"{answer}\n\n{DATA_GAP_DISCLOSURE}\n{coverage}"
+    lines: list[str] = []
+    if completion.has_data_gaps:
+        lines.extend(
+            (DATA_GAP_DISCLOSURE,)
+            + tuple(
+                f"- {_escape_markdown(gap.requested_coverage)}"
+                for gap in completion.data_gaps
+            )
+        )
+    if completion.insufficient_evidence:
+        lines.append(INSUFFICIENT_EVIDENCE_DISCLOSURE)
+    block = "\n".join(lines)
+    if not block:
+        raise ValueError("Incomplete Research requires a completion signal")
+    return f"{block}\n\n{answer}" if answer else block

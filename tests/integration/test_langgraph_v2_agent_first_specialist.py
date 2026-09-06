@@ -664,8 +664,8 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
     assert done[0]["data"]["metadata"]["completion_status"] == "incomplete"
     assert done[0]["data"]["metadata"]["termination_reason"] == "partial_results"
     assert done[0]["data"]["answer"] == (
-        "Apple revenue grew. [[E:1]]\n\n"
-        "Incomplete research: requested data was unavailable:\n- Apple revenue"
+        "Incomplete research: requested data was unavailable:\n- Apple revenue\n\n"
+        "Apple revenue grew. [[E:1]]"
     )
     assert synthesis.prepared is not None
     assert synthesis.prepared.data_gaps[0].model_dump() == {
