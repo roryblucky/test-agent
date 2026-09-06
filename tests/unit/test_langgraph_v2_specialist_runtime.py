@@ -162,7 +162,11 @@ async def test_specialist_function_model_has_one_request_and_structured_trace() 
     assert finding.finding == SpecialistFindingDraft(summary="No-tool finding")
     assert len(captures) == 1
     assert captures[0][1].function_tools == []
-    assert captures[0][1].model_settings == {"max_tokens": SPECIALIST_MAX_TOKENS}
+    assert captures[0][1].model_settings == {
+        "max_tokens": SPECIALIST_MAX_TOKENS,
+        "timeout": SPECIALIST_TIMEOUT_SECONDS,
+        "parallel_tool_calls": False,
+    }
     assert len(messages) == 3
     assert isinstance(messages[1], ModelResponse)
     assert messages[1].usage.requests == 1

@@ -123,8 +123,6 @@ class RequestEvidenceCatalog:
         *,
         finding_evidence_ids: tuple[str, ...],
         context: EvidenceInvocationContext,
-        as_of_date: date | None = None,
-        max_evidence_age_days: int | None = None,
     ) -> None:
         """Accept exact successful provenance referenced by the terminal Finding."""
         returned_items = tuple(returned)

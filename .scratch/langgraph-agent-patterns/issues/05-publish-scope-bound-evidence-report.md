@@ -30,3 +30,18 @@
 - 2026-09-06: Sol-high final review found zero remaining non-deferred Ticket 05
   issues. Deferred by the ticket boundary: cache overflow and outer retries
   (Ticket 08). Unresolved review comments: 0.
+- 2026-09-06: Follow-up review findings resolved: Tool-capable Specialist naming
+  is current; immutable `EvidenceInvocationContext` owns invocation identity and
+  authority; Evidence idempotence excludes noncanonical `raw_provider_payload`;
+  and PostgreSQL HTTP E2E proves authoritative empty results still publish an
+  Evidence-backed citation.
+- 2026-09-06: Standards follow-up removed the whole-Specialist timeout, moved the
+  60-second bound to each model request, made Tool execution sequential, disabled
+  provider parallel Tool calls, and removed unused freshness parameters from the
+  acceptance interface. Binding-owned 20-second Tool timeout/unavailability is
+  explicitly deferred to Ticket 07; cache overflow and outer retries remain
+  Ticket 08. The fixture-schema concern was dismissed: validation, lifecycle,
+  Alembic configuration, SQL translation, and migration behavior each have one
+  distinct owner, and the PostgreSQL migration/E2E tests verify the composed seam.
+  Final Standards/Spec re-review: zero unresolved Ticket 05 findings. Unresolved
+  review comments: 0.

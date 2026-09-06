@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from pydantic_ai import Agent
+from pydantic_ai.tool_manager import ToolManager
 
 from app.core.model_registry import ModelRegistry
 from app.langgraph_v2.agent_batch import (
@@ -47,10 +48,14 @@ class PydanticAISpecialistActor:
         async with self._lock:
             first_evidence = len(self.returned_evidence)
             try:
-                async with asyncio.timeout(SPECIALIST_TIMEOUT_SECONDS):
+                with ToolManager.parallel_execution_mode("sequential"):
                     result = await self.agent.run(
                         prompt,
-                        model_settings={"max_tokens": SPECIALIST_MAX_TOKENS},
+                        model_settings={
+                            "max_tokens": SPECIALIST_MAX_TOKENS,
+                            "timeout": SPECIALIST_TIMEOUT_SECONDS,
+                            "parallel_tool_calls": False,
+                        },
                     )
                 evidence = tuple(self.returned_evidence[first_evidence:])
             finally:
