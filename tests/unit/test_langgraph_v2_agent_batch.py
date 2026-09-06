@@ -573,9 +573,7 @@ def test_data_gap_enforces_bounds_and_hides_internal_provenance() -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_freezes_tool_and_source_intersection_before_provider_access() -> (
-    None
-):
+async def test_registry_freezes_tool_and_source_intersection_before_provider_access() -> None:
     calls: list[tuple[str, str]] = []
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
