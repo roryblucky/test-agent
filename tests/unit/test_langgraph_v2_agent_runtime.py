@@ -24,7 +24,7 @@ from app.config.models import (
     TenantConfig,
 )
 from app.core.model_registry import ModelRegistry
-from app.langgraph_v2.agent_graph import CoordinatorInput, Finish
+from app.langgraph_v2.agent_graph import CoordinatorDecision, CoordinatorInput, Finish
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.authorization import TrustedRequestContext
@@ -49,7 +49,7 @@ def test_coordinator_factory_disables_tools_and_builtin_retries() -> None:
     assert registry.name == "coordinator"
     assert registry.kwargs is not None
     assert registry.kwargs == {
-        "output_type": Finish,
+        "output_type": CoordinatorDecision,
         "instructions": registry.kwargs["instructions"],
         "tools": (),
         "retries": 0,

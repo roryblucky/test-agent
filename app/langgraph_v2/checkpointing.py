@@ -136,8 +136,15 @@ class AgentCheckpointStateAdapter:
         {"answer", "standalone_query", "completion_status", "termination_reason"}
     )
     _nullable_json_object_channels = frozenset(
-        {"clarification", "intent", "research_scope", "final_response"}
+        {
+            "clarification",
+            "intent",
+            "research_scope",
+            "active_batch",
+            "final_response",
+        }
     )
+    _json_object_channels = frozenset({"staged_contributions", "accepted_batches"})
 
     def validate_checkpoint_state(
         self,
@@ -162,6 +169,9 @@ class AgentCheckpointStateAdapter:
             raise TypeError("checkpoint halted is invalid")
         for channel in self._nullable_json_object_channels:
             if channel in channel_values and channel_values[channel] is not None:
+                _validate_json_object(channel_values[channel], channel=channel)
+        for channel in self._json_object_channels:
+            if channel in channel_values:
                 _validate_json_object(channel_values[channel], channel=channel)
         _validate_optional_model(
             channel_values.get("clarification"),

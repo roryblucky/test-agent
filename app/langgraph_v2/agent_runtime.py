@@ -16,6 +16,7 @@ from app.agents.query_understanding import (
     create_query_understanding_agent,
 )
 from app.config.models import AgentResearchConfig, LangGraphRuntimeMode
+from app.langgraph_v2.agent_batch import SpecialistRegistry
 from app.langgraph_v2.agent_graph import (
     CoordinatorActor,
     CoordinatorInput,
@@ -65,6 +66,7 @@ class AgentGraphRuntimeAdapter:
     checkpointer: BaseCheckpointSaver[Any]
     query_understanding_actor: QueryUnderstandingActor
     coordinator_actor: CoordinatorActor
+    specialist_registry: SpecialistRegistry
     intent_policies: Mapping[str, AgentIntentPolicy]
     moderation_provider: ModerationProvider
 
@@ -85,6 +87,7 @@ class AgentGraphRuntimeAdapter:
             self.checkpointer,
             query_understanding_actor=self.query_understanding_actor,
             coordinator_actor=self.coordinator_actor,
+            specialist_registry=self.specialist_registry,
             intent_policies=self.intent_policies,
             moderation_provider=self.moderation_provider,
             checkpoint_state_adapter=AgentCheckpointStateAdapter(),
@@ -107,6 +110,7 @@ def build_agent_runtime(
     checkpointer: BaseCheckpointSaver[Any],
     query_understanding_actor: QueryUnderstandingActor | None = None,
     coordinator_actor: CoordinatorActor | None = None,
+    specialist_registry: SpecialistRegistry | None = None,
     intent_policies: Mapping[str, AgentIntentPolicy] | None = None,
     moderation_provider: ModerationProvider | None = None,
 ) -> AgentGraphRuntimeAdapter:
@@ -122,6 +126,9 @@ def build_agent_runtime(
     coordinator = coordinator_actor or _resolve_coordinator_actor(
         app, request_context.tenant_id
     )
+    specialists = specialist_registry or SpecialistRegistry(
+        registrations=(), tenant_eligible_ids=frozenset()
+    )
     moderation = moderation_provider or getattr(
         app.state, "langgraph_v2_moderation_provider", None
     )
@@ -129,6 +136,7 @@ def build_agent_runtime(
         checkpointer=checkpointer,
         query_understanding_actor=actor,
         coordinator_actor=coordinator,
+        specialist_registry=specialists,
         intent_policies=policies,
         moderation_provider=moderation or MockModerationProvider(),
     )

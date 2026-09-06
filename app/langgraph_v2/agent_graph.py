@@ -16,8 +16,19 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.graph.message import (  # pyright: ignore[reportMissingTypeStubs]
     add_messages,
 )
+from langgraph.types import Overwrite
 from pydantic import BaseModel, ConfigDict
 
+from app.langgraph_v2.agent_batch import (
+    AcceptedTask,
+    ActiveBatch,
+    BatchContribution,
+    DispatchBatch,
+    SpecialistRegistry,
+    accept_initial_dispatch,
+    execute_specialist,
+    promote_batch,
+)
 from app.langgraph_v2.agent_completion import (
     IncompleteResearch,
     insufficient_evidence_answer,
@@ -76,12 +87,37 @@ class CoordinatorInput(BaseModel):
     specialist_descriptors: tuple[SpecialistDescriptor, ...]
 
 
+CoordinatorDecision = Finish | DispatchBatch
+
+
 class CoordinatorActor(Protocol):
     """Propose one bounded Coordinator decision."""
 
-    async def decide(self, input: CoordinatorInput) -> Finish:
+    async def decide(self, input: CoordinatorInput) -> CoordinatorDecision:
         """Return the typed Coordinator decision."""
         ...
+
+
+def _merge_contributions(
+    current: dict[str, dict[str, Any]],
+    update: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Merge immutable staged contributions, rejecting conflicting identities."""
+    merged = {**current}
+    for task_id, contribution in update.items():
+        existing = merged.get(task_id)
+        if existing is not None and existing != contribution:
+            raise ValueError("Batch contribution conflicts")
+        merged[task_id] = contribution
+    return merged
+
+
+def _merge_accepted_batches(
+    current: dict[str, dict[str, Any]],
+    update: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Merge immutable accepted batches, rejecting conflicting identities."""
+    return _merge_contributions(current, update)
 
 
 class AgentGraphState(TypedDict):
@@ -95,6 +131,13 @@ class AgentGraphState(TypedDict):
     standalone_query: NotRequired[str | None]
     intent: NotRequired[dict[str, Any] | None]
     research_scope: NotRequired[dict[str, Any] | None]
+    active_batch: NotRequired[dict[str, Any] | None]
+    staged_contributions: NotRequired[
+        Annotated[dict[str, dict[str, Any]], _merge_contributions]
+    ]
+    accepted_batches: NotRequired[
+        Annotated[dict[str, dict[str, Any]], _merge_accepted_batches]
+    ]
     clarification: NotRequired[dict[str, Any] | None]
     answer: NotRequired[str | None]
     completion_status: NotRequired[str | None]
@@ -110,6 +153,9 @@ class AgentGraphStateUpdate(TypedDict, total=False):
     standalone_query: str | None
     intent: dict[str, Any] | None
     research_scope: dict[str, Any] | None
+    active_batch: dict[str, Any] | None
+    staged_contributions: Any
+    accepted_batches: dict[str, dict[str, Any]]
     clarification: dict[str, Any] | None
     answer: str | None
     completion_status: str | None
@@ -139,6 +185,7 @@ def build_agent_graph(
     *,
     query_understanding_actor: QueryUnderstandingActor,
     coordinator_actor: CoordinatorActor,
+    specialist_registry: SpecialistRegistry,
     intent_policies: Mapping[str, AgentIntentPolicy],
     moderation_provider: ModerationProvider,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
@@ -162,6 +209,9 @@ def build_agent_graph(
             "standalone_query": None,
             "intent": None,
             "research_scope": None,
+            "active_batch": None,
+            "staged_contributions": cast(Any, Overwrite({})),
+            "accepted_batches": cast(Any, Overwrite({})),
             "clarification": None,
             "answer": None,
             "completion_status": None,
@@ -232,14 +282,64 @@ def build_agent_graph(
                 specialist_descriptors=scope.specialist_descriptors,
             )
         )
-        Finish.model_validate(decision)
         _emit(
             (
                 LiveStreamEvent(type="step_start", step="coordinator"),
                 LiveStreamEvent(type="step_completed", step="coordinator"),
             )
         )
-        return {}
+        if isinstance(decision, Finish):
+            return {}
+        if state.get("accepted_batches"):
+            raise ValueError(
+                "Coordinator cannot Dispatch after initial batch acceptance"
+            )
+        dispatch = DispatchBatch.model_validate(decision)
+        active_batch = accept_initial_dispatch(
+            dispatch,
+            request_id=state["request_id"],
+            registry=specialist_registry,
+            scope_descriptors=scope.specialist_descriptors,
+        )
+        return {"active_batch": _active_batch_dump(active_batch)}
+
+    async def execute_first_specialist(
+        state: AgentGraphState,
+    ) -> AgentGraphStateUpdate:
+        active_value = state.get("active_batch")
+        scope_value = state.get("research_scope")
+        if not isinstance(active_value, dict) or not isinstance(scope_value, dict):
+            raise TypeError("Agent active batch is invalid")
+        active_batch = _active_batch_load(active_value)
+        scope = ResearchScope.model_validate(scope_value)
+        contribution = await execute_specialist(
+            active_batch.tasks[0],
+            batch_id=active_batch.id,
+            registry=specialist_registry,
+            scope_descriptors=scope.specialist_descriptors,
+        )
+        return {
+            "staged_contributions": {
+                contribution.task_id: contribution.model_dump(mode="json")
+            }
+        }
+
+    async def batch_barrier(state: AgentGraphState) -> AgentGraphStateUpdate:
+        active_value = state.get("active_batch")
+        staged_value = state.get("staged_contributions", {})
+        if not isinstance(active_value, dict):
+            raise TypeError("Agent batch state is invalid")
+        active_batch = _active_batch_load(active_value)
+        contributions = {
+            task_id: BatchContribution.model_validate(value)
+            for task_id, value in staged_value.items()
+        }
+        accepted = promote_batch(active_batch, contributions)
+        return {
+            "accepted_batches": {accepted.id: accepted.model_dump(mode="json")},
+            "staged_contributions": cast(Any, Overwrite({})),
+            "active_batch": None,
+        }
 
     async def research_completion(state: AgentGraphState) -> AgentGraphStateUpdate:
         del state
@@ -272,9 +372,12 @@ def build_agent_graph(
             termination_reason = state.get("termination_reason")
             if completion_status != "incomplete" or termination_reason != "insufficient_evidence":
                 raise TypeError("Agent research completion is invalid")
-            metadata["steps_executed"].extend(
-                ["resolve_scope", "coordinator", "research_completion"]
-            )
+            metadata["steps_executed"].extend(["resolve_scope", "coordinator"])
+            if state.get("accepted_batches"):
+                metadata["steps_executed"].extend(
+                    ["execute_first_specialist", "batch_barrier", "coordinator"]
+                )
+            metadata["steps_executed"].append("research_completion")
             metadata["completion_status"] = completion_status
             metadata["termination_reason"] = termination_reason
         metadata["steps_executed"].append("finalize_state")
@@ -315,11 +418,20 @@ def build_agent_graph(
     def next_after_query_understanding(state: AgentGraphState) -> str:
         return "finalize_state" if state.get("clarification") is not None else "resolve_scope"
 
+    def next_after_coordinator(state: AgentGraphState) -> str:
+        return (
+            "execute_first_specialist"
+            if state.get("active_batch") is not None
+            else "research_completion"
+        )
+
     builder.add_node("initializer", initializer)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("pre_moderation", pre_moderation)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("query_understanding", query_understanding)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("resolve_scope", resolve_scope)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("coordinator", coordinator)  # pyright: ignore[reportUnknownMemberType]
+    builder.add_node("execute_first_specialist", execute_first_specialist)  # pyright: ignore[reportUnknownMemberType]
+    builder.add_node("batch_barrier", batch_barrier)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("research_completion", research_completion)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("finalize_state", finalize_state)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("publish", publish)  # pyright: ignore[reportUnknownMemberType]
@@ -336,7 +448,16 @@ def build_agent_graph(
         {"resolve_scope": "resolve_scope", "finalize_state": "finalize_state"},
     )
     builder.add_edge("resolve_scope", "coordinator")
-    builder.add_edge("coordinator", "research_completion")
+    builder.add_conditional_edges(
+        "coordinator",
+        next_after_coordinator,
+        {
+            "execute_first_specialist": "execute_first_specialist",
+            "research_completion": "research_completion",
+        },
+    )
+    builder.add_edge("execute_first_specialist", "batch_barrier")
+    builder.add_edge("batch_barrier", "coordinator")
     builder.add_edge("research_completion", "finalize_state")
     builder.add_edge("finalize_state", "publish")
     builder.add_edge("publish", END)
@@ -346,3 +467,48 @@ def build_agent_graph(
             checkpointer=checkpointer
         ),
     )
+
+
+def _active_batch_dump(batch: ActiveBatch) -> dict[str, Any]:
+    """Serialize the scalar active-batch manifest for checkpoint state."""
+    return {
+        "id": batch.id,
+        "tasks": [
+            {
+                "id": task.id,
+                "objective": task.objective,
+                "specialist_id": task.specialist_id,
+            }
+            for task in batch.tasks
+        ],
+    }
+
+
+def _active_batch_load(value: Mapping[str, object]) -> ActiveBatch:
+    """Validate one scalar active-batch manifest from checkpoint state."""
+    raw_tasks = value.get("tasks")
+    batch_id = value.get("id")
+    if not isinstance(batch_id, str) or not isinstance(raw_tasks, list):
+        raise TypeError("Agent active batch is invalid")
+    tasks: list[AcceptedTask] = []
+    for raw_task in cast(list[object], raw_tasks):
+        if not isinstance(raw_task, Mapping):
+            raise TypeError("Agent active batch is invalid")
+        record = cast(Mapping[str, object], raw_task)
+        task_id = record.get("id")
+        objective = record.get("objective")
+        specialist_id = record.get("specialist_id")
+        if (
+            not isinstance(task_id, str)
+            or not isinstance(objective, str)
+            or not isinstance(specialist_id, str)
+        ):
+            raise TypeError("Agent active batch is invalid")
+        tasks.append(
+            AcceptedTask(
+                id=task_id,
+                objective=objective,
+                specialist_id=specialist_id,
+            )
+        )
+    return ActiveBatch(id=batch_id, tasks=tuple(tasks))
