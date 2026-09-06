@@ -35,6 +35,7 @@ from app.langgraph_v2.agent_batch import (
     TaskSucceeded,
     accept_initial_dispatch,
     execute_specialist,
+    normalize_task_objective,
     promote_batch,
     validate_active_batch_manifest,
 )
@@ -237,6 +238,14 @@ def test_initial_dispatch_intersects_registered_tenant_and_scope_eligibility() -
 
     assert batch.task_ids == ("task_90fff3e68e9a59d229d7982b65c5fe8b",)
     assert batch.tasks[0].objective == "Assess the current market outlook."
+
+
+def test_task_objective_normalization_is_single_line_nfc_and_byte_bounded() -> None:
+    assert normalize_task_objective("Cafe\u0301\r\n\tanalysis\x00") == "Café analysis"
+    assert normalize_task_objective("é" * 256) == "é" * 256
+
+    with pytest.raises(ValueError, match="Task objective exceeds 512 UTF-8 bytes"):
+        normalize_task_objective("é" * 256 + "a")
 
 
 def test_initial_dispatch_accepts_eight_independent_tasks_in_manifest_order() -> None:

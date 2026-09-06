@@ -1,7 +1,10 @@
 """Deterministic conservative research-completion values."""
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.langgraph_v2.agent_batch import normalize_task_objective
 from app.langgraph_v2.agent_evidence import DataGapView
 
 INSUFFICIENT_EVIDENCE_DISCLOSURE = (
@@ -9,6 +12,12 @@ INSUFFICIENT_EVIDENCE_DISCLOSURE = (
 )
 DATA_GAP_DISCLOSURE = "Incomplete research: requested data was unavailable:"
 TASK_FAILURE_DISCLOSURE = "Incomplete research: one requested task could not complete."
+STRUCTURAL_LIMIT_DISCLOSURES = {
+    "task_limit": "Incomplete research: the Task limit ended further work.",
+    "coordination_limit": "Incomplete research: the Coordination limit ended further work.",
+    "coordinator_context_limit": "Incomplete research: the Coordinator context limit ended further work.",
+    "coordination_invalid": "Incomplete research: the Coordinator could not produce a valid next decision.",
+}
 _MARKDOWN_ESCAPED_CHARACTERS = frozenset("\\`*_{}[]<>()#+-.!|~")
 
 
@@ -20,6 +29,21 @@ class IncompleteResearch(BaseModel):
     insufficient_evidence: bool
     data_gaps: tuple[DataGapView, ...] = ()
     task_failures: int = Field(default=0, ge=0)
+    failed_task_objectives: tuple[str, ...] = ()
+    structural_reason: Literal[
+        "task_limit",
+        "coordination_limit",
+        "coordinator_context_limit",
+        "coordination_invalid",
+    ] | None = None
+
+    @field_validator("failed_task_objectives")
+    @classmethod
+    def _validate_failed_task_objectives(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Require disclosure to reuse the accepted canonical Task objective."""
+        if any(normalize_task_objective(objective) != objective for objective in value):
+            raise ValueError("Failed Task objective is not canonical")
+        return value
 
     @property
     def has_data_gaps(self) -> bool:
@@ -30,6 +54,11 @@ class IncompleteResearch(BaseModel):
     def has_task_failures(self) -> bool:
         """Expose expected Task inability as a separate partial-result signal."""
         return self.task_failures > 0
+
+    @property
+    def has_structural_limit(self) -> bool:
+        """Expose a deterministic bound that ended further coordination."""
+        return self.structural_reason is not None
 
 
 def insufficient_evidence_answer(completion: IncompleteResearch) -> str:
@@ -58,7 +87,15 @@ def render_incomplete_research(answer: str, completion: IncompleteResearch) -> s
             )
         )
     if completion.has_task_failures:
-        lines.append(TASK_FAILURE_DISCLOSURE)
+        lines.extend(
+            (TASK_FAILURE_DISCLOSURE,)
+            + tuple(
+                f"- {_escape_markdown(objective)}"
+                for objective in completion.failed_task_objectives
+            )
+        )
+    if completion.structural_reason is not None:
+        lines.append(STRUCTURAL_LIMIT_DISCLOSURES[completion.structural_reason])
     if completion.insufficient_evidence:
         lines.append(INSUFFICIENT_EVIDENCE_DISCLOSURE)
     block = "\n".join(lines)

@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import date
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 import psycopg
@@ -34,6 +34,11 @@ from app.langgraph_v2.agent_batch import (
     SpecialistTaskInput,
     TaskProposal,
 )
+from app.langgraph_v2.agent_coordination import (
+    CoordinatorInput,
+    CoordinatorOutputInvalid,
+    Finish,
+)
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     ExpectedToolUnavailability,
@@ -43,7 +48,6 @@ from app.langgraph_v2.agent_evidence import (
     ToolUnavailable,
     ToolUnavailableReason,
 )
-from app.langgraph_v2.agent_graph import CoordinatorInput, Finish
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
@@ -103,6 +107,165 @@ class _Coordinator:
                 ),
             )
         return Finish(kind="finish")
+
+
+class _RequestScopedCoordinator:
+    """Dispatch once whenever the current request has no accepted result."""
+
+    def __init__(self) -> None:
+        self.inputs: list[CoordinatorInput] = []
+
+    async def decide(self, input: CoordinatorInput) -> DispatchBatch | Finish:
+        self.inputs.append(input)
+        if input.prior_results:
+            return Finish(kind="finish")
+        return DispatchBatch(
+            kind="dispatch",
+            tasks=(
+                TaskProposal(
+                    specialist_id="market-data",
+                    objective="Assess the current request.",
+                ),
+            ),
+        )
+
+
+class _ConversationUnderstandingActor:
+    async def understand(
+        self, query: str, history: Sequence[ConversationExchange]
+    ) -> QueryUnderstandingOutput:
+        del history
+        return QueryUnderstandingOutput(
+            resolved_query=ResolvedQuery(original_query=query, standalone_query=query),
+            intent=IntentResult(intent="market_outlook", confidence=0.9),
+        )
+
+
+class _RollingCoordinator:
+    def __init__(self) -> None:
+        self.inputs: list[CoordinatorInput] = []
+
+    async def decide(self, input: CoordinatorInput) -> DispatchBatch | Finish:
+        self.inputs.append(input)
+        if len(self.inputs) == 1:
+            return DispatchBatch(
+                kind="dispatch",
+                tasks=(
+                    TaskProposal(
+                        specialist_id="market-data",
+                        objective="Establish the market premise.",
+                    ),
+                ),
+            )
+        if len(self.inputs) == 2:
+            return DispatchBatch(
+                kind="dispatch",
+                tasks=(
+                    TaskProposal(
+                        specialist_id="market-data",
+                        objective="Assess the premise implications.",
+                        context_task_ids=(input.prior_results[0].task_id,),
+                    ),
+                ),
+            )
+        return Finish(kind="finish")
+
+
+class _MaxRollingCoordinator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(self, input: CoordinatorInput) -> DispatchBatch | Finish:
+        del input
+        self.calls += 1
+        if self.calls <= 4:
+            return DispatchBatch(
+                kind="dispatch",
+                tasks=tuple(
+                    TaskProposal(
+                        specialist_id="market-data",
+                        objective=(f"Assess rolling dimension {self.calls}-{index}."),
+                    )
+                    for index in range(8)
+                ),
+            )
+        return Finish(kind="finish")
+
+
+class _OutcomeDrivenCoordinator:
+    def __init__(self) -> None:
+        self.inputs: list[CoordinatorInput] = []
+
+    async def decide(self, input: CoordinatorInput) -> DispatchBatch | Finish:
+        self.inputs.append(input)
+        if len(self.inputs) == 1:
+            return DispatchBatch(
+                kind="dispatch",
+                tasks=(
+                    TaskProposal(
+                        specialist_id="market-data",
+                        objective="Establish the market premise.",
+                    ),
+                ),
+            )
+        if len(self.inputs) == 2:
+            follow_up_count = 2 if input.failed_tasks else 1
+            return DispatchBatch(
+                kind="dispatch",
+                tasks=tuple(
+                    TaskProposal(
+                        specialist_id="market-data",
+                        objective=f"Assess follow-up {index}.",
+                    )
+                    for index in range(follow_up_count)
+                ),
+            )
+        return Finish(kind="finish")
+
+
+class _InvalidCoordinator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(self, input: CoordinatorInput) -> DispatchBatch:
+        del input
+        self.calls += 1
+        raise CoordinatorOutputInvalid("invalid output")
+
+    async def repair(
+        self,
+        input: CoordinatorInput,
+        *,
+        rejection: str,
+    ) -> DispatchBatch:
+        del input
+        assert rejection == "Coordinator decision is invalid"
+        self.calls += 1
+        raise CoordinatorOutputInvalid("still invalid")
+
+
+class _ContextSpecialist:
+    def __init__(self) -> None:
+        self.inputs: list[SpecialistTaskInput] = []
+
+    async def run(
+        self,
+        input: SpecialistTaskInput,
+        *,
+        usage: RunUsage | None = None,
+        usage_limits: UsageLimits | None = None,
+    ) -> SpecialistAttempt:
+        del usage, usage_limits
+        self.inputs.append(input)
+        if len(self.inputs) == 1:
+            assert input.context_results == ()
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(summary="The market premise.")
+            )
+        assert input.context_results[0].summary == "The market premise."
+        return SpecialistAttempt(
+            finding=SpecialistFindingDraft(summary="The premise implications.")
+        )
 
 
 class _ConcurrentBatchCoordinator:
@@ -310,6 +473,28 @@ class _RetryExhaustedSpecialist:
         )
 
 
+class _OutcomeDrivenSpecialist(_RetryExhaustedSpecialist):
+    def __init__(self, *, fail_premise: bool) -> None:
+        super().__init__()
+        self.fail_premise = fail_premise
+        self.inputs: list[SpecialistTaskInput] = []
+
+    async def run(
+        self,
+        input: SpecialistTaskInput,
+        *,
+        usage: RunUsage | None = None,
+        usage_limits: UsageLimits | None = None,
+    ) -> SpecialistAttempt:
+        self.inputs.append(input)
+        if self.fail_premise and input.objective == "Establish the market premise.":
+            return await super().run(input, usage=usage, usage_limits=usage_limits)
+        del usage, usage_limits
+        return SpecialistAttempt(
+            finding=SpecialistFindingDraft(summary=f"Finding for {input.objective}")
+        )
+
+
 async def _evidence_provider(source: str, query: str) -> EvidenceEnvelope:
     assert (source, query) == ("filing", "Apple revenue")
     return EvidenceEnvelope(
@@ -497,6 +682,217 @@ class _TenantManager:
         )
 
 
+def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    coordinator = _RollingCoordinator()
+    specialist = _ContextSpecialist()
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=coordinator,
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000096"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "What about it?",
+                "sessionId": conversation_id,
+                "clientRequestId": "rolling-round-request",
+            },
+            headers=_TENANT_HEADERS,
+        )
+        checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+    events = parse_sse(response.text)
+    assert response.status_code == 200
+    assert len([event for event in events if event["type"] == "done"]) == 1
+    assert len(coordinator.inputs) == 3
+    assert coordinator.inputs[1].prior_results[0].summary == "The market premise."
+    assert len(specialist.inputs) == 2
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    rounds = state["coordination_rounds"]
+    assert [round_["kind"] for round_ in rounds.values()] == [
+        "dispatch",
+        "dispatch",
+        "finish",
+    ]
+    assert state["active_batch"] is None
+    assert len(state["accepted_batches"]) == 2
+
+
+def test_maximum_legal_rolling_path_completes_within_recursion_limit(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    coordinator = _MaxRollingCoordinator()
+    specialist = _Specialist()
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=coordinator,
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000097"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "What about it?",
+                "sessionId": conversation_id,
+                "clientRequestId": "max-rolling-request",
+            },
+            headers=_TENANT_HEADERS,
+        )
+        checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+    events = parse_sse(response.text)
+    assert response.status_code == 200
+    assert len([event for event in events if event["type"] == "done"]) == 1
+    assert coordinator.calls == 5
+    assert len(specialist.inputs) == 32
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    rounds = list(state["coordination_rounds"].values())
+    assert [round_["revision"] for round_ in rounds] == [1, 2, 3, 4, 5]
+    assert [round_["kind"] for round_ in rounds] == [
+        "dispatch",
+        "dispatch",
+        "dispatch",
+        "dispatch",
+        "finish",
+    ]
+
+
+def test_next_request_in_one_conversation_resets_rolling_coordination_state(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    coordinator = _RequestScopedCoordinator()
+    specialist = _Specialist()
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_ConversationUnderstandingActor(),
+            coordinator_actor=coordinator,
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000101"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+    with TestClient(app) as client:
+        first = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "First request",
+                "sessionId": conversation_id,
+                "clientRequestId": "request-101a",
+            },
+            headers=_TENANT_HEADERS,
+        )
+        second = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "Second request",
+                "sessionId": conversation_id,
+                "clientRequestId": "request-101b",
+            },
+            headers=_TENANT_HEADERS,
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert (
+        len([event for event in parse_sse(first.text) if event["type"] == "done"]) == 1
+    )
+    assert (
+        len([event for event in parse_sse(second.text) if event["type"] == "done"]) == 1
+    )
+    assert len(specialist.inputs) == 2
+    assert [len(input.prior_results) for input in coordinator.inputs] == [0, 1, 0, 1]
+
+
 def test_first_no_tool_specialist_is_accepted_before_conservative_done(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -653,14 +1049,149 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
     assert done[0]["data"]["metadata"]["specialist_usage"] == accepted["usage"]
 
 
+def test_prior_outcome_changes_the_follow_up_execution_shape(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+
+    def run_scenario(*, fail_premise: bool, conversation_id: str) -> dict[str, object]:
+        coordinator = _OutcomeDrivenCoordinator()
+        specialist = _OutcomeDrivenSpecialist(fail_premise=fail_premise)
+        registry = SpecialistRegistry(
+            registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+            tenant_eligible_ids=frozenset({"market-data"}),
+        )
+
+        def factory(
+            *,
+            app: FastAPI,
+            request_context: TrustedRequestContext,
+            checkpointer: BaseCheckpointSaver[Any],
+        ) -> GraphRuntimeAdapter:
+            return build_agent_runtime(
+                app,
+                request_context=request_context,
+                checkpointer=checkpointer,
+                query_understanding_actor=_UnderstandingActor(),
+                coordinator_actor=coordinator,
+                specialist_registry=registry,
+                intent_policies={policy.intent: policy},
+            )
+
+        app = persistent_linear_app(
+            langgraph_v2_migrated_database_url,
+            agent_runtime_factory=factory,
+        )
+        app.state.tenant_manager = _TenantManager()
+        with TestClient(app) as client:
+            response = client.post(
+                "/v2/query/stream",
+                json={
+                    "query": "What about it?",
+                    "sessionId": conversation_id,
+                    "clientRequestId": f"outcome-{fail_premise}",
+                },
+                headers=_TENANT_HEADERS,
+            )
+            checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+        assert response.status_code == 200
+        assert checkpoint is not None
+        assert len(coordinator.inputs) == 3
+        return checkpoint.checkpoint["channel_values"]
+
+    success = run_scenario(
+        fail_premise=False,
+        conversation_id="00000000-0000-0000-0000-000000000098",
+    )
+    failure = run_scenario(
+        fail_premise=True,
+        conversation_id="00000000-0000-0000-0000-000000000099",
+    )
+
+    success_rounds = list(
+        cast(dict[str, dict[str, object]], success["coordination_rounds"]).values()
+    )
+    failure_rounds = list(
+        cast(dict[str, dict[str, object]], failure["coordination_rounds"]).values()
+    )
+    assert len(cast(list[object], success_rounds[1]["tasks"])) == 1
+    assert len(cast(list[object], failure_rounds[1]["tasks"])) == 2
+
+
+def test_rejected_candidates_leave_no_checkpoint_coordination_round(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    coordinator = _InvalidCoordinator()
+    specialist = _Specialist()
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=coordinator,
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000100"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={"query": "What about it?", "sessionId": conversation_id},
+            headers=_TENANT_HEADERS,
+        )
+        checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+    done = [event for event in parse_sse(response.text) if event["type"] == "done"]
+    assert response.status_code == 200
+    assert len(done) == 1
+    assert coordinator.calls == 2
+    assert specialist.inputs == []
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    assert state["coordination_rounds"] == {}
+    assert state["accepted_batches"] == {}
+    assert state["coordination_stop_reason"] == "coordination_invalid"
+
+
 def test_concurrent_mixed_batch_is_atomically_accepted_in_manifest_order(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    def run_batch(*, reverse_completion: bool, conversation_id: str) -> dict[str, object]:
+    def run_batch(
+        *, reverse_completion: bool, conversation_id: str
+    ) -> dict[str, object]:
         coordinator = _ConcurrentBatchCoordinator()
-        specialist = _ConcurrentBatchSpecialist(
-            reverse_completion=reverse_completion
-        )
+        specialist = _ConcurrentBatchSpecialist(reverse_completion=reverse_completion)
         app = _concurrent_batch_app(
             langgraph_v2_migrated_database_url,
             coordinator=coordinator,
@@ -672,9 +1203,7 @@ def test_concurrent_mixed_batch_is_atomically_accepted_in_manifest_order(
                 conversation_id=conversation_id,
                 client_request_id="mixed-batch-request",
             )
-            checkpoint = _concurrent_batch_checkpoint(
-                app, client, conversation_id
-            )
+            checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
 
         events = parse_sse(response.text)
         assert response.status_code == 200
@@ -760,11 +1289,13 @@ def test_batch_barrier_checkpoint_failure_never_half_accepts_a_mixed_batch(
     }
     assert len(barrier_task_ids) == 1
     barrier_channels = {
-        write[1]
-        for write in checkpoint.pending_writes
-        if write[0] in barrier_task_ids
+        write[1] for write in checkpoint.pending_writes if write[0] in barrier_task_ids
     }
-    assert {"accepted_batches", "active_batch", "staged_contributions"} <= barrier_channels
+    assert {
+        "accepted_batches",
+        "active_batch",
+        "staged_contributions",
+    } <= barrier_channels
 
 
 def test_fatal_specialist_failure_keeps_sibling_contributions_unaccepted(
@@ -796,7 +1327,9 @@ def test_fatal_specialist_failure_keeps_sibling_contributions_unaccepted(
     state = checkpoint.checkpoint["channel_values"]
     assert state["accepted_batches"] == {}
     assert checkpoint.pending_writes
-    assert any(write[1] == "staged_contributions" for write in checkpoint.pending_writes)
+    assert any(
+        write[1] == "staged_contributions" for write in checkpoint.pending_writes
+    )
     assert all(write[1] != "accepted_batches" for write in checkpoint.pending_writes)
 
 
@@ -834,11 +1367,15 @@ async def test_cancelling_a_concurrent_batch_never_accepts_any_sibling(
         coordinator=coordinator,
         specialist=specialist,
     )
-    request_context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+    request_context = TrustedRequestContext(
+        tenant_id="tenant-a", subject_id="subject-a"
+    )
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
-            payload=V2QueryRequest(query="What about it?", conversation_id=conversation_id),
+            payload=V2QueryRequest(
+                query="What about it?", conversation_id=conversation_id
+            ),
             http_request=stream_request(app),
             request_context=request_context,
         )
@@ -863,7 +1400,7 @@ async def test_cancelling_a_concurrent_batch_never_accepts_any_sibling(
         )
 
     assert len(specialist.inputs) == 8
-    assert all("\"type\":\"done\"" not in frame for frame in frames)
+    assert all('"type":"done"' not in frame for frame in frames)
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
     assert state["accepted_batches"] == {}

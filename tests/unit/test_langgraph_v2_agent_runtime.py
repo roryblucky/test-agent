@@ -1,5 +1,7 @@
 """Coordinator actor construction coverage."""
 
+import json
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pydantic_ai.models as models
@@ -8,7 +10,13 @@ from fastapi import FastAPI
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
 from pydantic_ai import Agent, capture_run_messages
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 
@@ -27,7 +35,14 @@ from app.config.models import (
     TenantConfig,
 )
 from app.core.model_registry import ModelRegistry
-from app.langgraph_v2.agent_graph import CoordinatorDecision, CoordinatorInput, Finish
+from app.langgraph_v2.agent_batch import SpecialistRegistry
+from app.langgraph_v2.agent_coordination import (
+    CoordinationRound,
+    CoordinatorDecision,
+    CoordinatorInput,
+    Finish,
+    decide_coordination_round,
+)
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.authorization import TrustedRequestContext
@@ -91,21 +106,58 @@ async def test_coordinator_runs_real_pydantic_actor_with_fixed_limits() -> None:
 
 
 @pytest.mark.asyncio
+async def test_coordinator_repair_reuses_the_frozen_input_with_only_feedback() -> None:
+    prompts: list[dict[str, object]] = []
+
+    class _RecordingAgent:
+        async def run(
+            self,
+            prompt: str,
+            *,
+            model_settings: dict[str, int],
+        ) -> SimpleNamespace:
+            assert model_settings == {"max_tokens": COORDINATOR_MAX_TOKENS}
+            prompts.append(json.loads(prompt))
+            return SimpleNamespace(output=Finish(kind="finish"))
+
+    input = CoordinatorInput(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        specialist_descriptors=(),
+    )
+    actor = PydanticAICoordinatorActor(cast(Any, _RecordingAgent()))
+
+    assert await actor.decide(input) == Finish(kind="finish")
+    assert await actor.repair(input, rejection="Task context is invalid") == Finish(
+        kind="finish"
+    )
+    assert prompts == [
+        {"input": input.model_dump(mode="json"), "validation_feedback": None},
+        {
+            "input": input.model_dump(mode="json"),
+            "validation_feedback": "Task context is invalid",
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_coordinator_function_model_captures_one_toolless_overrideable_trace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
     calls: list[str] = []
 
-    def finish_response(
-        messages: list[ModelMessage], info: AgentInfo
-    ) -> ModelResponse:
+    def finish_response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         calls.append("default")
         assert len(messages) == 1
         assert info.function_tools == []
         assert info.model_settings == {"max_tokens": COORDINATOR_MAX_TOKENS}
         return ModelResponse(
-            parts=[ToolCallPart(tool_name=info.output_tools[0].name, args={"kind": "finish"})]
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name, args={"kind": "finish"}
+                )
+            ]
         )
 
     def override_response(
@@ -114,7 +166,11 @@ async def test_coordinator_function_model_captures_one_toolless_overrideable_tra
         calls.append("override")
         assert len(messages) == 1
         return ModelResponse(
-            parts=[ToolCallPart(tool_name=info.output_tools[0].name, args={"kind": "finish"})]
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name, args={"kind": "finish"}
+                )
+            ]
         )
 
     agent = Agent(
@@ -142,6 +198,66 @@ async def test_coordinator_function_model_captures_one_toolless_overrideable_tra
     assert len(messages) == 3
     assert isinstance(messages[1], ModelResponse)
     assert messages[1].usage.requests == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinator_repairs_a_real_pydantic_invalid_output_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
+    prompts: list[dict[str, object]] = []
+
+    def response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        prompt = next(
+            part.content
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, UserPromptPart)
+        )
+        assert isinstance(prompt, str)
+        prompts.append(json.loads(prompt))
+        args: dict[str, str] = {"kind": "invalid" if len(prompts) == 1 else "finish"}
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=args)]
+        )
+
+    input = CoordinatorInput(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        specialist_descriptors=(),
+    )
+    actor = PydanticAICoordinatorActor(
+        Agent(
+            FunctionModel(response),
+            output_type=cast(type[Any], CoordinatorDecision),
+            tools=(),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+
+    decision = await decide_coordination_round(
+        actor,
+        input,
+        request_id="request-1",
+        rounds=(),
+        accepted_batches={},
+        registry=SpecialistRegistry(registrations=(), tenant_eligible_ids=frozenset()),
+        scope_descriptors=(),
+    )
+
+    assert isinstance(decision, CoordinationRound)
+    assert decision.kind == "finish"
+    assert prompts == [
+        {"input": input.model_dump(mode="json"), "validation_feedback": None},
+        {
+            "input": input.model_dump(mode="json"),
+            "validation_feedback": "Coordinator decision is invalid",
+        },
+    ]
 
 
 def test_finish_requires_its_discriminator() -> None:
@@ -181,7 +297,9 @@ def test_runtime_resolves_intent_policy_from_trusted_tenant_config() -> None:
     app.state.tenant_manager = _TenantManager()
     runtime = build_agent_runtime(
         app,
-        request_context=TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a"),
+        request_context=TrustedRequestContext(
+            tenant_id="tenant-a", subject_id="subject-a"
+        ),
         checkpointer=InMemorySaver(),
         query_understanding_actor=cast(Any, object()),
         coordinator_actor=cast(Any, object()),

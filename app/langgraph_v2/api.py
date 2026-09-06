@@ -24,6 +24,7 @@ from starlette.types import Receive, Scope, Send
 
 from app.config.models import LangGraphRuntimeMode
 from app.langgraph_v2.agent_batch import MAX_DISPATCH_BATCH_TASKS
+from app.langgraph_v2.agent_coordination import AGENT_RECURSION_LIMIT
 from app.langgraph_v2.answer import AnswerActor
 from app.langgraph_v2.authorization import (
     TrustedRequestContext,
@@ -396,7 +397,11 @@ def create_v2_router(
         if runtime_mode is LangGraphRuntimeMode.AGENT:
             graph_config = cast(
                 RunnableConfig,
-                {**graph_config, "max_concurrency": MAX_DISPATCH_BATCH_TASKS},
+                {
+                    **graph_config,
+                    "max_concurrency": MAX_DISPATCH_BATCH_TASKS,
+                    "recursion_limit": AGENT_RECURSION_LIMIT,
+                },
             )
         try:
             await validate_checkpoint_request_identity(

@@ -12,6 +12,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from app.langgraph_v2.agent_coordination import (
+    CoordinationInvariantError,
+    CoordinationRound,
+    validate_coordination_rounds,
+)
 from app.langgraph_v2.agent_scope import ResearchScope
 from app.langgraph_v2.contracts import V2QueryResponse
 from app.langgraph_v2.conversation_context import validate_request_identity
@@ -133,7 +138,14 @@ class AgentCheckpointStateAdapter:
 
     _string_channels = frozenset({"query", "conversation_id", "request_id"})
     _nullable_string_channels = frozenset(
-        {"answer", "standalone_query", "completion_status", "termination_reason"}
+        {
+            "answer",
+            "standalone_query",
+            "completion_status",
+            "termination_reason",
+            "coordination_stop_reason",
+            "coordination_request_id",
+        }
     )
     _nullable_json_object_channels = frozenset(
         {
@@ -144,7 +156,9 @@ class AgentCheckpointStateAdapter:
             "final_response",
         }
     )
-    _json_object_channels = frozenset({"staged_contributions", "accepted_batches"})
+    _json_object_channels = frozenset(
+        {"staged_contributions", "accepted_batches", "coordination_rounds"}
+    )
 
     def validate_checkpoint_state(
         self,
@@ -167,6 +181,18 @@ class AgentCheckpointStateAdapter:
             channel_values["halted"], bool
         ):
             raise TypeError("checkpoint halted is invalid")
+        if "coordination_finished" in channel_values and not isinstance(
+            channel_values["coordination_finished"], bool
+        ):
+            raise TypeError("checkpoint coordination_finished is invalid")
+        stop_reason = channel_values.get("coordination_stop_reason")
+        if stop_reason is not None and stop_reason not in {
+            "task_limit",
+            "coordination_limit",
+            "coordinator_context_limit",
+            "coordination_invalid",
+        }:
+            raise TypeError("checkpoint coordination_stop_reason is invalid")
         for channel in self._nullable_json_object_channels:
             if channel in channel_values and channel_values[channel] is not None:
                 _validate_json_object(channel_values[channel], channel=channel)
@@ -193,6 +219,28 @@ class AgentCheckpointStateAdapter:
             model=V2QueryResponse,
             channel="final_response",
         )
+        raw_rounds = channel_values.get("coordination_rounds", {})
+        if not isinstance(raw_rounds, dict):
+            raise TypeError("checkpoint coordination_rounds is invalid")
+        parsed_rounds: list[CoordinationRound] = []
+        for round_id, coordination_round in cast(dict[str, object], raw_rounds).items():
+            _validate_model(
+                coordination_round,
+                model=CoordinationRound,
+                channel="coordination_rounds",
+            )
+            parsed = CoordinationRound.model_validate(coordination_round)
+            if parsed.id != round_id:
+                raise TypeError("checkpoint coordination_rounds is invalid")
+            parsed_rounds.append(parsed)
+        if parsed_rounds:
+            request_id = channel_values.get("coordination_request_id")
+            if not isinstance(request_id, str):
+                raise TypeError("checkpoint request_id is invalid")
+            try:
+                validate_coordination_rounds(parsed_rounds, request_id=request_id)
+            except CoordinationInvariantError as error:
+                raise TypeError("checkpoint coordination_rounds is invalid") from error
         raw_messages = channel_values.get("conversation_messages", [])
         if not isinstance(raw_messages, list) or not all(
             isinstance(message, HumanMessage | AIMessage)
@@ -251,6 +299,7 @@ def _validate_optional_model(
         | IntentResult
         | ResearchScope
         | QueryUnderstandingClarification
+        | CoordinationRound
     ],
     channel: str,
 ) -> None:
@@ -269,6 +318,7 @@ def _validate_model(
         | IntentResult
         | ResearchScope
         | QueryUnderstandingClarification
+        | CoordinationRound
     ],
     channel: str,
 ) -> None:
@@ -335,6 +385,7 @@ async def validate_checkpoint_request_identity(
         state_adapter=state_adapter,
     )
     validate_request_identity(messages, request_id=request_id, query=query)
+
 
 def _encode_parts(*parts: str) -> str:
     payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()

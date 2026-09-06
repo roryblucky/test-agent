@@ -1,6 +1,7 @@
 """No-Tool Specialist PydanticAI actor coverage."""
 
 import asyncio
+import json
 from datetime import date
 from typing import cast
 
@@ -15,6 +16,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     ToolCallPart,
     ToolReturnPart,
+    UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -32,7 +34,13 @@ from app.agents.specialist import (
     create_specialist_agent,
 )
 from app.core.model_registry import ModelRegistry
-from app.langgraph_v2.agent_batch import SpecialistFindingDraft, SpecialistTaskInput
+from app.langgraph_v2.agent_batch import (
+    PriorResultView,
+    SpecialistFindingDraft,
+    SpecialistTaskInput,
+    canonical_context_json_details,
+)
+from app.langgraph_v2.agent_coordination import MAX_SPECIALIST_CONTEXT_BYTES
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
@@ -295,6 +303,132 @@ async def test_specialist_function_model_has_one_request_and_structured_trace() 
     assert len(result.new_messages()) == 3
     assert result.usage().requests == 1
     assert len(result_messages) == 3
+
+
+@pytest.mark.asyncio
+async def test_specialist_model_receives_only_materialized_prior_results() -> None:
+    prompts: list[dict[str, object]] = []
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        user_prompt = next(
+            part.content
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, UserPromptPart)
+        )
+        assert isinstance(user_prompt, str)
+        prompts.append(json.loads(user_prompt))
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={"summary": "Follow-up finding", "evidence_ids": []},
+                )
+            ]
+        )
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    prior = PriorResultView(
+        task_id="task-prior",
+        summary="Stable prior finding.",
+        evidence_ids=("evidence-1",),
+    )
+    context_json_bytes, context_json_sha256 = canonical_context_json_details((prior,))
+
+    await actor.run(
+        SpecialistTaskInput(
+            task_id="task-follow-up",
+            objective="Assess implications.",
+            context_results=(prior,),
+            context_json_bytes=context_json_bytes,
+            context_json_sha256=context_json_sha256,
+        )
+    )
+
+    assert prompts == [
+        {
+            "context_results": [prior.model_dump(mode="json")],
+            "objective": "Assess implications.",
+            "skill_summaries": [],
+            "task_id": "task-follow-up",
+            "validation_feedback": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_specialist_non_ascii_context_uses_the_accepted_utf8_serialization() -> (
+    None
+):
+    prompts: list[str] = []
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        prompt = next(
+            part.content
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, UserPromptPart)
+        )
+        assert isinstance(prompt, str)
+        prompts.append(prompt)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={"summary": "Follow-up finding", "evidence_ids": []},
+                )
+            ]
+        )
+
+    context = tuple(
+        PriorResultView(task_id=f"task-{index}", summary="é" * 2_600)
+        for index in range(8)
+    )
+    context_json_bytes, context_json_sha256 = canonical_context_json_details(context)
+    canonical_context = json.dumps(
+        [result.model_dump(mode="json") for result in context],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert context_json_bytes == len(canonical_context.encode("utf-8"))
+    assert context_json_bytes < MAX_SPECIALIST_CONTEXT_BYTES
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        )
+    )
+    await actor.run(
+        SpecialistTaskInput(
+            task_id="task-follow-up",
+            objective="Assess implications.",
+            context_results=context,
+            context_json_bytes=context_json_bytes,
+            context_json_sha256=context_json_sha256,
+        )
+    )
+
+    assert f'"context_results":{canonical_context},' in prompts[0]
+    assert "\\u00e9" not in prompts[0]
 
 
 @pytest.mark.asyncio
@@ -694,9 +828,10 @@ async def test_specialist_charges_a_provider_failure_without_a_usage_response() 
     assert model_calls == 2
     assert usage.requests == 2
     assert raised.value.facts.boundary is SpecialistModelBoundary.UNKNOWN
-    assert classify_specialist_failure(
-        raised.value.error, facts=raised.value.facts
-    ) is None
+    assert (
+        classify_specialist_failure(raised.value.error, facts=raised.value.facts)
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -734,9 +869,10 @@ async def test_specialist_uses_the_active_model_override_for_retry_boundary() ->
         await http_client.aclose()
 
     assert raised.value.facts.boundary is SpecialistModelBoundary.UNKNOWN
-    assert classify_specialist_failure(
-        raised.value.error, facts=raised.value.facts
-    ) is None
+    assert (
+        classify_specialist_failure(raised.value.error, facts=raised.value.facts)
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -771,9 +907,10 @@ async def test_specialist_retries_only_its_own_model_request_timeout(
 
     assert isinstance(raised.value.error, SpecialistModelRequestTimeout)
     assert usage.requests == 1
-    assert classify_specialist_failure(
-        raised.value.error, facts=raised.value.facts
-    ) is RetryDisposition.RETRY
+    assert (
+        classify_specialist_failure(raised.value.error, facts=raised.value.facts)
+        is RetryDisposition.RETRY
+    )
 
 
 @pytest.mark.asyncio
@@ -804,9 +941,10 @@ async def test_specialist_preserves_a_provider_timeout_as_fatal() -> None:
 
     assert type(raised.value.error) is TimeoutError
     assert usage.requests == 1
-    assert classify_specialist_failure(
-        raised.value.error, facts=raised.value.facts
-    ) is None
+    assert (
+        classify_specialist_failure(raised.value.error, facts=raised.value.facts)
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -831,9 +969,12 @@ async def test_specialist_only_converts_proven_request_limit_exhaustion() -> Non
         await actor.run(SpecialistTaskInput(task_id="task-1", objective="Assess."))
 
     assert not unexpected.value.facts.count_limit_exhausted
-    assert classify_specialist_failure(
-        unexpected.value.error, facts=unexpected.value.facts
-    ) is None
+    assert (
+        classify_specialist_failure(
+            unexpected.value.error, facts=unexpected.value.facts
+        )
+        is None
+    )
 
     edge_usage = RunUsage(requests=11)
     with pytest.raises(SpecialistInvocationFailure) as edge:
@@ -845,9 +986,7 @@ async def test_specialist_only_converts_proven_request_limit_exhaustion() -> Non
     assert edge_usage.requests == 12
     assert not edge.value.facts.count_limit_exhausted
     assert edge.value.facts.unreturned_model_requests == 1
-    assert classify_specialist_failure(
-        edge.value.error, facts=edge.value.facts
-    ) is None
+    assert classify_specialist_failure(edge.value.error, facts=edge.value.facts) is None
 
     limit_actor = PydanticAISpecialistActor(
         Agent(
@@ -868,9 +1007,10 @@ async def test_specialist_only_converts_proven_request_limit_exhaustion() -> Non
         )
 
     assert exhausted.value.facts.count_limit_exhausted
-    assert classify_specialist_failure(
-        exhausted.value.error, facts=exhausted.value.facts
-    ) is RetryDisposition.TASK_FAILED
+    assert (
+        classify_specialist_failure(exhausted.value.error, facts=exhausted.value.facts)
+        is RetryDisposition.TASK_FAILED
+    )
 
 
 @pytest.mark.asyncio
@@ -914,6 +1054,7 @@ async def test_specialist_does_not_treat_a_parallel_business_usage_limit_as_a_ga
 
     assert usage.tool_calls == 7
     assert not raised.value.facts.count_limit_exhausted
-    assert classify_specialist_failure(
-        raised.value.error, facts=raised.value.facts
-    ) is None
+    assert (
+        classify_specialist_failure(raised.value.error, facts=raised.value.facts)
+        is None
+    )

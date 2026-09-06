@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from app.langgraph_v2.agent_completion import (
     IncompleteResearch,
     render_incomplete_research,
@@ -63,3 +65,22 @@ def test_incomplete_research_discloses_expected_task_failure() -> None:
     assert answer.startswith(
         "Incomplete research: one requested task could not complete.\n\n"
     )
+
+
+def test_task_failure_disclosure_reuses_the_canonical_accepted_objective() -> None:
+    answer = render_incomplete_research(
+        "Published report.",
+        IncompleteResearch(
+            insufficient_evidence=False,
+            task_failures=1,
+            failed_task_objectives=("Café analysis",),
+        ),
+    )
+
+    assert "- Café analysis" in answer
+    with pytest.raises(ValueError, match="not canonical"):
+        IncompleteResearch(
+            insufficient_evidence=False,
+            task_failures=1,
+            failed_task_objectives=("Café\nanalysis",),
+        )

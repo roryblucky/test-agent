@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel
 
+from app.langgraph_v2.agent_coordination import accept_coordination_finish
 from app.langgraph_v2.checkpointing import (
     AgentCheckpointStateAdapter,
     LinearCheckpointStateAdapter,
@@ -85,6 +86,45 @@ def test_agent_checkpoint_adapter_rejects_malformed_clarification() -> None:
                 }
             }
         )
+
+
+def test_agent_checkpoint_adapter_round_trips_only_valid_coordination_rounds() -> None:
+    round_ = accept_coordination_finish(request_id="request-1", rounds=())
+    adapter = AgentCheckpointStateAdapter()
+
+    assert adapter.validate_checkpoint_state(
+        {
+            "coordination_rounds": {round_.id: round_.model_dump(mode="json")},
+            "request_id": "request-1",
+            "coordination_request_id": "request-1",
+            "coordination_finished": True,
+            "coordination_stop_reason": None,
+        }
+    ) == []
+
+    with pytest.raises(TypeError, match="checkpoint coordination_rounds is invalid"):
+        adapter.validate_checkpoint_state(
+            {
+                "coordination_rounds": {
+                    "round-6": {
+                        "id": "round-6",
+                        "revision": 6,
+                        "kind": "finish",
+                    }
+                }
+            }
+        )
+
+    with pytest.raises(TypeError, match="checkpoint coordination_rounds is invalid"):
+        adapter.validate_checkpoint_state(
+            {
+                "request_id": "request-1",
+                "coordination_rounds": {"forged-key": round_.model_dump(mode="json")},
+            }
+        )
+
+    with pytest.raises(TypeError, match="checkpoint coordination_stop_reason is invalid"):
+        adapter.validate_checkpoint_state({"coordination_stop_reason": "raw-error"})
 
 
 @pytest.mark.parametrize(

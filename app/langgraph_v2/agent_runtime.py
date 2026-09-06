@@ -18,11 +18,13 @@ from app.agents.query_understanding import (
 from app.agents.synthesis import PydanticAISynthesisActor, create_synthesis_agent
 from app.config.models import AgentResearchConfig, LangGraphRuntimeMode
 from app.langgraph_v2.agent_batch import SpecialistRegistry
-from app.langgraph_v2.agent_evidence import RequestEvidenceCatalog
-from app.langgraph_v2.agent_graph import (
+from app.langgraph_v2.agent_coordination import (
     CoordinatorActor,
     CoordinatorInput,
     Finish,
+)
+from app.langgraph_v2.agent_evidence import RequestEvidenceCatalog
+from app.langgraph_v2.agent_graph import (
     QueryUnderstandingActor,
     SynthesisActor,
     build_agent_graph,

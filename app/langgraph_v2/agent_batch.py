@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +49,9 @@ from app.langgraph_v2.specialist_retry import (
 
 _SPECIALIST_OUTPUT_MAX_BYTES = 16 * 1024
 MAX_DISPATCH_BATCH_TASKS = 8
+MAX_TASK_OBJECTIVE_BYTES = 512
+_EMPTY_CONTEXT_JSON_BYTES = 2
+_EMPTY_CONTEXT_JSON_SHA256 = hashlib.sha256(b"[]").hexdigest()
 
 
 class StructuredOutputInvalid(ValueError):
@@ -57,6 +61,21 @@ class StructuredOutputInvalid(ValueError):
 def _stable_id(prefix: str, value: Mapping[str, object]) -> str:
     canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return f"{prefix}_{hashlib.sha256(canonical).hexdigest()[:32]}"
+
+
+def normalize_task_objective(value: str) -> str:
+    """Return one canonical, bounded single-line Task objective."""
+    normalized = unicodedata.normalize("NFC", value)
+    single_line = "".join(
+        " " if character in "\r\n" or unicodedata.category(character).startswith("C") else character
+        for character in normalized
+    )
+    canonical = " ".join(single_line.split())
+    if not canonical:
+        raise ValueError("Task objective must not be blank")
+    if len(canonical.encode("utf-8")) > MAX_TASK_OBJECTIVE_BYTES:
+        raise ValueError("Task objective exceeds 512 UTF-8 bytes")
+    return canonical
 
 
 def _canonical_json_size(value: BaseModel) -> int:
@@ -76,7 +95,7 @@ class TaskProposal(BaseModel):
 
     specialist_id: str = Field(min_length=1)
     objective: str = Field(min_length=1)
-    context_task_ids: tuple[str, ...] = ()
+    context_task_ids: tuple[str, ...] = Field(max_length=8, default=())
 
 
 class DispatchBatch(BaseModel):
@@ -125,6 +144,30 @@ class SpecialistResult(BaseModel):
         """Reject a Result that exceeds its complete accepted-state bound."""
         if self.canonical_json_size() > _SPECIALIST_OUTPUT_MAX_BYTES:
             raise StructuredOutputInvalid("Specialist result exceeds 16 KiB")
+
+
+class PriorResultView(BaseModel):
+    """Bounded earlier successful Result projection for Coordinator or Specialist."""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    summary: str
+    evidence_ids: tuple[str, ...] = Field(max_length=16, default=())
+    data_gaps: tuple[DataGapView, ...] = Field(max_length=8, default=())
+
+
+def canonical_context_json_details(
+    results: Sequence[PriorResultView],
+) -> tuple[int, str]:
+    """Return the sole canonical serialization used for Specialist context."""
+    payload = json.dumps(
+        [result.model_dump(mode="json") for result in results],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return len(payload), hashlib.sha256(payload).hexdigest()
 
 
 class GapProvenance(BaseModel):
@@ -358,6 +401,9 @@ class AcceptedTask:
     id: str
     objective: str
     specialist_id: str
+    context_task_ids: tuple[str, ...] = ()
+    context_json_bytes: int = _EMPTY_CONTEXT_JSON_BYTES
+    context_json_sha256: str = _EMPTY_CONTEXT_JSON_SHA256
 
 
 @dataclass(frozen=True)
@@ -366,9 +412,12 @@ class ActiveBatch:
 
     id: str
     tasks: tuple[AcceptedTask, ...]
+    round: int = 1
 
     def __post_init__(self) -> None:
         """Reject malformed manifests before they can be dispatched or promoted."""
+        if self.round < 1:
+            raise ValueError("Active Batch round is invalid")
         if not 1 <= len(self.tasks) <= MAX_DISPATCH_BATCH_TASKS:
             raise ValueError("Active Batch Task count is invalid")
         if len(set(self.task_ids)) != len(self.tasks):
@@ -566,6 +615,9 @@ class SpecialistTaskInput:
 
     task_id: str
     objective: str
+    context_results: tuple[PriorResultView, ...] = ()
+    context_json_bytes: int = _EMPTY_CONTEXT_JSON_BYTES
+    context_json_sha256: str = _EMPTY_CONTEXT_JSON_SHA256
     validation_feedback: str | None = None
 
 
@@ -581,33 +633,26 @@ def accept_initial_dispatch(
     if not 1 <= len(proposals) <= MAX_DISPATCH_BATCH_TASKS:
         raise ValueError(
             f"Dispatch Batch exceeds {MAX_DISPATCH_BATCH_TASKS} Tasks"
-        )
+    )
     for proposal in proposals:
-        if not proposal.objective.strip():
-            raise ValueError("Specialist objective must not be blank")
+        normalize_task_objective(proposal.objective)
         if proposal.context_task_ids:
             raise ValueError("initial Dispatch cannot select prior Task context")
         registry.resolve(proposal.specialist_id, scope_descriptors=scope_descriptors)
-    batch_id = _stable_id(
-        "batch", {"request_id": request_id, "round": 1}
-    )
+    batch_id = batch_id_for(request_id=request_id, round=1)
     active_batch = ActiveBatch(
         id=batch_id,
         tasks=tuple(
             AcceptedTask(
-                id=_stable_id(
-                    "task",
-                    {
-                        "request_id": request_id,
-                        "round": 1,
-                        "dispatch_order": dispatch_order,
-                    },
+                id=task_id_for(
+                    request_id=request_id, round=1, dispatch_order=dispatch_order
                 ),
-                objective=proposal.objective.strip(),
+                objective=normalize_task_objective(proposal.objective),
                 specialist_id=proposal.specialist_id,
             )
             for dispatch_order, proposal in enumerate(proposals)
         ),
+        round=1,
     )
     validate_active_batch_manifest(
         active_batch,
@@ -618,6 +663,23 @@ def accept_initial_dispatch(
     return active_batch
 
 
+def batch_id_for(*, request_id: str, round: int) -> str:
+    """Return a stable Graph-owned Batch identity for one Coordination Round."""
+    return _stable_id("batch", {"request_id": request_id, "round": round})
+
+
+def task_id_for(*, request_id: str, round: int, dispatch_order: int) -> str:
+    """Return a stable Graph-owned Task identity within one Coordination Round."""
+    return _stable_id(
+        "task",
+        {
+            "request_id": request_id,
+            "round": round,
+            "dispatch_order": dispatch_order,
+        },
+    )
+
+
 def validate_active_batch_manifest(
     batch: ActiveBatch,
     *,
@@ -626,22 +688,39 @@ def validate_active_batch_manifest(
     scope_descriptors: Sequence[SpecialistDescriptor],
 ) -> None:
     """Revalidate a checkpointed batch before it can fan out Specialist work."""
-    expected_batch_id = _stable_id("batch", {"request_id": request_id, "round": 1})
+    expected_batch_id = batch_id_for(request_id=request_id, round=batch.round)
     if batch.id != expected_batch_id:
         raise ValueError("Active Batch identity is invalid")
     for dispatch_order, task in enumerate(batch.tasks):
-        expected_task_id = _stable_id(
-            "task",
-            {
-                "request_id": request_id,
-                "round": 1,
-                "dispatch_order": dispatch_order,
-            },
+        expected_task_id = task_id_for(
+            request_id=request_id,
+            round=batch.round,
+            dispatch_order=dispatch_order,
         )
         if task.id != expected_task_id:
             raise ValueError("Active Batch Task identity is invalid")
-        if not task.objective.strip() or task.objective != task.objective.strip():
+        try:
+            canonical_objective = normalize_task_objective(task.objective)
+        except ValueError as error:
+            raise ValueError("Active Batch Task objective is invalid") from error
+        if task.objective != canonical_objective:
             raise ValueError("Active Batch Task objective is invalid")
+        if (
+            len(task.context_task_ids) > 8
+            or len(set(task.context_task_ids)) != len(task.context_task_ids)
+            or task.context_json_bytes < 0
+            or len(task.context_json_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in task.context_json_sha256
+            )
+        ):
+            raise ValueError("Active Batch Task context is invalid")
+        if not task.context_task_ids and (
+            task.context_json_bytes != _EMPTY_CONTEXT_JSON_BYTES
+            or task.context_json_sha256 != _EMPTY_CONTEXT_JSON_SHA256
+        ):
+            raise ValueError("Active Batch Task context is invalid")
         registry.resolve(task.specialist_id, scope_descriptors=scope_descriptors)
 
 
@@ -654,6 +733,7 @@ async def execute_specialist(
     catalog: RequestEvidenceCatalog | None = None,
     context: EvidenceInvocationContext,
     scope_skill_names: frozenset[str] = frozenset(),
+    context_results: tuple[PriorResultView, ...] = (),
     tool_telemetry: ToolTelemetry | None = None,
     diagnostics: SpecialistExecutionDiagnostics | None = None,
 ) -> BatchContribution:
@@ -707,6 +787,9 @@ async def execute_specialist(
                 SpecialistTaskInput(
                     task_id=task.id,
                     objective=task.objective,
+                    context_results=context_results,
+                    context_json_bytes=task.context_json_bytes,
+                    context_json_sha256=task.context_json_sha256,
                     validation_feedback=validation_feedback,
                 ),
                 usage=cumulative_usage,

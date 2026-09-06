@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
-from app.langgraph_v2.agent_graph import CoordinatorInput, Finish
+from app.langgraph_v2.agent_coordination import CoordinatorInput, Finish
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
 from app.langgraph_v2.api import GraphRuntimeAdapter, GraphRuntimeFactory
