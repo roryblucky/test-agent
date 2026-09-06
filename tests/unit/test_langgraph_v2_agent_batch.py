@@ -32,6 +32,7 @@ from app.langgraph_v2.agent_batch import (
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
+    SpecialistToolCapture,
     ToolUnavailabilityRecord,
     ToolUnavailableReason,
 )
@@ -129,11 +130,10 @@ def _gap_registry(
 
     def factory(
         tools: tuple[object, ...],
-        returned_evidence: object,
+        tool_capture: object,
         skill_invocation: object,
-        returned_unavailability: object,
     ) -> _Specialist:
-        del tools, returned_evidence, skill_invocation, returned_unavailability
+        del tools, tool_capture, skill_invocation
         return _Specialist(unavailability=records)
 
     return SpecialistRegistry(
@@ -402,9 +402,7 @@ async def test_execute_specialist_persists_only_activated_skill_pins() -> None:
     accepted = promote_batch(batch, {contribution.task_id: contribution})
 
     assert contribution.skill_pins == (pin,)
-    assert accepted.skill_pins == (
-        TaskSkillPins(task_id=batch.tasks[0].id, pins=(pin,)),
-    )
+    assert accepted.skill_pins == (TaskSkillPins(task_id=batch.tasks[0].id, pins=(pin,)),)
 
 
 @pytest.mark.asyncio
@@ -437,6 +435,57 @@ async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record(
     assert gap.provenance.unavailability_id == "unavailable-1"
     assert gap.provenance.tool_id == "filing-tool"
     assert len(contribution.outcome.result.data_gaps) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_rejects_conflicting_tool_call_provenance(
+) -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=scope_descriptors,
+    )
+    record = _unavailability_record(task_id=batch.tasks[0].id)
+
+    with pytest.raises(ValueError, match="Data Gap provenance"):
+        await execute_specialist(
+            batch.tasks[0],
+            batch_id=batch.id,
+            registry=_gap_registry(
+                (record, record.model_copy(update={"id": "unavailable-2"}))
+            ),
+            scope_descriptors=scope_descriptors,
+            context=_context(task_id=batch.tasks[0].id),
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_rejects_missing_tool_call_provenance() -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=scope_descriptors,
+    )
+    record = _unavailability_record(task_id=batch.tasks[0].id).model_copy(
+        update={"tool_call_id": ""}
+    )
+
+    with pytest.raises(ValueError, match="Data Gap provenance"):
+        await execute_specialist(
+            batch.tasks[0],
+            batch_id=batch.id,
+            registry=_gap_registry((record,)),
+            scope_descriptors=scope_descriptors,
+            context=_context(task_id=batch.tasks[0].id),
+        )
 
 
 @pytest.mark.parametrize(
@@ -554,11 +603,10 @@ async def test_registry_freezes_tool_and_source_intersection_before_provider_acc
 
     def factory(
         tools: tuple[object, ...],
-        returned_evidence: object,
+        tool_capture: object,
         skill_invocation: object,
-        returned_unavailability: object,
     ) -> _Specialist:
-        del returned_evidence, skill_invocation, returned_unavailability
+        del tool_capture, skill_invocation
         captured.extend(tools)
         return _Specialist()
 
@@ -618,11 +666,10 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
 
     def factory(
         tools: tuple[object, ...],
-        returned_evidence: object,
+        tool_capture: object,
         skill_invocation: object,
-        returned_unavailability: object,
     ) -> _Specialist:
-        del returned_evidence, skill_invocation, returned_unavailability
+        del tool_capture, skill_invocation
         captured.append(tools)
         return _Specialist()
 
@@ -653,10 +700,14 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
     assert captured == [()]
 
 
-def test_registry_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> None:
+def test_registry_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> (
+    None
+):
     direct_actor = _Specialist()
     registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=direct_actor),),
+        registrations=(
+            SpecialistRegistration(id="market-data", actor=direct_actor),
+        ),
         tenant_eligible_ids=frozenset({"market-data"}),
         skill_registry=SpecialistSkillRegistry(
             registrations=(
@@ -698,11 +749,10 @@ def test_registry_binds_skill_activation_without_expanding_frozen_business_tools
 
     def factory(
         tools: tuple[Callable[..., object], ...],
-        returned_evidence: list[EvidenceEnvelope],
+        tool_capture: SpecialistToolCapture,
         skill_invocation: SkillInvocation | None,
-        returned_unavailability: object,
     ) -> _Specialist:
-        del returned_evidence, returned_unavailability
+        del tool_capture
         assert skill_invocation is not None
         captured_tools.extend(tools)
         captured_invocation.append(skill_invocation)
@@ -764,9 +814,7 @@ def test_registry_binds_skill_activation_without_expanding_frozen_business_tools
         "shared-skill",
         "market-skill",
     ]
-    assert (
-        invocation.activate("shared-skill").instructions == "SHARED-FULL-INSTRUCTIONS"
-    )
+    assert invocation.activate("shared-skill").instructions == "SHARED-FULL-INSTRUCTIONS"
 
 
 def _tool_name(tool: Callable[..., object]) -> str:

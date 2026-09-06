@@ -32,8 +32,8 @@ from app.langgraph_v2.agent_batch import (
 )
 from app.langgraph_v2.agent_completion import (
     IncompleteResearch,
-    append_data_gap_disclosure,
     insufficient_evidence_answer,
+    render_incomplete_research,
 )
 from app.langgraph_v2.agent_evidence import (
     DataGapView,
@@ -314,7 +314,11 @@ def build_agent_graph(
                 specialist_descriptors=scope.specialist_descriptors,
             )
         )
-        _emit((LiveStreamEvent(type="step_completed", step="coordinator"),))
+        _emit(
+            (
+                LiveStreamEvent(type="step_completed", step="coordinator"),
+            )
+        )
         if isinstance(decision, Finish):
             return {}
         if state.get("accepted_batches"):
@@ -394,7 +398,7 @@ def build_agent_graph(
     async def research_completion(state: AgentGraphState) -> AgentGraphStateUpdate:
         completion = IncompleteResearch(
             insufficient_evidence=True,
-            has_data_gaps=bool(_accepted_data_gap_views(state)),
+            data_gaps=_accepted_data_gap_views(state),
         )
         return {
             "answer": insufficient_evidence_answer(completion),
@@ -429,18 +433,23 @@ def build_agent_graph(
         )
         candidate = await synthesis_actor.synthesize(prepared)
         published = publish_report(candidate, prepared)
-        completion = IncompleteResearch(
-            insufficient_evidence=False,
-            has_data_gaps=bool(data_gaps),
+        completion = (
+            IncompleteResearch(insufficient_evidence=False, data_gaps=data_gaps)
+            if data_gaps
+            else None
         )
         return {
-            "answer": append_data_gap_disclosure(published.answer, completion),
+            "answer": (
+                render_incomplete_research(published.answer, completion)
+                if completion is not None
+                else published.answer
+            ),
             "citations": [item.model_dump(mode="json") for item in published.citations],
             "completion_status": "incomplete"
-            if completion.has_data_gaps
+            if completion is not None
             else "complete",
             "termination_reason": (
-                "partial_results" if completion.has_data_gaps else "evidence_backed"
+                "partial_results" if completion is not None else "evidence_backed"
             ),
         }
 

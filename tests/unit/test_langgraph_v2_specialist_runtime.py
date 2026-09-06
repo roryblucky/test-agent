@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 
+import app.langgraph_v2.agent_evidence as agent_evidence
 from app.agents.specialist import (
     SPECIALIST_MAX_TOKENS,
     SPECIALIST_TIMEOUT_SECONDS,
@@ -30,7 +31,7 @@ from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
     ExpectedToolUnavailability,
-    ToolUnavailabilityRecord,
+    SpecialistToolCapture,
     ToolUnavailable,
     ToolUnavailableReason,
     bind_evidence_tool,
@@ -102,7 +103,7 @@ def test_bound_specialist_factory_uses_exact_frozen_tools() -> None:
         cast(ModelRegistry, registry),
         model_name="specialist",
         tools=(read_evidence,),
-        returned_evidence=[],
+        tool_capture=SpecialistToolCapture(),
     )
 
     assert isinstance(actor, PydanticAISpecialistActor)
@@ -282,7 +283,7 @@ async def test_specialist_function_model_has_one_request_and_structured_trace() 
 
 @pytest.mark.asyncio
 async def test_specialist_accepts_tool_metadata_only_after_terminal_finding() -> None:
-    returned_evidence: list[EvidenceEnvelope] = []
+    capture = SpecialistToolCapture()
     calls = 0
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
@@ -303,7 +304,7 @@ async def test_specialist_accepts_tool_metadata_only_after_terminal_finding() ->
     tool = bind_evidence_tool(
         provider,
         context=_context(),
-        returned_evidence=returned_evidence,
+        capture=capture,
     )
 
     def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -353,7 +354,7 @@ async def test_specialist_accepts_tool_metadata_only_after_terminal_finding() ->
             output_retries=0,
             end_strategy="early",
         ),
-        returned_evidence=returned_evidence,
+        tool_capture=capture,
     )
 
     attempt = await actor.run(
@@ -363,7 +364,7 @@ async def test_specialist_accepts_tool_metadata_only_after_terminal_finding() ->
     assert calls == 2
     assert attempt.finding.evidence_ids == ("evidence-1",)
     assert attempt.evidence[0].id == "evidence-1"
-    assert returned_evidence == []
+    assert capture.evidence == []
 
 
 @pytest.mark.asyncio
@@ -371,8 +372,7 @@ async def test_specialist_keeps_expected_unavailability_after_a_fallback() -> No
     class SourceUnreachable(Exception):
         pass
 
-    returned_evidence: list[EvidenceEnvelope] = []
-    returned_unavailability: list[ToolUnavailabilityRecord] = []
+    capture = SpecialistToolCapture()
     provider_calls = 0
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
@@ -397,8 +397,7 @@ async def test_specialist_keeps_expected_unavailability_after_a_fallback() -> No
     tool = bind_evidence_tool(
         provider,
         context=_context(),
-        returned_evidence=returned_evidence,
-        returned_unavailability=returned_unavailability,
+        capture=capture,
         expected_unavailability=(
             ExpectedToolUnavailability(
                 exception_type=SourceUnreachable,
@@ -464,8 +463,7 @@ async def test_specialist_keeps_expected_unavailability_after_a_fallback() -> No
             output_retries=0,
             end_strategy="early",
         ),
-        returned_evidence=returned_evidence,
-        returned_unavailability=returned_unavailability,
+        tool_capture=capture,
     )
 
     attempt = await actor.run(
@@ -476,24 +474,22 @@ async def test_specialist_keeps_expected_unavailability_after_a_fallback() -> No
     assert attempt.finding.evidence_ids == ("evidence-1",)
     assert len(attempt.unavailability) == 1
     assert attempt.unavailability[0].reason is ToolUnavailableReason.SOURCE_UNREACHABLE
-    assert returned_evidence == []
-    assert returned_unavailability == []
+    assert capture.evidence == []
+    assert capture.unavailability == []
 
 
 @pytest.mark.asyncio
-async def test_specialist_parallel_tool_calls_keep_a_successful_sibling() -> None:
-    class SourceUnreachable(Exception):
-        pass
-
+async def test_specialist_parallel_timeout_keeps_a_successful_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     sibling_started = asyncio.Event()
-    returned_evidence: list[EvidenceEnvelope] = []
-    returned_unavailability: list[ToolUnavailabilityRecord] = []
+    capture = SpecialistToolCapture()
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         assert source == "filing"
         if query == "unavailable coverage":
             await sibling_started.wait()
-            raise SourceUnreachable()
+            await asyncio.sleep(1)
         assert query == "fallback coverage"
         sibling_started.set()
         return EvidenceEnvelope(
@@ -518,15 +514,9 @@ async def test_specialist_parallel_tool_calls_keep_a_successful_sibling() -> Non
                 )
             }
         ),
-        returned_evidence=returned_evidence,
-        returned_unavailability=returned_unavailability,
-        expected_unavailability=(
-            ExpectedToolUnavailability(
-                exception_type=SourceUnreachable,
-                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-            ),
-        ),
+        capture=capture,
     )
+    monkeypatch.setattr(agent_evidence, "TOOL_TIMEOUT_SECONDS", 0.01)
     model_calls = 0
 
     def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -577,8 +567,7 @@ async def test_specialist_parallel_tool_calls_keep_a_successful_sibling() -> Non
             output_retries=0,
             end_strategy="early",
         ),
-        returned_evidence=returned_evidence,
-        returned_unavailability=returned_unavailability,
+        tool_capture=capture,
     )
 
     attempt = await asyncio.wait_for(
@@ -589,7 +578,7 @@ async def test_specialist_parallel_tool_calls_keep_a_successful_sibling() -> Non
     assert attempt.finding.evidence_ids == ("evidence-1",)
     assert [item.id for item in attempt.evidence] == ["evidence-1"]
     assert [item.reason for item in attempt.unavailability] == [
-        ToolUnavailableReason.SOURCE_UNREACHABLE
+        ToolUnavailableReason.CALL_TIMEOUT
     ]
 
 
@@ -598,8 +587,7 @@ async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
     class SourceUnreachable(Exception):
         pass
 
-    returned_evidence: list[EvidenceEnvelope] = []
-    returned_unavailability: list[ToolUnavailabilityRecord] = []
+    capture = SpecialistToolCapture()
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         del source, query
@@ -608,8 +596,7 @@ async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
     tool = bind_evidence_tool(
         provider,
         context=_context(),
-        returned_evidence=returned_evidence,
-        returned_unavailability=returned_unavailability,
+        capture=capture,
         expected_unavailability=(
             ExpectedToolUnavailability(
                 exception_type=SourceUnreachable,
@@ -644,12 +631,11 @@ async def test_specialist_discards_tool_metadata_when_model_fails() -> None:
             output_retries=0,
             end_strategy="early",
         ),
-        returned_evidence=returned_evidence,
-        returned_unavailability=returned_unavailability,
+        tool_capture=capture,
     )
 
     with pytest.raises(Exception):
         await actor.run(SpecialistTaskInput(task_id="task-1", objective="Assess."))
 
-    assert actor.returned_evidence == []
-    assert actor.returned_unavailability == []
+    assert actor.tool_capture.evidence == []
+    assert actor.tool_capture.unavailability == []

@@ -2,12 +2,12 @@
 
 from pydantic import BaseModel, ConfigDict
 
+from app.langgraph_v2.agent_evidence import DataGapView
+
 INSUFFICIENT_EVIDENCE_DISCLOSURE = (
     "Incomplete research: no eligible Evidence was available."
 )
-DATA_GAP_DISCLOSURE = (
-    "Incomplete research: one or more requested data sources were unavailable."
-)
+DATA_GAP_DISCLOSURE = "Incomplete research: requested data was unavailable:"
 
 
 class IncompleteResearch(BaseModel):
@@ -16,18 +16,26 @@ class IncompleteResearch(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     insufficient_evidence: bool
-    has_data_gaps: bool = False
+    data_gaps: tuple[DataGapView, ...] = ()
+
+    @property
+    def has_data_gaps(self) -> bool:
+        """Expose the sole partial-result signal used by terminal routing."""
+        return bool(self.data_gaps)
 
 
 def insufficient_evidence_answer(completion: IncompleteResearch) -> str:
     """Render the sole fixed disclosure for a zero-Evidence completion."""
     if not completion.insufficient_evidence:
         raise ValueError("Incomplete Research requires a completion signal")
-    return append_data_gap_disclosure(INSUFFICIENT_EVIDENCE_DISCLOSURE, completion)
+    return render_incomplete_research(INSUFFICIENT_EVIDENCE_DISCLOSURE, completion)
 
 
-def append_data_gap_disclosure(answer: str, completion: IncompleteResearch) -> str:
-    """Append the conservative code-owned gap disclosure when required."""
+def render_incomplete_research(answer: str, completion: IncompleteResearch) -> str:
+    """Render code-owned incompleteness and its bounded missing coverage labels."""
     if not completion.has_data_gaps:
         return answer
-    return f"{answer}\n\n{DATA_GAP_DISCLOSURE}"
+    coverage = "\n".join(
+        f"- {gap.requested_coverage}" for gap in completion.data_gaps
+    )
+    return f"{answer}\n\n{DATA_GAP_DISCLOSURE}\n{coverage}"

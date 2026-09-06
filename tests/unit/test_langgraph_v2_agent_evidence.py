@@ -16,7 +16,7 @@ from app.langgraph_v2.agent_evidence import (
     ExpectedToolUnavailability,
     FinancialResearchReport,
     RequestEvidenceCatalog,
-    ToolUnavailabilityRecord,
+    SpecialistToolCapture,
     ToolUnavailable,
     ToolUnavailableReason,
     bind_evidence_tool,
@@ -74,7 +74,7 @@ async def test_expected_tool_unavailability_becomes_bounded_model_data() -> None
     class SourceUnreachable(Exception):
         pass
 
-    records: list[ToolUnavailabilityRecord] = []
+    capture = SpecialistToolCapture()
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         del source, query
@@ -90,7 +90,7 @@ async def test_expected_tool_unavailability_becomes_bounded_model_data() -> None
                 reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
             ),
         ),
-        returned_unavailability=records,
+        capture=capture,
         now=lambda: datetime(2026, 9, 6, 12, tzinfo=UTC),
     )
 
@@ -102,9 +102,9 @@ async def test_expected_tool_unavailability_becomes_bounded_model_data() -> None
         reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
         requested_coverage="Apple revenue",
     )
-    assert len(records) == 1
-    assert records[0].model_dump() == {
-        "id": records[0].id,
+    assert len(capture.unavailability) == 1
+    assert capture.unavailability[0].model_dump() == {
+        "id": capture.unavailability[0].id,
         "tenant_id": "tenant-a",
         "request_id": "request-1",
         "task_id": "task-1",
@@ -242,8 +242,7 @@ async def test_evidence_tool_freezes_source_before_provider_access() -> None:
 
 @pytest.mark.asyncio
 async def test_evidence_tool_projects_oversized_success_as_unavailable() -> None:
-    returned_evidence: list[EvidenceEnvelope] = []
-    returned_unavailability: list[ToolUnavailabilityRecord] = []
+    capture = SpecialistToolCapture()
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         del source, query
@@ -252,8 +251,7 @@ async def test_evidence_tool_projects_oversized_success_as_unavailable() -> None
     tool = bind_evidence_tool(
         provider,
         context=_context(),
-        returned_evidence=returned_evidence,
-        returned_unavailability=returned_unavailability,
+        capture=capture,
     )
 
     returned = await tool(_tool_context(), "filing", "Apple revenue")
@@ -262,12 +260,12 @@ async def test_evidence_tool_projects_oversized_success_as_unavailable() -> None
         reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
         requested_coverage="Apple revenue",
     )
-    assert returned_evidence == []
-    assert len(returned_unavailability) == 1
+    assert capture.evidence == []
+    assert len(capture.unavailability) == 1
 
 
 @pytest.mark.asyncio
-async def test_unavailable_return_accepts_exactly_4_kib_and_sanitizes_one_byte_more() -> (
+async def test_unavailable_return_keeps_the_4_kib_boundary_and_projects_oversize_gap() -> (
     None
 ):
     class SourceUnreachable(Exception):
@@ -289,6 +287,26 @@ async def test_unavailable_return_accepts_exactly_4_kib_and_sanitizes_one_byte_m
         + 1
     )
     too_large_coverage = f"{exact_coverage}x"
+    assert len(
+        json.dumps(
+            ToolUnavailable(
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                requested_coverage=exact_coverage,
+            ).model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) == 4 * 1024
+    assert len(
+        json.dumps(
+            ToolUnavailable(
+                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                requested_coverage=too_large_coverage,
+            ).model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ) == 4 * 1024 + 1
     context = _context().model_copy(
         update={"allowed_queries": frozenset({exact_coverage, too_large_coverage})}
     )
@@ -313,22 +331,12 @@ async def test_unavailable_return_accepts_exactly_4_kib_and_sanitizes_one_byte_m
         _tool_context(tool_call_id="call-2"), "filing", too_large_coverage
     )
 
-    assert isinstance(exact.return_value, ToolUnavailable)
-    assert exact.return_value.reason is ToolUnavailableReason.SOURCE_UNREACHABLE
-    assert (
-        len(
-            json.dumps(
-                exact.return_value.model_dump(mode="json"),
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        == 4 * 1024
-    )
-    assert too_large.return_value == ToolUnavailable(
+    unusable = ToolUnavailable(
         reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
         requested_coverage="Requested coverage could not be safely projected.",
     )
+    assert exact.return_value == unusable
+    assert too_large.return_value == unusable
 
 
 @pytest.mark.asyncio
@@ -354,7 +362,7 @@ async def test_unknown_and_provider_timeout_fail_closed() -> None:
 async def test_binding_owned_timeout_becomes_call_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    records: list[ToolUnavailabilityRecord] = []
+    capture = SpecialistToolCapture()
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         del source, query
@@ -366,7 +374,7 @@ async def test_binding_owned_timeout_becomes_call_timeout(
     tool = bind_evidence_tool(
         provider,
         context=_context(),
-        returned_unavailability=records,
+        capture=capture,
     )
 
     returned = await tool(_tool_context(), "filing", "Apple revenue")
@@ -375,7 +383,7 @@ async def test_binding_owned_timeout_becomes_call_timeout(
         reason=ToolUnavailableReason.CALL_TIMEOUT,
         requested_coverage="Apple revenue",
     )
-    assert records[0].reason is ToolUnavailableReason.CALL_TIMEOUT
+    assert capture.unavailability[0].reason is ToolUnavailableReason.CALL_TIMEOUT
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,8 @@ from app.langgraph_v2.agent_evidence import (
     EvidenceProvider,
     ExpectedToolUnavailability,
     RequestEvidenceCatalog,
+    SpecialistToolCapture,
+    ToolTelemetryStatus,
     ToolUnavailabilityRecord,
     ToolUnavailableReason,
     bind_evidence_tool,
@@ -186,6 +188,7 @@ def _derive_data_gaps(
 ) -> tuple[DataGap, ...]:
     """Promote only current trusted binding records into canonical Data Gaps."""
     records_by_id: dict[str, ToolUnavailabilityRecord] = {}
+    records_by_tool_call_id: dict[str, ToolUnavailabilityRecord] = {}
     for record in records:
         if (
             record.tenant_id != context.tenant_id
@@ -200,12 +203,18 @@ def _derive_data_gaps(
             raise ValueError("Data Gap provenance is not eligible")
         if record.attempt != context.attempt:
             raise ValueError("Data Gap provenance is stale")
+        if not record.tool_call_id:
+            raise ValueError("Data Gap provenance is missing")
         existing = records_by_id.get(record.id)
         if existing is not None:
             if existing != record:
                 raise ValueError("Data Gap provenance conflicts")
             continue
+        existing_call = records_by_tool_call_id.get(record.tool_call_id)
+        if existing_call is not None and existing_call != record:
+            raise ValueError("Data Gap provenance conflicts")
         records_by_id[record.id] = record
+        records_by_tool_call_id[record.tool_call_id] = record
     return tuple(
         DataGap(
             requested_coverage=record.requested_coverage,
@@ -295,7 +304,7 @@ class SpecialistActor(Protocol):
 
 
 SpecialistTool = Callable[..., object]
-ToolTelemetry = Callable[[str, str], None]
+ToolTelemetry = Callable[[str, ToolTelemetryStatus], None]
 
 
 class SpecialistActorFactory(Protocol):
@@ -304,9 +313,8 @@ class SpecialistActorFactory(Protocol):
     def __call__(
         self,
         tools: tuple[SpecialistTool, ...],
-        returned_evidence: list[EvidenceEnvelope],
+        tool_capture: SpecialistToolCapture,
         skill_invocation: SkillInvocation | None,
-        returned_unavailability: list[ToolUnavailabilityRecord],
     ) -> SpecialistActor:
         """Return an actor limited to exactly the supplied Tool bindings."""
         ...
@@ -414,14 +422,13 @@ class SpecialistRegistry:
         if actor_factory is None:
             raise AssertionError("Specialist actor factory is required")
         registered = {tool.id: tool for tool in self.tool_registrations}
-        returned_evidence: list[EvidenceEnvelope] = []
-        returned_unavailability: list[ToolUnavailabilityRecord] = []
+        tool_capture = SpecialistToolCapture()
         tools: list[SpecialistTool] = []
         for tool_id in sorted(effective_ids):
             tool = registered[tool_id]
 
             def report_tool_status(
-                status: str,
+                status: ToolTelemetryStatus,
                 *,
                 tool_id: str = tool_id,
                 audit: ToolTelemetry | None = tool.audit,
@@ -445,8 +452,7 @@ class SpecialistRegistry:
                         & context.allowed_queries,
                     }
                 ),
-                returned_evidence=returned_evidence,
-                returned_unavailability=returned_unavailability,
+                capture=tool_capture,
                 telemetry=report_tool_status,
                 tool_id=tool_id,
                 expected_unavailability=tool.expected_unavailability,
@@ -458,9 +464,8 @@ class SpecialistRegistry:
             tools.append(skill_invocation.activation_tool())
         return actor_factory(
             tuple(tools),
-            returned_evidence,
+            tool_capture,
             skill_invocation,
-            returned_unavailability,
         )
 
 

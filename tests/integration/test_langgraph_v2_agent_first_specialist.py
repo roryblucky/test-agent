@@ -32,7 +32,7 @@ from app.langgraph_v2.agent_evidence import (
     ExpectedToolUnavailability,
     FinancialResearchReport,
     PreparedSynthesis,
-    ToolUnavailabilityRecord,
+    SpecialistToolCapture,
     ToolUnavailable,
     ToolUnavailableReason,
 )
@@ -118,15 +118,14 @@ async def _evidence_provider(source: str, query: str) -> EvidenceEnvelope:
 
 def _evidence_specialist_factory(
     tools: tuple[Callable[..., object], ...],
-    returned_evidence: list[EvidenceEnvelope],
+    tool_capture: SpecialistToolCapture,
     skill_invocation: SkillInvocation | None,
-    returned_unavailability: list[ToolUnavailabilityRecord],
 ) -> SpecialistActor:
     return _specialist_factory(
         query="Apple revenue",
         summary="Apple revenue grew.",
         evidence_id="evidence-1",
-    )(tools, returned_evidence, skill_invocation, returned_unavailability)
+    )(tools, tool_capture, skill_invocation)
 
 
 def _specialist_factory(
@@ -134,9 +133,8 @@ def _specialist_factory(
 ) -> SpecialistActorFactory:
     def build(
         tools: tuple[Callable[..., object], ...],
-        returned_evidence: list[EvidenceEnvelope],
+        tool_capture: SpecialistToolCapture,
         skill_invocation: SkillInvocation | None,
-        returned_unavailability: list[ToolUnavailabilityRecord],
     ) -> PydanticAISpecialistActor:
         calls = 0
 
@@ -173,9 +171,8 @@ def _specialist_factory(
                 output_retries=0,
                 end_strategy="early",
             ),
-            returned_evidence=returned_evidence,
+            tool_capture=tool_capture,
             skill_invocation=skill_invocation,
-            returned_unavailability=returned_unavailability,
         )
 
     return build
@@ -183,9 +180,8 @@ def _specialist_factory(
 
 def _skill_specialist_factory(
     tools: tuple[Callable[..., object], ...],
-    returned_evidence: list[EvidenceEnvelope],
+    tool_capture: SpecialistToolCapture,
     skill_invocation: SkillInvocation | None,
-    returned_unavailability: list[ToolUnavailabilityRecord],
 ) -> PydanticAISpecialistActor:
     assert skill_invocation is not None
     calls = 0
@@ -241,9 +237,8 @@ def _skill_specialist_factory(
             output_retries=0,
             end_strategy="early",
         ),
-        returned_evidence=returned_evidence,
+        tool_capture=tool_capture,
         skill_invocation=skill_invocation,
-        returned_unavailability=returned_unavailability,
     )
 
 
@@ -465,8 +460,7 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
     assert any(
         event["type"] == "progress"
         and event.get("step") == "tool"
-        and event.get("data")
-        == {
+        and event.get("data") == {
             "task_id": "task_90fff3e68e9a59d229d7982b65c5fe8b",
             "tool_id": "filing_reader",
             "status": "completed",
@@ -506,9 +500,8 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
 
     def specialist_factory(
         tools: tuple[Callable[..., object], ...],
-        returned_evidence: list[EvidenceEnvelope],
+        tool_capture: SpecialistToolCapture,
         skill_invocation: SkillInvocation | None,
-        returned_unavailability: list[ToolUnavailabilityRecord],
     ) -> PydanticAISpecialistActor:
         del skill_invocation
         model_calls = 0
@@ -569,8 +562,7 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
                 output_retries=0,
                 end_strategy="early",
             ),
-            returned_evidence=returned_evidence,
-            returned_unavailability=returned_unavailability,
+            tool_capture=tool_capture,
         )
 
     class PartialSynthesis:
@@ -673,7 +665,7 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
     assert done[0]["data"]["metadata"]["termination_reason"] == "partial_results"
     assert done[0]["data"]["answer"] == (
         "Apple revenue grew. [[E:1]]\n\n"
-        "Incomplete research: one or more requested data sources were unavailable."
+        "Incomplete research: requested data was unavailable:\n- Apple revenue"
     )
     assert synthesis.prepared is not None
     assert synthesis.prepared.data_gaps[0].model_dump() == {
@@ -801,7 +793,8 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
     assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
     assert "FULL-SKILL-REFERENCE-SENTINEL" not in repr(state)
     assert all(
-        "filing-analysis" not in input.model_dump_json() for input in coordinator.inputs
+        "filing-analysis" not in input.model_dump_json()
+        for input in coordinator.inputs
     )
 
 

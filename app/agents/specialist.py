@@ -16,7 +16,7 @@ from app.langgraph_v2.agent_batch import (
     SpecialistFindingDraft,
     SpecialistTaskInput,
 )
-from app.langgraph_v2.agent_evidence import EvidenceEnvelope, ToolUnavailabilityRecord
+from app.langgraph_v2.agent_evidence import SpecialistToolCapture
 from app.langgraph_v2.agent_skills import SkillInvocation
 
 SPECIALIST_TIMEOUT_SECONDS = 60
@@ -36,34 +36,32 @@ class PydanticAISpecialistActor:
     """Run one bounded Specialist invocation with fixed actor-local limits."""
 
     agent: Agent[None, SpecialistFindingDraft]
-    returned_evidence: list[EvidenceEnvelope] = field(
-        default_factory=list[EvidenceEnvelope]
-    )
-    returned_unavailability: list[ToolUnavailabilityRecord] = field(
-        default_factory=list[ToolUnavailabilityRecord]
-    )
+    tool_capture: SpecialistToolCapture = field(default_factory=SpecialistToolCapture)
     skill_invocation: SkillInvocation | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def run(self, input: SpecialistTaskInput) -> SpecialistAttempt:
         """Return one structured finding from the assigned Task only."""
         skill_summaries = (
-            self.skill_invocation.summaries if self.skill_invocation is not None else ()
+            self.skill_invocation.summaries
+            if self.skill_invocation is not None
+            else ()
         )
         prompt = json.dumps(
             {
                 "task_id": input.task_id,
                 "objective": input.objective,
                 "skill_summaries": [
-                    summary.model_dump(mode="json") for summary in skill_summaries
+                    summary.model_dump(mode="json")
+                    for summary in skill_summaries
                 ],
             },
             sort_keys=True,
             separators=(",", ":"),
         )
         async with self._lock:
-            first_evidence = len(self.returned_evidence)
-            first_unavailability = len(self.returned_unavailability)
+            first_evidence = len(self.tool_capture.evidence)
+            first_unavailability = len(self.tool_capture.unavailability)
             try:
                 with ToolManager.parallel_execution_mode("parallel_ordered_events"):
                     result: AgentRunResult[
@@ -76,19 +74,21 @@ class PydanticAISpecialistActor:
                             "parallel_tool_calls": True,
                         },
                     )
-                evidence = tuple(self.returned_evidence[first_evidence:])
+                evidence = tuple(self.tool_capture.evidence[first_evidence:])
                 unavailability = tuple(
-                    self.returned_unavailability[first_unavailability:]
+                    self.tool_capture.unavailability[first_unavailability:]
                 )
             finally:
-                del self.returned_evidence[first_evidence:]
-                del self.returned_unavailability[first_unavailability:]
+                del self.tool_capture.evidence[first_evidence:]
+                del self.tool_capture.unavailability[first_unavailability:]
         return SpecialistAttempt(
             finding=result.output,
             evidence=evidence,
             unavailability=unavailability,
             skill_pins=(
-                self.skill_invocation.pins if self.skill_invocation is not None else ()
+                self.skill_invocation.pins
+                if self.skill_invocation is not None
+                else ()
             ),
         )
 
@@ -117,16 +117,12 @@ def create_bound_specialist_actor(
     *,
     model_name: str,
     tools: tuple[Callable[..., object], ...],
-    returned_evidence: list[EvidenceEnvelope],
+    tool_capture: SpecialistToolCapture,
     skill_invocation: SkillInvocation | None = None,
-    returned_unavailability: list[ToolUnavailabilityRecord] | None = None,
 ) -> PydanticAISpecialistActor:
     """Build a production Specialist only after its Tool bindings are frozen."""
     return PydanticAISpecialistActor(
         create_specialist_agent(registry, model_name=model_name, tools=tools),
-        returned_evidence=returned_evidence,
-        returned_unavailability=(
-            returned_unavailability if returned_unavailability is not None else []
-        ),
+        tool_capture=tool_capture,
         skill_invocation=skill_invocation,
     )
