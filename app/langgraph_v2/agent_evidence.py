@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import ToolReturn
@@ -12,6 +14,8 @@ from pydantic_ai import ToolReturn
 from app.models.workflow import CitationReference
 
 _EVIDENCE_MARKER = re.compile(r"\[\[E:([1-9][0-9]*)\]\]")
+_MARKER_LIKE = re.compile(r"\[\[\s*E\s*:")
+_TOOL_RETURN_MAX_BYTES = 4 * 1024
 
 
 class EvidenceEnvelope(BaseModel):
@@ -28,6 +32,8 @@ class EvidenceEnvelope(BaseModel):
     title: str = Field(min_length=1)
     body: str = Field(min_length=1)
     excerpt: str = Field(min_length=1, max_length=4096)
+    as_of_date: date
+    raw_provider_payload: str | None = None
 
 
 EvidenceProvider = Callable[[str, str], Awaitable[EvidenceEnvelope]]
@@ -37,28 +43,51 @@ def bind_evidence_tool(
     provider: EvidenceProvider,
     *,
     allowed_sources: frozenset[str],
+    allowed_queries: frozenset[str] | None = None,
     tenant_id: str,
     request_id: str,
     task_id: str,
+    returned_evidence: list[EvidenceEnvelope] | None = None,
+    telemetry: Callable[[str], None] | None = None,
 ) -> Callable[[str, str], Awaitable[ToolReturn[dict[str, str]]]]:
     """Bind one frozen Scope-limited Evidence reader for a Specialist run."""
 
     async def read_evidence(source: str, query: str) -> ToolReturn[dict[str, str]]:
         """Fetch one source only when its trusted Scope permits it."""
         if source not in allowed_sources:
+            if telemetry is not None:
+                telemetry("rejected")
             raise ValueError("Evidence source is not eligible")
-        evidence = await provider(source, query)
-        if (
-            evidence.source != source
-            or evidence.tenant_id != tenant_id
-            or evidence.request_id != request_id
-            or evidence.task_id != task_id
-        ):
-            raise ValueError("Evidence provenance is not eligible")
-        return ToolReturn(
-            return_value={"evidence_id": evidence.id, "excerpt": evidence.excerpt},
-            metadata=evidence,
-        )
+        if allowed_queries is not None and query not in allowed_queries:
+            if telemetry is not None:
+                telemetry("rejected")
+            raise ValueError("Evidence query is not eligible")
+        if telemetry is not None:
+            telemetry("started")
+        try:
+            evidence = await provider(source, query)
+            if (
+                evidence.source != source
+                or evidence.tenant_id != tenant_id
+                or evidence.request_id != request_id
+                or evidence.task_id != task_id
+            ):
+                raise ValueError("Evidence provenance is not eligible")
+            return_value = {"evidence_id": evidence.id, "excerpt": evidence.excerpt}
+            if (
+                len(json.dumps(return_value, separators=(",", ":")).encode())
+                > _TOOL_RETURN_MAX_BYTES
+            ):
+                raise ValueError("Evidence Tool return exceeds 4 KiB")
+            if returned_evidence is not None:
+                returned_evidence.append(evidence)
+        except BaseException:
+            if telemetry is not None:
+                telemetry("failed")
+            raise
+        if telemetry is not None:
+            telemetry("completed")
+        return ToolReturn(return_value=return_value, metadata=evidence)
 
     return read_evidence
 
@@ -78,13 +107,19 @@ class RequestEvidenceCatalog:
         finding_evidence_ids: tuple[str, ...],
         tenant_id: str,
         request_id: str,
+        as_of_date: date | None = None,
+        max_evidence_age_days: int | None = None,
         task_id: str,
     ) -> None:
         """Accept exact successful provenance referenced by the terminal Finding."""
         returned_items = tuple(returned)
-        returned_by_id = {evidence.id: evidence for evidence in returned_items}
-        if len(returned_by_id) != len(returned_items):
-            raise ValueError("Evidence provenance conflicts")
+        returned_by_id: dict[str, EvidenceEnvelope] = {}
+        for evidence in returned_items:
+            existing_returned = returned_by_id.get(evidence.id)
+            if existing_returned is not None and existing_returned != evidence:
+                raise ValueError("Evidence provenance conflicts")
+            returned_by_id[evidence.id] = evidence
+        accepted: list[EvidenceEnvelope] = []
         for evidence_id in finding_evidence_ids:
             evidence = returned_by_id.get(evidence_id)
             if evidence is None:
@@ -98,6 +133,8 @@ class RequestEvidenceCatalog:
             existing = self._evidence.get(evidence.id)
             if existing is not None and existing != evidence:
                 raise ValueError("Evidence body conflicts")
+            accepted.append(evidence)
+        for evidence in accepted:
             self._evidence[evidence.id] = evidence
 
     def resolve(
@@ -106,6 +143,8 @@ class RequestEvidenceCatalog:
         *,
         tenant_id: str,
         request_id: str,
+        as_of_date: date | None = None,
+        max_evidence_age_days: int | None = None,
     ) -> EvidenceEnvelope:
         """Return only Evidence owned by this active Tenant Request."""
         evidence = self._evidence.get(evidence_id)
@@ -113,6 +152,14 @@ class RequestEvidenceCatalog:
             evidence is None
             or evidence.tenant_id != tenant_id
             or evidence.request_id != request_id
+            or (
+                as_of_date is not None
+                and (
+                    evidence.as_of_date > as_of_date
+                    or (as_of_date - evidence.as_of_date).days
+                    > (max_evidence_age_days or 0)
+                )
+            )
         ):
             raise ValueError("Evidence is not accepted")
         return evidence
@@ -145,7 +192,7 @@ class FinancialResearchReport(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    markdown: str = Field(min_length=1)
+    markdown_report: str = Field(min_length=1)
 
 
 class PublishedReport(BaseModel):
@@ -165,6 +212,8 @@ def prepare_synthesis(
     catalog: RequestEvidenceCatalog,
     tenant_id: str,
     request_id: str,
+    as_of_date: date | None = None,
+    max_evidence_age_days: int = 7,
 ) -> PreparedSynthesis:
     """Build the sole bounded Evidence projection Synthesis may receive."""
     evidence = tuple(
@@ -180,6 +229,8 @@ def prepare_synthesis(
                 evidence_id,
                 tenant_id=tenant_id,
                 request_id=request_id,
+                as_of_date=as_of_date,
+                max_evidence_age_days=max_evidence_age_days,
             )
             for evidence_id in accepted_evidence_ids
         )
@@ -196,9 +247,9 @@ def publish_report(
     prepared: PreparedSynthesis,
 ) -> PublishedReport:
     """Validate every Evidence marker and derive public citations in code."""
-    markers = _EVIDENCE_MARKER.findall(candidate.markdown)
-    marker_text = _EVIDENCE_MARKER.sub("", candidate.markdown)
-    if "[[E:" in marker_text or not markers:
+    markers = _EVIDENCE_MARKER.findall(candidate.markdown_report)
+    marker_text = _EVIDENCE_MARKER.sub("", candidate.markdown_report)
+    if _MARKER_LIKE.search(marker_text) or not markers:
         raise ValueError("Evidence marker is invalid")
     citations: list[CitationReference] = []
     for marker in markers:
@@ -216,4 +267,4 @@ def publish_report(
                 snippet=evidence.excerpt,
             )
         )
-    return PublishedReport(answer=candidate.markdown, citations=tuple(citations))
+    return PublishedReport(answer=candidate.markdown_report, citations=tuple(citations))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import StrEnum
 from typing import Annotated, Any
 
@@ -13,6 +14,7 @@ class LangGraphRuntimeMode(StrEnum):
 
     LINEAR = "linear"
     AGENT = "agent"
+
 
 # ---------------------------------------------------------------------------
 # LLM Config
@@ -417,6 +419,44 @@ class AgentResearchIntentConfig(BaseModel):
             serialization_alias="specialistDescriptors",
         ),
     ] = Field(default_factory=list[AgentResearchSpecialistConfig])
+    allowed_tool_ids: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("allowed_tool_ids", "allowedToolIds"),
+            serialization_alias="allowedToolIds",
+        ),
+    ] = Field(default_factory=list[str])
+    allowed_sources: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("allowed_sources", "allowedSources"),
+            serialization_alias="allowedSources",
+        ),
+    ] = Field(default_factory=list[str])
+    allowed_queries: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices("allowed_queries", "allowedQueries"),
+            serialization_alias="allowedQueries",
+        ),
+    ] = Field(default_factory=list[str])
+    as_of_date: Annotated[
+        date,
+        Field(
+            validation_alias=AliasChoices("as_of_date", "asOfDate"),
+            serialization_alias="asOfDate",
+        ),
+    ] = Field(default_factory=date.today)
+    max_evidence_age_days: Annotated[
+        int,
+        Field(
+            validation_alias=AliasChoices(
+                "max_evidence_age_days", "maxEvidenceAgeDays"
+            ),
+            serialization_alias="maxEvidenceAgeDays",
+            ge=0,
+        ),
+    ] = 7
 
     model_config = {"populate_by_name": True}
 
@@ -440,6 +480,13 @@ class AgentResearchConfig(BaseModel):
             serialization_alias="coordinatorModel",
         ),
     ] = "coordinator"
+    synthesis_model: Annotated[
+        str,
+        Field(
+            validation_alias=AliasChoices("synthesis_model", "synthesisModel"),
+            serialization_alias="synthesisModel",
+        ),
+    ] = "synthesis"
     intents: list[AgentResearchIntentConfig] = Field(
         default_factory=list[AgentResearchIntentConfig]
     )

@@ -38,3 +38,14 @@ def test_disposable_postgres_fixture_accepts_an_explicit_test_database() -> None
     )
 
     assert url.endswith("/agent_kms_test_42")
+
+
+def test_disposable_postgres_fixture_accepts_an_explicit_test_schema() -> None:
+    url = require_disposable_postgres_url(
+        {
+            "LANGGRAPH_V2_TEST_DATABASE_URL": "postgresql://postgres:secret@db/postgres",
+            "LANGGRAPH_V2_TEST_SCHEMA": "agent_test",
+        }
+    )
+
+    assert url.endswith("/postgres")

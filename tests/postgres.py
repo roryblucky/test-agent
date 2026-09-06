@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from psycopg.conninfo import conninfo_to_dict
 
@@ -32,10 +33,31 @@ def require_disposable_postgres_url(environment: Mapping[str, str]) -> str:
             f"{variable} is not a valid PostgreSQL connection string."
         ) from error
 
-    if re.search(r"(?:^|[_-])test(?:$|[_-])", database_name, re.IGNORECASE) is None:
+    schema_name = environment.get("LANGGRAPH_V2_TEST_SCHEMA", "")
+    is_test_database = (
+        re.search(r"(?:^|[_-])test(?:$|[_-])", database_name, re.IGNORECASE)
+        is not None
+    )
+    is_test_schema = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*_test", schema_name)
+    if not is_test_database and not is_test_schema:
         raise UnsafeDisposablePostgres(
             f"Refusing database {database_name!r}; it could be production. "
-            "The disposable database name must contain a standalone 'test' segment."
+            "Use a database name with a standalone 'test' segment or set "
+            "LANGGRAPH_V2_TEST_SCHEMA to a schema ending in '_test'."
         )
 
     return database_url
+
+
+def scoped_disposable_postgres_url(database_url: str, schema_name: str) -> str:
+    """Apply one validated disposable schema as PostgreSQL search path."""
+    if not schema_name:
+        return database_url
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*_test", schema_name) is None:
+        raise UnsafeDisposablePostgres("Test schema must end in '_test'.")
+    parts = urlsplit(database_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["options"] = f"-csearch_path={schema_name}"
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -26,6 +27,11 @@ class AgentIntentPolicy(BaseModel):
     intent: str = Field(min_length=1)
     description: str = Field(min_length=1)
     specialist_descriptors: tuple[SpecialistDescriptor, ...] = ()
+    allowed_tool_ids: frozenset[str] = frozenset()
+    allowed_sources: frozenset[str] = frozenset()
+    allowed_queries: frozenset[str] = frozenset()
+    as_of_date: date = Field(default_factory=date.today)
+    max_evidence_age_days: int = Field(default=7, ge=0)
 
 
 class ResearchScope(BaseModel):
@@ -35,6 +41,11 @@ class ResearchScope(BaseModel):
 
     intent: str
     specialist_descriptors: tuple[SpecialistDescriptor, ...]
+    allowed_tool_ids: frozenset[str]
+    allowed_sources: frozenset[str]
+    allowed_queries: frozenset[str]
+    as_of_date: date
+    max_evidence_age_days: int
 
 
 def resolve_research_scope(
@@ -48,4 +59,9 @@ def resolve_research_scope(
     return ResearchScope(
         intent=policy.intent,
         specialist_descriptors=policy.specialist_descriptors,
+        allowed_tool_ids=policy.allowed_tool_ids,
+        allowed_sources=policy.allowed_sources,
+        allowed_queries=policy.allowed_queries,
+        as_of_date=policy.as_of_date,
+        max_evidence_age_days=policy.max_evidence_age_days,
     )

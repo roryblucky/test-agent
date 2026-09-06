@@ -20,6 +20,7 @@ from langgraph.types import Overwrite
 from pydantic import BaseModel, ConfigDict
 
 from app.langgraph_v2.agent_batch import (
+    AcceptedBatch,
     AcceptedTask,
     ActiveBatch,
     BatchContribution,
@@ -32,6 +33,13 @@ from app.langgraph_v2.agent_batch import (
 from app.langgraph_v2.agent_completion import (
     IncompleteResearch,
     insufficient_evidence_answer,
+)
+from app.langgraph_v2.agent_evidence import (
+    FinancialResearchReport,
+    PreparedSynthesis,
+    RequestEvidenceCatalog,
+    prepare_synthesis,
+    publish_report,
 )
 from app.langgraph_v2.agent_scope import (
     AgentIntentPolicy,
@@ -51,6 +59,7 @@ from app.langgraph_v2.conversation_context import (
 from app.langgraph_v2.pre_moderation import ModerationProvider, run_pre_moderation
 from app.langgraph_v2.stream import RequestOwnedGraph
 from app.models.workflow import (
+    CitationReference,
     IntentResult,
     QueryUnderstandingClarification,
     QueryUnderstandingOutput,
@@ -95,6 +104,14 @@ class CoordinatorActor(Protocol):
 
     async def decide(self, input: CoordinatorInput) -> CoordinatorDecision:
         """Return the typed Coordinator decision."""
+        ...
+
+
+class SynthesisActor(Protocol):
+    """Turn a frozen Evidence projection into one report candidate."""
+
+    async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
+        """Return one model-authored Markdown candidate."""
         ...
 
 
@@ -143,6 +160,7 @@ class AgentGraphState(TypedDict):
     completion_status: NotRequired[str | None]
     termination_reason: NotRequired[str | None]
     final_response: NotRequired[dict[str, Any] | None]
+    citations: NotRequired[list[dict[str, Any]]]
 
 
 class AgentGraphStateUpdate(TypedDict, total=False):
@@ -161,6 +179,7 @@ class AgentGraphStateUpdate(TypedDict, total=False):
     completion_status: str | None
     termination_reason: str | None
     final_response: dict[str, Any] | None
+    citations: list[dict[str, Any]]
 
 
 def _emit(events: Sequence[LiveStreamEvent]) -> None:
@@ -172,9 +191,13 @@ def _emit(events: Sequence[LiveStreamEvent]) -> None:
 def _clarification_answer(clarification: QueryUnderstandingClarification) -> str:
     questions = clarification.questions
     if not 1 <= len(questions) <= 3:
-        raise ValueError("Query Understanding clarification requires one to three questions")
+        raise ValueError(
+            "Query Understanding clarification requires one to three questions"
+        )
     if any(not question.question.strip() for question in questions):
-        raise ValueError("Query Understanding clarification questions must not be blank")
+        raise ValueError(
+            "Query Understanding clarification questions must not be blank"
+        )
     if any(len(question.options) > 4 for question in questions):
         raise ValueError("Query Understanding clarification options exceed the limit")
     return questions[0].question
@@ -188,11 +211,15 @@ def build_agent_graph(
     specialist_registry: SpecialistRegistry,
     intent_policies: Mapping[str, AgentIntentPolicy],
     moderation_provider: ModerationProvider,
+    tenant_id: str,
+    evidence_catalog: RequestEvidenceCatalog | None = None,
+    synthesis_actor: SynthesisActor | None = None,
     history_token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
     checkpoint_state_adapter: AgentCheckpointStateAdapter | None = None,
 ) -> RequestOwnedGraph:
     """Compile clarification plus first legal Coordinator Finish path."""
     state_adapter = checkpoint_state_adapter or AgentCheckpointStateAdapter()
+    catalog = evidence_catalog or RequestEvidenceCatalog()
     builder: StateGraph[AgentGraphState, None, AgentGraphState, AgentGraphState] = (
         StateGraph(AgentGraphState)
     )
@@ -217,6 +244,7 @@ def build_agent_graph(
             "completion_status": None,
             "termination_reason": None,
             "final_response": None,
+            "citations": [],
         }
 
     async def pre_moderation(state: AgentGraphState) -> AgentGraphStateUpdate:
@@ -275,6 +303,7 @@ def build_agent_graph(
         if not isinstance(scope_value, dict):
             raise TypeError("Agent Research Scope is invalid")
         scope = ResearchScope.model_validate(scope_value)
+        _emit((LiveStreamEvent(type="step_start", step="coordinator"),))
         decision = await coordinator_actor.decide(
             CoordinatorInput(
                 standalone_query=standalone_query,
@@ -284,7 +313,6 @@ def build_agent_graph(
         )
         _emit(
             (
-                LiveStreamEvent(type="step_start", step="coordinator"),
                 LiveStreamEvent(type="step_completed", step="coordinator"),
             )
         )
@@ -312,12 +340,30 @@ def build_agent_graph(
             raise TypeError("Agent active batch is invalid")
         active_batch = _active_batch_load(active_value)
         scope = ResearchScope.model_validate(scope_value)
+        task = active_batch.tasks[0]
+        _emit((LiveStreamEvent(type="step_start", step="specialist"),))
         contribution = await execute_specialist(
-            active_batch.tasks[0],
+            task,
             batch_id=active_batch.id,
             registry=specialist_registry,
             scope_descriptors=scope.specialist_descriptors,
+            catalog=catalog,
+            tenant_id=tenant_id,
+            request_id=state["request_id"],
+            scope_tool_ids=scope.allowed_tool_ids,
+            scope_sources=scope.allowed_sources,
+            scope_queries=scope.allowed_queries,
+            tool_telemetry=lambda tool_id, status: _emit(
+                (
+                    LiveStreamEvent(
+                        type="progress",
+                        step="tool",
+                        data={"task_id": task.id, "tool_id": tool_id, "status": status},
+                    ),
+                )
+            ),
         )
+        _emit((LiveStreamEvent(type="step_completed", step="specialist"),))
         return {
             "staged_contributions": {
                 contribution.task_id: contribution.model_dump(mode="json")
@@ -350,6 +396,34 @@ def build_agent_graph(
             "termination_reason": "insufficient_evidence",
         }
 
+    async def synthesis(state: AgentGraphState) -> AgentGraphStateUpdate:
+        if synthesis_actor is None:
+            raise RuntimeError("Agent Synthesis actor is not configured")
+        standalone_query = state.get("standalone_query")
+        scope_value = state.get("research_scope")
+        if not isinstance(standalone_query, str) or not isinstance(scope_value, dict):
+            raise TypeError("Agent Synthesis input is invalid")
+        scope = ResearchScope.model_validate(scope_value)
+        evidence_ids = _accepted_evidence_ids(state)
+        prepared = prepare_synthesis(
+            standalone_query=standalone_query,
+            intent=scope.intent,
+            accepted_evidence_ids=evidence_ids,
+            catalog=catalog,
+            tenant_id=tenant_id,
+            request_id=state["request_id"],
+            as_of_date=scope.as_of_date,
+            max_evidence_age_days=scope.max_evidence_age_days,
+        )
+        candidate = await synthesis_actor.synthesize(prepared)
+        published = publish_report(candidate, prepared)
+        return {
+            "answer": published.answer,
+            "citations": [item.model_dump(mode="json") for item in published.citations],
+            "completion_status": "complete",
+            "termination_reason": "evidence_backed",
+        }
+
     async def finalize_state(state: AgentGraphState) -> AgentGraphStateUpdate:
         answer = state.get("answer")
         if not isinstance(answer, str):
@@ -370,24 +444,37 @@ def build_agent_graph(
         if clarification is None:
             completion_status = state.get("completion_status")
             termination_reason = state.get("termination_reason")
-            if completion_status != "incomplete" or termination_reason != "insufficient_evidence":
+            if completion_status == "incomplete":
+                if termination_reason != "insufficient_evidence":
+                    raise TypeError("Agent research completion is invalid")
+            elif (
+                completion_status != "complete"
+                or termination_reason != "evidence_backed"
+            ):
                 raise TypeError("Agent research completion is invalid")
             metadata["steps_executed"].extend(["resolve_scope", "coordinator"])
             if state.get("accepted_batches"):
                 metadata["steps_executed"].extend(
                     ["execute_first_specialist", "batch_barrier", "coordinator"]
                 )
-            metadata["steps_executed"].append("research_completion")
+            metadata["steps_executed"].append(
+                "synthesis"
+                if completion_status == "complete"
+                else "research_completion"
+            )
             metadata["completion_status"] = completion_status
             metadata["termination_reason"] = termination_reason
         metadata["steps_executed"].append("finalize_state")
+        raw_citations = state.get("citations", [])
         response = V2QueryResponse(
             query=state["query"],
             answer=answer,
             clarification=clarification,
             conversation_id=state["conversation_id"],
             metadata=metadata,
-            citations=[],
+            citations=[
+                CitationReference.model_validate(citation) for citation in raw_citations
+            ],
         )
         return {
             "final_response": response.model_dump(mode="json", by_alias=True),
@@ -416,14 +503,16 @@ def build_agent_graph(
         return "end" if state.get("halted", False) else "query_understanding"
 
     def next_after_query_understanding(state: AgentGraphState) -> str:
-        return "finalize_state" if state.get("clarification") is not None else "resolve_scope"
+        return (
+            "finalize_state"
+            if state.get("clarification") is not None
+            else "resolve_scope"
+        )
 
     def next_after_coordinator(state: AgentGraphState) -> str:
-        return (
-            "execute_first_specialist"
-            if state.get("active_batch") is not None
-            else "research_completion"
-        )
+        if state.get("active_batch") is not None:
+            return "execute_first_specialist"
+        return "synthesis" if _accepted_evidence_ids(state) else "research_completion"
 
     builder.add_node("initializer", initializer)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("pre_moderation", pre_moderation)  # pyright: ignore[reportUnknownMemberType]
@@ -433,6 +522,7 @@ def build_agent_graph(
     builder.add_node("execute_first_specialist", execute_first_specialist)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("batch_barrier", batch_barrier)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("research_completion", research_completion)  # pyright: ignore[reportUnknownMemberType]
+    builder.add_node("synthesis", synthesis)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("finalize_state", finalize_state)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("publish", publish)  # pyright: ignore[reportUnknownMemberType]
     builder.add_edge(START, "initializer")
@@ -454,11 +544,13 @@ def build_agent_graph(
         {
             "execute_first_specialist": "execute_first_specialist",
             "research_completion": "research_completion",
+            "synthesis": "synthesis",
         },
     )
     builder.add_edge("execute_first_specialist", "batch_barrier")
     builder.add_edge("batch_barrier", "coordinator")
     builder.add_edge("research_completion", "finalize_state")
+    builder.add_edge("synthesis", "finalize_state")
     builder.add_edge("finalize_state", "publish")
     builder.add_edge("publish", END)
     return cast(
@@ -467,6 +559,17 @@ def build_agent_graph(
             checkpointer=checkpointer
         ),
     )
+
+
+def _accepted_evidence_ids(state: AgentGraphState) -> tuple[str, ...]:
+    """Return accepted Evidence IDs in deterministic batch and Task order."""
+    accepted_batches = state.get("accepted_batches", {})
+    evidence_ids: list[str] = []
+    for raw_batch in accepted_batches.values():
+        accepted = AcceptedBatch.model_validate(raw_batch)
+        for outcome in accepted.outcomes:
+            evidence_ids.extend(outcome.result.evidence_ids)
+    return tuple(evidence_ids)
 
 
 def _active_batch_dump(batch: ActiveBatch) -> dict[str, Any]:

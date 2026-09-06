@@ -1,11 +1,17 @@
 """Public first-batch validation and acceptance coverage."""
 
+from collections.abc import Awaitable, Callable
+from datetime import date
+from typing import cast
+
 import pytest
 from pydantic import ValidationError
 
 from app.langgraph_v2.agent_batch import (
     BatchContribution,
     DispatchBatch,
+    EvidenceToolRegistration,
+    SpecialistAttempt,
     SpecialistFindingDraft,
     SpecialistRegistration,
     SpecialistRegistry,
@@ -17,6 +23,7 @@ from app.langgraph_v2.agent_batch import (
     execute_specialist,
     promote_batch,
 )
+from app.langgraph_v2.agent_evidence import EvidenceEnvelope
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 
 
@@ -24,9 +31,9 @@ class _Specialist:
     def __init__(self, finding: SpecialistFindingDraft | None = None) -> None:
         self.finding = finding or SpecialistFindingDraft(summary="No-tool finding")
 
-    async def run(self, input: object) -> SpecialistFindingDraft:
+    async def run(self, input: object) -> SpecialistAttempt:
         del input
-        return self.finding
+        return SpecialistAttempt(finding=self.finding)
 
 
 def _registry(
@@ -193,7 +200,9 @@ def test_specialist_finding_canonical_size_has_exact_boundary(size: int) -> None
     if size == 16 * 1024:
         assert finding.canonical_json_size() == size
     else:
-        with pytest.raises(StructuredOutputInvalid, match="Specialist finding exceeds 16 KiB"):
+        with pytest.raises(
+            StructuredOutputInvalid, match="Specialist finding exceeds 16 KiB"
+        ):
             finding.require_canonical_size()
 
 
@@ -205,8 +214,19 @@ def test_specialist_finding_rejects_more_than_16_evidence_ids() -> None:
         )
 
 
+def test_specialist_finding_accepts_exactly_16_evidence_ids() -> None:
+    finding = SpecialistFindingDraft(
+        summary="Maximum references",
+        evidence_ids=tuple(f"evidence-{index}" for index in range(16)),
+    )
+
+    assert len(finding.evidence_ids) == 16
+
+
 @pytest.mark.asyncio
-async def test_execute_specialist_enforces_the_16_kib_boundary_before_contribution() -> None:
+async def test_execute_specialist_enforces_the_16_kib_boundary_before_contribution() -> (
+    None
+):
     scope_descriptors = (
         SpecialistDescriptor(id="market-data", description="Market data"),
     )
@@ -238,3 +258,127 @@ async def test_execute_specialist_enforces_the_16_kib_boundary_before_contributi
             registry=_registry(finding=too_large),
             scope_descriptors=scope_descriptors,
         )
+
+
+@pytest.mark.asyncio
+async def test_registry_freezes_tool_and_source_intersection_before_provider_access() -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        calls.append((source, query))
+        return EvidenceEnvelope(
+            id="evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            task_id="task-1",
+            source=source,
+            source_url="https://example.test/filing",
+            title="Annual filing",
+            body="Body",
+            excerpt="Excerpt",
+            as_of_date=date(2026, 9, 6),
+        )
+
+    captured: list[object] = []
+    audit: list[tuple[str, str]] = []
+
+    def record_audit(tool_id: str, status: str) -> None:
+        audit.append((tool_id, status))
+        if status == "completed":
+            raise RuntimeError("audit transport failed")
+
+    def factory(tools: tuple[object, ...], returned_evidence: object) -> _Specialist:
+        del returned_evidence
+        captured.extend(tools)
+        return _Specialist()
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=factory,
+                allowed_tool_ids=frozenset({"filing-tool"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing-tool",
+                provider=provider,
+                allowed_sources=frozenset({"filing", "private"}),
+                allowed_queries=frozenset({"Apple"}),
+                audit=record_audit,
+            ),
+        ),
+        tenant_eligible_tool_ids=frozenset({"filing-tool"}),
+    )
+    registration = registry.resolve(
+        "market-data",
+        scope_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+
+    actor = registry.bind_actor(
+        registration,
+        scope_tool_ids=frozenset({"filing-tool", "unregistered"}),
+        scope_sources=frozenset({"filing"}),
+        scope_queries=frozenset({"Apple"}),
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task-1",
+    )
+
+    assert isinstance(actor, _Specialist)
+    assert len(captured) == 1
+    tool = cast(
+        Callable[[str, str], Awaitable[object]], captured[0]
+    )
+    with pytest.raises(ValueError, match="Evidence source is not eligible"):
+        await tool("private", "Apple")
+    assert calls == []
+    with pytest.raises(ValueError, match="Evidence query is not eligible"):
+        await tool("filing", "Broad query")
+    assert calls == []
+    await tool("filing", "Apple")
+    assert calls == [("filing", "Apple")]
+    assert audit == [
+        ("filing-tool", "rejected"),
+        ("filing-tool", "rejected"),
+        ("filing-tool", "started"),
+        ("filing-tool", "completed"),
+    ]
+
+
+def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
+    captured: list[tuple[object, ...]] = []
+
+    def factory(tools: tuple[object, ...], returned_evidence: object) -> _Specialist:
+        del returned_evidence
+        captured.append(tools)
+        return _Specialist()
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=factory,
+                allowed_tool_ids=frozenset({"filing-tool"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(),
+        tenant_eligible_tool_ids=frozenset(),
+    )
+    actor = registry.bind_actor(
+        registry.registrations[0],
+        scope_tool_ids=frozenset(),
+        scope_sources=frozenset(),
+        scope_queries=frozenset(),
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task-1",
+    )
+
+    assert isinstance(actor, _Specialist)
+    assert captured == [()]

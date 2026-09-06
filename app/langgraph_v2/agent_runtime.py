@@ -15,13 +15,16 @@ from app.agents.query_understanding import (
     DEFAULT_INSTRUCTIONS,
     create_query_understanding_agent,
 )
+from app.agents.synthesis import PydanticAISynthesisActor, create_synthesis_agent
 from app.config.models import AgentResearchConfig, LangGraphRuntimeMode
 from app.langgraph_v2.agent_batch import SpecialistRegistry
+from app.langgraph_v2.agent_evidence import RequestEvidenceCatalog
 from app.langgraph_v2.agent_graph import (
     CoordinatorActor,
     CoordinatorInput,
     Finish,
     QueryUnderstandingActor,
+    SynthesisActor,
     build_agent_graph,
 )
 from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
@@ -69,6 +72,8 @@ class AgentGraphRuntimeAdapter:
     specialist_registry: SpecialistRegistry
     intent_policies: Mapping[str, AgentIntentPolicy]
     moderation_provider: ModerationProvider
+    tenant_id: str
+    synthesis_actor: SynthesisActor | None = None
 
     @property
     def runtime_mode(self) -> LangGraphRuntimeMode:
@@ -90,6 +95,9 @@ class AgentGraphRuntimeAdapter:
             specialist_registry=self.specialist_registry,
             intent_policies=self.intent_policies,
             moderation_provider=self.moderation_provider,
+            tenant_id=self.tenant_id,
+            evidence_catalog=RequestEvidenceCatalog(),
+            synthesis_actor=self.synthesis_actor,
             checkpoint_state_adapter=AgentCheckpointStateAdapter(),
         )
 
@@ -113,6 +121,7 @@ def build_agent_runtime(
     specialist_registry: SpecialistRegistry | None = None,
     intent_policies: Mapping[str, AgentIntentPolicy] | None = None,
     moderation_provider: ModerationProvider | None = None,
+    synthesis_actor: SynthesisActor | None = None,
 ) -> AgentGraphRuntimeAdapter:
     """Build one Agent runtime from trusted Tenant configuration and dependencies."""
     policies = (
@@ -126,11 +135,19 @@ def build_agent_runtime(
     coordinator = coordinator_actor or _resolve_coordinator_actor(
         app, request_context.tenant_id
     )
-    specialists = specialist_registry or SpecialistRegistry(
-        registrations=(), tenant_eligible_ids=frozenset()
+    configured_specialists = getattr(
+        app.state, "langgraph_v2_specialist_registry", None
+    )
+    specialists = (
+        specialist_registry
+        or configured_specialists
+        or SpecialistRegistry(registrations=(), tenant_eligible_ids=frozenset())
     )
     moderation = moderation_provider or getattr(
         app.state, "langgraph_v2_moderation_provider", None
+    )
+    synthesis = synthesis_actor or _resolve_synthesis_actor(
+        app, request_context.tenant_id
     )
     return AgentGraphRuntimeAdapter(
         checkpointer=checkpointer,
@@ -139,6 +156,8 @@ def build_agent_runtime(
         specialist_registry=specialists,
         intent_policies=policies,
         moderation_provider=moderation or MockModerationProvider(),
+        tenant_id=request_context.tenant_id,
+        synthesis_actor=synthesis,
     )
 
 
@@ -186,6 +205,21 @@ def _resolve_coordinator_actor(app: FastAPI, tenant_id: str) -> CoordinatorActor
     )
 
 
+def _resolve_synthesis_actor(app: FastAPI, tenant_id: str) -> SynthesisActor | None:
+    configured = getattr(app.state, "langgraph_v2_synthesis_actor", None)
+    if configured is not None:
+        return configured
+    manager = getattr(app.state, "tenant_manager", None)
+    config = _agent_research_config(app, tenant_id)
+    if manager is None or not hasattr(manager, "get_model_registry") or config is None:
+        return None
+    return PydanticAISynthesisActor(
+        create_synthesis_agent(
+            manager.get_model_registry(tenant_id), model_name=config.synthesis_model
+        )
+    )
+
+
 def _resolve_intent_policies(
     app: FastAPI,
     tenant_id: str,
@@ -204,6 +238,11 @@ def _resolve_intent_policies(
                 )
                 for descriptor in policy.specialist_descriptors
             ),
+            allowed_tool_ids=frozenset(policy.allowed_tool_ids),
+            allowed_sources=frozenset(policy.allowed_sources),
+            allowed_queries=frozenset(policy.allowed_queries),
+            as_of_date=policy.as_of_date,
+            max_evidence_age_days=policy.max_evidence_age_days,
         )
         for policy in config.intents
     }

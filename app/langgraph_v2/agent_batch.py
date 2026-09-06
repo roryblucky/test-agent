@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.langgraph_v2.agent_evidence import (
+    EvidenceEnvelope,
+    EvidenceProvider,
+    RequestEvidenceCatalog,
+    bind_evidence_tool,
+)
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 
 _SPECIALIST_FINDING_MAX_BYTES = 16 * 1024
@@ -76,6 +82,15 @@ class SpecialistResult(BaseModel):
     evidence_ids: tuple[str, ...] = Field(max_length=16, default=())
 
 
+class SpecialistAttempt(BaseModel):
+    """Actor-local terminal output, including app-only Tool metadata."""
+
+    model_config = ConfigDict(frozen=True)
+
+    finding: SpecialistFindingDraft
+    evidence: tuple[EvidenceEnvelope, ...] = ()
+
+
 class TaskSucceeded(BaseModel):
     """Platform-owned terminal Task Outcome for accepted Specialist work."""
 
@@ -131,9 +146,36 @@ class ActiveBatch:
 class SpecialistActor(Protocol):
     """Execute one bounded Specialist Task without exposing Tools to graph code."""
 
-    async def run(self, input: SpecialistTaskInput) -> SpecialistFindingDraft:
-        """Return the model-authored terminal finding draft."""
+    async def run(self, input: SpecialistTaskInput) -> SpecialistAttempt:
+        """Return one terminal finding plus app-only Tool metadata."""
         ...
+
+
+EvidenceTool = Callable[[str, str], object]
+ToolTelemetry = Callable[[str, str], None]
+
+
+class SpecialistActorFactory(Protocol):
+    """Build one Specialist actor after its Tool set is frozen."""
+
+    def __call__(
+        self,
+        tools: tuple[EvidenceTool, ...],
+        returned_evidence: list[EvidenceEnvelope],
+    ) -> SpecialistActor:
+        """Return an actor limited to exactly the supplied Tool bindings."""
+        ...
+
+
+@dataclass(frozen=True)
+class EvidenceToolRegistration:
+    """One code-registered Evidence Tool and its maximum source authority."""
+
+    id: str
+    provider: EvidenceProvider
+    allowed_sources: frozenset[str]
+    allowed_queries: frozenset[str] = frozenset()
+    audit: ToolTelemetry | None = None
 
 
 @dataclass(frozen=True)
@@ -141,7 +183,9 @@ class SpecialistRegistration:
     """Typed code registration for one Specialist actor."""
 
     id: str
-    actor: SpecialistActor
+    actor: SpecialistActor | None = None
+    actor_factory: SpecialistActorFactory | None = None
+    allowed_tool_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -150,6 +194,8 @@ class SpecialistRegistry:
 
     registrations: Sequence[SpecialistRegistration]
     tenant_eligible_ids: frozenset[str]
+    tool_registrations: Sequence[EvidenceToolRegistration] = ()
+    tenant_eligible_tool_ids: frozenset[str] = frozenset()
 
     def resolve(
         self,
@@ -168,6 +214,78 @@ class SpecialistRegistry:
         ):
             raise ValueError("Specialist is not eligible")
         return registered[specialist_id]
+
+    def effective_tool_ids(
+        self,
+        registration: SpecialistRegistration,
+        *,
+        scope_tool_ids: frozenset[str],
+    ) -> frozenset[str]:
+        """Freeze registered, Tenant, Scope, and Specialist Tool authority."""
+        registered_ids = frozenset(tool.id for tool in self.tool_registrations)
+        return (
+            registered_ids
+            & self.tenant_eligible_tool_ids
+            & scope_tool_ids
+            & registration.allowed_tool_ids
+        )
+
+    def bind_actor(
+        self,
+        registration: SpecialistRegistration,
+        *,
+        scope_tool_ids: frozenset[str],
+        scope_sources: frozenset[str],
+        scope_queries: frozenset[str],
+        tenant_id: str,
+        request_id: str,
+        task_id: str,
+        tool_telemetry: ToolTelemetry | None = None,
+    ) -> SpecialistActor:
+        """Create one actor with a frozen Scope-narrowed Tool surface."""
+        effective_ids = self.effective_tool_ids(
+            registration, scope_tool_ids=scope_tool_ids
+        )
+        if not effective_ids and registration.actor_factory is None:
+            if registration.actor is not None:
+                return registration.actor
+            raise ValueError("Specialist Tool actor factory is not configured")
+        actor_factory = registration.actor_factory
+        if actor_factory is None:
+            raise AssertionError("Specialist actor factory is required")
+        registered = {tool.id: tool for tool in self.tool_registrations}
+        returned_evidence: list[EvidenceEnvelope] = []
+        tools: list[EvidenceTool] = []
+        for tool_id in sorted(effective_ids):
+            tool = registered[tool_id]
+
+            def report_tool_status(
+                status: str,
+                *,
+                tool_id: str = tool_id,
+                audit: ToolTelemetry | None = tool.audit,
+            ) -> None:
+                if audit is not None:
+                    try:
+                        audit(tool_id, status)
+                    except BaseException:
+                        pass
+                if tool_telemetry is not None:
+                    tool_telemetry(tool_id, status)
+
+            binding = bind_evidence_tool(
+                tool.provider,
+                allowed_sources=tool.allowed_sources & scope_sources,
+                allowed_queries=tool.allowed_queries & scope_queries,
+                tenant_id=tenant_id,
+                request_id=request_id,
+                task_id=task_id,
+                returned_evidence=returned_evidence,
+                telemetry=report_tool_status,
+            )
+            binding.__name__ = tool_id
+            tools.append(binding)
+        return actor_factory(tuple(tools), returned_evidence)
 
 
 @dataclass(frozen=True)
@@ -215,15 +333,46 @@ async def execute_specialist(
     batch_id: str,
     registry: SpecialistRegistry,
     scope_descriptors: Sequence[SpecialistDescriptor],
+    catalog: RequestEvidenceCatalog | None = None,
+    tenant_id: str | None = None,
+    request_id: str | None = None,
+    scope_tool_ids: frozenset[str] = frozenset(),
+    scope_sources: frozenset[str] = frozenset(),
+    scope_queries: frozenset[str] = frozenset(),
+    tool_telemetry: ToolTelemetry | None = None,
 ) -> BatchContribution:
     """Run one registered no-Tool Specialist and stage only its terminal outcome."""
     registration = registry.resolve(
         task.specialist_id, scope_descriptors=scope_descriptors
     )
-    draft = await registration.actor.run(
+    actor = registry.bind_actor(
+        registration,
+        scope_tool_ids=scope_tool_ids,
+        scope_sources=scope_sources,
+        scope_queries=scope_queries,
+        tenant_id=tenant_id or "",
+        request_id=request_id or "",
+        task_id=task.id,
+        tool_telemetry=tool_telemetry,
+    )
+    attempt = await actor.run(
         SpecialistTaskInput(task_id=task.id, objective=task.objective)
     )
+    draft = attempt.finding
     draft.require_canonical_size()
+    if catalog is None:
+        if attempt.evidence:
+            raise ValueError("Evidence cache is not configured")
+    else:
+        if tenant_id is None or request_id is None:
+            raise ValueError("Evidence cache identity is not configured")
+        catalog.accept_referenced(
+            attempt.evidence,
+            finding_evidence_ids=draft.evidence_ids,
+            tenant_id=tenant_id,
+            request_id=request_id,
+            task_id=task.id,
+        )
     return BatchContribution(
         batch_id=batch_id,
         task_id=task.id,
