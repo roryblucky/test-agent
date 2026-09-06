@@ -239,6 +239,7 @@ def _resolve_intent_policies(
                 for descriptor in policy.specialist_descriptors
             ),
             allowed_tool_ids=frozenset(policy.allowed_tool_ids),
+            allowed_skill_names=frozenset(policy.allowed_skill_names),
             allowed_sources=frozenset(policy.allowed_sources),
             allowed_queries=frozenset(policy.allowed_queries),
             as_of_date=policy.as_of_date,

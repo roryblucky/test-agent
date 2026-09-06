@@ -358,6 +358,7 @@ def build_agent_graph(
             scope_descriptors=scope.specialist_descriptors,
             catalog=catalog,
             context=invocation_context,
+            scope_skill_names=scope.allowed_skill_names,
             tool_telemetry=lambda tool_id, status: _emit(
                 (
                     LiveStreamEvent(

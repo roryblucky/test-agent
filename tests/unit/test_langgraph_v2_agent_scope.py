@@ -16,6 +16,7 @@ def test_scope_uses_only_trusted_policy_not_model_metadata() -> None:
             SpecialistDescriptor(id="market-data", description="Market data"),
             SpecialistDescriptor(id="news", description="News"),
         ),
+        allowed_skill_names=frozenset({"filing-analysis"}),
     )
     intent = IntentResult(
         intent="market_outlook",
@@ -32,6 +33,7 @@ def test_scope_uses_only_trusted_policy_not_model_metadata() -> None:
 
     assert scope.intent == "market_outlook"
     assert scope.specialist_descriptors == policy.specialist_descriptors
+    assert scope.allowed_skill_names == frozenset({"filing-analysis"})
     assert not hasattr(scope, "tools")
 
 

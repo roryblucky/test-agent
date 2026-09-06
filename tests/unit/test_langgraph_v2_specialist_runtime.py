@@ -30,6 +30,10 @@ from app.langgraph_v2.agent_evidence import (
     EvidenceInvocationContext,
     bind_evidence_tool,
 )
+from app.langgraph_v2.agent_skills import (
+    SkillRegistration,
+    SpecialistSkillRegistry,
+)
 
 
 def _context() -> EvidenceInvocationContext:
@@ -76,6 +80,7 @@ def test_specialist_factory_disables_tools_and_builtin_retries() -> None:
         "output_retries": 0,
         "end_strategy": "early",
     }
+    assert "activate one eligible Skill" in registry.kwargs["instructions"]
 
 
 def test_bound_specialist_factory_uses_exact_frozen_tools() -> None:
@@ -95,6 +100,88 @@ def test_bound_specialist_factory_uses_exact_frozen_tools() -> None:
     assert isinstance(actor, PydanticAISpecialistActor)
     assert registry.kwargs is not None
     assert registry.kwargs["tools"] == (read_evidence,)
+
+
+@pytest.mark.asyncio
+async def test_specialist_activates_a_summary_before_using_an_existing_tool() -> None:
+    skill_registry = SpecialistSkillRegistry(
+        registrations=(
+            SkillRegistration(
+                name="filing-analysis",
+                version="1",
+                description="Read a filing.",
+                instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
+                required_tool_ids=frozenset({"read_evidence"}),
+            ),
+        ),
+        tenant_eligible_names=frozenset({"filing-analysis"}),
+        shared_skill_names=frozenset({"filing-analysis"}),
+    )
+    invocation = skill_registry.begin_invocation(
+        specialist_skill_names=frozenset(),
+        scope_skill_names=frozenset({"filing-analysis"}),
+        effective_tool_ids=frozenset({"read_evidence"}),
+    )
+    calls = 0
+
+    async def read_evidence() -> dict[str, str]:
+        return {"excerpt": "already-authorized-tool-result"}
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        business_tools = [
+            tool.name for tool in info.function_tools if tool.name != "activate_skill"
+        ]
+        assert business_tools == ["read_evidence"]
+        if calls == 1:
+            assert "filing-analysis" in repr(messages)
+            assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="activate_skill",
+                        args={"skill_name": "filing-analysis"},
+                    )
+                ]
+            )
+        if calls == 2:
+            assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name="read_evidence", args={})]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={"summary": "Filing analysis", "evidence_ids": []},
+                )
+            ]
+        )
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(read_evidence, invocation.activation_tool()),
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        ),
+        skill_invocation=invocation,
+    )
+
+    attempt = await actor.run(
+        SpecialistTaskInput(
+            task_id="task-1",
+            objective="Assess the filing.",
+            skill_summaries=invocation.summaries,
+        )
+    )
+
+    assert calls == 3
+    assert attempt.skill_pins == invocation.pins
 
 
 @pytest.mark.asyncio

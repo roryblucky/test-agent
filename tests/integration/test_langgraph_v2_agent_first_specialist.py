@@ -34,6 +34,11 @@ from app.langgraph_v2.agent_evidence import (
 from app.langgraph_v2.agent_graph import CoordinatorInput, Finish
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
+from app.langgraph_v2.agent_skills import (
+    SkillInvocation,
+    SkillRegistration,
+    SpecialistSkillRegistry,
+)
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
@@ -106,13 +111,15 @@ async def _evidence_provider(source: str, query: str) -> EvidenceEnvelope:
 
 
 def _evidence_specialist_factory(
-    tools: tuple[Callable[..., object], ...], returned_evidence: list[EvidenceEnvelope]
+    tools: tuple[Callable[..., object], ...],
+    returned_evidence: list[EvidenceEnvelope],
+    skill_invocation: SkillInvocation | None,
 ) -> SpecialistActor:
     return _specialist_factory(
         query="Apple revenue",
         summary="Apple revenue grew.",
         evidence_id="evidence-1",
-    )(tools, returned_evidence)
+    )(tools, returned_evidence, skill_invocation)
 
 
 def _specialist_factory(
@@ -121,6 +128,7 @@ def _specialist_factory(
     def build(
         tools: tuple[Callable[..., object], ...],
         returned_evidence: list[EvidenceEnvelope],
+        skill_invocation: SkillInvocation | None,
     ) -> PydanticAISpecialistActor:
         calls = 0
 
@@ -158,9 +166,73 @@ def _specialist_factory(
                 end_strategy="early",
             ),
             returned_evidence=returned_evidence,
+            skill_invocation=skill_invocation,
         )
 
     return build
+
+
+def _skill_specialist_factory(
+    tools: tuple[Callable[..., object], ...],
+    returned_evidence: list[EvidenceEnvelope],
+    skill_invocation: SkillInvocation | None,
+) -> PydanticAISpecialistActor:
+    assert skill_invocation is not None
+    calls = 0
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        business_tools = [
+            tool.name for tool in info.function_tools if tool.name != "activate_skill"
+        ]
+        assert business_tools == ["filing_reader"]
+        if calls == 1:
+            assert "filing-analysis" in repr(messages)
+            assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="activate_skill",
+                        args={"skill_name": "filing-analysis"},
+                    )
+                ]
+            )
+        if calls == 2:
+            assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="filing_reader",
+                        args={"source": "filing", "query": "Apple revenue"},
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={
+                        "summary": "Apple revenue grew.",
+                        "evidence_ids": ["evidence-1"],
+                    },
+                )
+            ]
+        )
+
+    return PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=tools,
+            retries=0,
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        ),
+        returned_evidence=returned_evidence,
+        skill_invocation=skill_invocation,
+    )
 
 
 async def _empty_evidence_provider(source: str, query: str) -> EvidenceEnvelope:
@@ -402,6 +474,117 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
         )
     assert "BODY-SENTINEL" not in persisted_text
     assert "RAW-PROVIDER-SENTINEL" not in persisted_text
+
+
+def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    coordinator = _Coordinator()
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        allowed_tool_ids=frozenset({"filing_reader"}),
+        allowed_skill_names=frozenset({"filing-analysis"}),
+        allowed_sources=frozenset({"filing"}),
+        allowed_queries=frozenset({"Apple revenue"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=_skill_specialist_factory,
+                allowed_tool_ids=frozenset({"filing_reader"}),
+                allowed_skill_names=frozenset({"filing-analysis"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=_evidence_provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple revenue"}),
+            ),
+        ),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+        skill_registry=SpecialistSkillRegistry(
+            registrations=(
+                SkillRegistration(
+                    name="filing-analysis",
+                    version="2026.09",
+                    description="Read an eligible filing before analysis.",
+                    instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
+                    required_tool_ids=frozenset({"filing_reader"}),
+                ),
+            ),
+            tenant_eligible_names=frozenset({"filing-analysis"}),
+            shared_skill_names=frozenset({"filing-analysis"}),
+        ),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=coordinator,
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+            synthesis_actor=_Synthesis(),
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000084"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "What about it?",
+                "sessionId": conversation_id,
+                "clientRequestId": "request-1",
+            },
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+        assert client.portal is not None
+        checkpoint = client.portal.call(
+            lambda: app.state.langgraph_v2_checkpointer.aget_tuple(
+                thread_checkpoint_config(
+                    thread_id=thread_id_for(
+                        "tenant-a", "subject-a", "agent", conversation_id
+                    )
+                )
+            )
+        )
+
+    done = [event for event in parse_sse(response.text) if event["type"] == "done"]
+    assert response.status_code == 200
+    assert done[0]["data"]["answer"] == "Apple revenue grew. [[E:1]]"
+    assert done[0]["data"]["citations"][0]["evidence_id"] == "evidence-1"
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    skill_pins = next(iter(state["accepted_batches"].values()))["skill_pins"]
+    pin = skill_pins[0]["pins"][0]
+    assert pin["name"] == "filing-analysis"
+    assert pin["version"] == "2026.09"
+    assert len(pin["content_hash"]) == 64
+    assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
+    assert all(
+        "filing-analysis" not in input.model_dump_json()
+        for input in coordinator.inputs
+    )
 
 
 def test_authoritative_empty_result_still_publishes_evidence_backed_report(

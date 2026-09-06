@@ -109,6 +109,7 @@ def test_runtime_resolves_intent_policy_from_trusted_tenant_config() -> None:
                         AgentResearchIntentConfig(
                             intent="market_outlook",
                             description="Assess market conditions.",
+                            allowed_skill_names=["filing-analysis"],
                             specialist_descriptors=[
                                 AgentResearchSpecialistConfig(
                                     id="market-data", description="Market data"
@@ -131,4 +132,7 @@ def test_runtime_resolves_intent_policy_from_trusted_tenant_config() -> None:
 
     assert runtime.intent_policies["market_outlook"].specialist_descriptors == (
         SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    assert runtime.intent_policies["market_outlook"].allowed_skill_names == frozenset(
+        {"filing-analysis"}
     )

@@ -426,6 +426,15 @@ class AgentResearchIntentConfig(BaseModel):
             serialization_alias="allowedToolIds",
         ),
     ] = Field(default_factory=list[str])
+    allowed_skill_names: Annotated[
+        list[str],
+        Field(
+            validation_alias=AliasChoices(
+                "allowed_skill_names", "allowedSkillNames"
+            ),
+            serialization_alias="allowedSkillNames",
+        ),
+    ] = Field(default_factory=list[str])
     allowed_sources: Annotated[
         list[str],
         Field(

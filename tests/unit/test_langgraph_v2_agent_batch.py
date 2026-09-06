@@ -18,6 +18,7 @@ from app.langgraph_v2.agent_batch import (
     SpecialistResult,
     StructuredOutputInvalid,
     TaskProposal,
+    TaskSkillPins,
     TaskSucceeded,
     accept_initial_dispatch,
     execute_specialist,
@@ -25,15 +26,26 @@ from app.langgraph_v2.agent_batch import (
 )
 from app.langgraph_v2.agent_evidence import EvidenceEnvelope, EvidenceInvocationContext
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
+from app.langgraph_v2.agent_skills import (
+    SkillInvocation,
+    SkillPin,
+    SkillRegistration,
+    SpecialistSkillRegistry,
+)
 
 
 class _Specialist:
-    def __init__(self, finding: SpecialistFindingDraft | None = None) -> None:
+    def __init__(
+        self,
+        finding: SpecialistFindingDraft | None = None,
+        skill_pins: tuple[SkillPin, ...] = (),
+    ) -> None:
         self.finding = finding or SpecialistFindingDraft(summary="No-tool finding")
+        self.skill_pins = skill_pins
 
     async def run(self, input: object) -> SpecialistAttempt:
         del input
-        return SpecialistAttempt(finding=self.finding)
+        return SpecialistAttempt(finding=self.finding, skill_pins=self.skill_pins)
 
 
 def _context(*, task_id: str = "task-1") -> EvidenceInvocationContext:
@@ -274,6 +286,45 @@ async def test_execute_specialist_enforces_the_16_kib_boundary_before_contributi
 
 
 @pytest.mark.asyncio
+async def test_execute_specialist_persists_only_activated_skill_pins() -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=scope_descriptors,
+    )
+    pin = SkillPin(
+        name="filing-analysis",
+        version="1",
+        content_hash="a" * 64,
+    )
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor=_Specialist(skill_pins=(pin,)),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+    )
+    accepted = promote_batch(batch, {contribution.task_id: contribution})
+
+    assert contribution.skill_pins == (pin,)
+    assert accepted.skill_pins == (TaskSkillPins(task_id=batch.tasks[0].id, pins=(pin,)),)
+
+
+@pytest.mark.asyncio
 async def test_registry_freezes_tool_and_source_intersection_before_provider_access() -> None:
     calls: list[tuple[str, str]] = []
 
@@ -300,8 +351,12 @@ async def test_registry_freezes_tool_and_source_intersection_before_provider_acc
         if status == "completed":
             raise RuntimeError("audit transport failed")
 
-    def factory(tools: tuple[object, ...], returned_evidence: object) -> _Specialist:
-        del returned_evidence
+    def factory(
+        tools: tuple[object, ...],
+        returned_evidence: object,
+        skill_invocation: object,
+    ) -> _Specialist:
+        del returned_evidence, skill_invocation
         captured.extend(tools)
         return _Specialist()
 
@@ -361,8 +416,12 @@ async def test_registry_freezes_tool_and_source_intersection_before_provider_acc
 def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
     captured: list[tuple[object, ...]] = []
 
-    def factory(tools: tuple[object, ...], returned_evidence: object) -> _Specialist:
-        del returned_evidence
+    def factory(
+        tools: tuple[object, ...],
+        returned_evidence: object,
+        skill_invocation: object,
+    ) -> _Specialist:
+        del returned_evidence, skill_invocation
         captured.append(tools)
         return _Specialist()
 
@@ -391,3 +450,89 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
 
     assert isinstance(actor, _Specialist)
     assert captured == [()]
+
+
+def test_registry_binds_skill_activation_without_expanding_frozen_business_tools() -> (
+    None
+):
+    captured_tools: list[Callable[..., object]] = []
+    captured_invocation: list[SkillInvocation] = []
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        del source, query
+        raise AssertionError("Tool must not run while binding a Skill")
+
+    def factory(
+        tools: tuple[Callable[..., object], ...],
+        returned_evidence: list[EvidenceEnvelope],
+        skill_invocation: SkillInvocation | None,
+    ) -> _Specialist:
+        del returned_evidence
+        assert skill_invocation is not None
+        captured_tools.extend(tools)
+        captured_invocation.append(skill_invocation)
+        return _Specialist()
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=factory,
+                allowed_tool_ids=frozenset({"filing-tool"}),
+                allowed_skill_names=frozenset({"market-skill"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing-tool",
+                provider=provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple"}),
+            ),
+        ),
+        tenant_eligible_tool_ids=frozenset({"filing-tool"}),
+        skill_registry=SpecialistSkillRegistry(
+            registrations=(
+                SkillRegistration(
+                    name="shared-skill",
+                    version="1",
+                    description="Shared summary",
+                    instructions="SHARED-FULL-INSTRUCTIONS",
+                    required_tool_ids=frozenset({"filing-tool"}),
+                ),
+                SkillRegistration(
+                    name="market-skill",
+                    version="1",
+                    description="Market summary",
+                    instructions="MARKET-FULL-INSTRUCTIONS",
+                ),
+            ),
+            tenant_eligible_names=frozenset({"shared-skill", "market-skill"}),
+            shared_skill_names=frozenset({"shared-skill"}),
+        ),
+    )
+
+    actor = registry.bind_actor(
+        registry.registrations[0],
+        context=_context(),
+        scope_skill_names=frozenset({"shared-skill", "market-skill"}),
+    )
+
+    assert isinstance(actor, _Specialist)
+    assert [_tool_name(tool) for tool in captured_tools] == [
+        "filing-tool",
+        "activate_skill",
+    ]
+    invocation = captured_invocation[0]
+    assert [summary.name for summary in invocation.summaries] == [
+        "shared-skill",
+        "market-skill",
+    ]
+    assert invocation.activate("shared-skill").instructions == "SHARED-FULL-INSTRUCTIONS"
+
+
+def _tool_name(tool: Callable[..., object]) -> str:
+    name = getattr(tool, "__name__", None)
+    assert isinstance(name, str)
+    return name

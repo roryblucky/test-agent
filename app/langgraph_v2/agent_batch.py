@@ -18,6 +18,12 @@ from app.langgraph_v2.agent_evidence import (
     bind_evidence_tool,
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
+from app.langgraph_v2.agent_skills import (
+    SkillInvocation,
+    SkillPin,
+    SkillSummary,
+    SpecialistSkillRegistry,
+)
 
 _SPECIALIST_FINDING_MAX_BYTES = 16 * 1024
 
@@ -90,6 +96,7 @@ class SpecialistAttempt(BaseModel):
 
     finding: SpecialistFindingDraft
     evidence: tuple[EvidenceEnvelope, ...] = ()
+    skill_pins: tuple[SkillPin, ...] = ()
 
 
 class TaskSucceeded(BaseModel):
@@ -111,6 +118,16 @@ class BatchContribution(BaseModel):
     task_id: str
     attempt: Literal[1]
     outcome: TaskSucceeded
+    skill_pins: tuple[SkillPin, ...] = ()
+
+
+class TaskSkillPins(BaseModel):
+    """Immutable Skill pins associated with one accepted Task."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    pins: tuple[SkillPin, ...]
 
 
 class AcceptedBatch(BaseModel):
@@ -120,6 +137,7 @@ class AcceptedBatch(BaseModel):
 
     id: str
     outcomes: tuple[TaskSucceeded, ...]
+    skill_pins: tuple[TaskSkillPins, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -153,6 +171,7 @@ class SpecialistActor(Protocol):
 
 
 EvidenceTool = Callable[[str, str], object]
+SpecialistTool = Callable[..., object]
 ToolTelemetry = Callable[[str, str], None]
 
 
@@ -161,8 +180,9 @@ class SpecialistActorFactory(Protocol):
 
     def __call__(
         self,
-        tools: tuple[EvidenceTool, ...],
+        tools: tuple[SpecialistTool, ...],
         returned_evidence: list[EvidenceEnvelope],
+        skill_invocation: SkillInvocation | None,
     ) -> SpecialistActor:
         """Return an actor limited to exactly the supplied Tool bindings."""
         ...
@@ -187,6 +207,7 @@ class SpecialistRegistration:
     actor: SpecialistActor | None = None
     actor_factory: SpecialistActorFactory | None = None
     allowed_tool_ids: frozenset[str] = frozenset()
+    allowed_skill_names: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -197,6 +218,7 @@ class SpecialistRegistry:
     tenant_eligible_ids: frozenset[str]
     tool_registrations: Sequence[EvidenceToolRegistration] = ()
     tenant_eligible_tool_ids: frozenset[str] = frozenset()
+    skill_registry: SpecialistSkillRegistry | None = None
 
     def resolve(
         self,
@@ -236,22 +258,32 @@ class SpecialistRegistry:
         registration: SpecialistRegistration,
         *,
         context: EvidenceInvocationContext,
+        scope_skill_names: frozenset[str] = frozenset(),
         tool_telemetry: ToolTelemetry | None = None,
     ) -> SpecialistActor:
         """Create one actor with a frozen Scope-narrowed Tool surface."""
         effective_ids = self.effective_tool_ids(
             registration, scope_tool_ids=context.allowed_tool_ids
         )
-        if not effective_ids and registration.actor_factory is None:
+        skill_invocation = self._begin_skill_invocation(
+            registration,
+            scope_skill_names=scope_skill_names,
+            effective_tool_ids=effective_ids,
+        )
+        if (
+            not effective_ids
+            and skill_invocation is None
+            and registration.actor_factory is None
+        ):
             if registration.actor is not None:
                 return registration.actor
-            raise ValueError("Specialist Tool actor factory is not configured")
+            raise ValueError("Specialist actor factory is not configured")
         actor_factory = registration.actor_factory
         if actor_factory is None:
             raise AssertionError("Specialist actor factory is required")
         registered = {tool.id: tool for tool in self.tool_registrations}
         returned_evidence: list[EvidenceEnvelope] = []
-        tools: list[EvidenceTool] = []
+        tools: list[SpecialistTool] = []
         for tool_id in sorted(effective_ids):
             tool = registered[tool_id]
 
@@ -285,7 +317,25 @@ class SpecialistRegistry:
             )
             binding.__name__ = tool_id
             tools.append(binding)
-        return actor_factory(tuple(tools), returned_evidence)
+        if skill_invocation is not None and skill_invocation.summaries:
+            tools.append(skill_invocation.activation_tool())
+        return actor_factory(tuple(tools), returned_evidence, skill_invocation)
+
+    def _begin_skill_invocation(
+        self,
+        registration: SpecialistRegistration,
+        *,
+        scope_skill_names: frozenset[str],
+        effective_tool_ids: frozenset[str],
+    ) -> SkillInvocation | None:
+        """Create one invocation-local Skill view from trusted registration."""
+        if self.skill_registry is None:
+            return None
+        return self.skill_registry.begin_invocation(
+            specialist_skill_names=registration.allowed_skill_names,
+            scope_skill_names=scope_skill_names,
+            effective_tool_ids=effective_tool_ids,
+        )
 
 
 @dataclass(frozen=True)
@@ -294,6 +344,7 @@ class SpecialistTaskInput:
 
     task_id: str
     objective: str
+    skill_summaries: tuple[SkillSummary, ...] = ()
 
 
 def accept_initial_dispatch(
@@ -335,6 +386,7 @@ async def execute_specialist(
     scope_descriptors: Sequence[SpecialistDescriptor],
     catalog: RequestEvidenceCatalog | None = None,
     context: EvidenceInvocationContext,
+    scope_skill_names: frozenset[str] = frozenset(),
     tool_telemetry: ToolTelemetry | None = None,
 ) -> BatchContribution:
     """Run one registered bounded Specialist and stage its terminal outcome."""
@@ -344,6 +396,7 @@ async def execute_specialist(
     actor = registry.bind_actor(
         registration,
         context=context,
+        scope_skill_names=scope_skill_names,
         tool_telemetry=tool_telemetry,
     )
     attempt = await actor.run(
@@ -371,6 +424,7 @@ async def execute_specialist(
                 evidence_ids=draft.evidence_ids,
             ),
         ),
+        skill_pins=attempt.skill_pins,
     )
 
 
@@ -390,4 +444,12 @@ def promote_batch(
         for contribution in ordered
     ):
         raise ValueError("Batch contribution manifest is invalid")
-    return AcceptedBatch(id=batch.id, outcomes=tuple(item.outcome for item in ordered))
+    return AcceptedBatch(
+        id=batch.id,
+        outcomes=tuple(item.outcome for item in ordered),
+        skill_pins=tuple(
+            TaskSkillPins(task_id=item.task_id, pins=item.skill_pins)
+            for item in ordered
+            if item.skill_pins
+        ),
+    )
