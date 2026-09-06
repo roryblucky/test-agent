@@ -33,11 +33,11 @@ from app.langgraph_v2.agent_skills import (
     SpecialistSkillRegistry,
 )
 
-_SPECIALIST_FINDING_MAX_BYTES = 16 * 1024
+_SPECIALIST_OUTPUT_MAX_BYTES = 16 * 1024
 
 
 class StructuredOutputInvalid(ValueError):
-    """Reject a returned Specialist draft before it becomes a contribution."""
+    """Reject an over-limit Specialist contract before contribution acceptance."""
 
 
 def _stable_id(prefix: str, value: Mapping[str, object]) -> str:
@@ -88,7 +88,7 @@ class SpecialistFindingDraft(BaseModel):
 
     def require_canonical_size(self) -> None:
         """Reject an over-limit model output before it becomes a contribution."""
-        if self.canonical_json_size() > _SPECIALIST_FINDING_MAX_BYTES:
+        if self.canonical_json_size() > _SPECIALIST_OUTPUT_MAX_BYTES:
             raise StructuredOutputInvalid("Specialist finding exceeds 16 KiB")
 
 
@@ -107,7 +107,7 @@ class SpecialistResult(BaseModel):
 
     def require_canonical_size(self) -> None:
         """Reject a Result that exceeds its complete accepted-state bound."""
-        if self.canonical_json_size() > _SPECIALIST_FINDING_MAX_BYTES:
+        if self.canonical_json_size() > _SPECIALIST_OUTPUT_MAX_BYTES:
             raise StructuredOutputInvalid("Specialist result exceeds 16 KiB")
 
 
