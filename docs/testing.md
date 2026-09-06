@@ -1,5 +1,21 @@
 # Testing
 
+For local runs, copy the ignored machine-local PostgreSQL configuration once:
+
+```shell
+cp .env.test.local.example .env.test.local
+```
+
+Set the password in `.env.test.local`, then use the project wrapper so pytest
+automatically receives the local database and schema configuration:
+
+```shell
+scripts/run-pytest tests
+```
+
+The wrapper prefers the project's `.venv` and falls back to `uv run`. CI may
+continue to supply the variables explicitly as shown below.
+
 Run the static and full-suite gates with:
 
 ```shell
@@ -56,9 +72,11 @@ profile, not a production capacity benchmark.
 ## Disposable PostgreSQL fixture
 
 The LangGraph v2 migration test requires a running PostgreSQL database supplied
-through `LANGGRAPH_V2_TEST_DATABASE_URL`. The database name must contain a
-standalone `test` segment, for example `agent_kms_test_42`; the fixture rejects
-names such as `production` before connecting.
+through `LANGGRAPH_V2_TEST_DATABASE_URL`. Use either a database name containing
+a standalone `test` segment, such as `agent_kms_test_42`, or set
+`LANGGRAPH_V2_TEST_SCHEMA` to a dedicated schema whose name ends in `_test`.
+The schema form permits a shared local database such as `postgres`; the fixture
+checks that the selected schema is empty and cleans only that schema.
 
 Create a dedicated empty database, then run:
 
@@ -67,11 +85,19 @@ LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost/agent_kms
   uv run pytest tests/integration/test_langgraph_v2_migrations.py
 ```
 
+For a dedicated local schema, use:
+
+```shell
+LANGGRAPH_V2_TEST_DATABASE_URL='postgresql://postgres:secret@localhost:5432/postgres' \
+LANGGRAPH_V2_TEST_SCHEMA='agent_test' \
+  PYTHONPATH=. uv run pytest tests/integration/test_langgraph_v2_migrations.py
+```
+
 The fixture fails with an actionable message when the variable is missing, the
-database is unreachable, or user-created schemas, relations, functions, or
-types already exist. It never cleans an unrecognised database. After the test,
-it removes the `langgraph_v2` schema and Alembic version table so the dedicated
-database can be reused.
+database is unreachable, or the selected test database/schema is not empty. It
+never cleans an unrecognised target. After the test, it recreates the selected
+test schema, or removes the LangGraph and Alembic tables from a dedicated test
+database, so the target can be reused.
 
 The v2 application lifespan also runs the official LangGraph PostgreSQL
 checkpointer setup. Checkpointer integration tests use the same disposable

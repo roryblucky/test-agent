@@ -83,3 +83,9 @@ Issues and specs are tracked as local Markdown files under `.scratch/`. See `doc
 ### Domain docs
 
 This is a single-context repo; domain docs are read from root `CONTEXT.md` and root `docs/adr/` when present. See `docs/agents/domain.md`.
+
+### PostgreSQL integration tests
+
+Use `scripts/run-pytest` for PostgreSQL-backed tests; it loads the ignored
+machine-local `.env.test.local` when present. See `docs/testing.md` for setup
+and fixture safety rules.

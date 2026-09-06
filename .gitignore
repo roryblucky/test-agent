@@ -11,3 +11,5 @@ wheels/
 .agents
 .claude
 
+# Machine-local test credentials
+.env.test.local
