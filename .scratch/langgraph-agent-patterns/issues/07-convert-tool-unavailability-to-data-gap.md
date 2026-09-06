@@ -4,17 +4,24 @@
 
 **Blocked by:** 05: 发布首份 Scope-bound Evidence-backed Report
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] binding 只捕获已注册的预期 inability 与自身 20 秒 timeout，并映射到封闭的 reason-code 集合；其他异常不被吞掉。
-- [ ] model-visible fallback return 上限为 4 KiB；测试覆盖恰好上限与多 1 byte，无法安全投影时使用 `response_unusable`。
-- [ ] app-only metadata 保留完整 binding 字段，但不得包含 secrets、raw provider payload 或其他不可信大对象。
-- [ ] 支持 fallback、multi-hop 与 Specialist 内部 fan-out；单个预期 unavailable 不取消 sibling，也不触发外层 Specialist retry。
-- [ ] accepted attempt 中每个 accepted unavailable 与一个 Data Gap 一一对应；完全相同的重复项幂等。
-- [ ] missing、stale、cross-Run、cross-Task、cross-attempt 或相互冲突的 Data Gap provenance 均 fatal。
-- [ ] failed 或 abandoned attempt 的 Data Gap 不得被接受，并为 Ticket 08 的跨 attempt 隔离提供测试基础。
-- [ ] 每个贡献最多 8 个 Data Gap；coverage 最多 256 个 UTF-8 bytes，identifier 最多 64 个 ASCII characters，source 最多 256 个 UTF-8 bytes；每项覆盖恰好上限与多 1。
-- [ ] `DataGapView` 隐藏内部 ID、tool 与 source 信息。
-- [ ] accepted partial success 单调地设置 incomplete；fallback 成功不能清除此信号。
-- [ ] 权威 negative/empty Evidence 仍可完整完成，不自动成为 Data Gap。
+- [x] binding 只捕获已注册的预期 inability 与自身 20 秒 timeout，并映射到封闭的 reason-code 集合；其他异常不被吞掉。
+- [x] model-visible fallback return 上限为 4 KiB；测试覆盖恰好上限与多 1 byte，无法安全投影时使用 `response_unusable`。
+- [x] app-only metadata 保留完整 binding 字段，但不得包含 secrets、raw provider payload 或其他不可信大对象。
+- [x] 支持 fallback、multi-hop 与 Specialist 内部 fan-out；单个预期 unavailable 不取消 sibling，也不触发外层 Specialist retry。
+- [x] accepted attempt 中每个 accepted unavailable 与一个 Data Gap 一一对应；完全相同的重复项幂等。
+- [x] missing、stale、cross-Run、cross-Task、cross-attempt 或相互冲突的 Data Gap provenance 均 fatal。
+- [x] failed 或 abandoned attempt 的 Data Gap 不得被接受，并为 Ticket 08 的跨 attempt 隔离提供测试基础。
+- [x] 每个贡献最多 8 个 Data Gap；coverage 最多 256 个 UTF-8 bytes，identifier 最多 64 个 ASCII characters，source 最多 256 个 UTF-8 bytes；每项覆盖恰好上限与多 1。
+- [x] `DataGapView` 隐藏内部 ID、tool 与 source 信息。
+- [x] accepted partial success 单调地设置 incomplete；fallback 成功不能清除此信号。
+- [x] 权威 negative/empty Evidence 仍可完整完成，不自动成为 Data Gap。
 
+## Comments
+
+- 实作：`f44e322`，审查修订至 `a675348`；Tool unavailable 仅由 binding 导出为安全 metadata 与 canonical Data Gap。
+- seam：gpt-5.6-sol medium 已确认 binding、PydanticAI actor、`execute_specialist`、`SpecialistResult`、`DataGapView` 与 synthesis-completion 边界。
+- 验证：focused unit 56 passed；PostgreSQL integration 8 passed；`scripts/run-pytest -q tests` 为 339 passed、1 skipped；ruff 与 diff check 通过。pyright 仅保留既有 `alembic/env.py:22` 未使用 `translate`。
+- 复审：gpt-5.6-sol high Standards 与 Spec 双轴终审均为 0；所有发现以代码、边界测试或格式复原关闭。
+- 未决 review comments：0。
