@@ -16,7 +16,7 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.graph.message import (  # pyright: ignore[reportMissingTypeStubs]
     add_messages,
 )
-from langgraph.types import Overwrite
+from langgraph.types import Overwrite, Send
 from pydantic import BaseModel, ConfigDict
 
 from app.langgraph_v2.agent_batch import (
@@ -31,6 +31,7 @@ from app.langgraph_v2.agent_batch import (
     accept_initial_dispatch,
     execute_specialist,
     promote_batch,
+    validate_active_batch_manifest,
 )
 from app.langgraph_v2.agent_completion import (
     IncompleteResearch,
@@ -121,11 +122,11 @@ class SynthesisActor(Protocol):
         ...
 
 
-def _merge_contributions(
+def _merge_staged_contributions(
     current: dict[str, dict[str, Any]],
     update: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Merge immutable staged contributions, rejecting conflicting identities."""
+    """Merge immutable staged Task contributions."""
     merged = {**current}
     for task_id, contribution in update.items():
         existing = merged.get(task_id)
@@ -139,8 +140,14 @@ def _merge_accepted_batches(
     current: dict[str, dict[str, Any]],
     update: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Merge immutable accepted batches, rejecting conflicting identities."""
-    return _merge_contributions(current, update)
+    """Merge immutable accepted Batch records."""
+    merged = {**current}
+    for batch_id, accepted_batch in update.items():
+        existing = merged.get(batch_id)
+        if existing is not None and existing != accepted_batch:
+            raise ValueError("Accepted Batch conflicts")
+        merged[batch_id] = accepted_batch
+    return merged
 
 
 class AgentGraphState(TypedDict):
@@ -155,8 +162,9 @@ class AgentGraphState(TypedDict):
     intent: NotRequired[dict[str, Any] | None]
     research_scope: NotRequired[dict[str, Any] | None]
     active_batch: NotRequired[dict[str, Any] | None]
+    dispatched_task: NotRequired[dict[str, Any]]
     staged_contributions: NotRequired[
-        Annotated[dict[str, dict[str, Any]], _merge_contributions]
+        Annotated[dict[str, dict[str, Any]], _merge_staged_contributions]
     ]
     accepted_batches: NotRequired[
         Annotated[dict[str, dict[str, Any]], _merge_accepted_batches]
@@ -334,16 +342,29 @@ def build_agent_graph(
         )
         return {"active_batch": _active_batch_dump(active_batch)}
 
-    async def execute_first_specialist(
+    async def execute_specialist_task(
         state: AgentGraphState,
     ) -> AgentGraphStateUpdate:
         active_value = state.get("active_batch")
         scope_value = state.get("research_scope")
-        if not isinstance(active_value, dict) or not isinstance(scope_value, dict):
+        task_value = state.get("dispatched_task")
+        if (
+            not isinstance(active_value, dict)
+            or not isinstance(scope_value, dict)
+            or not isinstance(task_value, dict)
+        ):
             raise TypeError("Agent active batch is invalid")
         active_batch = _active_batch_load(active_value)
         scope = ResearchScope.model_validate(scope_value)
-        task = active_batch.tasks[0]
+        validate_active_batch_manifest(
+            active_batch,
+            request_id=state["request_id"],
+            registry=specialist_registry,
+            scope_descriptors=scope.specialist_descriptors,
+        )
+        task = _accepted_task_load(task_value)
+        if task not in active_batch.tasks:
+            raise ValueError("Dispatched Specialist Task is not in the active batch")
         invocation_context = EvidenceInvocationContext(
             tenant_id=tenant_id,
             request_id=state["request_id"],
@@ -367,7 +388,11 @@ def build_agent_graph(
                     LiveStreamEvent(
                         type="progress",
                         step="tool",
-                        data={"task_id": task.id, "tool_id": tool_id, "status": status},
+                        data={
+                            "task_id": task.id,
+                            "tool_id": tool_id,
+                            "status": status,
+                        },
                     ),
                 )
             ),
@@ -491,7 +516,7 @@ def build_agent_graph(
             metadata["steps_executed"].extend(["resolve_scope", "coordinator"])
             if state.get("accepted_batches"):
                 metadata["steps_executed"].extend(
-                    ["execute_first_specialist", "batch_barrier", "coordinator"]
+                    ["execute_specialist_task", "batch_barrier", "coordinator"]
                 )
                 metadata["specialist_usage"] = _accepted_specialist_usage(
                     state
@@ -548,9 +573,29 @@ def build_agent_graph(
             else "resolve_scope"
         )
 
-    def next_after_coordinator(state: AgentGraphState) -> str:
-        if state.get("active_batch") is not None:
-            return "execute_first_specialist"
+    def next_after_coordinator(state: AgentGraphState) -> str | list[Send]:
+        active_value = cast(object, state.get("active_batch"))
+        if active_value is not None:
+            if not isinstance(active_value, dict):
+                raise TypeError("Agent active batch is invalid")
+            scope_value = state.get("research_scope")
+            if not isinstance(scope_value, dict):
+                raise TypeError("Agent Research Scope is invalid")
+            active_batch = _active_batch_load(cast(Mapping[str, object], active_value))
+            scope = ResearchScope.model_validate(scope_value)
+            validate_active_batch_manifest(
+                active_batch,
+                request_id=state["request_id"],
+                registry=specialist_registry,
+                scope_descriptors=scope.specialist_descriptors,
+            )
+            return [
+                Send(
+                    "execute_specialist_task",
+                    {**state, "dispatched_task": _accepted_task_dump(task)},
+                )
+                for task in active_batch.tasks
+            ]
         return "synthesis" if _accepted_evidence_ids(state) else "research_completion"
 
     builder.add_node("initializer", initializer)  # pyright: ignore[reportUnknownMemberType]
@@ -558,7 +603,7 @@ def build_agent_graph(
     builder.add_node("query_understanding", query_understanding)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("resolve_scope", resolve_scope)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("coordinator", coordinator)  # pyright: ignore[reportUnknownMemberType]
-    builder.add_node("execute_first_specialist", execute_first_specialist)  # pyright: ignore[reportUnknownMemberType]
+    builder.add_node("execute_specialist_task", execute_specialist_task)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("batch_barrier", batch_barrier)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("research_completion", research_completion)  # pyright: ignore[reportUnknownMemberType]
     builder.add_node("synthesis", synthesis)  # pyright: ignore[reportUnknownMemberType]
@@ -581,12 +626,11 @@ def build_agent_graph(
         "coordinator",
         next_after_coordinator,
         {
-            "execute_first_specialist": "execute_first_specialist",
             "research_completion": "research_completion",
             "synthesis": "synthesis",
         },
     )
-    builder.add_edge("execute_first_specialist", "batch_barrier")
+    builder.add_edge("execute_specialist_task", "batch_barrier")
     builder.add_edge("batch_barrier", "coordinator")
     builder.add_edge("research_completion", "finalize_state")
     builder.add_edge("synthesis", "finalize_state")
@@ -685,3 +729,30 @@ def _active_batch_load(value: Mapping[str, object]) -> ActiveBatch:
             )
         )
     return ActiveBatch(id=batch_id, tasks=tuple(tasks))
+
+
+def _accepted_task_dump(task: AcceptedTask) -> dict[str, str]:
+    """Serialize one Send branch's trusted Task manifest entry."""
+    return {
+        "id": task.id,
+        "objective": task.objective,
+        "specialist_id": task.specialist_id,
+    }
+
+
+def _accepted_task_load(value: Mapping[str, object]) -> AcceptedTask:
+    """Validate one Send branch's trusted Task manifest entry."""
+    task_id = value.get("id")
+    objective = value.get("objective")
+    specialist_id = value.get("specialist_id")
+    if (
+        not isinstance(task_id, str)
+        or not isinstance(objective, str)
+        or not isinstance(specialist_id, str)
+    ):
+        raise TypeError("Agent dispatched Task is invalid")
+    return AcceptedTask(
+        id=task_id,
+        objective=objective,
+        specialist_id=specialist_id,
+    )

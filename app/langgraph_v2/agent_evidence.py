@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import threading
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -267,8 +267,8 @@ def _unavailability_record(
 
 
 def _same_canonical_evidence(left: EvidenceEnvelope, right: EvidenceEnvelope) -> bool:
-    """Compare accepted Evidence while excluding noncanonical provider payload."""
-    excluded = {"raw_provider_payload"}
+    """Compare evidence content while excluding per-invocation provenance."""
+    excluded = {"raw_provider_payload", "task_id"}
     return left.model_dump(exclude=excluded) == right.model_dump(exclude=excluded)
 
 
@@ -394,12 +394,11 @@ def bind_evidence_tool(
 
 @dataclass
 class RequestEvidenceCatalog:
-    """Hold request-local Evidence bodies and mark only references publishable."""
+    """Hold request-local Evidence bodies for accepted-state projections."""
 
     _evidence: dict[str, EvidenceEnvelope] = field(
         default_factory=dict[str, EvidenceEnvelope]
     )
-    _accepted_ids: set[str] = field(default_factory=set[str])
     _body_sizes: dict[str, int] = field(default_factory=dict[str, int])
     _total_body_bytes: int = 0
     _lock: Any = field(default_factory=threading.RLock, repr=False)
@@ -417,7 +416,7 @@ class RequestEvidenceCatalog:
         finding_evidence_ids: tuple[str, ...],
         context: EvidenceInvocationContext,
     ) -> None:
-        """Cache returned bodies and mark only Finding references publishable."""
+        """Cache returned bodies after validating one staged Finding reference."""
         returned_items = tuple(returned)
         with self._lock:
             returned_by_id: dict[str, EvidenceEnvelope] = {}
@@ -464,8 +463,9 @@ class RequestEvidenceCatalog:
                         )
                     self._body_sizes[body_hash] = body_size
                     self._total_body_bytes += body_size
-                self._evidence[evidence.id] = evidence
-            self._accepted_ids.update(finding_evidence_ids)
+                stored = evidence.model_copy(update={"raw_provider_payload": None})
+                if existing is None or stored.task_id < existing.task_id:
+                    self._evidence[evidence.id] = stored
 
     def resolve(
         self,
@@ -473,6 +473,7 @@ class RequestEvidenceCatalog:
         *,
         tenant_id: str,
         request_id: str,
+        accepted_evidence_ids: Collection[str],
         as_of_date: date | None = None,
         max_evidence_age_days: int | None = None,
     ) -> EvidenceEnvelope:
@@ -481,7 +482,7 @@ class RequestEvidenceCatalog:
             evidence = self._evidence.get(evidence_id)
             if (
                 evidence is None
-                or evidence_id not in self._accepted_ids
+                or evidence_id not in accepted_evidence_ids
                 or evidence.tenant_id != tenant_id
                 or evidence.request_id != request_id
                 or (
@@ -563,6 +564,7 @@ def prepare_synthesis(
                 evidence_id,
                 tenant_id=tenant_id,
                 request_id=request_id,
+                accepted_evidence_ids=accepted_evidence_ids,
                 as_of_date=as_of_date,
                 max_evidence_age_days=max_evidence_age_days,
             )

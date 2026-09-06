@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from app.api.schemas import QueryResponse
 from app.config.models import (
@@ -26,7 +27,11 @@ from app.langgraph_v2.api import (
 )
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.graph import LinearGraphState
-from app.langgraph_v2.postgres import V2PostgresConfig, postgres_lifespan
+from app.langgraph_v2.postgres import (
+    CheckpointerFactory,
+    V2PostgresConfig,
+    postgres_lifespan,
+)
 from app.langgraph_v2.pre_moderation import ModerationProvider
 from app.langgraph_v2.question_refinement import QuestionRefinementActor
 from app.langgraph_v2.reranking import Ranker
@@ -127,6 +132,7 @@ def persistent_linear_app(
     moderation_provider: ModerationProvider | None = None,
     answer_actor: AnswerActor | None = None,
     agent_runtime_factory: GraphRuntimeFactory | None = None,
+    checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
 ) -> FastAPI:
     """Create the test-only Linear Core with its real application database pool."""
 
@@ -135,6 +141,7 @@ def persistent_linear_app(
         async with postgres_lifespan(
             app,
             config=V2PostgresConfig(database_url=database_url),
+            checkpointer_factory=checkpointer_factory,
         ):
             yield
 

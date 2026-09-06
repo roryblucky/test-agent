@@ -141,6 +141,79 @@ async def test_concurrent_identical_evidence_bodies_are_counted_once() -> None:
     assert catalog.cached_body_bytes == len(b"same body")
 
 
+@pytest.mark.asyncio
+async def test_concurrent_siblings_converge_on_the_same_evidence_id_and_body() -> (
+    None
+):
+    catalog = RequestEvidenceCatalog()
+    first_context = _context()
+    second_context = first_context.model_copy(update={"task_id": "task-2"})
+
+    await asyncio.gather(
+        asyncio.to_thread(
+            catalog.accept_referenced,
+            (_evidence(id="shared-evidence", body="same body"),),
+            finding_evidence_ids=("shared-evidence",),
+            context=first_context,
+        ),
+        asyncio.to_thread(
+            catalog.accept_referenced,
+            (
+                _evidence(
+                    id="shared-evidence",
+                    body="same body",
+                    task_id="task-2",
+                ),
+            ),
+            finding_evidence_ids=("shared-evidence",),
+            context=second_context,
+        ),
+    )
+    assert catalog.cached_body_bytes == len(b"same body")
+    accepted = catalog.resolve(
+        "shared-evidence",
+        tenant_id="tenant-a",
+        request_id="request-1",
+        accepted_evidence_ids=("shared-evidence",),
+    )
+    assert accepted.body == "same body"
+    assert accepted.task_id == "task-1"
+    assert accepted.raw_provider_payload is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_siblings_reject_the_same_evidence_id_with_different_body() -> (
+    None
+):
+    catalog = RequestEvidenceCatalog()
+    first_context = _context()
+    second_context = first_context.model_copy(update={"task_id": "task-2"})
+
+    results = await asyncio.gather(
+        asyncio.to_thread(
+            catalog.accept_referenced,
+            (_evidence(id="shared-evidence", body="first body"),),
+            finding_evidence_ids=("shared-evidence",),
+            context=first_context,
+        ),
+        asyncio.to_thread(
+            catalog.accept_referenced,
+            (
+                _evidence(
+                    id="shared-evidence",
+                    body="second body",
+                    task_id="task-2",
+                ),
+            ),
+            finding_evidence_ids=("shared-evidence",),
+            context=second_context,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, ValueError) for result in results) == 1
+
+
 def test_only_accepted_referenced_evidence_is_prepared_and_published() -> None:
     catalog = RequestEvidenceCatalog()
     catalog.accept_referenced(
@@ -148,7 +221,6 @@ def test_only_accepted_referenced_evidence_is_prepared_and_published() -> None:
         finding_evidence_ids=("evidence-1",),
         context=_context(),
     )
-
     prepared = prepare_synthesis(
         standalone_query="Apple outlook",
         intent="market_outlook",
@@ -209,9 +281,11 @@ def test_evidence_cache_ignores_noncanonical_raw_payload_for_idempotence() -> No
             finding_evidence_ids=("evidence-1",),
             context=_context(),
         )
-
     accepted = catalog.resolve(
-        "evidence-1", tenant_id="tenant-a", request_id="request-1"
+        "evidence-1",
+        tenant_id="tenant-a",
+        request_id="request-1",
+        accepted_evidence_ids=("evidence-1",),
     )
     assert accepted.body == first.body
 
@@ -223,13 +297,49 @@ def test_evidence_cache_keeps_orphans_diagnostic_only() -> None:
         finding_evidence_ids=("evidence-1",),
         context=_context(),
     )
-
     assert (
-        catalog.resolve("evidence-1", tenant_id="tenant-a", request_id="request-1").body
+        catalog.resolve(
+            "evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_evidence_ids=("evidence-1",),
+        ).body
         == "Apple revenue grew."
     )
     with pytest.raises(ValueError, match="Evidence is not accepted"):
-        catalog.resolve("orphan-1", tenant_id="tenant-a", request_id="request-1")
+        catalog.resolve(
+            "orphan-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_evidence_ids=("evidence-1",),
+        )
+
+
+def test_referenced_evidence_is_ineligible_without_checkpointed_accepted_state() -> None:
+    catalog = RequestEvidenceCatalog()
+    catalog.accept_referenced(
+        (_evidence(),),
+        finding_evidence_ids=("evidence-1",),
+        context=_context(),
+    )
+
+    with pytest.raises(ValueError, match="Evidence is not accepted"):
+        catalog.resolve(
+            "evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_evidence_ids=(),
+        )
+
+    assert (
+        catalog.resolve(
+            "evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_evidence_ids=("evidence-1",),
+        ).body
+        == "Apple revenue grew."
+    )
 
 
 def test_evidence_cache_rejects_exact_item_and_total_capacity_overflow() -> None:
@@ -600,7 +710,12 @@ def test_evidence_cache_does_not_commit_before_all_references_validate() -> None
         )
 
     with pytest.raises(ValueError, match="Evidence is not accepted"):
-        catalog.resolve("evidence-1", tenant_id="tenant-a", request_id="request-1")
+        catalog.resolve(
+            "evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_evidence_ids=(),
+        )
 
 
 def test_synthesis_rejects_evidence_older_than_scope_freshness_window() -> None:

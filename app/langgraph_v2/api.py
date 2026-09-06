@@ -17,11 +17,13 @@ from typing import Annotated, Any, Protocol, TypedDict, cast
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import BaseMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from starlette.requests import ClientDisconnect
 from starlette.types import Receive, Scope, Send
 
 from app.config.models import LangGraphRuntimeMode
+from app.langgraph_v2.agent_batch import MAX_DISPATCH_BATCH_TASKS
 from app.langgraph_v2.answer import AnswerActor
 from app.langgraph_v2.authorization import (
     TrustedRequestContext,
@@ -391,6 +393,11 @@ def create_v2_router(
                 conversation_id,
             ),
         )
+        if runtime_mode is LangGraphRuntimeMode.AGENT:
+            graph_config = cast(
+                RunnableConfig,
+                {**graph_config, "max_concurrency": MAX_DISPATCH_BATCH_TASKS},
+            )
         try:
             await validate_checkpoint_request_identity(
                 checkpointer,

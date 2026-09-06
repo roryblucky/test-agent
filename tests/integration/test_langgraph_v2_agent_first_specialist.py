@@ -1,16 +1,21 @@
 """Public first bounded Specialist Task coverage."""
 
+import asyncio
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from datetime import date
 from typing import Any
+from uuid import UUID
 
 import psycopg
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage, UsageLimits
@@ -50,7 +55,9 @@ from app.langgraph_v2.agent_skills import (
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
+from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_context import ConversationExchange
+from app.langgraph_v2.postgres import CheckpointerFactory
 from app.langgraph_v2.specialist_retry import (
     SpecialistFailureFacts,
     SpecialistInvocationFailure,
@@ -61,6 +68,8 @@ from app.models.workflow import IntentResult, QueryUnderstandingOutput, Resolved
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
+    stream_request,
+    v2_stream_endpoint,
 )
 
 
@@ -94,6 +103,164 @@ class _Coordinator:
                 ),
             )
         return Finish(kind="finish")
+
+
+class _ConcurrentBatchCoordinator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(self, input: CoordinatorInput) -> DispatchBatch | Finish:
+        del input
+        self.calls += 1
+        if self.calls == 1:
+            return DispatchBatch(
+                kind="dispatch",
+                tasks=tuple(
+                    TaskProposal(
+                        specialist_id="market-data",
+                        objective=f"Assess market dimension {index}.",
+                    )
+                    for index in range(8)
+                ),
+            )
+        return Finish(kind="finish")
+
+
+class _ConcurrentBatchSpecialist:
+    def __init__(
+        self,
+        *,
+        reverse_completion: bool,
+        fatal_index: int | None = None,
+    ) -> None:
+        self.reverse_completion = reverse_completion
+        self.fatal_index = fatal_index
+        self.active = 0
+        self.max_active = 0
+        self.inputs: list[SpecialistTaskInput] = []
+        self.all_entered = asyncio.Event()
+
+    async def run(
+        self,
+        input: SpecialistTaskInput,
+        *,
+        usage: RunUsage | None = None,
+        usage_limits: UsageLimits | None = None,
+    ) -> SpecialistAttempt:
+        del usage, usage_limits
+        index = int(input.objective.removesuffix(".").rsplit(" ", 1)[1])
+        self.inputs.append(input)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if len(self.inputs) == 8:
+                self.all_entered.set()
+            await asyncio.wait_for(self.all_entered.wait(), timeout=1)
+            delay = index if self.reverse_completion else 7 - index
+            await asyncio.sleep(delay / 1000)
+            if index == self.fatal_index:
+                raise RuntimeError("forced Specialist fatal failure")
+            if index == 3:
+                raise SpecialistInvocationFailure(
+                    UsageLimitExceeded("Task request limit reached"),
+                    facts=SpecialistFailureFacts(
+                        boundary=SpecialistModelBoundary.AZURE_OPENAI,
+                        at_model_request_boundary=True,
+                        terminal_output_tool_rejected=False,
+                        count_limit_exhausted=True,
+                        unreturned_model_requests=0,
+                        usage_limits=specialist_usage_limits(),
+                    ),
+                    messages=(),
+                )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(
+                    summary=f"Finding for market dimension {index}."
+                )
+            )
+        finally:
+            self.active -= 1
+
+
+_CONCURRENT_BATCH_POLICY = AgentIntentPolicy(
+    intent="market_outlook",
+    description="Assess market conditions.",
+    specialist_descriptors=(
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    ),
+)
+_TENANT_HEADERS = {"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
+
+
+def _concurrent_batch_app(
+    database_url: str,
+    *,
+    coordinator: _ConcurrentBatchCoordinator,
+    specialist: SpecialistActor,
+    checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
+) -> FastAPI:
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=coordinator,
+            specialist_registry=registry,
+            intent_policies={_CONCURRENT_BATCH_POLICY.intent: _CONCURRENT_BATCH_POLICY},
+        )
+
+    app = persistent_linear_app(
+        database_url,
+        agent_runtime_factory=factory,
+        checkpointer_factory=checkpointer_factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+    return app
+
+
+def _post_concurrent_batch_request(
+    client: TestClient,
+    *,
+    conversation_id: str,
+    client_request_id: str,
+) -> Any:
+    return client.post(
+        "/v2/query/stream",
+        json={
+            "query": "What about it?",
+            "sessionId": conversation_id,
+            "clientRequestId": client_request_id,
+        },
+        headers=_TENANT_HEADERS,
+    )
+
+
+def _concurrent_batch_checkpoint(
+    app: FastAPI,
+    client: TestClient,
+    conversation_id: str,
+) -> Any:
+    assert client.portal is not None
+    return client.portal.call(
+        lambda: app.state.langgraph_v2_checkpointer.aget_tuple(
+            thread_checkpoint_config(
+                thread_id=thread_id_for(
+                    "tenant-a", "subject-a", "agent", conversation_id
+                )
+            )
+        )
+    )
 
 
 class _Specialist:
@@ -484,6 +651,223 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
         "cost_is_complete": True,
     }
     assert done[0]["data"]["metadata"]["specialist_usage"] == accepted["usage"]
+
+
+def test_concurrent_mixed_batch_is_atomically_accepted_in_manifest_order(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    def run_batch(*, reverse_completion: bool, conversation_id: str) -> dict[str, object]:
+        coordinator = _ConcurrentBatchCoordinator()
+        specialist = _ConcurrentBatchSpecialist(
+            reverse_completion=reverse_completion
+        )
+        app = _concurrent_batch_app(
+            langgraph_v2_migrated_database_url,
+            coordinator=coordinator,
+            specialist=specialist,
+        )
+        with TestClient(app) as client:
+            response = _post_concurrent_batch_request(
+                client,
+                conversation_id=conversation_id,
+                client_request_id="mixed-batch-request",
+            )
+            checkpoint = _concurrent_batch_checkpoint(
+                app, client, conversation_id
+            )
+
+        events = parse_sse(response.text)
+        assert response.status_code == 200
+        assert len([event for event in events if event["type"] == "done"]) == 1
+        assert coordinator.calls == 2
+        assert len(specialist.inputs) == 8
+        assert specialist.max_active == 8
+        assert checkpoint is not None
+        state = checkpoint.checkpoint["channel_values"]
+        assert state["active_batch"] is None
+        assert state["staged_contributions"] == {}
+        accepted = next(iter(state["accepted_batches"].values()))
+        assert [outcome["kind"] for outcome in accepted["outcomes"]] == [
+            "succeeded",
+            "succeeded",
+            "succeeded",
+            "failed",
+            "succeeded",
+            "succeeded",
+            "succeeded",
+            "succeeded",
+        ]
+        return accepted
+
+    forward = run_batch(
+        reverse_completion=False,
+        conversation_id="00000000-0000-0000-0000-000000000091",
+    )
+    reverse = run_batch(
+        reverse_completion=True,
+        conversation_id="00000000-0000-0000-0000-000000000092",
+    )
+
+    assert reverse == forward
+
+
+def test_batch_barrier_checkpoint_failure_never_half_accepts_a_mixed_batch(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class _BarrierFailureSaver(AsyncPostgresSaver):
+        async def aput(
+            self,
+            config: RunnableConfig,
+            checkpoint: Any,
+            metadata: Any,
+            new_versions: Any,
+        ) -> RunnableConfig:
+            if checkpoint.get("channel_values", {}).get("accepted_batches"):
+                raise RuntimeError("forced batch barrier checkpoint failure")
+            return await super().aput(config, checkpoint, metadata, new_versions)
+
+    coordinator = _ConcurrentBatchCoordinator()
+    specialist = _ConcurrentBatchSpecialist(reverse_completion=False)
+    conversation_id = "00000000-0000-0000-0000-000000000093"
+    app = _concurrent_batch_app(
+        langgraph_v2_migrated_database_url,
+        coordinator=coordinator,
+        specialist=specialist,
+        checkpointer_factory=_BarrierFailureSaver,
+    )
+    with TestClient(app) as client:
+        response = _post_concurrent_batch_request(
+            client,
+            conversation_id=conversation_id,
+            client_request_id="checkpoint-failure-request",
+        )
+        checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+    events = parse_sse(response.text)
+    assert all(event["type"] != "done" for event in events)
+    assert events[-1] == {
+        "type": "error",
+        "data": "forced batch barrier checkpoint failure",
+    }
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    assert state["accepted_batches"] == {}
+    assert checkpoint.pending_writes
+    barrier_task_ids = {
+        write[0]
+        for write in checkpoint.pending_writes
+        if write[1] == "accepted_batches"
+    }
+    assert len(barrier_task_ids) == 1
+    barrier_channels = {
+        write[1]
+        for write in checkpoint.pending_writes
+        if write[0] in barrier_task_ids
+    }
+    assert {"accepted_batches", "active_batch", "staged_contributions"} <= barrier_channels
+
+
+def test_fatal_specialist_failure_keeps_sibling_contributions_unaccepted(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    coordinator = _ConcurrentBatchCoordinator()
+    specialist = _ConcurrentBatchSpecialist(
+        reverse_completion=False,
+        fatal_index=3,
+    )
+    conversation_id = "00000000-0000-0000-0000-000000000094"
+    app = _concurrent_batch_app(
+        langgraph_v2_migrated_database_url,
+        coordinator=coordinator,
+        specialist=specialist,
+    )
+    with TestClient(app) as client:
+        response = _post_concurrent_batch_request(
+            client,
+            conversation_id=conversation_id,
+            client_request_id="fatal-batch-request",
+        )
+        checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+    events = parse_sse(response.text)
+    assert all(event["type"] != "done" for event in events)
+    assert events[-1] == {"type": "error", "data": "forced Specialist fatal failure"}
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    assert state["accepted_batches"] == {}
+    assert checkpoint.pending_writes
+    assert any(write[1] == "staged_contributions" for write in checkpoint.pending_writes)
+    assert all(write[1] != "accepted_batches" for write in checkpoint.pending_writes)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_concurrent_batch_never_accepts_any_sibling(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class _BlockingSpecialist:
+        def __init__(self) -> None:
+            self.inputs: list[SpecialistTaskInput] = []
+            self.all_entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del usage, usage_limits
+            self.inputs.append(input)
+            if len(self.inputs) == 8:
+                self.all_entered.set()
+            await self.release.wait()
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(summary=input.objective)
+            )
+
+    coordinator = _ConcurrentBatchCoordinator()
+    specialist = _BlockingSpecialist()
+    conversation_id = UUID("00000000-0000-0000-0000-000000000095")
+    app = _concurrent_batch_app(
+        langgraph_v2_migrated_database_url,
+        coordinator=coordinator,
+        specialist=specialist,
+    )
+    request_context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            payload=V2QueryRequest(query="What about it?", conversation_id=conversation_id),
+            http_request=stream_request(app),
+            request_context=request_context,
+        )
+        subscriber = response.body_iterator
+        frames: list[str] = []
+
+        async def consume() -> None:
+            frames.extend([frame async for frame in subscriber])
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.wait_for(specialist.all_entered.wait(), timeout=1)
+        consumer.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumer
+        await subscriber.aclose()
+        checkpoint = await app.state.langgraph_v2_checkpointer.aget_tuple(
+            thread_checkpoint_config(
+                thread_id=thread_id_for(
+                    "tenant-a", "subject-a", "agent", str(conversation_id)
+                )
+            )
+        )
+
+    assert len(specialist.inputs) == 8
+    assert all("\"type\":\"done\"" not in frame for frame in frames)
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    assert state["accepted_batches"] == {}
+    assert all(write[1] != "accepted_batches" for write in checkpoint.pending_writes)
 
 
 def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(

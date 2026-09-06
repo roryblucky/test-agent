@@ -47,6 +47,7 @@ from app.langgraph_v2.specialist_retry import (
 )
 
 _SPECIALIST_OUTPUT_MAX_BYTES = 16 * 1024
+MAX_DISPATCH_BATCH_TASKS = 8
 
 
 class StructuredOutputInvalid(ValueError):
@@ -79,12 +80,14 @@ class TaskProposal(BaseModel):
 
 
 class DispatchBatch(BaseModel):
-    """Coordinator decision that requests one first-round Task."""
+    """Coordinator decision that requests one independent first-round batch."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal["dispatch"]
-    tasks: tuple[TaskProposal, ...] = Field(min_length=1, max_length=1)
+    tasks: tuple[TaskProposal, ...] = Field(
+        min_length=1, max_length=MAX_DISPATCH_BATCH_TASKS
+    )
 
 
 class SpecialistFindingDraft(BaseModel):
@@ -359,10 +362,17 @@ class AcceptedTask:
 
 @dataclass(frozen=True)
 class ActiveBatch:
-    """Scalar manifest for the sole Ticket 04 first-round batch."""
+    """Immutable first-round manifest awaiting whole-batch acceptance."""
 
     id: str
     tasks: tuple[AcceptedTask, ...]
+
+    def __post_init__(self) -> None:
+        """Reject malformed manifests before they can be dispatched or promoted."""
+        if not 1 <= len(self.tasks) <= MAX_DISPATCH_BATCH_TASKS:
+            raise ValueError("Active Batch Task count is invalid")
+        if len(set(self.task_ids)) != len(self.tasks):
+            raise ValueError("Active Batch Task identities conflict")
 
     @property
     def task_ids(self) -> tuple[str, ...]:
@@ -566,28 +576,73 @@ def accept_initial_dispatch(
     registry: SpecialistRegistry,
     scope_descriptors: Sequence[SpecialistDescriptor],
 ) -> ActiveBatch:
-    """Validate one first Dispatch and assign graph-owned stable Task identity."""
-    proposal = decision.tasks[0]
-    if not proposal.objective.strip():
-        raise ValueError("Specialist objective must not be blank")
-    if proposal.context_task_ids:
-        raise ValueError("initial Dispatch cannot select prior Task context")
-    registry.resolve(proposal.specialist_id, scope_descriptors=scope_descriptors)
-    task_id = _stable_id(
-        "task",
-        {"request_id": request_id, "round": 1, "dispatch_order": 0},
+    """Validate a first Dispatch before assigning graph-owned Task identities."""
+    proposals = tuple(decision.tasks)
+    if not 1 <= len(proposals) <= MAX_DISPATCH_BATCH_TASKS:
+        raise ValueError(
+            f"Dispatch Batch exceeds {MAX_DISPATCH_BATCH_TASKS} Tasks"
+        )
+    for proposal in proposals:
+        if not proposal.objective.strip():
+            raise ValueError("Specialist objective must not be blank")
+        if proposal.context_task_ids:
+            raise ValueError("initial Dispatch cannot select prior Task context")
+        registry.resolve(proposal.specialist_id, scope_descriptors=scope_descriptors)
+    batch_id = _stable_id(
+        "batch", {"request_id": request_id, "round": 1}
     )
-    batch_id = _stable_id("batch", {"request_id": request_id, "round": 1})
-    return ActiveBatch(
+    active_batch = ActiveBatch(
         id=batch_id,
-        tasks=(
+        tasks=tuple(
             AcceptedTask(
-                id=task_id,
+                id=_stable_id(
+                    "task",
+                    {
+                        "request_id": request_id,
+                        "round": 1,
+                        "dispatch_order": dispatch_order,
+                    },
+                ),
                 objective=proposal.objective.strip(),
                 specialist_id=proposal.specialist_id,
-            ),
+            )
+            for dispatch_order, proposal in enumerate(proposals)
         ),
     )
+    validate_active_batch_manifest(
+        active_batch,
+        request_id=request_id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+    return active_batch
+
+
+def validate_active_batch_manifest(
+    batch: ActiveBatch,
+    *,
+    request_id: str,
+    registry: SpecialistRegistry,
+    scope_descriptors: Sequence[SpecialistDescriptor],
+) -> None:
+    """Revalidate a checkpointed batch before it can fan out Specialist work."""
+    expected_batch_id = _stable_id("batch", {"request_id": request_id, "round": 1})
+    if batch.id != expected_batch_id:
+        raise ValueError("Active Batch identity is invalid")
+    for dispatch_order, task in enumerate(batch.tasks):
+        expected_task_id = _stable_id(
+            "task",
+            {
+                "request_id": request_id,
+                "round": 1,
+                "dispatch_order": dispatch_order,
+            },
+        )
+        if task.id != expected_task_id:
+            raise ValueError("Active Batch Task identity is invalid")
+        if not task.objective.strip() or task.objective != task.objective.strip():
+            raise ValueError("Active Batch Task objective is invalid")
+        registry.resolve(task.specialist_id, scope_descriptors=scope_descriptors)
 
 
 async def execute_specialist(
@@ -801,6 +856,8 @@ def promote_batch(
 ) -> AcceptedBatch:
     """Validate exact manifest membership before atomically promoting a batch."""
     if set(contributions) != set(batch.task_ids):
+        raise ValueError("Batch contribution manifest is invalid")
+    if any(task_id != contribution.task_id for task_id, contribution in contributions.items()):
         raise ValueError("Batch contribution manifest is invalid")
     ordered = tuple(contributions[task_id] for task_id in batch.task_ids)
     if any(

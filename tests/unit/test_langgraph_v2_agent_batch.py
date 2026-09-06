@@ -14,6 +14,8 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.langgraph_v2.agent_batch import (
+    AcceptedTask,
+    ActiveBatch,
     BatchContribution,
     DataGap,
     DispatchBatch,
@@ -34,6 +36,7 @@ from app.langgraph_v2.agent_batch import (
     accept_initial_dispatch,
     execute_specialist,
     promote_batch,
+    validate_active_batch_manifest,
 )
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
@@ -236,6 +239,154 @@ def test_initial_dispatch_intersects_registered_tenant_and_scope_eligibility() -
     assert batch.tasks[0].objective == "Assess the current market outlook."
 
 
+def test_initial_dispatch_accepts_eight_independent_tasks_in_manifest_order() -> None:
+    decision = DispatchBatch(
+        kind="dispatch",
+        tasks=tuple(
+            TaskProposal(
+                specialist_id="market-data",
+                objective=f"Assess market dimension {index}.",
+            )
+            for index in range(8)
+        ),
+    )
+
+    batch = accept_initial_dispatch(
+        decision,
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+
+    assert len(batch.tasks) == 8
+    assert [task.objective for task in batch.tasks] == [
+        f"Assess market dimension {index}." for index in range(8)
+    ]
+    assert len(set(batch.task_ids)) == 8
+
+
+def test_initial_dispatch_rejects_ninth_task_even_if_model_validation_was_bypassed() -> (
+    None
+):
+    decision = DispatchBatch.model_construct(
+        kind="dispatch",
+        tasks=tuple(
+            TaskProposal(
+                specialist_id="market-data",
+                objective=f"Assess market dimension {index}.",
+            )
+            for index in range(9)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Dispatch Batch exceeds 8 Tasks"):
+        accept_initial_dispatch(
+            decision,
+            request_id="request-1",
+            registry=_registry(),
+            scope_descriptors=(
+                SpecialistDescriptor(id="market-data", description="Market data"),
+            ),
+        )
+
+    with pytest.raises(ValidationError):
+        DispatchBatch(
+            kind="dispatch",
+            tasks=decision.tasks,
+        )
+
+
+def test_active_batch_rejects_duplicate_task_identities() -> None:
+    task = AcceptedTask(
+        id="task-1",
+        objective="Assess market outlook.",
+        specialist_id="market-data",
+    )
+
+    with pytest.raises(ValueError, match="Active Batch Task identities conflict"):
+        ActiveBatch(id="batch-1", tasks=(task, task))
+
+
+def test_active_batch_rejects_recovered_manifest_larger_than_eight_tasks() -> None:
+    tasks = tuple(
+        AcceptedTask(
+            id=f"task-{index}",
+            objective=f"Assess market dimension {index}.",
+            specialist_id="market-data",
+        )
+        for index in range(9)
+    )
+
+    with pytest.raises(ValueError, match="Active Batch Task count is invalid"):
+        ActiveBatch(id="batch-1", tasks=tasks)
+
+
+def test_recovered_active_batch_is_validated_before_specialist_fanout() -> None:
+    valid = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    task = valid.tasks[0]
+    invalid_batches = (
+        (
+            ActiveBatch(
+                id=valid.id,
+                tasks=(
+                    AcceptedTask(
+                        id="task-invalid",
+                        objective=task.objective,
+                        specialist_id=task.specialist_id,
+                    ),
+                ),
+            ),
+            "Active Batch Task identity is invalid",
+        ),
+        (
+            ActiveBatch(
+                id=valid.id,
+                tasks=(
+                    AcceptedTask(
+                        id=task.id,
+                        objective=" ",
+                        specialist_id=task.specialist_id,
+                    ),
+                ),
+            ),
+            "Active Batch Task objective is invalid",
+        ),
+        (
+            ActiveBatch(
+                id=valid.id,
+                tasks=(
+                    AcceptedTask(
+                        id=task.id,
+                        objective=task.objective,
+                        specialist_id="other",
+                    ),
+                ),
+            ),
+            "Specialist is not eligible",
+        ),
+    )
+
+    for batch, error in invalid_batches:
+        with pytest.raises(ValueError, match=error):
+            validate_active_batch_manifest(
+                batch,
+                request_id="request-1",
+                registry=_registry(),
+                scope_descriptors=(
+                    SpecialistDescriptor(id="market-data", description="Market data"),
+                ),
+            )
+
+
 def test_initial_dispatch_rejects_specialist_outside_tenant_eligibility() -> None:
     with pytest.raises(ValueError, match="Specialist is not eligible"):
         accept_initial_dispatch(
@@ -345,6 +496,50 @@ def test_barrier_promotes_exact_immutable_contribution_and_clears_staging() -> N
                 contribution.task_id: contribution.model_copy(
                     update={"batch_id": "forged"}
                 )
+            },
+        )
+
+
+def test_barrier_rejects_contributions_staged_under_another_task_identity() -> None:
+    batch = accept_initial_dispatch(
+        DispatchBatch(
+            kind="dispatch",
+            tasks=(
+                TaskProposal(
+                    specialist_id="market-data",
+                    objective="Assess market valuation.",
+                ),
+                TaskProposal(
+                    specialist_id="market-data",
+                    objective="Assess market momentum.",
+                ),
+            ),
+        ),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    contributions = {
+        task.id: BatchContribution(
+            batch_id=batch.id,
+            task_id=task.id,
+            attempt=1,
+            outcome=TaskSucceeded(
+                task_id=task.id,
+                result=SpecialistResult(summary=task.objective),
+            ),
+        )
+        for task in batch.tasks
+    }
+
+    with pytest.raises(ValueError, match="Batch contribution manifest is invalid"):
+        promote_batch(
+            batch,
+            {
+                batch.task_ids[0]: contributions[batch.task_ids[1]],
+                batch.task_ids[1]: contributions[batch.task_ids[0]],
             },
         )
 
