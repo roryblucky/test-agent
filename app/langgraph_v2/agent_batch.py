@@ -45,6 +45,16 @@ def _stable_id(prefix: str, value: Mapping[str, object]) -> str:
     return f"{prefix}_{hashlib.sha256(canonical).hexdigest()[:32]}"
 
 
+def _canonical_json_size(value: BaseModel) -> int:
+    return len(
+        json.dumps(
+            value.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
+
+
 class TaskProposal(BaseModel):
     """Model-authored bounded request for one registered Specialist."""
 
@@ -74,13 +84,7 @@ class SpecialistFindingDraft(BaseModel):
 
     def canonical_json_size(self) -> int:
         """Return canonical UTF-8 size used by the acceptance boundary."""
-        return len(
-            json.dumps(
-                self.model_dump(mode="json"),
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        )
+        return _canonical_json_size(self)
 
     def require_canonical_size(self) -> None:
         """Reject an over-limit model output before it becomes a contribution."""
@@ -96,6 +100,15 @@ class SpecialistResult(BaseModel):
     summary: str
     evidence_ids: tuple[str, ...] = Field(max_length=16, default=())
     data_gaps: tuple[DataGap, ...] = Field(max_length=8, default=())
+
+    def canonical_json_size(self) -> int:
+        """Return the complete accepted Result's canonical UTF-8 size."""
+        return _canonical_json_size(self)
+
+    def require_canonical_size(self) -> None:
+        """Reject a Result that exceeds its complete accepted-state bound."""
+        if self.canonical_json_size() > _SPECIALIST_FINDING_MAX_BYTES:
+            raise StructuredOutputInvalid("Specialist result exceeds 16 KiB")
 
 
 class GapProvenance(BaseModel):
@@ -533,17 +546,19 @@ async def execute_specialist(
             scope_tool_ids=context.allowed_tool_ids,
         ),
     )
+    result = SpecialistResult(
+        summary=draft.summary,
+        evidence_ids=draft.evidence_ids,
+        data_gaps=data_gaps,
+    )
+    result.require_canonical_size()
     return BatchContribution(
         batch_id=batch_id,
         task_id=task.id,
         attempt=1,
         outcome=TaskSucceeded(
             task_id=task.id,
-            result=SpecialistResult(
-                summary=draft.summary,
-                evidence_ids=draft.evidence_ids,
-                data_gaps=data_gaps,
-            ),
+            result=result,
         ),
         skill_pins=attempt.skill_pins,
     )

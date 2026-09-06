@@ -123,6 +123,8 @@ def _unavailability_record(
 
 def _gap_registry(
     records: tuple[ToolUnavailabilityRecord, ...],
+    *,
+    finding: SpecialistFindingDraft | None = None,
 ) -> SpecialistRegistry:
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         del source, query
@@ -134,7 +136,7 @@ def _gap_registry(
         skill_invocation: object,
     ) -> _Specialist:
         del tools, tool_capture, skill_invocation
-        return _Specialist(unavailability=records)
+        return _Specialist(finding=finding, unavailability=records)
 
     return SpecialistRegistry(
         registrations=(
@@ -327,6 +329,29 @@ def test_specialist_finding_accepts_exactly_16_evidence_ids() -> None:
     assert len(finding.evidence_ids) == 16
 
 
+def test_specialist_result_canonical_size_includes_data_gaps() -> None:
+    gap = DataGap(
+        requested_coverage="Apple revenue",
+        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+        provenance=GapProvenance(
+            unavailability_id="unavailable-1",
+            tool_id="filing-tool",
+            source="filing",
+            observed_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
+        ),
+    )
+    template = SpecialistResult(summary="", data_gaps=(gap,))
+    exact = SpecialistResult(
+        summary="x" * (16 * 1024 - template.canonical_json_size()),
+        data_gaps=(gap,),
+    )
+
+    assert exact.canonical_json_size() == 16 * 1024
+    exact.require_canonical_size()
+    with pytest.raises(StructuredOutputInvalid, match="Specialist result exceeds 16 KiB"):
+        SpecialistResult(summary=f"{exact.summary}x", data_gaps=(gap,)).require_canonical_size()
+
+
 @pytest.mark.asyncio
 async def test_execute_specialist_enforces_the_16_kib_boundary_before_contribution() -> (
     None
@@ -340,8 +365,9 @@ async def test_execute_specialist_enforces_the_16_kib_boundary_before_contributi
         registry=_registry(),
         scope_descriptors=scope_descriptors,
     )
+    template = SpecialistResult(summary="")
     exact = SpecialistFindingDraft(
-        summary="x" * (16 * 1024 - len('{"evidence_ids":[],"summary":""}'))
+        summary="x" * (16 * 1024 - template.canonical_json_size())
     )
     contribution = await execute_specialist(
         batch.tasks[0],
@@ -355,7 +381,7 @@ async def test_execute_specialist_enforces_the_16_kib_boundary_before_contributi
 
     too_large = SpecialistFindingDraft(summary=f"{exact.summary}x")
     with pytest.raises(
-        StructuredOutputInvalid, match="Specialist finding exceeds 16 KiB"
+        StructuredOutputInvalid, match="Specialist result exceeds 16 KiB"
     ):
         await execute_specialist(
             batch.tasks[0],
@@ -435,6 +461,55 @@ async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record(
     assert gap.provenance.unavailability_id == "unavailable-1"
     assert gap.provenance.tool_id == "filing-tool"
     assert len(contribution.outcome.result.data_gaps) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_checks_result_size_after_deriving_data_gaps() -> None:
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=_registry(),
+        scope_descriptors=scope_descriptors,
+    )
+    record = _unavailability_record(task_id=batch.tasks[0].id)
+    gap = DataGap(
+        requested_coverage=record.requested_coverage,
+        reason=record.reason,
+        provenance=GapProvenance(
+            unavailability_id=record.id,
+            tool_id=record.tool_id,
+            source=record.source,
+            observed_at=record.observed_at,
+        ),
+    )
+    template = SpecialistResult(summary="", data_gaps=(gap,))
+    exact = SpecialistFindingDraft(
+        summary="x" * (16 * 1024 - template.canonical_json_size())
+    )
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=_gap_registry((record,), finding=exact),
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id),
+    )
+
+    assert contribution.outcome.result.canonical_json_size() == 16 * 1024
+    with pytest.raises(StructuredOutputInvalid, match="Specialist result exceeds 16 KiB"):
+        await execute_specialist(
+            batch.tasks[0],
+            batch_id=batch.id,
+            registry=_gap_registry(
+                (record,),
+                finding=SpecialistFindingDraft(summary=f"{exact.summary}x"),
+            ),
+            scope_descriptors=scope_descriptors,
+            context=_context(task_id=batch.tasks[0].id),
+        )
 
 
 @pytest.mark.asyncio
