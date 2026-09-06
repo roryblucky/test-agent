@@ -81,7 +81,9 @@ def test_specialist_factory_disables_tools_and_builtin_retries() -> None:
         "output_retries": 0,
         "end_strategy": "early",
     }
-    assert "activate one eligible Skill" in registry.kwargs["instructions"]
+    instructions = registry.kwargs["instructions"]
+    assert isinstance(instructions, str)
+    assert "activate one eligible Skill" in instructions
 
 
 def test_bound_specialist_factory_uses_exact_frozen_tools() -> None:
