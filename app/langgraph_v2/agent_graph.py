@@ -155,7 +155,7 @@ class AgentGraphState(TypedDict):
     intent: NotRequired[dict[str, Any] | None]
     research_scope: NotRequired[dict[str, Any] | None]
     active_batch: NotRequired[dict[str, Any] | None]
-    dispatched_task: NotRequired[dict[str, Any]]
+    dispatched_task: NotRequired[dict[str, Any] | None]
     staged_contributions: NotRequired[
         Annotated[dict[str, dict[str, Any]], _merge_staged_contributions]
     ]
@@ -186,6 +186,7 @@ class AgentGraphStateUpdate(TypedDict, total=False):
     intent: dict[str, Any] | None
     research_scope: dict[str, Any] | None
     active_batch: dict[str, Any] | None
+    dispatched_task: dict[str, Any] | None
     staged_contributions: Any
     accepted_batches: dict[str, dict[str, Any]]
     coordination_rounds: dict[str, dict[str, Any]]
@@ -257,6 +258,7 @@ def build_agent_graph(
             "intent": None,
             "research_scope": None,
             "active_batch": None,
+            "dispatched_task": None,
             "staged_contributions": cast(Any, Overwrite({})),
             "accepted_batches": cast(Any, Overwrite({})),
             "coordination_rounds": cast(Any, Overwrite({})),

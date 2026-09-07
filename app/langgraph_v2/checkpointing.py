@@ -156,6 +156,7 @@ class AgentCheckpointStateAdapter:
             "research_scope",
             "incomplete_research",
             "active_batch",
+            "dispatched_task",
             "final_response",
         }
     )
