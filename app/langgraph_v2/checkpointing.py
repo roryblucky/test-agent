@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from app.langgraph_v2.agent_completion import IncompleteResearch
 from app.langgraph_v2.agent_coordination import (
     CoordinationInvariantError,
     CoordinationRound,
@@ -153,6 +154,7 @@ class AgentCheckpointStateAdapter:
             "clarification",
             "intent",
             "research_scope",
+            "incomplete_research",
             "active_batch",
             "final_response",
         }
@@ -209,6 +211,11 @@ class AgentCheckpointStateAdapter:
             channel_values.get("research_scope"),
             model=ResearchScope,
             channel="research_scope",
+        )
+        _validate_optional_model(
+            channel_values.get("incomplete_research"),
+            model=IncompleteResearch,
+            channel="incomplete_research",
         )
         _validate_optional_model(
             channel_values.get("final_response"),
@@ -293,6 +300,7 @@ def _validate_optional_model(
         | GroundednessResult
         | ModerationDecision
         | IntentResult
+        | IncompleteResearch
         | ResearchScope
         | QueryUnderstandingClarification
         | CoordinationRound
@@ -312,6 +320,7 @@ def _validate_model(
         | GroundednessResult
         | ModerationDecision
         | IntentResult
+        | IncompleteResearch
         | ResearchScope
         | QueryUnderstandingClarification
         | CoordinationRound

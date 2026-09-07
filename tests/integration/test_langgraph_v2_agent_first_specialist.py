@@ -24,6 +24,7 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.agents.specialist import PydanticAISpecialistActor
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
+from app.langgraph_v2 import agent_graph
 from app.langgraph_v2.agent_batch import (
     CalculationToolRegistration,
     DispatchBatch,
@@ -37,6 +38,7 @@ from app.langgraph_v2.agent_batch import (
     SpecialistTaskInput,
     TaskProposal,
 )
+from app.langgraph_v2.agent_completion import IncompleteResearch
 from app.langgraph_v2.agent_coordination import (
     CoordinatorInput,
     CoordinatorOutputInvalid,
@@ -47,7 +49,9 @@ from app.langgraph_v2.agent_evidence import (
     ExpectedToolUnavailability,
     FinancialResearchReport,
     PreparedSynthesis,
+    PublishedReport,
     SpecialistToolCapture,
+    SynthesisActor,
     ToolUnavailable,
     ToolUnavailableReason,
 )
@@ -69,7 +73,12 @@ from app.langgraph_v2.calculations import (
     PriceObservation,
     TrustedPriceSeries,
 )
-from app.langgraph_v2.checkpointing import thread_checkpoint_config, thread_id_for
+from app.langgraph_v2.checkpointing import (
+    AgentCheckpointStateAdapter,
+    read_conversation_messages,
+    thread_checkpoint_config,
+    thread_id_for,
+)
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.postgres import CheckpointerFactory
@@ -1058,6 +1067,11 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
     accepted = next(iter(state["accepted_batches"].values()))
     assert accepted["outcomes"][0]["kind"] == "failed"
     assert accepted["outcomes"][0]["task_id"].startswith("task_")
+    completion = IncompleteResearch.model_validate(state["incomplete_research"])
+    assert completion == IncompleteResearch(
+        insufficient_evidence=True,
+        failed_task_ids=(accepted["outcomes"][0]["task_id"],),
+    )
     assert accepted["usage"] == {
         "model_requests": 3,
         "completed_tool_calls": 0,
@@ -1799,6 +1813,157 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
         )
     assert "BODY-SENTINEL" not in persisted_text
     assert "RAW-PROVIDER-SENTINEL" not in persisted_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["prepare", "synthesis", "gate"])
+async def test_cancellation_before_finalization_never_publishes_research_state(
+    langgraph_v2_migrated_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_prepare = agent_graph.prepare_synthesis
+    original_synthesize = agent_graph.synthesize_report
+
+    def barrier_prepare(**kwargs: Any) -> PreparedSynthesis:
+        prepared = original_prepare(**kwargs)
+        if phase == "prepare":
+            entered.set()
+        return prepared
+
+    async def barrier_synthesize(
+        actor: SynthesisActor,
+        prepared: PreparedSynthesis,
+    ) -> PublishedReport:
+        published = await original_synthesize(actor, prepared)
+        if phase == "gate":
+            entered.set()
+            await release.wait()
+        return published
+
+    class _BarrierSynthesis:
+        async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
+            del prepared
+            if phase == "synthesis":
+                entered.set()
+            if phase in {"prepare", "synthesis"}:
+                await release.wait()
+            return FinancialResearchReport(
+                markdown_report="Apple revenue grew. [[E:1]]"
+            )
+
+        async def repair(
+            self,
+            prepared: PreparedSynthesis,
+            *,
+            validation_errors: tuple[str, ...],
+        ) -> FinancialResearchReport:
+            del validation_errors
+            return await self.synthesize(prepared)
+
+    monkeypatch.setattr(agent_graph, "prepare_synthesis", barrier_prepare)
+    monkeypatch.setattr(agent_graph, "synthesize_report", barrier_synthesize)
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+        allowed_tool_ids=frozenset({"filing_reader"}),
+        allowed_sources=frozenset({"filing"}),
+        allowed_queries=frozenset({"Apple revenue"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=_evidence_specialist_factory,
+                allowed_tool_ids=frozenset({"filing_reader"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=_evidence_provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple revenue"}),
+            ),
+        ),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=_Coordinator(),
+            specialist_registry=registry,
+            intent_policies={policy.intent: policy},
+            synthesis_actor=_BarrierSynthesis(),
+        )
+
+    conversation_id = UUID(
+        {
+            "prepare": "00000000-0000-0000-0000-000000000068",
+            "synthesis": "00000000-0000-0000-0000-000000000069",
+            "gate": "00000000-0000-0000-0000-000000000070",
+        }[phase]
+    )
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = _TenantManager()
+    request_context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            payload=V2QueryRequest(
+                query="What about it?",
+                conversation_id=conversation_id,
+                client_request_id="request-1",
+            ),
+            http_request=stream_request(app),
+            request_context=request_context,
+        )
+        subscriber = response.body_iterator
+        frames: list[str] = []
+
+        async def consume() -> None:
+            frames.extend([frame async for frame in subscriber])
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        consumer.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumer
+        release.set()
+        await subscriber.aclose()
+        messages = await read_conversation_messages(
+            app.state.langgraph_v2_checkpointer,
+            thread_checkpoint_config(
+                thread_id=thread_id_for(
+                    "tenant-a", "subject-a", "agent", str(conversation_id)
+                )
+            ),
+            state_adapter=AgentCheckpointStateAdapter(),
+        )
+
+    events = [event for frame in frames for event in parse_sse(frame)]
+    assert all(event["type"] not in {"token", "citations", "done"} for event in events)
+    assert [(message.id, message.type, message.text) for message in messages] == [
+        ("request-1:user", "human", "What about it?"),
+    ]
 
 
 def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplete(

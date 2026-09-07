@@ -172,6 +172,7 @@ class AgentGraphState(TypedDict):
     answer: NotRequired[str | None]
     completion_status: NotRequired[str | None]
     termination_reason: NotRequired[str | None]
+    incomplete_research: NotRequired[dict[str, Any] | None]
     final_response: NotRequired[dict[str, Any] | None]
     citations: NotRequired[list[dict[str, Any]]]
 
@@ -195,6 +196,7 @@ class AgentGraphStateUpdate(TypedDict, total=False):
     answer: str | None
     completion_status: str | None
     termination_reason: str | None
+    incomplete_research: dict[str, Any] | None
     final_response: dict[str, Any] | None
     citations: list[dict[str, Any]]
 
@@ -265,6 +267,7 @@ def build_agent_graph(
             "answer": None,
             "completion_status": None,
             "termination_reason": None,
+            "incomplete_research": None,
             "final_response": None,
             "citations": [],
         }
@@ -494,6 +497,7 @@ def build_agent_graph(
             ),
             "completion_status": "incomplete",
             "termination_reason": completion_termination_reason(completion),
+            "incomplete_research": completion.model_dump(mode="json"),
         }
 
     async def synthesis(state: AgentGraphState) -> AgentGraphStateUpdate:
@@ -549,6 +553,9 @@ def build_agent_graph(
                 completion_termination_reason(completion)
                 if completion is not None
                 else "evidence_backed"
+            ),
+            "incomplete_research": (
+                completion.model_dump(mode="json") if completion is not None else None
             ),
         }
 

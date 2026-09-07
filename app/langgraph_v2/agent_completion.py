@@ -154,8 +154,7 @@ def render_incomplete_research(
         lines.extend(
             (TASK_FAILURE_DISCLOSURE,)
             + tuple(
-                f"- {_escape_markdown(objective)}"
-                for objective in (task.objective for task in failed_tasks)
+                f"- {_escape_markdown(task.objective)}" for task in failed_tasks
             )
         )
     lines.extend(
