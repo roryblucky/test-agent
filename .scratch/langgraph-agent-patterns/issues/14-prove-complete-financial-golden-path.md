@@ -4,7 +4,7 @@
 
 **Blocked by:** 06: 渐进激活 Specialist-owned Skills; 13: 证明 research 与 clarification 终态遵守 committed-state publication
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 使用固定 as-of date、synthetic fund ID 与 benchmark ID，全部模型与业务数据由 deterministic fakes 提供，不访问真实 provider。
 - [ ] typed registry 只提供 golden path 所需的 market-analysis 与 fund-research Specialists，以及 price-series、fund-holdings、fund-reports、company-news 四个 mock registered business Tools。
@@ -18,4 +18,3 @@
 - [ ] 同一路由上的 Linear-configured 与 Agent-configured Tenants 都保持各自行为，request input 不能覆盖模式。
 - [ ] 不同 Conversations 可以独立执行；本 ticket 不引入同一 Conversation 的并发 Request 测试或锁协议。
 - [ ] 同一个 Agent Graph builder 能通过 dependency injection 装配 fake actors 与 Specialist registry，graph control 不导入金融 actor 实现。
-
