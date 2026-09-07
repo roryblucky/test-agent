@@ -4,7 +4,7 @@
 
 **Blocked by:** 10: 执行有界 rolling Coordination Rounds; 11: 推广并由代码渲染 Calculation Artifacts
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Prepared Synthesis 只包含 canonical spec 明确允许的字段，不含 Conversation history、runtime state、raw payload 或其他隐式上下文。
 - [ ] repair 复用完全相同的冻结 input value，只额外提供 aliases 与确定性 validation errors；不得用 digest 或重新 materialize 的近似输入替代。

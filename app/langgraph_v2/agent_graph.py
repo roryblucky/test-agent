@@ -54,12 +54,11 @@ from app.langgraph_v2.agent_coordination import (
 from app.langgraph_v2.agent_evidence import (
     DataGapView,
     EvidenceInvocationContext,
-    FinancialResearchReport,
-    PreparedSynthesis,
     PreparedSynthesisLimitExceeded,
     RequestEvidenceCatalog,
+    SynthesisActor,
     prepare_synthesis,
-    publish_report,
+    synthesize_report,
 )
 from app.langgraph_v2.agent_scope import (
     AgentIntentPolicy,
@@ -106,14 +105,6 @@ class QueryUnderstandingActor(Protocol):
         history: Sequence[ConversationExchange],
     ) -> QueryUnderstandingOutput:
         """Return the typed query-understanding result for one request."""
-        ...
-
-
-class SynthesisActor(Protocol):
-    """Turn a frozen Evidence projection into one report candidate."""
-
-    async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
-        """Return one model-authored Markdown candidate."""
         ...
 
 
@@ -574,8 +565,7 @@ def build_agent_graph(
                 "completion_status": "incomplete",
                 "termination_reason": completion_termination_reason(completion),
             }
-        candidate = await synthesis_actor.synthesize(prepared)
-        published = publish_report(candidate, prepared)
+        published = await synthesize_report(synthesis_actor, prepared)
         completion = (
             IncompleteResearch(
                 insufficient_evidence=False,

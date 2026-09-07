@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -26,9 +26,9 @@ from app.langgraph_v2.calculations import (
 from app.models.workflow import CitationReference
 
 _EVIDENCE_MARKER = re.compile(r"\[\[E:([1-9][0-9]*)\]\]")
-_MARKER_LIKE = re.compile(r"\[\[\s*E\s*:")
+_MARKER_LIKE = re.compile(r"\[\[\s*[Ee]\s*:")
 _CALCULATION_MARKER = re.compile(r"\[\[C:([1-9][0-9]*)\]\]")
-_CALCULATION_MARKER_LIKE = re.compile(r"\[\[\s*C\s*:")
+_CALCULATION_MARKER_LIKE = re.compile(r"\[\[\s*[Cc]\s*:")
 _TOOL_RETURN_MAX_BYTES = 4 * 1024
 _EVIDENCE_BODY_MAX_BYTES = 16 * 1024
 _REQUEST_EVIDENCE_BODY_MAX_BYTES = 8 * 1024 * 1024
@@ -36,12 +36,30 @@ DATA_GAP_TEXT_MAX_BYTES = 256
 DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS = 64
 TOOL_TIMEOUT_SECONDS = 20
 _UNUSABLE_COVERAGE = "Requested coverage could not be safely projected."
+_MAX_PREPARED_EVIDENCE = 64
 _MAX_PREPARED_CALCULATIONS = 32
 _MAX_PREPARED_CALCULATION_BYTES = 2 * 1024
 
 
 class PreparedSynthesisLimitExceeded(ValueError):
     """Stop before a bounded Synthesis projection would exceed its limits."""
+
+
+class SynthesisCandidateRejected(ValueError):
+    """A schema or publication-gate rejection eligible for one repair."""
+
+    def __init__(self, validation_errors: tuple[str, ...]) -> None:
+        if not validation_errors:
+            raise ValueError("Synthesis validation errors are required")
+        self.validation_errors = validation_errors
+        super().__init__("; ".join(validation_errors))
+
+
+class SynthesisOutputInvalid(SynthesisCandidateRejected):
+    """Keep model output failure separate from fatal runtime failures."""
+
+    def __init__(self) -> None:
+        super().__init__(("Synthesis report is invalid",))
 
 
 def require_data_gap_text(value: str, *, label: str) -> str:
@@ -95,7 +113,7 @@ class ToolTelemetryStatus(StrEnum):
 class ToolUnavailable(BaseModel):
     """Bounded expected inability returned to the active Specialist."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal["tool_unavailable"] = "tool_unavailable"
     reason: ToolUnavailableReason
@@ -105,7 +123,7 @@ class ToolUnavailable(BaseModel):
 class DataGapView(BaseModel):
     """Safe Data Gap projection for actor prompts and publication."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     requested_coverage: str = Field(min_length=1)
     reason: ToolUnavailableReason
@@ -120,7 +138,7 @@ class DataGapView(BaseModel):
 class ToolUnavailabilityRecord(BaseModel):
     """App-only provenance for one expected unavailable Tool outcome."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str = Field(min_length=1)
     tenant_id: str
@@ -560,7 +578,7 @@ class PreparedSynthesis(BaseModel):
 
     standalone_query: str
     intent: str
-    evidence: tuple[PreparedEvidence, ...]
+    evidence: tuple[PreparedEvidence, ...] = Field(max_length=_MAX_PREPARED_EVIDENCE)
     data_gaps: tuple[DataGapView, ...] = ()
     calculations: tuple[PreparedCalculation, ...] = Field(
         max_length=_MAX_PREPARED_CALCULATIONS,
@@ -574,7 +592,7 @@ class PreparedSynthesis(BaseModel):
 class FinancialResearchReport(BaseModel):
     """Minimal model-authored Markdown candidate with Evidence markers."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     markdown_report: str = Field(min_length=1)
 
@@ -586,6 +604,27 @@ class PublishedReport(BaseModel):
 
     answer: str
     citations: tuple[CitationReference, ...]
+
+
+class SynthesisActor(Protocol):
+    """Produce one typed report candidate from a frozen projection."""
+
+    async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
+        """Produce the first candidate without repair feedback."""
+        ...
+
+
+class SynthesisRepairActor(SynthesisActor, Protocol):
+    """Produce the one allowed repair for an unchanged frozen projection."""
+
+    async def repair(
+        self,
+        prepared: PreparedSynthesis,
+        *,
+        validation_errors: tuple[str, ...],
+    ) -> FinancialResearchReport:
+        """Produce a repaired candidate from deterministic gate errors only."""
+        ...
 
 
 def prepare_synthesis(
@@ -602,6 +641,10 @@ def prepare_synthesis(
     accepted_calculations: tuple[CalculationArtifact, ...] = (),
 ) -> PreparedSynthesis:
     """Build the sole bounded Evidence projection Synthesis may receive."""
+    if len(accepted_evidence_ids) > _MAX_PREPARED_EVIDENCE:
+        raise ValueError("Prepared Evidence count exceeds 64")
+    if len(set(accepted_evidence_ids)) != len(accepted_evidence_ids):
+        raise ValueError("Prepared Evidence identifiers must be unique")
     resolved_evidence = tuple(
         catalog.resolve(
             evidence_id,
@@ -613,6 +656,8 @@ def prepare_synthesis(
         )
         for evidence_id in accepted_evidence_ids
     )
+    if any(not item.body for item in resolved_evidence):
+        raise ValueError("Evidence body is unavailable for Synthesis")
     evidence = tuple(
         PreparedEvidence(
             id=item.id,
@@ -672,29 +717,38 @@ def publish_report(
     prepared: PreparedSynthesis,
 ) -> PublishedReport:
     """Validate every Evidence marker and derive public citations in code."""
+    _validate_calculation_projection(prepared)
     calculation_markers = _CALCULATION_MARKER.findall(candidate.markdown_report)
-    calculation_marker_text = _CALCULATION_MARKER.sub("", candidate.markdown_report)
-    if _CALCULATION_MARKER_LIKE.search(calculation_marker_text):
-        raise ValueError("Calculation marker is invalid")
-    for marker in calculation_markers:
-        index = int(marker)
-        if index > len(prepared.calculation_artifacts):
-            raise ValueError("Calculation marker is not eligible")
+    evidence_markers = _EVIDENCE_MARKER.findall(candidate.markdown_report)
+    validation_errors = (
+        *_marker_errors(
+            marker_name="Evidence",
+            markers=evidence_markers,
+            marker_remainder=_EVIDENCE_MARKER.sub("", candidate.markdown_report),
+            marker_like=_MARKER_LIKE,
+            catalog_size=len(prepared.evidence),
+            require_all=True,
+        ),
+        *_marker_errors(
+            marker_name="Calculation",
+            markers=calculation_markers,
+            marker_remainder=_CALCULATION_MARKER.sub("", candidate.markdown_report),
+            marker_like=_CALCULATION_MARKER_LIKE,
+            catalog_size=len(prepared.calculation_artifacts),
+            require_all=False,
+        ),
+    )
+    if validation_errors:
+        raise SynthesisCandidateRejected(validation_errors)
     answer = _CALCULATION_MARKER.sub(
         lambda match: _render_calculation(
             prepared.calculation_artifacts[int(match.group(1)) - 1]
         ),
         candidate.markdown_report,
     )
-    markers = _EVIDENCE_MARKER.findall(answer)
-    marker_text = _EVIDENCE_MARKER.sub("", answer)
-    if _MARKER_LIKE.search(marker_text) or not markers:
-        raise ValueError("Evidence marker is invalid")
     citations: list[CitationReference] = []
-    for marker in markers:
+    for marker in evidence_markers:
         index = int(marker)
-        if index > len(prepared.evidence):
-            raise ValueError("Evidence marker is not eligible")
         evidence = prepared.evidence[index - 1]
         citations.append(
             CitationReference(
@@ -707,6 +761,69 @@ def publish_report(
             )
         )
     return PublishedReport(answer=answer, citations=tuple(citations))
+
+
+async def synthesize_report(
+    actor: SynthesisActor,
+    prepared: PreparedSynthesis,
+) -> PublishedReport:
+    """Own the one allowed repair while preserving one frozen Synthesis value."""
+    try:
+        return publish_report(await actor.synthesize(prepared), prepared)
+    except SynthesisCandidateRejected as rejection:
+        repair_actor = cast(SynthesisRepairActor, actor)
+        if not callable(getattr(repair_actor, "repair", None)):
+            raise RuntimeError("Synthesis actor does not support repair") from rejection
+        return publish_report(
+            await repair_actor.repair(
+                prepared, validation_errors=rejection.validation_errors
+            ),
+            prepared,
+        )
+
+
+def _marker_errors(
+    *,
+    marker_name: str,
+    markers: tuple[str, ...] | list[str],
+    marker_remainder: str,
+    marker_like: re.Pattern[str],
+    catalog_size: int,
+    require_all: bool,
+) -> tuple[str, ...]:
+    """Return deterministic strict-marker failures without semantic inference."""
+    errors: list[str] = []
+    if marker_like.search(marker_remainder):
+        errors.append(f"{marker_name} marker is malformed")
+    indexes = tuple(int(marker) for marker in markers)
+    if any(index > catalog_size for index in indexes):
+        errors.append(f"{marker_name} marker is not eligible")
+    if len(set(indexes)) != len(indexes):
+        errors.append(f"{marker_name} marker is duplicated")
+    if require_all and set(indexes) != set(range(1, catalog_size + 1)):
+        errors.append(f"{marker_name} marker is missing")
+    return tuple(errors)
+
+
+def _validate_calculation_projection(prepared: PreparedSynthesis) -> None:
+    """Reject a reconstructed or misaligned value-free Calculation alias map."""
+    if len(prepared.calculations) != len(prepared.calculation_artifacts):
+        raise ValueError("Prepared Calculation projection is invalid")
+    for index, (projection, artifact) in enumerate(
+        zip(prepared.calculations, prepared.calculation_artifacts, strict=True),
+        start=1,
+    ):
+        if projection != PreparedCalculation(
+            alias=f"C:{index}",
+            method=artifact.method,
+            unit=artifact.unit,
+            currency=artifact.currency,
+            period_start=artifact.period_start,
+            period_end=artifact.period_end,
+            as_of_date=artifact.as_of_date,
+            assumptions=artifact.assumptions,
+        ):
+            raise ValueError("Prepared Calculation projection is invalid")
 
 
 def _render_calculation(artifact: CalculationArtifact) -> str:

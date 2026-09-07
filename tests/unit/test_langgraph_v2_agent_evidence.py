@@ -314,6 +314,22 @@ def test_synthesis_receives_value_free_calculation_aliases_and_code_renders_them
         publish_report(
             FinancialResearchReport(markdown_report="[[C:2]] [[E:1]]"), prepared
         )
+    assert publish_report(
+        FinancialResearchReport(markdown_report="Apple grew. [[E:1]]"), prepared
+    ).answer == "Apple grew. [[E:1]]"
+    for markdown in (
+        "[[C:1]] [[C:1]] [[E:1]]",
+        "[[C:x]] [[E:1]]",
+        "[[C:01]] [[E:1]]",
+        "[[ C:1]] [[E:1]]",
+    ):
+        with pytest.raises(ValueError, match="Calculation marker"):
+            publish_report(FinancialResearchReport(markdown_report=markdown), prepared)
+    with pytest.raises(ValueError, match="projection is invalid"):
+        publish_report(
+            FinancialResearchReport(markdown_report="[[C:1]] [[E:1]]"),
+            prepared.model_copy(update={"calculations": ()}),
+        )
     foreign_artifact = provisional_executor.execute(
         CalculationRequest(
             method=CalculationMethod.PERIOD_RETURN,
@@ -932,7 +948,13 @@ async def test_binding_owned_timeout_becomes_call_timeout(
 
 @pytest.mark.parametrize(
     "markdown",
-    ["Apple grew. [[E:x]]", "Apple grew. [[E:2]]", "Apple grew. [[E:1]] [[ E:2]]"],
+    [
+        "Apple grew.",
+        "Apple grew. [[E:1]] [[E:1]]",
+        "Apple grew. [[E:x]]",
+        "Apple grew. [[E:2]]",
+        "Apple grew. [[E:1]] [[ E:2]]",
+    ],
 )
 def test_report_gate_rejects_malformed_or_unknown_evidence_marker(
     markdown: str,
@@ -954,6 +976,104 @@ def test_report_gate_rejects_malformed_or_unknown_evidence_marker(
 
     with pytest.raises(ValueError, match="Evidence marker"):
         publish_report(FinancialResearchReport(markdown_report=markdown), prepared)
+
+
+def test_prepared_evidence_enforces_the_projection_count_limit() -> None:
+    catalog = RequestEvidenceCatalog()
+    evidence_ids = tuple(f"evidence-{index}" for index in range(65))
+    catalog.accept_referenced(
+        tuple(_evidence(id=evidence_id) for evidence_id in evidence_ids),
+        finding_evidence_ids=evidence_ids,
+        context=_context(),
+    )
+
+    prepared = prepare_synthesis(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        accepted_evidence_ids=evidence_ids[:64],
+        catalog=catalog,
+        tenant_id="tenant-a",
+        request_id="request-1",
+    )
+
+    assert len(prepared.evidence) == 64
+    with pytest.raises(ValueError, match="Prepared Evidence count exceeds 64"):
+        prepare_synthesis(
+            standalone_query="Apple outlook",
+            intent="market_outlook",
+            accepted_evidence_ids=evidence_ids,
+            catalog=catalog,
+            tenant_id="tenant-a",
+            request_id="request-1",
+        )
+
+
+def test_prepared_synthesis_rejects_duplicate_evidence_and_missing_bodies() -> None:
+    catalog = RequestEvidenceCatalog()
+    evidence = _evidence()
+    catalog.accept_referenced(
+        (evidence,), finding_evidence_ids=(evidence.id,), context=_context()
+    )
+
+    with pytest.raises(ValueError, match="identifiers must be unique"):
+        prepare_synthesis(
+            standalone_query="Apple outlook",
+            intent="market_outlook",
+            accepted_evidence_ids=(evidence.id, evidence.id),
+            catalog=catalog,
+            tenant_id="tenant-a",
+            request_id="request-1",
+        )
+
+    missing_body = evidence.model_copy(update={"body": ""})
+    recovery_catalog = RequestEvidenceCatalog()
+    recovery_catalog.accept_referenced(
+        (missing_body,),
+        finding_evidence_ids=(missing_body.id,),
+        context=_context(),
+    )
+    with pytest.raises(ValueError, match="body is unavailable"):
+        prepare_synthesis(
+            standalone_query="Apple outlook",
+            intent="market_outlook",
+            accepted_evidence_ids=(missing_body.id,),
+            catalog=recovery_catalog,
+            tenant_id="tenant-a",
+            request_id="request-1",
+        )
+
+
+def test_report_gate_requires_each_prepared_evidence_once() -> None:
+    catalog = RequestEvidenceCatalog()
+    first = _evidence(id="evidence-1")
+    second = _evidence(id="evidence-2")
+    catalog.accept_referenced(
+        (first, second),
+        finding_evidence_ids=(first.id, second.id),
+        context=_context(),
+    )
+    prepared = prepare_synthesis(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        accepted_evidence_ids=(first.id, second.id),
+        catalog=catalog,
+        tenant_id="tenant-a",
+        request_id="request-1",
+    )
+
+    with pytest.raises(ValueError, match="Evidence marker is missing"):
+        publish_report(
+            FinancialResearchReport(markdown_report="Apple grew. [[E:1]]"), prepared
+        )
+
+    published = publish_report(
+        FinancialResearchReport(markdown_report="Second [[E:2]], first [[E:1]]"),
+        prepared,
+    )
+    assert [citation.evidence_id for citation in published.citations] == [
+        "evidence-2",
+        "evidence-1",
+    ]
 
 
 def test_evidence_cache_does_not_commit_before_all_references_validate() -> None:
