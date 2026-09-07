@@ -290,9 +290,12 @@ def test_synthesis_receives_value_free_calculation_aliases_and_code_renders_them
         publish_report(
             FinancialResearchReport(markdown_report="[[C:2]] [[E:1]]"), prepared
         )
-    assert publish_report(
-        FinancialResearchReport(markdown_report="Apple grew. [[E:1]]"), prepared
-    ).answer == "Apple grew. [[E:1]]"
+    assert (
+        publish_report(
+            FinancialResearchReport(markdown_report="Apple grew. [[E:1]]"), prepared
+        ).answer
+        == "Apple grew. [[E:1]]"
+    )
     for markdown in (
         "[[C:1]] [[C:1]] [[E:1]]",
         "[[C:x]] [[E:1]]",
@@ -534,6 +537,7 @@ def test_evidence_cache_rejects_cross_scope_provenance(
 @pytest.mark.asyncio
 async def test_evidence_tool_freezes_source_before_provider_access() -> None:
     calls: list[tuple[str, str]] = []
+    capture = SpecialistToolCapture()
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
         calls.append((source, query))
@@ -542,6 +546,7 @@ async def test_evidence_tool_freezes_source_before_provider_access() -> None:
     tool = bind_evidence_tool(
         provider,
         context=_context(),
+        capture=capture,
     )
 
     returned = await tool(_tool_context(), "filing", "Apple revenue")
@@ -550,7 +555,8 @@ async def test_evidence_tool_freezes_source_before_provider_access() -> None:
         "evidence_id": "evidence-1",
         "excerpt": "Apple revenue grew.",
     }
-    assert returned.metadata == _evidence()
+    assert returned.metadata is None
+    assert capture.evidence == [_evidence()]
     assert calls == [("filing", "Apple revenue")]
     with pytest.raises(ValueError, match="Evidence source is not eligible"):
         await tool(_tool_context(), "private", "Apple revenue")

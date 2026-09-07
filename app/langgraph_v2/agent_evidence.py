@@ -260,7 +260,7 @@ def bind_evidence_tool(
             capture.unavailability.append(record)
         if telemetry is not None:
             telemetry(ToolTelemetryStatus.UNAVAILABLE)
-        return ToolReturn(return_value=unavailable, metadata=record)
+        return ToolReturn(return_value=unavailable)
 
     async def read_evidence(
         run_context: RunContext[None], source: str, query: str
@@ -327,7 +327,7 @@ def bind_evidence_tool(
             )
         if telemetry is not None:
             telemetry(ToolTelemetryStatus.COMPLETED)
-        return ToolReturn(return_value=return_value, metadata=evidence)
+        return ToolReturn(return_value=return_value)
 
     return read_evidence
 
@@ -635,9 +635,7 @@ async def synthesize_report(
         return publish_report(await actor.synthesize(prepared), prepared)
     except SynthesisCandidateRejected as rejection:
         return publish_report(
-            await actor.repair(
-                prepared, validation_errors=rejection.validation_errors
-            ),
+            await actor.repair(prepared, validation_errors=rejection.validation_errors),
             prepared,
         )
 

@@ -363,10 +363,7 @@ def bind_calculation_tool(
             period_end=artifact.period_end,
             formatted_value=artifact.formatted_value,
         )
-        return ToolReturn(
-            return_value=result,
-            metadata=artifact,
-        )
+        return ToolReturn(return_value=result)
 
     return calculate
 

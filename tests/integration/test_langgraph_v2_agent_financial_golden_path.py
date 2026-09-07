@@ -95,6 +95,17 @@ _FUND_OBJECTIVE = f"Research {_FUND_ID} holdings and disclosures."
 _NEWS_OBJECTIVE = f"Review company news selected from {_FUND_ID} research."
 
 
+@dataclass(frozen=True)
+class FinancialFixtureContent:
+    """Optional untrusted-content fixtures for financial integration coverage."""
+
+    evidence_bodies: Mapping[str, str] = field(default_factory=dict[str, str])
+    evidence_excerpts: Mapping[str, str] = field(default_factory=dict[str, str])
+    result_summaries: Mapping[str, str] = field(default_factory=dict[str, str])
+    skill_references: Mapping[str, str] = field(default_factory=dict[str, str])
+    raw_provider_payload: str = "RAW-PROVIDER-PAYLOAD-MUST-NOT-PERSIST"
+
+
 @pytest.fixture(autouse=True)
 def disable_real_model_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the external path deterministic even if a fixture regresses."""
@@ -130,6 +141,7 @@ class _FinancialTools:
     request_id: str = _REQUEST_ID
     fund_task_dispatch_order: int = 1
     synchronize_first_batch: bool = True
+    content: FinancialFixtureContent = field(default_factory=FinancialFixtureContent)
     price_entered: asyncio.Event = field(default_factory=asyncio.Event)
     holdings_entered: asyncio.Event = field(default_factory=asyncio.Event)
     provider_calls: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
@@ -207,8 +219,8 @@ class _FinancialTools:
             body="fixed news: portfolio company announced earnings",
         )
 
-    @staticmethod
     def _evidence(
+        self,
         *,
         evidence_id: str,
         request_id: str,
@@ -225,20 +237,25 @@ class _FinancialTools:
             source=source,
             source_url=f"https://fixture.test/{evidence_id}",
             title=query,
-            body=body,
-            excerpt=f"Fixture evidence for {query}.",
+            body=self.content.evidence_bodies.get(evidence_id, body),
+            excerpt=self.content.evidence_excerpts.get(
+                evidence_id, f"Fixture evidence for {query}."
+            ),
             as_of_date=_AS_OF_DATE,
-            raw_provider_payload="RAW-PROVIDER-PAYLOAD-MUST-NOT-PERSIST",
+            raw_provider_payload=self.content.raw_provider_payload,
         )
 
 
+@dataclass
 class _FinancialUnderstanding:
+    history_views: list[list[object]] = field(default_factory=list[list[object]])
+
     async def understand(
         self,
         query: str,
         history: Sequence[object],
     ) -> QueryUnderstandingOutput:
-        assert history == []
+        self.history_views.append(list(history))
         assert _FUND_ID in query and _BENCHMARK_ID in query
         return QueryUnderstandingOutput(
             resolved_query=ResolvedQuery(
@@ -345,12 +362,17 @@ class _FinancialSpecialists:
     alternate_holdings_failure: bool = False
     failing_task_ids: frozenset[str] = frozenset()
     failure_diagnostic: str = "fixture holdings retry"
+    result_summaries: Mapping[str, str] = field(default_factory=dict[str, str])
     emitted_failure_diagnostics: list[str] = field(default_factory=list[str])
     skill_views: list[tuple[str, tuple[str, ...]]] = field(
         default_factory=list[tuple[str, tuple[str, ...]]]
     )
     activated_instruction_views: list[str] = field(default_factory=list[str])
     task_prompts: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    message_views: list[str] = field(default_factory=list[str])
+    business_tool_views: list[frozenset[str]] = field(
+        default_factory=list[frozenset[str]]
+    )
 
     def market_analysis(
         self,
@@ -401,6 +423,7 @@ class _FinancialSpecialists:
         def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             nonlocal calls
             calls += 1
+            self.message_views.append(repr(messages))
             prompt = _prompt_body(messages)
             if calls == 1:
                 self.task_prompts.append(prompt)
@@ -434,6 +457,7 @@ class _FinancialSpecialists:
                 else {"fund_holdings", "fund_reports", "company_news"}
             )
             assert business_tools == expected_tools
+            self.business_tool_views.append(frozenset(business_tools))
             if calls == 1:
                 self.skill_views.append((objective, summary_names))
                 assert "FULL-" not in repr(messages)
@@ -500,7 +524,9 @@ class _FinancialSpecialists:
                         parts=[ToolCallPart(tool_name=tool_name, args=args)]
                     )
                 evidence_ids = ["price-evidence"]
-                summary = "Market analysis completed."
+                summary = self.result_summaries.get(
+                    objective, "Market analysis completed."
+                )
             elif objective == _FUND_OBJECTIVE:
                 sequence = (
                     (
@@ -515,7 +541,9 @@ class _FinancialSpecialists:
                         parts=[ToolCallPart(tool_name=tool_name, args=args)]
                     )
                 evidence_ids = ["holdings-evidence", "report-evidence"]
-                summary = "Fund holdings and disclosure research completed."
+                summary = self.result_summaries.get(
+                    objective, "Fund holdings and disclosure research completed."
+                )
             else:
                 assert objective == _NEWS_OBJECTIVE
                 raw_context_results = cast(object, prompt["context_results"])
@@ -539,7 +567,9 @@ class _FinancialSpecialists:
                         ]
                     )
                 evidence_ids = ["news-evidence"]
-                summary = "Company-news follow-up completed."
+                summary = self.result_summaries.get(
+                    objective, "Company-news follow-up completed."
+                )
             return ModelResponse(
                 parts=[
                     ToolCallPart(
@@ -637,13 +667,18 @@ class FinancialFixture:
     request_id: str = _REQUEST_ID
     failure_request_ids: frozenset[str] | None = None
     failure_diagnostic: str = "fixture holdings retry"
+    content: FinancialFixtureContent = field(default_factory=FinancialFixtureContent)
     tools: _FinancialTools = field(default_factory=_FinancialTools)
+    understanding: _FinancialUnderstanding = field(
+        default_factory=_FinancialUnderstanding
+    )
     coordinator: _FinancialCoordinator = field(default_factory=_FinancialCoordinator)
     specialists: _FinancialSpecialists = field(init=False)
     synthesis: _FinancialSynthesis = field(default_factory=_FinancialSynthesis)
 
     def __post_init__(self) -> None:
         self.configure_run(request_id=self.request_id, fund_task_dispatch_order=1)
+        self.tools.content = self.content
         self.tools.synchronize_first_batch = not self.alternate_holdings_failure
         failure_request_ids = (
             self.failure_request_ids
@@ -657,6 +692,7 @@ class FinancialFixture:
                 for request_id in failure_request_ids
             ),
             failure_diagnostic=self.failure_diagnostic,
+            result_summaries=self.content.result_summaries,
         )
 
     def configure_run(
@@ -765,7 +801,10 @@ class FinancialFixture:
                         references=(
                             SkillReference(
                                 name="common-reference",
-                                content="FULL-COMMON-SKILL-REFERENCE",
+                                content=self.content.skill_references.get(
+                                    "financial-common",
+                                    "FULL-COMMON-SKILL-REFERENCE",
+                                ),
                             ),
                         ),
                     ),
@@ -784,7 +823,10 @@ class FinancialFixture:
                         references=(
                             SkillReference(
                                 name="fund-reference",
-                                content="FULL-FUND-SKILL-REFERENCE",
+                                content=self.content.skill_references.get(
+                                    "fund-disclosure",
+                                    "FULL-FUND-SKILL-REFERENCE",
+                                ),
                             ),
                         ),
                     ),
@@ -855,7 +897,7 @@ def financial_app(
             request_context=request_context,
             checkpointer=checkpointer,
             query_understanding_actor=query_understanding_actor
-            or _FinancialUnderstanding(),
+            or fixture.understanding,
             coordinator_actor=coordinator_actor or fixture.coordinator,
             specialist_registry=registry,
             intent_policies={policy.intent: policy},
@@ -884,7 +926,9 @@ def _post_financial_request(client: TestClient, conversation_id: UUID) -> Any:
     )
 
 
-def _checkpoint(app: FastAPI, client: TestClient, conversation_id: UUID) -> Any:
+def financial_checkpoint(
+    app: FastAPI, client: TestClient, conversation_id: UUID
+) -> Any:
     assert client.portal is not None
     return client.portal.call(
         lambda: app.state.langgraph_v2_checkpointer.aget_tuple(
@@ -897,7 +941,9 @@ def _checkpoint(app: FastAPI, client: TestClient, conversation_id: UUID) -> Any:
     )
 
 
-def _messages(app: FastAPI, client: TestClient, conversation_id: UUID) -> list[Any]:
+def financial_messages(
+    app: FastAPI, client: TestClient, conversation_id: UUID
+) -> list[Any]:
     assert client.portal is not None
     return client.portal.call(
         lambda: read_conversation_messages(
@@ -928,11 +974,11 @@ def test_financial_golden_path_commits_one_validated_report_per_conversation(
             for conversation_id in conversation_ids
         ]
         checkpoints = [
-            _checkpoint(app, client, conversation_id)
+            financial_checkpoint(app, client, conversation_id)
             for conversation_id in conversation_ids
         ]
         messages = [
-            _messages(app, client, conversation_id)
+            financial_messages(app, client, conversation_id)
             for conversation_id in conversation_ids
         ]
 
@@ -1100,7 +1146,7 @@ def test_failed_holdings_changes_the_next_decision_and_still_finishes_bounded(
 
     with TestClient(app) as client:
         response = _post_financial_request(client, conversation_id)
-        checkpoint = _checkpoint(app, client, conversation_id)
+        checkpoint = financial_checkpoint(app, client, conversation_id)
 
     assert response.status_code == 200
     assert fixture.coordinator.follow_up_context_ids == []

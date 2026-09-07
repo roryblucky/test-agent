@@ -304,7 +304,7 @@ async def test_calculation_tool_keeps_the_canonical_value_out_of_model_data() ->
         "formatted_value": "10.0000%",
     }
     assert "canonical_value" not in result.model_dump()
-    assert returned.metadata == captured[0]
+    assert returned.metadata is None
 
 
 def test_calculation_artifact_internal_records_are_deeply_immutable() -> None:
