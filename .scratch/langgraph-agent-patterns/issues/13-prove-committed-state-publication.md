@@ -4,7 +4,7 @@
 
 **Blocked by:** 12: 在冻结的 Prepared Synthesis 上 repair 并 fail closed
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] 只有专用 publication owner 能发出 answer token、citations 与 `done`；所有前置节点只写 canonical state 或发送无答案内容的 progress。
 - [ ] clarification、完整 research、partial results、execution limit、两者并存以及 insufficient Evidence 的终态都复用同一 checkpoint-first 规则；pre-moderation 明确排除在 research completion 外。

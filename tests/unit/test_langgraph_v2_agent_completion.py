@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from app.langgraph_v2.agent_completion import (
+    FailedTaskDisclosure,
     IncompleteResearch,
     completion_termination_reason,
     render_incomplete_research,
@@ -59,13 +60,53 @@ def test_incomplete_research_discloses_expected_task_failure() -> None:
         "Published report.",
         IncompleteResearch(
             insufficient_evidence=False,
-            task_failures=1,
+            failed_task_ids=("task-1",),
+        ),
+        failed_tasks=(
+            FailedTaskDisclosure(task_id="task-1", objective="Market analysis"),
         ),
     )
 
     assert answer.startswith(
-        "Incomplete research: one requested task could not complete.\n\n"
+        "Incomplete research: one requested task could not complete.\n"
+        "- Market analysis\n\n"
     )
+
+
+def test_incomplete_research_preserves_failed_task_ids_across_round_trip() -> None:
+    completion = IncompleteResearch(
+        insufficient_evidence=False,
+        failed_task_ids=("task-1",),
+    )
+
+    assert completion.failed_task_ids == ("task-1",)
+    assert IncompleteResearch.model_validate_json(completion.model_dump_json()) == completion
+    assert render_incomplete_research(
+        "Published report.",
+        completion,
+        failed_tasks=(
+            FailedTaskDisclosure(task_id="task-1", objective="Café analysis"),
+        ),
+    ) == (
+        "Incomplete research: one requested task could not complete.\n"
+        "- Café analysis\n\nPublished report."
+    )
+
+
+def test_incomplete_research_rejects_a_disclosure_for_the_wrong_failed_task() -> None:
+    completion = IncompleteResearch(
+        insufficient_evidence=False,
+        failed_task_ids=("task-1",),
+    )
+
+    with pytest.raises(ValueError, match="do not match accepted failures"):
+        render_incomplete_research(
+            "Published report.",
+            completion,
+            failed_tasks=(
+                FailedTaskDisclosure(task_id="task-2", objective="Market analysis"),
+            ),
+        )
 
 
 def test_task_failure_disclosure_reuses_the_canonical_accepted_objective() -> None:
@@ -73,17 +114,24 @@ def test_task_failure_disclosure_reuses_the_canonical_accepted_objective() -> No
         "Published report.",
         IncompleteResearch(
             insufficient_evidence=False,
-            task_failures=1,
-            failed_task_objectives=("Café analysis",),
+            failed_task_ids=("task-1",),
+        ),
+        failed_tasks=(
+            FailedTaskDisclosure(task_id="task-1", objective="Café analysis"),
         ),
     )
 
     assert "- Café analysis" in answer
     with pytest.raises(ValueError, match="not canonical"):
-        IncompleteResearch(
-            insufficient_evidence=False,
-            task_failures=1,
-            failed_task_objectives=("Café\nanalysis",),
+        render_incomplete_research(
+            "Published report.",
+            IncompleteResearch(
+                insufficient_evidence=False,
+                failed_task_ids=("task-1",),
+            ),
+            failed_tasks=(
+                FailedTaskDisclosure(task_id="task-1", objective="Café\nanalysis"),
+            ),
         )
 
 
@@ -109,3 +157,38 @@ def test_structural_reasons_are_ordered_and_preserved_in_completion() -> None:
                 "task_limit",
             ),
         )
+
+
+@pytest.mark.parametrize(
+    ("completion", "expected_reason"),
+    [
+        (
+            IncompleteResearch(
+                insufficient_evidence=False,
+                failed_task_ids=("task-1",),
+            ),
+            "partial_results",
+        ),
+        (
+            IncompleteResearch(
+                insufficient_evidence=False,
+                structural_reasons=("task_limit",),
+            ),
+            "execution_limit",
+        ),
+        (
+            IncompleteResearch(
+                insufficient_evidence=True,
+                failed_task_ids=("task-1",),
+                structural_reasons=("task_limit",),
+            ),
+            "partial_results_and_execution_limit",
+        ),
+        (IncompleteResearch(insufficient_evidence=True), "insufficient_evidence"),
+    ],
+)
+def test_completion_termination_reason_preserves_partial_and_limit_priority(
+    completion: IncompleteResearch,
+    expected_reason: str,
+) -> None:
+    assert completion_termination_reason(completion) == expected_reason

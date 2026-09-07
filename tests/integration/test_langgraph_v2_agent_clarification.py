@@ -199,6 +199,12 @@ def test_agent_clarification_is_committed_before_one_done_event(
     }
     assert "completion_status" not in done[0]["data"]["metadata"]
     assert "termination_reason" not in done[0]["data"]["metadata"]
+    assert "".join(event["data"] for event in events if event["type"] == "token") == (
+        done[0]["data"]["answer"]
+    )
+    assert all(event["type"] != "citations" for event in events)
+    event_types = [event["type"] for event in events]
+    assert event_types.index("token") < event_types.index("done")
     assert actor.histories == [[]]
     assert [(message.type, message.text) for message in messages] == [
         ("human", "What about it?"),
@@ -460,7 +466,128 @@ async def test_agent_cancellation_at_final_checkpoint_never_publishes_done(
         )
 
     assert actor.histories == [[]]
-    assert all(parse_sse(frame)[0]["type"] != "done" for frame in frames)
+    assert all(
+        parse_sse(frame)[0]["type"] not in {"token", "citations", "done"}
+        for frame in frames
+    )
     assert [message.type for message in messages] == (
         ["human", "ai"] if after_commit else ["human"]
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_cancellation_during_publish_keeps_committed_message_without_done(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    actor = _ClarifyingActor()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        async with postgres_lifespan(
+            app,
+            config=V2PostgresConfig(database_url=langgraph_v2_migrated_database_url),
+        ):
+            yield
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.tenant_manager = _AgentTenantManager()
+    from app.langgraph_v2.api import register_v2_routes
+
+    register_v2_routes(
+        app,
+        enabled=True,
+        agent_runtime_factory=_agent_runtime_factory(actor),
+    )
+    conversation_id = UUID("00000000-0000-0000-0000-000000000066")
+    request_context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+
+    async with app.router.lifespan_context(app):
+        response = await v2_stream_endpoint(app)(
+            payload=V2QueryRequest(
+                query="What about it?",
+                conversation_id=conversation_id,
+                client_request_id="publish-cancel",
+            ),
+            http_request=stream_request(app),
+            request_context=request_context,
+        )
+        subscriber = response.body_iterator
+        frames: list[str] = []
+        while True:
+            frame = await anext(subscriber)
+            frames.append(frame)
+            if parse_sse(frame)[0]["type"] == "token":
+                break
+        await subscriber.aclose()
+        messages = await read_conversation_messages(
+            app.state.langgraph_v2_checkpointer,
+            thread_checkpoint_config(
+                thread_id=thread_id_for(
+                    "tenant-a", "subject-a", "agent", str(conversation_id)
+                )
+            ),
+            state_adapter=AgentCheckpointStateAdapter(),
+        )
+
+    assert actor.histories == [[]]
+    assert any(parse_sse(frame)[0]["type"] == "token" for frame in frames)
+    assert all(parse_sse(frame)[0]["type"] != "done" for frame in frames)
+    assert [(message.id, message.type, message.text) for message in messages] == [
+        ("publish-cancel:user", "human", "What about it?"),
+        ("publish-cancel:assistant", "ai", "Which company do you mean?"),
+    ]
+
+
+def test_agent_final_checkpoint_failure_has_no_final_frames_or_message(
+    langgraph_v2_migrated_database_url: str,
+) -> None:
+    class _FailingFinalSaver(AsyncPostgresSaver):
+        async def aput(
+            self,
+            config: RunnableConfig,
+            checkpoint: Any,
+            metadata: Any,
+            new_versions: Any,
+        ) -> RunnableConfig:
+            if checkpoint.get("channel_values", {}).get("final_response") is not None:
+                raise RuntimeError("final checkpoint failed")
+            return await super().aput(config, checkpoint, metadata, new_versions)
+
+    actor = _ClarifyingActor()
+    conversation_id = "00000000-0000-0000-0000-000000000067"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=_agent_runtime_factory(actor),
+        checkpointer_factory=_FailingFinalSaver,
+    )
+    app.state.tenant_manager = _AgentTenantManager()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "What about it?",
+                "sessionId": conversation_id,
+                "clientRequestId": "failed-final-checkpoint",
+            },
+            headers={"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"},
+        )
+        assert client.portal is not None
+        messages = client.portal.call(
+            lambda: read_conversation_messages(
+                app.state.langgraph_v2_checkpointer,
+                thread_checkpoint_config(
+                    thread_id=thread_id_for(
+                        "tenant-a", "subject-a", "agent", conversation_id
+                    )
+                ),
+                state_adapter=AgentCheckpointStateAdapter(),
+            )
+        )
+
+    events = parse_sse(response.text)
+    assert actor.histories == [[]]
+    assert all(event["type"] not in {"token", "citations", "done"} for event in events)
+    assert [(message.id, message.type, message.text) for message in messages] == [
+        ("failed-final-checkpoint:user", "human", "What about it?"),
+    ]

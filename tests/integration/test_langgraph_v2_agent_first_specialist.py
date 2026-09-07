@@ -1760,6 +1760,16 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
     assert response.status_code == 200
     assert done[0]["data"]["answer"] == "Apple revenue grew. [[E:1]]"
     assert done[0]["data"]["citations"][0]["evidence_id"] == "evidence-1"
+    assert "".join(event["data"] for event in events if event["type"] == "token") == done[
+        0
+    ]["data"]["answer"]
+    assert [event["data"] for event in events if event["type"] == "citations"] == [
+        done[0]["data"]["citations"]
+    ]
+    event_types = [event["type"] for event in events]
+    assert event_types.index("token") < event_types.index("citations") < event_types.index(
+        "done"
+    )
     assert any(
         event["type"] == "step_start" and event.get("step") == "specialist"
         for event in events

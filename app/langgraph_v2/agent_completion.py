@@ -34,25 +34,39 @@ CompletionTerminationReason = Literal[
 ]
 
 
+class FailedTaskDisclosure(BaseModel):
+    """Canonical accepted Task text paired with its stable identity at render time."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+
+    @field_validator("objective")
+    @classmethod
+    def _validate_objective(cls, value: str) -> str:
+        if normalize_task_objective(value) != value:
+            raise ValueError("Failed Task objective is not canonical")
+        return value
+
+
 class IncompleteResearch(BaseModel):
     """Application-only projection for a bounded incomplete terminal path."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     insufficient_evidence: bool
     data_gaps: tuple[DataGapView, ...] = ()
-    task_failures: int = Field(default=0, ge=0)
-    failed_task_objectives: tuple[str, ...] = ()
+    failed_task_ids: tuple[str, ...] = ()
     structural_reasons: tuple[StructuralReason, ...] = ()
 
-    @field_validator("failed_task_objectives")
+    @field_validator("failed_task_ids")
     @classmethod
-    def _validate_failed_task_objectives(
+    def _validate_failed_task_ids(
         cls, value: tuple[str, ...]
     ) -> tuple[str, ...]:
-        """Require disclosure to reuse the accepted canonical Task objective."""
-        if any(normalize_task_objective(objective) != objective for objective in value):
-            raise ValueError("Failed Task objective is not canonical")
+        if any(not task_id for task_id in value) or len(set(value)) != len(value):
+            raise ValueError("Failed Task identifiers are invalid")
         return value
 
     @field_validator("structural_reasons")
@@ -75,7 +89,7 @@ class IncompleteResearch(BaseModel):
     @property
     def has_task_failures(self) -> bool:
         """Expose expected Task inability as a separate partial-result signal."""
-        return self.task_failures > 0
+        return bool(self.failed_task_ids)
 
     @property
     def has_structural_limit(self) -> bool:
@@ -98,11 +112,17 @@ def completion_termination_reason(
     return "insufficient_evidence"
 
 
-def insufficient_evidence_answer(completion: IncompleteResearch) -> str:
+def insufficient_evidence_answer(
+    completion: IncompleteResearch,
+    *,
+    failed_tasks: tuple[FailedTaskDisclosure, ...] = (),
+) -> str:
     """Render the sole fixed disclosure for a zero-Evidence completion."""
     if not completion.insufficient_evidence:
         raise ValueError("Incomplete Research requires a completion signal")
-    return render_incomplete_research("", completion)
+    return render_incomplete_research(
+        "", completion, failed_tasks=failed_tasks
+    )
 
 
 def _escape_markdown(value: str) -> str:
@@ -112,8 +132,15 @@ def _escape_markdown(value: str) -> str:
     )
 
 
-def render_incomplete_research(answer: str, completion: IncompleteResearch) -> str:
+def render_incomplete_research(
+    answer: str,
+    completion: IncompleteResearch,
+    *,
+    failed_tasks: tuple[FailedTaskDisclosure, ...] = (),
+) -> str:
     """Render code-owned incompleteness and its bounded missing coverage labels."""
+    if tuple(task.task_id for task in failed_tasks) != completion.failed_task_ids:
+        raise ValueError("Failed Task disclosures do not match accepted failures")
     lines: list[str] = []
     if completion.has_data_gaps:
         lines.extend(
@@ -128,7 +155,7 @@ def render_incomplete_research(answer: str, completion: IncompleteResearch) -> s
             (TASK_FAILURE_DISCLOSURE,)
             + tuple(
                 f"- {_escape_markdown(objective)}"
-                for objective in completion.failed_task_objectives
+                for objective in (task.objective for task in failed_tasks)
             )
         )
     lines.extend(

@@ -32,6 +32,7 @@ from app.langgraph_v2.agent_batch import (
     validate_promoted_calculation_contribution,
 )
 from app.langgraph_v2.agent_completion import (
+    FailedTaskDisclosure,
     IncompleteResearch,
     completion_termination_reason,
     insufficient_evidence_answer,
@@ -479,15 +480,18 @@ def build_agent_graph(
 
     async def research_completion(state: AgentGraphState) -> AgentGraphStateUpdate:
         stop_reason = _coordination_stop_reason(state)
+        failed_tasks = _accepted_failed_task_disclosures(state)
         completion = IncompleteResearch(
             insufficient_evidence=not _accepted_evidence_ids(state),
             data_gaps=_accepted_data_gap_views(state),
-            task_failures=_accepted_task_failure_count(state),
-            failed_task_objectives=_accepted_failed_task_objectives(state),
+            failed_task_ids=tuple(task.task_id for task in failed_tasks),
             structural_reasons=(stop_reason,) if stop_reason is not None else (),
         )
         return {
-            "answer": insufficient_evidence_answer(completion),
+            "answer": insufficient_evidence_answer(
+                completion,
+                failed_tasks=failed_tasks,
+            ),
             "completion_status": "incomplete",
             "termination_reason": completion_termination_reason(completion),
         }
@@ -503,6 +507,7 @@ def build_agent_graph(
         evidence_ids = _accepted_evidence_ids(state)
         data_gaps = _accepted_data_gap_views(state)
         stop_reason = _coordination_stop_reason(state)
+        failed_tasks = _accepted_failed_task_disclosures(state)
         prepared = prepare_synthesis(
             standalone_query=standalone_query,
             intent=scope.intent,
@@ -520,18 +525,21 @@ def build_agent_graph(
             IncompleteResearch(
                 insufficient_evidence=False,
                 data_gaps=data_gaps,
-                task_failures=_accepted_task_failure_count(state),
-                failed_task_objectives=_accepted_failed_task_objectives(state),
+                failed_task_ids=tuple(task.task_id for task in failed_tasks),
                 structural_reasons=(stop_reason,) if stop_reason is not None else (),
             )
             if data_gaps
-            or _accepted_task_failure_count(state)
+            or failed_tasks
             or stop_reason is not None
             else None
         )
         return {
             "answer": (
-                render_incomplete_research(published.answer, completion)
+                render_incomplete_research(
+                    published.answer,
+                    completion,
+                    failed_tasks=failed_tasks,
+                )
                 if completion is not None
                 else published.answer
             ),
@@ -616,15 +624,24 @@ def build_agent_graph(
         if not isinstance(final_response, dict):
             raise TypeError("Agent final response is invalid")
         response = V2QueryResponse.model_validate(final_response)
-        _emit(
-            (
+        if response.answer is None:
+            raise TypeError("Agent committed final answer is invalid")
+        events = [LiveStreamEvent(type="token", data=response.answer)]
+        if response.citations:
+            events.append(
                 LiveStreamEvent(
-                    type="done",
-                    data=response.model_dump(by_alias=True),
-                    checkpoint_terminal=True,
-                ),
+                    type="citations",
+                    data=[citation.model_dump(mode="json") for citation in response.citations],
+                )
+            )
+        events.append(
+            LiveStreamEvent(
+                type="done",
+                data=response.model_dump(by_alias=True),
+                checkpoint_terminal=True,
             )
         )
+        _emit(tuple(events))
         return {}
 
     def next_after_pre_moderation(state: AgentGraphState) -> str:
@@ -751,13 +768,19 @@ def _accepted_data_gap_views(state: AgentGraphState) -> tuple[DataGapView, ...]:
     )
 
 
-def _accepted_task_failure_count(state: AgentGraphState) -> int:
-    """Count expected failed Tasks without exposing diagnostics to graph prompts."""
-    return sum(
-        not isinstance(outcome, TaskSucceeded)
-        for _, accepted in _accepted_round_batches(state)
-        for outcome in accepted.outcomes
-    )
+def _accepted_failed_task_disclosures(
+    state: AgentGraphState,
+) -> tuple[FailedTaskDisclosure, ...]:
+    """Pair failed Task IDs and accepted canonical objectives at publication time."""
+    disclosures: list[FailedTaskDisclosure] = []
+    for round_, accepted in _accepted_round_batches(state):
+        outcomes = {outcome.task_id: outcome for outcome in accepted.outcomes}
+        disclosures.extend(
+            FailedTaskDisclosure(task_id=task.id, objective=task.objective)
+            for task in round_.tasks
+            if not isinstance(outcomes[task.id], TaskSucceeded)
+        )
+    return tuple(disclosures)
 
 
 def _accepted_specialist_usage(state: AgentGraphState) -> SpecialistUsage:
@@ -766,19 +789,6 @@ def _accepted_specialist_usage(state: AgentGraphState) -> SpecialistUsage:
     for _, accepted in _accepted_round_batches(state):
         usage = usage.add(accepted.usage)
     return usage
-
-
-def _accepted_failed_task_objectives(state: AgentGraphState) -> tuple[str, ...]:
-    """Return the accepted canonical objectives for expected Task failures."""
-    objectives: list[str] = []
-    for round_, accepted in _accepted_round_batches(state):
-        outcomes = {outcome.task_id: outcome for outcome in accepted.outcomes}
-        objectives.extend(
-            task.objective
-            for task in round_.tasks
-            if not isinstance(outcomes[task.id], TaskSucceeded)
-        )
-    return tuple(objectives)
 
 
 def _coordination_rounds(state: AgentGraphState) -> tuple[CoordinationRound, ...]:

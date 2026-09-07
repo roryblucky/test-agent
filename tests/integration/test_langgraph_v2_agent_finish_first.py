@@ -123,12 +123,18 @@ def test_agent_first_finish_publishes_one_insufficient_evidence_answer(
             )
         )
 
-    done = [event for event in parse_sse(response.text) if event["type"] == "done"]
+    events = parse_sse(response.text)
+    done = [event for event in events if event["type"] == "done"]
     assert response.status_code == 200
     assert len(done) == 1
     answer = done[0]["data"]["answer"]
     assert answer == "Incomplete research: no eligible Evidence was available."
     assert answer.count("no eligible Evidence") == 1
+    assert "".join(event["data"] for event in events if event["type"] == "token") == answer
+    assert [event["type"] for event in events].index("token") < [
+        event["type"] for event in events
+    ].index("done")
+    assert all(event["type"] != "citations" for event in events)
     assert done[0]["data"]["metadata"]["completion_status"] == "incomplete"
     assert done[0]["data"]["metadata"]["termination_reason"] == "insufficient_evidence"
     assert understanding.histories == [[]]
