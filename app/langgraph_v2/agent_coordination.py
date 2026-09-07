@@ -417,18 +417,19 @@ async def decide_coordination_round(
     scope_descriptors: Sequence[SpecialistDescriptor],
 ) -> AcceptedCoordinationDispatch | CoordinationRound | CoordinationStopped:
     """Own exactly one same-round repair without changing the frozen input."""
-    rejection = CoordinationCandidateRejected("Coordinator decision is invalid")
+    rejection_reason: str | None = None
     for attempt in range(2):
         try:
             if attempt == 0:
                 candidate = await actor.decide(input)
             else:
+                assert rejection_reason is not None
                 repair = cast(
                     Callable[..., Awaitable[CoordinatorDecision]] | None,
                     getattr(actor, "repair", None),
                 )
                 candidate = (
-                    await repair(input, rejection=rejection.reason)
+                    await repair(input, rejection=rejection_reason)
                     if repair is not None
                     else await actor.decide(input)
                 )
@@ -446,12 +447,11 @@ async def decide_coordination_round(
                 scope_descriptors=scope_descriptors,
             )
         except (CoordinatorOutputInvalid, ValidationError):
-            rejection = CoordinationCandidateRejected("Coordinator decision is invalid")
+            rejection_reason = "Coordinator decision is invalid"
         except CoordinationCandidateRejected as error:
-            rejection = error
-        if attempt == 1:
-            return CoordinationStopped(reason=_stopped_reason(rejection.reason))
-    raise AssertionError("Coordinator repair did not reach a terminal outcome")
+            rejection_reason = error.reason
+    assert rejection_reason is not None
+    return CoordinationStopped(reason=_stopped_reason(rejection_reason))
 
 
 def _stopped_reason(rejection: str) -> StructuralStopReason:
