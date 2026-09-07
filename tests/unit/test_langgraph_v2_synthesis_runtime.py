@@ -50,6 +50,10 @@ def test_synthesis_factory_instructs_evidence_markers() -> None:
     assert registry.kwargs is not None
     assert registry.kwargs["instructions"] == SYNTHESIS_INSTRUCTIONS
     assert registry.kwargs["tools"] == ()
+    assert registry.kwargs["retries"] == 0
+    assert registry.kwargs["tool_retries"] == 0
+    assert registry.kwargs["output_retries"] == 0
+    assert registry.kwargs["end_strategy"] == "early"
 
 
 @pytest.mark.asyncio

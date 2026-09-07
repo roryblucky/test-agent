@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -536,7 +536,7 @@ class RequestEvidenceCatalog:
 class PreparedEvidence(BaseModel):
     """Bounded source view permitted in a Synthesis prompt."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str
     source: str
@@ -548,7 +548,7 @@ class PreparedEvidence(BaseModel):
 class PreparedCalculation(BaseModel):
     """Value-free Calculation projection permitted in a Synthesis prompt."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     alias: str
     method: str
@@ -574,7 +574,7 @@ class PreparedCalculation(BaseModel):
 class PreparedSynthesis(BaseModel):
     """Frozen bounded business input for one Synthesis invocation."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     standalone_query: str
     intent: str
@@ -607,15 +607,11 @@ class PublishedReport(BaseModel):
 
 
 class SynthesisActor(Protocol):
-    """Produce one typed report candidate from a frozen projection."""
+    """Produce a candidate and its one permitted frozen-input repair."""
 
     async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
         """Produce the first candidate without repair feedback."""
         ...
-
-
-class SynthesisRepairActor(SynthesisActor, Protocol):
-    """Produce the one allowed repair for an unchanged frozen projection."""
 
     async def repair(
         self,
@@ -771,11 +767,8 @@ async def synthesize_report(
     try:
         return publish_report(await actor.synthesize(prepared), prepared)
     except SynthesisCandidateRejected as rejection:
-        repair_actor = cast(SynthesisRepairActor, actor)
-        if not callable(getattr(repair_actor, "repair", None)):
-            raise RuntimeError("Synthesis actor does not support repair") from rejection
         return publish_report(
-            await repair_actor.repair(
+            await actor.repair(
                 prepared, validation_errors=rejection.validation_errors
             ),
             prepared,

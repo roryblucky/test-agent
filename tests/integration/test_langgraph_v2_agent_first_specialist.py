@@ -671,6 +671,12 @@ class _Synthesis:
         del prepared
         return FinancialResearchReport(markdown_report="Apple revenue grew. [[E:1]]")
 
+    async def repair(
+        self, prepared: object, *, validation_errors: tuple[str, ...]
+    ) -> FinancialResearchReport:
+        del validation_errors
+        return await self.synthesize(prepared)
+
 
 class _EmptySynthesis:
     async def synthesize(self, prepared: object) -> FinancialResearchReport:
@@ -678,6 +684,12 @@ class _EmptySynthesis:
         return FinancialResearchReport(
             markdown_report="No matching filing records were found. [[E:1]]"
         )
+
+    async def repair(
+        self, prepared: object, *, validation_errors: tuple[str, ...]
+    ) -> FinancialResearchReport:
+        del validation_errors
+        return await self.synthesize(prepared)
 
 
 class _TenantManager:
@@ -1349,8 +1361,21 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
         ) -> FinancialResearchReport:
             self.prepared = prepared
             return FinancialResearchReport(
-                markdown_report="First [[C:1]], last [[C:16]]. [[E:1]]"
+                markdown_report=(
+                    "First [[C:1]], last [[C:16]]. "
+                    "[[E:1]] [[E:2]] [[E:3]] [[E:4]] "
+                    "[[E:5]] [[E:6]] [[E:7]] [[E:8]]"
+                )
             )
+
+        async def repair(
+            self,
+            prepared: PreparedSynthesis,
+            *,
+            validation_errors: tuple[str, ...],
+        ) -> FinancialResearchReport:
+            del validation_errors
+            return await self.synthesize(prepared)
 
     def run_batch(
         *, reverse_completion: bool, conversation_id: str
@@ -1453,7 +1478,9 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
             f"{last.period_end}; assumptions: {'; '.join(last.assumptions)})"
         )
         assert done[0]["data"]["answer"] == (
-            f"First {first_rendered}, last {last_rendered}. [[E:1]]"
+            f"First {first_rendered}, last {last_rendered}. "
+            "[[E:1]] [[E:2]] [[E:3]] [[E:4]] "
+            "[[E:5]] [[E:6]] [[E:7]] [[E:8]]"
         )
         return (
             accepted,
@@ -2059,6 +2086,15 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
             return FinancialResearchReport(
                 markdown_report="Apple revenue grew. [[E:1]]"
             )
+
+        async def repair(
+            self,
+            prepared: PreparedSynthesis,
+            *,
+            validation_errors: tuple[str, ...],
+        ) -> FinancialResearchReport:
+            del validation_errors
+            return await self.synthesize(prepared)
 
     policy = AgentIntentPolicy(
         intent="market_outlook",
