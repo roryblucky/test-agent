@@ -14,11 +14,10 @@
 - [x] 静态 builder 使用 fake Coordinator 与 Specialist registry；graph control 不得导入金融领域实现。
 - [x] Agent builder 与 Linear builder 分离；官方 checkpoint 是唯一 durable authority。不得新增应用自有 Run model/repository/table、重复 checkpoint pointer、transport Event journal、Redis recovery、`AgentTeamDefinition`、Team registry、配置 loader 或 workflow DSL；Run/Task identity 不是产品持久化实体。
 - [x] Specialist 首次调用关闭隐藏 Tool/output retry，使用显式 end strategy，单次模型请求超时 60 秒，`max_tokens` 为 2000。
-- [x] Specialist Result 的 canonical JSON 上限为 16 KiB；测试覆盖恰好 16 KiB 与多 1 byte，超限在生成 contribution 前作为 structured-output-invalid 拒绝。
 - [x] 使用 PydanticAI 的基础 `TestModel`/`FunctionModel`、actor override 与 `ALLOW_MODEL_REQUESTS=False`；每次 invocation 独立 capture，并分别断言 output schema、`new_messages`、usage 和精确的一请求轨迹。
 
 ## Comments
 
-- Sol-high combined review (Standards + Spec): Standards had no findings. Resolved Spec P1 by allowing the Coordinator prompt to return `Dispatch` or `Finish`; resolved Spec P2 by capturing TestModel/FunctionModel actor runs with exact three-message, one-request traces; resolved Spec P2 by exercising both 16 KiB boundary cases through `execute_specialist`. Verified after the fixes with Ruff, Pyright, and `pytest tests -q` (280 passed, 1 skipped). Unresolved review comments: 0.
+- Sol-high combined review (Standards + Spec): Standards had no findings. Resolved Spec P1 by allowing the Coordinator prompt to return `Dispatch` or `Finish`; resolved Spec P2 by capturing TestModel/FunctionModel actor runs with exact three-message, one-request traces. Verified after the fixes with Ruff, Pyright, and `pytest tests -q` (280 passed, 1 skipped). Unresolved review comments: 0.
 - Sol-high re-review found one remaining Spec P2. Resolved it by asserting the production Specialist factory's schema/retry/end-strategy configuration and `AgentRunResult.new_messages()` alongside the actor capture. Final verification: Ruff, Pyright, and `pytest tests -q` (281 passed, 1 skipped). Unresolved review comments: 0.
 - Sol-high final re-review found a last Spec P2: the direct second actor invocation lacked its own capture context. Resolved it with an independent `capture_run_messages()` assertion. Final verification remains Ruff, Pyright, and `pytest tests -q` (281 passed, 1 skipped). Unresolved review comments: 0.

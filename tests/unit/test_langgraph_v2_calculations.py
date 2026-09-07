@@ -16,13 +16,10 @@ from app.langgraph_v2.calculations import (
     CalculationExecutor,
     CalculationMethod,
     CalculationRequest,
-    CalculationStateLimitExceeded,
     CalculationToolResult,
     PriceObservation,
     TrustedPriceSeries,
-    accepted_calculation_artifacts,
     bind_calculation_tool,
-    calculation_state_json_size,
 )
 
 
@@ -55,14 +52,6 @@ def _period_return_artifact(*, ref: str, evidence_ref: str):
             task_id=f"task_{'a' * 32}",
             attempt=1,
         ),
-    )
-
-
-def _period_return_artifact_at_size(*, ref: str, size: int):
-    provisional = _period_return_artifact(ref=ref, evidence_ref="evidence")
-    return _period_return_artifact(
-        ref=ref,
-        evidence_ref="x" * (size - provisional.canonical_json_size() + len("evidence")),
     )
 
 
@@ -316,45 +305,6 @@ async def test_calculation_tool_keeps_the_canonical_value_out_of_model_data() ->
     }
     assert "canonical_value" not in result.model_dump()
     assert returned.metadata == captured[0]
-
-
-def test_calculation_artifact_enforces_the_exact_four_kib_boundary() -> None:
-    at_limit = _period_return_artifact_at_size(ref="series-size", size=4 * 1024)
-    over_limit = _period_return_artifact_at_size(ref="series-size", size=4 * 1024 + 1)
-
-    assert at_limit.canonical_json_size() == 4096
-    at_limit.require_integrity()
-    at_limit.require_canonical_size()
-    assert over_limit.canonical_json_size() == 4097
-    with pytest.raises(ValueError, match="Calculation Artifact exceeds 4KiB"):
-        over_limit.require_canonical_size()
-
-
-def test_calculation_state_enforces_the_exact_one_mib_boundary() -> None:
-    fixed = tuple(
-        _period_return_artifact_at_size(ref=f"series-{index:03}", size=4 * 1024)
-        for index in range(255)
-    )
-    last_base = _period_return_artifact(ref="series-255", evidence_ref="evidence")
-    last_size = last_base.canonical_json_size() + (
-        1024 * 1024 - calculation_state_json_size((*fixed, last_base))
-    )
-    at_limit = (
-        *fixed,
-        _period_return_artifact_at_size(ref="series-255", size=last_size),
-    )
-    over_limit = (
-        *fixed,
-        _period_return_artifact_at_size(ref="series-255", size=last_size + 1),
-    )
-
-    assert calculation_state_json_size(at_limit) == 1024 * 1024
-    assert accepted_calculation_artifacts(at_limit)
-    assert calculation_state_json_size(over_limit) == 1024 * 1024 + 1
-    with pytest.raises(
-        CalculationStateLimitExceeded, match="Calculation state exceeds 1MiB"
-    ):
-        accepted_calculation_artifacts(over_limit)
 
 
 def test_calculation_artifact_internal_records_are_deeply_immutable() -> None:

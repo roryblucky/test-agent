@@ -39,7 +39,6 @@ from app.langgraph_v2.agent_completion import (
 )
 from app.langgraph_v2.agent_coordination import (
     AcceptedCoordinationDispatch,
-    CoordinationContextLimitExceeded,
     CoordinationInvariantError,
     CoordinationRound,
     CoordinationStopped,
@@ -54,7 +53,6 @@ from app.langgraph_v2.agent_coordination import (
 from app.langgraph_v2.agent_evidence import (
     DataGapView,
     EvidenceInvocationContext,
-    PreparedSynthesisLimitExceeded,
     RequestEvidenceCatalog,
     SynthesisActor,
     prepare_synthesis,
@@ -65,15 +63,9 @@ from app.langgraph_v2.agent_scope import (
     ResearchScope,
     resolve_research_scope,
 )
-from app.langgraph_v2.agent_termination import (
-    CALCULATION_STATE_LIMIT,
-    COORDINATION_STOP_REASONS,
-    COORDINATOR_CONTEXT_LIMIT,
-    PREPARED_SYNTHESIS_LIMIT,
-)
+from app.langgraph_v2.agent_termination import COORDINATION_STOP_REASONS
 from app.langgraph_v2.calculations import (
     CalculationArtifact,
-    CalculationStateLimitExceeded,
     accepted_calculation_artifacts,
 )
 from app.langgraph_v2.checkpointing import AgentCheckpointStateAdapter
@@ -334,19 +326,13 @@ def build_agent_graph(
         scope = ResearchScope.model_validate(scope_value)
         rounds = _coordination_rounds(state)
         accepted_batches = _accepted_batches(state)
-        try:
-            input = project_coordinator_input(
-                standalone_query=standalone_query,
-                intent=scope.intent,
-                specialist_descriptors=scope.specialist_descriptors,
-                rounds=rounds,
-                accepted_batches=accepted_batches,
-            )
-        except CoordinationContextLimitExceeded:
-            return {
-                "coordination_finished": True,
-                "coordination_stop_reason": COORDINATOR_CONTEXT_LIMIT,
-            }
+        input = project_coordinator_input(
+            standalone_query=standalone_query,
+            intent=scope.intent,
+            specialist_descriptors=scope.specialist_descriptors,
+            rounds=rounds,
+            accepted_batches=accepted_batches,
+        )
         _emit((LiveStreamEvent(type="step_start", step="coordinator"),))
         decision = await decide_coordination_round(
             coordinator_actor,
@@ -485,24 +471,6 @@ def build_agent_graph(
                 )
             ),
         )
-        try:
-            accepted_calculation_artifacts(
-                (
-                    *(
-                        artifact
-                        for prior in _accepted_batches(state).values()
-                        for artifact in prior.calculations
-                    ),
-                    *accepted.calculations,
-                )
-            )
-        except CalculationStateLimitExceeded:
-            return {
-                "staged_contributions": cast(Any, Overwrite({})),
-                "active_batch": None,
-                "coordination_finished": True,
-                "coordination_stop_reason": CALCULATION_STATE_LIMIT,
-            }
         return {
             "accepted_batches": {accepted.id: accepted.model_dump(mode="json")},
             "staged_contributions": cast(Any, Overwrite({})),
@@ -535,36 +503,18 @@ def build_agent_graph(
         evidence_ids = _accepted_evidence_ids(state)
         data_gaps = _accepted_data_gap_views(state)
         stop_reason = _coordination_stop_reason(state)
-        try:
-            prepared = prepare_synthesis(
-                standalone_query=standalone_query,
-                intent=scope.intent,
-                accepted_evidence_ids=evidence_ids,
-                catalog=catalog,
-                tenant_id=tenant_id,
-                request_id=state["request_id"],
-                as_of_date=scope.as_of_date,
-                max_evidence_age_days=scope.max_evidence_age_days,
-                data_gaps=data_gaps,
-                accepted_calculations=_accepted_calculations(state),
-            )
-        except PreparedSynthesisLimitExceeded:
-            completion = IncompleteResearch(
-                insufficient_evidence=False,
-                data_gaps=data_gaps,
-                task_failures=_accepted_task_failure_count(state),
-                failed_task_objectives=_accepted_failed_task_objectives(state),
-                structural_reasons=tuple(
-                    reason
-                    for reason in (stop_reason, PREPARED_SYNTHESIS_LIMIT)
-                    if reason is not None
-                ),
-            )
-            return {
-                "answer": render_incomplete_research("", completion),
-                "completion_status": "incomplete",
-                "termination_reason": completion_termination_reason(completion),
-            }
+        prepared = prepare_synthesis(
+            standalone_query=standalone_query,
+            intent=scope.intent,
+            accepted_evidence_ids=evidence_ids,
+            catalog=catalog,
+            tenant_id=tenant_id,
+            request_id=state["request_id"],
+            as_of_date=scope.as_of_date,
+            max_evidence_age_days=scope.max_evidence_age_days,
+            data_gaps=data_gaps,
+            accepted_calculations=_accepted_calculations(state),
+        )
         published = await synthesize_report(synthesis_actor, prepared)
         completion = (
             IncompleteResearch(
@@ -886,12 +836,6 @@ def _accepted_round_batches(
 ) -> tuple[tuple[CoordinationRound, AcceptedBatch], ...]:
     """Pair every dispatch manifest with its exact accepted batch outcomes."""
     accepted_batches = _accepted_batches(state)
-    overflow_terminal = (
-        state.get("coordination_stop_reason") == CALCULATION_STATE_LIMIT
-        and state.get("coordination_finished") is True
-        and state.get("active_batch") is None
-        and state.get("staged_contributions") == {}
-    )
     dispatch_rounds = tuple(
         round_ for round_ in _coordination_rounds(state) if round_.kind == "dispatch"
     )
@@ -900,16 +844,11 @@ def _accepted_round_batches(
         for round_ in dispatch_rounds
         if round_.batch_id is None or round_.batch_id not in accepted_batches
     )
-    if overflow_terminal:
-        if not dispatch_rounds or missing_batch_rounds != (dispatch_rounds[-1],):
-            raise CoordinationInvariantError("Calculation overflow state is invalid")
-    elif missing_batch_rounds:
+    if missing_batch_rounds:
         raise CoordinationInvariantError("Accepted Batch is missing")
     ordered: list[tuple[CoordinationRound, AcceptedBatch]] = []
     for round_ in dispatch_rounds:
         if round_.batch_id is None or round_.batch_id not in accepted_batches:
-            if overflow_terminal:
-                continue
             raise CoordinationInvariantError("Accepted Batch is missing")
         accepted = accepted_batches[round_.batch_id]
         if {outcome.task_id for outcome in accepted.outcomes} != {
@@ -931,8 +870,6 @@ def _active_batch_dump(batch: ActiveBatch) -> dict[str, Any]:
                 "objective": task.objective,
                 "specialist_id": task.specialist_id,
                 "context_task_ids": list(task.context_task_ids),
-                "context_json_bytes": task.context_json_bytes,
-                "context_json_sha256": task.context_json_sha256,
             }
             for task in batch.tasks
         ],
@@ -959,8 +896,6 @@ def _active_batch_load(value: Mapping[str, object]) -> ActiveBatch:
         objective = record.get("objective")
         specialist_id = record.get("specialist_id")
         context_task_ids = record.get("context_task_ids")
-        context_json_bytes = record.get("context_json_bytes")
-        context_json_sha256 = record.get("context_json_sha256")
         if (
             not isinstance(task_id, str)
             or not isinstance(objective, str)
@@ -970,8 +905,6 @@ def _active_batch_load(value: Mapping[str, object]) -> ActiveBatch:
                 isinstance(context_task_id, str)
                 for context_task_id in cast(list[object], context_task_ids)
             )
-            or not isinstance(context_json_bytes, int)
-            or not isinstance(context_json_sha256, str)
         ):
             raise TypeError("Agent active batch is invalid")
         tasks.append(
@@ -980,8 +913,6 @@ def _active_batch_load(value: Mapping[str, object]) -> ActiveBatch:
                 objective=objective,
                 specialist_id=specialist_id,
                 context_task_ids=tuple(cast(list[str], context_task_ids)),
-                context_json_bytes=context_json_bytes,
-                context_json_sha256=context_json_sha256,
             )
         )
     return ActiveBatch(id=batch_id, tasks=tuple(tasks), round=round_value)
@@ -994,8 +925,6 @@ def _accepted_task_dump(task: AcceptedTask) -> dict[str, Any]:
         "objective": task.objective,
         "specialist_id": task.specialist_id,
         "context_task_ids": list(task.context_task_ids),
-        "context_json_bytes": task.context_json_bytes,
-        "context_json_sha256": task.context_json_sha256,
     }
 
 
@@ -1005,8 +934,6 @@ def _accepted_task_load(value: Mapping[str, object]) -> AcceptedTask:
     objective = value.get("objective")
     specialist_id = value.get("specialist_id")
     context_task_ids = value.get("context_task_ids")
-    context_json_bytes = value.get("context_json_bytes")
-    context_json_sha256 = value.get("context_json_sha256")
     if (
         not isinstance(task_id, str)
         or not isinstance(objective, str)
@@ -1016,8 +943,6 @@ def _accepted_task_load(value: Mapping[str, object]) -> AcceptedTask:
             isinstance(context_task_id, str)
             for context_task_id in cast(list[object], context_task_ids)
         )
-        or not isinstance(context_json_bytes, int)
-        or not isinstance(context_json_sha256, str)
     ):
         raise TypeError("Agent dispatched Task is invalid")
     return AcceptedTask(
@@ -1025,6 +950,4 @@ def _accepted_task_load(value: Mapping[str, object]) -> AcceptedTask:
         objective=objective,
         specialist_id=specialist_id,
         context_task_ids=tuple(cast(list[str], context_task_ids)),
-        context_json_bytes=context_json_bytes,
-        context_json_sha256=context_json_sha256,
     )

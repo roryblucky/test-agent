@@ -10,7 +10,7 @@ import pytest
 from pydantic import ValidationError
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import IncompleteToolCall, ModelHTTPError
-from pydantic_ai.messages import ModelRequest, ModelResponse
+from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -30,7 +30,6 @@ from app.langgraph_v2.agent_batch import (
     SpecialistResult,
     SpecialistTaskInput,
     SpecialistUsage,
-    StructuredOutputInvalid,
     TaskFailed,
     TaskProposal,
     TaskSkillPins,
@@ -252,12 +251,8 @@ def test_initial_dispatch_intersects_registered_tenant_and_scope_eligibility() -
     assert batch.tasks[0].objective == "Assess the current market outlook."
 
 
-def test_task_objective_normalization_is_single_line_nfc_and_byte_bounded() -> None:
+def test_task_objective_normalization_is_single_line_and_nfc() -> None:
     assert normalize_task_objective("Cafe\u0301\r\n\tanalysis\x00") == "Café analysis"
-    assert normalize_task_objective("é" * 256) == "é" * 256
-
-    with pytest.raises(ValueError, match="Task objective exceeds 512 UTF-8 bytes"):
-        normalize_task_objective("é" * 256 + "a")
 
 
 def test_initial_dispatch_accepts_eight_independent_tasks_in_manifest_order() -> None:
@@ -706,20 +701,6 @@ def test_calculation_contribution_enforces_eight_items_and_idempotent_ids() -> N
         )
 
 
-@pytest.mark.parametrize("size", [16 * 1024, 16 * 1024 + 1])
-def test_specialist_finding_canonical_size_has_exact_boundary(size: int) -> None:
-    summary = "x" * (size - len('{"evidence_ids":[],"summary":""}'))
-    finding = SpecialistFindingDraft(summary=summary)
-
-    if size == 16 * 1024:
-        assert finding.canonical_json_size() == size
-    else:
-        with pytest.raises(
-            StructuredOutputInvalid, match="Specialist finding exceeds 16 KiB"
-        ):
-            finding.require_canonical_size()
-
-
 def test_specialist_finding_rejects_more_than_16_evidence_ids() -> None:
     with pytest.raises(ValidationError):
         SpecialistFindingDraft(
@@ -735,74 +716,6 @@ def test_specialist_finding_accepts_exactly_16_evidence_ids() -> None:
     )
 
     assert len(finding.evidence_ids) == 16
-
-
-def test_specialist_result_canonical_size_includes_data_gaps() -> None:
-    gap = DataGap(
-        requested_coverage="Apple revenue",
-        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-        provenance=GapProvenance(
-            unavailability_id="unavailable-1",
-            tool_id="filing-tool",
-            source="filing",
-            observed_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
-        ),
-    )
-    template = SpecialistResult(summary="", data_gaps=(gap,))
-    exact = SpecialistResult(
-        summary="x" * (16 * 1024 - template.canonical_json_size()),
-        data_gaps=(gap,),
-    )
-
-    assert exact.canonical_json_size() == 16 * 1024
-    exact.require_canonical_size()
-    with pytest.raises(
-        StructuredOutputInvalid, match="Specialist result exceeds 16 KiB"
-    ):
-        SpecialistResult(
-            summary=f"{exact.summary}x", data_gaps=(gap,)
-        ).require_canonical_size()
-
-
-@pytest.mark.asyncio
-async def test_execute_specialist_enforces_the_16_kib_boundary_before_contribution() -> (
-    None
-):
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
-    batch = accept_initial_dispatch(
-        _dispatch(),
-        request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=scope_descriptors,
-    )
-    template = SpecialistResult(summary="")
-    exact = SpecialistFindingDraft(
-        summary="x" * (16 * 1024 - template.canonical_json_size())
-    )
-    contribution = await execute_specialist(
-        batch.tasks[0],
-        batch_id=batch.id,
-        registry=_registry(finding=exact),
-        scope_descriptors=scope_descriptors,
-        context=_context(task_id=batch.tasks[0].id),
-    )
-
-    assert isinstance(contribution.outcome, TaskSucceeded)
-    assert contribution.outcome.result.summary == exact.summary
-
-    too_large = SpecialistFindingDraft(summary=f"{exact.summary}x")
-    failed = await execute_specialist(
-        batch.tasks[0],
-        batch_id=batch.id,
-        registry=_registry(finding=too_large),
-        scope_descriptors=scope_descriptors,
-        context=_context(task_id=batch.tasks[0].id),
-    )
-
-    assert failed.attempt == 3
-    assert failed.outcome == TaskFailed(task_id=batch.tasks[0].id)
 
 
 @pytest.mark.asyncio
@@ -935,80 +848,6 @@ async def test_execute_specialist_returns_task_failed_after_third_retry() -> Non
 
 
 @pytest.mark.asyncio
-async def test_execute_specialist_feeds_validation_failure_to_a_fresh_attempt() -> None:
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
-    inputs: list[SpecialistTaskInput] = []
-    failed_message = ModelRequest(parts=[])
-
-    class _ValidationRetryingActor:
-        def __init__(self, attempt: int) -> None:
-            self.attempt = attempt
-
-        async def run(
-            self,
-            input: SpecialistTaskInput,
-            *,
-            usage: RunUsage | None = None,
-            usage_limits: UsageLimits | None = None,
-        ) -> SpecialistAttempt:
-            del usage, usage_limits
-            inputs.append(input)
-            if self.attempt == 1:
-                return SpecialistAttempt(
-                    finding=SpecialistFindingDraft(summary="x" * (16 * 1024)),
-                    messages=(failed_message,),
-                )
-            return SpecialistAttempt(
-                finding=SpecialistFindingDraft(summary="accepted"),
-            )
-
-    actor_count = 0
-
-    def factory(
-        tools: tuple[object, ...],
-        tool_capture: object,
-        skill_invocation: object,
-    ) -> _ValidationRetryingActor:
-        nonlocal actor_count
-        del tools, tool_capture, skill_invocation
-        actor_count += 1
-        return _ValidationRetryingActor(actor_count)
-
-    registry = SpecialistRegistry(
-        registrations=(
-            SpecialistRegistration(id="market-data", actor_factory=factory),
-        ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-    )
-    batch = accept_initial_dispatch(
-        _dispatch(),
-        request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
-    )
-    diagnostics = SpecialistExecutionDiagnostics()
-
-    contribution = await execute_specialist(
-        batch.tasks[0],
-        batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
-        context=_context(task_id=batch.tasks[0].id),
-        diagnostics=diagnostics,
-    )
-
-    assert contribution.attempt == 2
-    assert inputs[0].validation_feedback is None
-    assert inputs[1].validation_feedback == (
-        "Return one valid structured Specialist finding within all stated "
-        "output limits."
-    )
-    assert diagnostics.failed_attempts[0].messages == (failed_message,)
-
-
-@pytest.mark.asyncio
 async def test_execute_specialist_promotes_only_the_accepted_attempt_calculations() -> (
     None
 ):
@@ -1061,8 +900,8 @@ async def test_execute_specialist_promotes_only_the_accepted_attempt_calculation
             )
             return SpecialistAttempt(
                 finding=SpecialistFindingDraft(
-                    summary="x" * (16 * 1024) if self.attempt == 1 else "accepted",
-                    evidence_ids=() if self.attempt == 1 else ("evidence-1",),
+                    summary="accepted",
+                    evidence_ids=("missing",) if self.attempt == 1 else ("evidence-1",),
                 ),
                 calculations=(calculation,),
                 evidence=(
@@ -1270,56 +1109,6 @@ async def test_execute_specialist_reports_priced_model_usage(
 
 
 @pytest.mark.asyncio
-async def test_evidence_cache_overflow_stages_task_failed_without_evidence_ids() -> (
-    None
-):
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
-    oversized = EvidenceEnvelope(
-        id="evidence-too-large",
-        tenant_id="tenant-a",
-        request_id="request-1",
-        task_id="task-placeholder",
-        source="filing",
-        source_url="https://example.test/filing",
-        title="Annual filing",
-        body="x" * (16 * 1024 + 1),
-        excerpt="Too large.",
-        as_of_date=date(2026, 9, 6),
-    )
-    specialist = _Specialist(
-        finding=SpecialistFindingDraft(
-            summary="Oversized evidence",
-            evidence_ids=(oversized.id,),
-        )
-    )
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-        tenant_eligible_ids=frozenset({"market-data"}),
-    )
-    batch = accept_initial_dispatch(
-        _dispatch(),
-        request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
-    )
-    specialist.evidence = (oversized.model_copy(update={"task_id": batch.tasks[0].id}),)
-
-    contribution = await execute_specialist(
-        batch.tasks[0],
-        batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
-        catalog=RequestEvidenceCatalog(),
-        context=_context(task_id=batch.tasks[0].id),
-    )
-
-    assert contribution.attempt == 1
-    assert contribution.outcome == TaskFailed(task_id=batch.tasks[0].id)
-
-
-@pytest.mark.asyncio
 async def test_execute_specialist_persists_only_activated_skill_pins() -> None:
     scope_descriptors = (
         SpecialistDescriptor(id="market-data", description="Market data"),
@@ -1391,58 +1180,6 @@ async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record(
     assert gap.provenance.unavailability_id == "unavailable-1"
     assert gap.provenance.tool_id == "filing-tool"
     assert len(contribution.outcome.result.data_gaps) == 1
-
-
-@pytest.mark.asyncio
-async def test_execute_specialist_checks_result_size_after_deriving_data_gaps() -> None:
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
-    batch = accept_initial_dispatch(
-        _dispatch(),
-        request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=scope_descriptors,
-    )
-    record = _unavailability_record(task_id=batch.tasks[0].id)
-    gap = DataGap(
-        requested_coverage=record.requested_coverage,
-        reason=record.reason,
-        provenance=GapProvenance(
-            unavailability_id=record.id,
-            tool_id=record.tool_id,
-            source=record.source,
-            observed_at=record.observed_at,
-        ),
-    )
-    template = SpecialistResult(summary="", data_gaps=(gap,))
-    exact = SpecialistFindingDraft(
-        summary="x" * (16 * 1024 - template.canonical_json_size())
-    )
-
-    contribution = await execute_specialist(
-        batch.tasks[0],
-        batch_id=batch.id,
-        registry=_gap_registry((record,), finding=exact),
-        scope_descriptors=scope_descriptors,
-        context=_context(task_id=batch.tasks[0].id),
-    )
-
-    assert isinstance(contribution.outcome, TaskSucceeded)
-    assert contribution.outcome.result.canonical_json_size() == 16 * 1024
-    failed = await execute_specialist(
-        batch.tasks[0],
-        batch_id=batch.id,
-        registry=_gap_registry(
-            (record,),
-            finding=SpecialistFindingDraft(summary=f"{exact.summary}x"),
-        ),
-        scope_descriptors=scope_descriptors,
-        context=_context(task_id=batch.tasks[0].id),
-    )
-
-    assert failed.attempt == 3
-    assert failed.outcome == TaskFailed(task_id=batch.tasks[0].id)
 
 
 @pytest.mark.asyncio
@@ -1534,7 +1271,7 @@ async def test_execute_specialist_rejects_ineligible_data_gap_provenance(
         )
 
 
-def test_data_gap_enforces_bounds_and_hides_internal_provenance() -> None:
+def test_data_gap_hides_internal_provenance_and_enforces_count_limit() -> None:
     exact = DataGap(
         requested_coverage="🐍" * 64,
         reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
@@ -1551,25 +1288,12 @@ def test_data_gap_enforces_bounds_and_hides_internal_provenance() -> None:
         "reason": ToolUnavailableReason.SOURCE_UNREACHABLE,
         "observed_at": datetime(2026, 9, 6, 12, tzinfo=UTC),
     }
-    with pytest.raises(ValidationError, match="Data Gap coverage"):
-        DataGap(
-            requested_coverage="🐍" * 65,
-            reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-            provenance=exact.provenance,
-        )
-    with pytest.raises(ValidationError, match="Data Gap identifier"):
-        GapProvenance(
-            unavailability_id="u" * 65,
-            tool_id="tool",
-            observed_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
-        )
-    with pytest.raises(ValidationError, match="Data Gap source"):
-        GapProvenance(
-            unavailability_id="gap",
-            tool_id="tool",
-            source="🐍" * 65,
-            observed_at=datetime(2026, 9, 6, 12, tzinfo=UTC),
-        )
+    accepted = SpecialistResult(
+        summary="Maximum gaps",
+        data_gaps=tuple(exact.model_copy() for _ in range(8)),
+    )
+
+    assert len(accepted.data_gaps) == 8
     with pytest.raises(ValidationError):
         SpecialistResult(
             summary="Too many gaps",

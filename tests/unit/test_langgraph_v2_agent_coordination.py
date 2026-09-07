@@ -1,6 +1,5 @@
 """Rolling Coordination Round acceptance and projection coverage."""
 
-import json
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -10,7 +9,6 @@ from app.langgraph_v2.agent_batch import (
     AcceptedBatch,
     ActiveBatch,
     DispatchBatch,
-    PriorResultView,
     SpecialistRegistration,
     SpecialistRegistry,
     SpecialistResult,
@@ -21,12 +19,8 @@ from app.langgraph_v2.agent_batch import (
     task_id_for,
 )
 from app.langgraph_v2.agent_coordination import (
-    MAX_COORDINATOR_CONTEXT_BYTES,
-    MAX_COORDINATOR_RESULT_BYTES,
-    MAX_SPECIALIST_CONTEXT_BYTES,
     AcceptedCoordinationDispatch,
     CoordinationCandidateRejected,
-    CoordinationContextLimitExceeded,
     CoordinationInvariantError,
     CoordinationRound,
     CoordinationStopped,
@@ -169,7 +163,9 @@ def test_follow_up_dispatch_projects_and_materializes_only_prior_successes() -> 
     assert first.round.revision == 1
     assert second.round.revision == 2
     assert coordinator_input.prior_results[0].task_id == first.active_batch.tasks[0].id
-    assert coordinator_input.prior_results[0].summary == "The first-round market finding."
+    assert (
+        coordinator_input.prior_results[0].summary == "The first-round market finding."
+    )
     assert context == coordinator_input.prior_results
 
 
@@ -373,64 +369,6 @@ async def test_schema_invalid_actor_output_gets_one_repair_then_stops() -> None:
     assert actor.calls == 2
 
 
-def test_context_serialization_change_after_acceptance_is_fatal() -> None:
-    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
-    first = accept_coordination_dispatch(
-        DispatchBatch(
-            kind="dispatch",
-            tasks=(
-                TaskProposal(
-                    specialist_id="market-data",
-                    objective="Establish the premise.",
-                ),
-            ),
-        ),
-        request_id="request-1",
-        rounds=(),
-        accepted_batches={},
-        registry=_registry(),
-        scope_descriptors=scope,
-    )
-    accepted = _accepted_batch(first.active_batch.id, first.active_batch.tasks[0].id)
-    second = accept_coordination_dispatch(
-        DispatchBatch(
-            kind="dispatch",
-            tasks=(
-                TaskProposal(
-                    specialist_id="market-data",
-                    objective="Use the premise.",
-                    context_task_ids=(first.active_batch.tasks[0].id,),
-                ),
-            ),
-        ),
-        request_id="request-1",
-        rounds=(first.round,),
-        accepted_batches={first.active_batch.id: accepted},
-        registry=_registry(),
-        scope_descriptors=scope,
-    )
-    changed = accepted.model_copy(
-        update={
-            "outcomes": (
-                TaskSucceeded(
-                    task_id=first.active_batch.tasks[0].id,
-                    result=SpecialistResult(
-                        summary="X" * len("The first-round market finding.")
-                    ),
-                ),
-            )
-        }
-    )
-
-    with pytest.raises(CoordinationInvariantError, match="changed after validation"):
-        materialize_specialist_context(
-            second.active_batch.tasks[0],
-            current_round=second.round.revision,
-            rounds=(first.round,),
-            accepted_batches={first.active_batch.id: changed},
-        )
-
-
 def test_coordination_acceptance_persists_canonical_objectives_and_round_manifest() -> (
     None
 ):
@@ -562,10 +500,14 @@ def test_task_limit_takes_precedence_when_all_32_tasks_are_accepted() -> None:
 def test_checkpoint_round_validation_rejects_a_fifth_dispatch_round() -> None:
     rounds, _ = _accepted_rounds(tasks_per_round=1, count=4)
     fifth_finish = accept_coordination_finish(request_id="request-1", rounds=rounds)
-    fifth_task = rounds[-1].tasks[0].model_copy(
-        update={
-            "id": task_id_for(request_id="request-1", round=5, dispatch_order=0)
-        }
+    fifth_task = (
+        rounds[-1]
+        .tasks[0]
+        .model_copy(
+            update={
+                "id": task_id_for(request_id="request-1", round=5, dispatch_order=0)
+            }
+        )
     )
     fifth_dispatch = fifth_finish.model_copy(
         update={
@@ -576,19 +518,46 @@ def test_checkpoint_round_validation_rejects_a_fifth_dispatch_round() -> None:
     )
 
     with pytest.raises(CoordinationInvariantError, match="dispatch limit"):
-        validate_coordination_rounds(
-            rounds + (fifth_dispatch,), request_id="request-1"
-        )
+        validate_coordination_rounds(rounds + (fifth_dispatch,), request_id="request-1")
 
 
-def test_context_reference_count_and_specialist_context_bytes_fail_before_send() -> (
-    None
-):
+def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() -> None:
     scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
-    first, accepted_batches = _accepted_rounds(tasks_per_round=5, count=1)
+    first, accepted_batches = _accepted_rounds(tasks_per_round=8, count=1)
     first_round = first[0]
     first_batch = accepted_batches[first_round.batch_id or ""]
     context_ids = tuple(outcome.task_id for outcome in first_batch.outcomes)
+    accepted = accept_coordination_dispatch(
+        DispatchBatch(
+            kind="dispatch",
+            tasks=(
+                TaskProposal(
+                    specialist_id="market-data",
+                    objective="Use all accepted context references.",
+                    context_task_ids=context_ids,
+                ),
+            ),
+        ),
+        request_id="request-1",
+        rounds=first,
+        accepted_batches=accepted_batches,
+        registry=_registry(),
+        scope_descriptors=scope,
+    )
+
+    assert accepted.active_batch.tasks[0].context_task_ids == context_ids
+    assert (
+        tuple(
+            result.task_id
+            for result in materialize_specialist_context(
+                accepted.active_batch.tasks[0],
+                current_round=accepted.round.revision,
+                rounds=first,
+                accepted_batches=accepted_batches,
+            )
+        )
+        == context_ids
+    )
 
     with pytest.raises(CoordinationCandidateRejected, match="Task context is invalid"):
         accept_coordination_dispatch(
@@ -598,8 +567,7 @@ def test_context_reference_count_and_specialist_context_bytes_fail_before_send()
                     TaskProposal.model_construct(
                         specialist_id="market-data",
                         objective="Too many context references.",
-                        context_task_ids=context_ids
-                        + ("missing-1", "missing-2", "missing-3", "missing-4"),
+                        context_task_ids=context_ids + ("missing",),
                     ),
                 ),
             ),
@@ -609,214 +577,3 @@ def test_context_reference_count_and_specialist_context_bytes_fail_before_send()
             registry=_registry(),
             scope_descriptors=scope,
         )
-
-    rounds, accepted_batches = _accepted_rounds(
-        tasks_per_round=5,
-        count=1,
-        summary_for=lambda _round, _task: "x" * 15_900,
-    )
-    first_round = rounds[0]
-    batch = accepted_batches[first_round.batch_id or ""]
-    with pytest.raises(
-        CoordinationCandidateRejected, match="Specialist context exceeds 64 KiB"
-    ):
-        accept_coordination_dispatch(
-            DispatchBatch(
-                kind="dispatch",
-                tasks=(
-                    TaskProposal(
-                        specialist_id="market-data",
-                        objective="Use all prior results.",
-                        context_task_ids=tuple(
-                            outcome.task_id for outcome in batch.outcomes
-                        ),
-                    ),
-                ),
-            ),
-            request_id="request-1",
-            rounds=rounds,
-            accepted_batches=accepted_batches,
-            registry=_registry(),
-            scope_descriptors=scope,
-        )
-
-
-def test_coordinator_projection_rejects_single_and_aggregate_context_limits() -> None:
-    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
-    rounds, accepted_batches = _accepted_rounds(
-        tasks_per_round=1,
-        count=1,
-        summary_for=lambda _round, _task: "x" * MAX_COORDINATOR_RESULT_BYTES,
-    )
-    with pytest.raises(CoordinationContextLimitExceeded):
-        project_coordinator_input(
-            standalone_query="Market outlook",
-            intent="market_outlook",
-            specialist_descriptors=scope,
-            rounds=rounds,
-            accepted_batches=accepted_batches,
-        )
-
-
-def test_specialist_context_byte_limit_accepts_exactly_64_kib_and_rejects_one_more() -> (
-    None
-):
-    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
-
-    def summaries_for_context_size(target: int) -> tuple[str, ...]:
-        views = tuple(
-            PriorResultView(
-                task_id=task_id_for(
-                    request_id="request-1", round=1, dispatch_order=index
-                ),
-                summary="",
-            )
-            for index in range(5)
-        )
-        baseline = len(
-            json.dumps(
-                [view.model_dump(mode="json") for view in views],
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        quotient, remainder = divmod(target - baseline, len(views))
-        return tuple("x" * (quotient + (index < remainder)) for index in range(5))
-
-    def dispatch_with_context_size(target: int) -> AcceptedCoordinationDispatch:
-        summaries = summaries_for_context_size(target)
-        rounds, accepted_batches = _accepted_rounds(
-            tasks_per_round=5,
-            count=1,
-            summary_for=lambda _round, task: summaries[task],
-        )
-        first_round = rounds[0]
-        batch = accepted_batches[first_round.batch_id or ""]
-        return accept_coordination_dispatch(
-            DispatchBatch(
-                kind="dispatch",
-                tasks=(
-                    TaskProposal(
-                        specialist_id="market-data",
-                        objective="Use the exact prior context.",
-                        context_task_ids=tuple(
-                            outcome.task_id for outcome in batch.outcomes
-                        ),
-                    ),
-                ),
-            ),
-            request_id="request-1",
-            rounds=rounds,
-            accepted_batches=accepted_batches,
-            registry=_registry(),
-            scope_descriptors=scope,
-        )
-
-    exact = dispatch_with_context_size(MAX_SPECIALIST_CONTEXT_BYTES)
-    assert exact.active_batch.tasks[0].context_json_bytes == MAX_SPECIALIST_CONTEXT_BYTES
-
-    with pytest.raises(
-        CoordinationCandidateRejected, match="Specialist context exceeds 64 KiB"
-    ):
-        dispatch_with_context_size(MAX_SPECIALIST_CONTEXT_BYTES + 1)
-
-
-def test_coordinator_projection_byte_limits_accept_exactly_and_reject_one_more() -> (
-    None
-):
-    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
-
-    def summary_for_exact_result_size(target: int, task_index: int) -> str:
-        task_id = task_id_for(
-            request_id="request-1", round=1, dispatch_order=task_index
-        )
-        baseline = len(
-            json.dumps(
-                PriorResultView(task_id=task_id, summary="").model_dump(mode="json"),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        return "x" * (target - baseline)
-
-    rounds, accepted_batches = _accepted_rounds(
-        tasks_per_round=1,
-        count=1,
-        summary_for=lambda _round, task: summary_for_exact_result_size(
-            MAX_COORDINATOR_RESULT_BYTES, task
-        ),
-    )
-    assert project_coordinator_input(
-        standalone_query="Market outlook",
-        intent="market_outlook",
-        specialist_descriptors=scope,
-        rounds=rounds,
-        accepted_batches=accepted_batches,
-    ).prior_results
-
-    rounds, accepted_batches = _accepted_rounds(
-        tasks_per_round=1,
-        count=1,
-        summary_for=lambda _round, task: summary_for_exact_result_size(
-            MAX_COORDINATOR_RESULT_BYTES + 1, task
-        ),
-    )
-    with pytest.raises(CoordinationContextLimitExceeded):
-        project_coordinator_input(
-            standalone_query="Market outlook",
-            intent="market_outlook",
-            specialist_descriptors=scope,
-            rounds=rounds,
-            accepted_batches=accepted_batches,
-        )
-
-    def summaries_for_aggregate_size(target: int) -> tuple[str, ...]:
-        views = tuple(
-            PriorResultView(
-                task_id=task_id_for(
-                    request_id="request-1", round=1, dispatch_order=index
-                ),
-                summary="",
-            )
-            for index in range(8)
-        )
-        baseline = len(
-            json.dumps(
-                {
-                    "prior_results": [view.model_dump(mode="json") for view in views],
-                    "failed_tasks": [],
-                    "data_gaps": [],
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        quotient, remainder = divmod(target - baseline, len(views))
-        return tuple("x" * (quotient + (index < remainder)) for index in range(8))
-
-    def projection_with_aggregate_size(target: int) -> CoordinatorInput:
-        summaries = summaries_for_aggregate_size(target)
-        rounds, accepted_batches = _accepted_rounds(
-            tasks_per_round=8,
-            count=1,
-            summary_for=lambda _round, task: summaries[task],
-        )
-        return project_coordinator_input(
-            standalone_query="Market outlook",
-            intent="market_outlook",
-            specialist_descriptors=scope,
-            rounds=rounds,
-            accepted_batches=accepted_batches,
-        )
-
-    assert (
-        len(
-            projection_with_aggregate_size(MAX_COORDINATOR_CONTEXT_BYTES).prior_results
-        )
-        == 8
-    )
-    with pytest.raises(CoordinationContextLimitExceeded):
-        projection_with_aggregate_size(MAX_COORDINATOR_CONTEXT_BYTES + 1)

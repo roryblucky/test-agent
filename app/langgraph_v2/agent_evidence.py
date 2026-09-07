@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import re
 import threading
 from collections.abc import Awaitable, Callable, Collection, Iterable
@@ -14,7 +13,7 @@ from enum import StrEnum
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_ai import RunContext, ToolReturn
 
 from app.langgraph_v2.calculations import (
@@ -29,20 +28,9 @@ _EVIDENCE_MARKER = re.compile(r"\[\[E:([1-9][0-9]*)\]\]")
 _MARKER_LIKE = re.compile(r"\[\[\s*[Ee]\s*:")
 _CALCULATION_MARKER = re.compile(r"\[\[C:([1-9][0-9]*)\]\]")
 _CALCULATION_MARKER_LIKE = re.compile(r"\[\[\s*[Cc]\s*:")
-_TOOL_RETURN_MAX_BYTES = 4 * 1024
-_EVIDENCE_BODY_MAX_BYTES = 16 * 1024
-_REQUEST_EVIDENCE_BODY_MAX_BYTES = 8 * 1024 * 1024
-DATA_GAP_TEXT_MAX_BYTES = 256
-DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS = 64
 TOOL_TIMEOUT_SECONDS = 20
-_UNUSABLE_COVERAGE = "Requested coverage could not be safely projected."
 _MAX_PREPARED_EVIDENCE = 64
 _MAX_PREPARED_CALCULATIONS = 32
-_MAX_PREPARED_CALCULATION_BYTES = 2 * 1024
-
-
-class PreparedSynthesisLimitExceeded(ValueError):
-    """Stop before a bounded Synthesis projection would exceed its limits."""
 
 
 class SynthesisCandidateRejected(ValueError):
@@ -60,35 +48,6 @@ class SynthesisOutputInvalid(SynthesisCandidateRejected):
 
     def __init__(self) -> None:
         super().__init__(("Synthesis report is invalid",))
-
-
-def require_data_gap_text(value: str, *, label: str) -> str:
-    """Return a Data Gap text field only when it fits its shared byte bound."""
-    if len(value.encode("utf-8")) > DATA_GAP_TEXT_MAX_BYTES:
-        raise ValueError(f"{label} exceeds {DATA_GAP_TEXT_MAX_BYTES} UTF-8 bytes")
-    return value
-
-
-def require_data_gap_identifier(value: str, *, label: str) -> str:
-    """Return an opaque Data Gap identifier only when it fits its shared bound."""
-    if (
-        not value
-        or not value.isascii()
-        or len(value) > DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS
-    ):
-        raise ValueError(
-            f"{label} must contain at most "
-            f"{DATA_GAP_IDENTIFIER_MAX_ASCII_CHARACTERS} ASCII characters"
-        )
-    return value
-
-
-def _is_projectable_data_gap_text(value: str) -> bool:
-    try:
-        require_data_gap_text(value, label="Data Gap text")
-    except ValueError:
-        return False
-    return bool(value)
 
 
 class ToolUnavailableReason(StrEnum):
@@ -113,7 +72,7 @@ class ToolTelemetryStatus(StrEnum):
 class ToolUnavailable(BaseModel):
     """Bounded expected inability returned to the active Specialist."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(frozen=True)
 
     kind: Literal["tool_unavailable"] = "tool_unavailable"
     reason: ToolUnavailableReason
@@ -123,22 +82,17 @@ class ToolUnavailable(BaseModel):
 class DataGapView(BaseModel):
     """Safe Data Gap projection for actor prompts and publication."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(frozen=True)
 
     requested_coverage: str = Field(min_length=1)
     reason: ToolUnavailableReason
     observed_at: datetime
 
-    @field_validator("requested_coverage")
-    @classmethod
-    def _validate_coverage(cls, value: str) -> str:
-        return require_data_gap_text(value, label="Data Gap coverage")
-
 
 class ToolUnavailabilityRecord(BaseModel):
     """App-only provenance for one expected unavailable Tool outcome."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(frozen=True)
 
     id: str = Field(min_length=1)
     tenant_id: str
@@ -152,23 +106,6 @@ class ToolUnavailabilityRecord(BaseModel):
     reason: ToolUnavailableReason
     requested_coverage: str = Field(min_length=1)
 
-    @field_validator("id", "tool_id")
-    @classmethod
-    def _validate_identifier(cls, value: str) -> str:
-        return require_data_gap_identifier(value, label="Data Gap identifier")
-
-    @field_validator("source")
-    @classmethod
-    def _validate_source(cls, value: str | None) -> str | None:
-        if value is not None:
-            require_data_gap_text(value, label="Data Gap source")
-        return value
-
-    @field_validator("requested_coverage")
-    @classmethod
-    def _validate_requested_coverage(cls, value: str) -> str:
-        return require_data_gap_text(value, label="Data Gap coverage")
-
 
 @dataclass(frozen=True)
 class ExpectedToolUnavailability:
@@ -180,6 +117,10 @@ class ExpectedToolUnavailability:
 
 class _ProviderTimeoutEscaped(Exception):
     """Keep a provider-raised timeout distinct from binding-owned timeout."""
+
+
+class _ProviderResponseUnusable(Exception):
+    """Keep a returned value that fails the registered success contract typed."""
 
 
 class EvidenceEnvelope(BaseModel):
@@ -195,13 +136,9 @@ class EvidenceEnvelope(BaseModel):
     source_url: str = Field(min_length=1)
     title: str = Field(min_length=1)
     body: str = Field(min_length=1)
-    excerpt: str = Field(min_length=1, max_length=4096)
+    excerpt: str = Field(min_length=1)
     as_of_date: date
     raw_provider_payload: str | None = None
-
-
-class EvidenceCacheCapacityExceeded(ValueError):
-    """Reject a request-local Evidence write that would exceed a hard cache cap."""
 
 
 class EvidenceReferenceInvalid(ValueError):
@@ -242,27 +179,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _tool_return_size(value: object) -> int:
-    return len(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-
-
-def _bounded_unavailable(
-    *,
-    reason: ToolUnavailableReason,
-    requested_coverage: str,
-) -> ToolUnavailable:
-    unavailable = ToolUnavailable(
-        reason=reason,
-        requested_coverage=requested_coverage,
-    )
-    if _tool_return_size(unavailable.model_dump(mode="json")) <= _TOOL_RETURN_MAX_BYTES:
-        return unavailable
-    return ToolUnavailable(
-        reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
-        requested_coverage=_UNUSABLE_COVERAGE,
-    )
-
-
 def _unavailability_record(
     *,
     context: EvidenceInvocationContext,
@@ -278,8 +194,6 @@ def _unavailability_record(
     observed_at = now()
     if observed_at.tzinfo is None:
         raise ValueError("Tool observation time must be timezone-aware")
-    coverage_is_safe = _is_projectable_data_gap_text(unavailable.requested_coverage)
-    source_is_safe = source is None or _is_projectable_data_gap_text(source)
     return ToolUnavailabilityRecord(
         id=f"unavailable_{uuid4().hex}",
         tenant_id=context.tenant_id,
@@ -288,16 +202,10 @@ def _unavailability_record(
         attempt=context.attempt,
         tool_call_id=tool_call_id,
         tool_id=tool_id,
-        source=source if source_is_safe else None,
+        source=source,
         observed_at=observed_at.astimezone(UTC),
-        reason=(
-            unavailable.reason
-            if coverage_is_safe and source_is_safe
-            else ToolUnavailableReason.RESPONSE_UNUSABLE
-        ),
-        requested_coverage=(
-            unavailable.requested_coverage if coverage_is_safe else _UNUSABLE_COVERAGE
-        ),
+        reason=unavailable.reason,
+        requested_coverage=unavailable.requested_coverage,
     )
 
 
@@ -318,16 +226,19 @@ def bind_evidence_tool(
     now: Callable[[], datetime] = _utc_now,
 ) -> Callable[..., Awaitable[ToolReturn[dict[str, str] | ToolUnavailable]]]:
     """Bind one frozen Scope-limited Evidence reader for a Specialist run."""
-    require_data_gap_identifier(tool_id, label="Evidence Tool identifier")
     expected_types = tuple(item.exception_type for item in expected_unavailability)
     if len(set(expected_types)) != len(expected_types):
         raise ValueError("Expected Tool unavailability registration conflicts")
 
     async def provider_result(source: str, query: str) -> EvidenceEnvelope:
         try:
-            return await provider(source, query)
+            returned = await provider(source, query)
         except TimeoutError as error:
             raise _ProviderTimeoutEscaped from error
+        try:
+            return EvidenceEnvelope.model_validate(returned)
+        except ValidationError as error:
+            raise _ProviderResponseUnusable from error
 
     def unavailable_result(
         *,
@@ -336,18 +247,12 @@ def bind_evidence_tool(
         query: str,
         run_context: RunContext[None],
     ) -> ToolReturn[dict[str, str] | ToolUnavailable]:
-        source_is_safe = _is_projectable_data_gap_text(source)
-        unavailable = _bounded_unavailable(
-            reason=(
-                reason if source_is_safe else ToolUnavailableReason.RESPONSE_UNUSABLE
-            ),
-            requested_coverage=query,
-        )
+        unavailable = ToolUnavailable(reason=reason, requested_coverage=query)
         record = _unavailability_record(
             context=context,
             run_context=run_context,
             tool_id=tool_id,
-            source=source if source_is_safe else None,
+            source=source,
             unavailable=unavailable,
             now=now,
         )
@@ -383,19 +288,19 @@ def bind_evidence_tool(
             ):
                 raise ValueError("Evidence provenance is not eligible")
             return_value = {"evidence_id": evidence.id, "excerpt": evidence.excerpt}
-            if _tool_return_size(return_value) > _TOOL_RETURN_MAX_BYTES:
-                return unavailable_result(
-                    reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
-                    source=source,
-                    query=query,
-                    run_context=run_context,
-                )
             if capture is not None:
                 capture.evidence.append(evidence)
         except _ProviderTimeoutEscaped as error:
             cause = error.__cause__
             assert isinstance(cause, TimeoutError)
             raise cause
+        except _ProviderResponseUnusable:
+            return unavailable_result(
+                reason=ToolUnavailableReason.RESPONSE_UNUSABLE,
+                source=source,
+                query=query,
+                run_context=run_context,
+            )
         except TimeoutError:
             return unavailable_result(
                 reason=ToolUnavailableReason.CALL_TIMEOUT,
@@ -434,15 +339,7 @@ class RequestEvidenceCatalog:
     _evidence: dict[str, EvidenceEnvelope] = field(
         default_factory=dict[str, EvidenceEnvelope]
     )
-    _body_sizes: dict[str, int] = field(default_factory=dict[str, int])
-    _total_body_bytes: int = 0
     _lock: Any = field(default_factory=threading.RLock, repr=False)
-
-    @property
-    def cached_body_bytes(self) -> int:
-        """Expose the request-local unique-body footprint for capacity tests."""
-        with self._lock:
-            return self._total_body_bytes
 
     def accept_referenced(
         self,
@@ -484,20 +381,6 @@ class RequestEvidenceCatalog:
                     existing, evidence
                 ):
                     raise ValueError("Evidence body conflicts")
-                body_size = len(evidence.body.encode("utf-8"))
-                if body_size > _EVIDENCE_BODY_MAX_BYTES:
-                    raise EvidenceCacheCapacityExceeded("Evidence body exceeds 16 KiB")
-                body_hash = hashlib.sha256(evidence.body.encode("utf-8")).hexdigest()
-                if body_hash not in self._body_sizes:
-                    if (
-                        self._total_body_bytes + body_size
-                        > _REQUEST_EVIDENCE_BODY_MAX_BYTES
-                    ):
-                        raise EvidenceCacheCapacityExceeded(
-                            "Request Evidence cache exceeds 8 MiB"
-                        )
-                    self._body_sizes[body_hash] = body_size
-                    self._total_body_bytes += body_size
                 stored = evidence.model_copy(update={"raw_provider_payload": None})
                 if existing is None or stored.task_id < existing.task_id:
                     self._evidence[evidence.id] = stored
@@ -534,7 +417,7 @@ class RequestEvidenceCatalog:
 
 
 class PreparedEvidence(BaseModel):
-    """Bounded source view permitted in a Synthesis prompt."""
+    """Source view permitted in a Synthesis prompt."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -559,20 +442,9 @@ class PreparedCalculation(BaseModel):
     as_of_date: date
     assumptions: tuple[str, ...]
 
-    def canonical_json_size(self) -> int:
-        """Measure the exact bounded prompt projection."""
-        return len(
-            json.dumps(
-                self.model_dump(mode="json"),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-
 
 class PreparedSynthesis(BaseModel):
-    """Frozen bounded business input for one Synthesis invocation."""
+    """Frozen business input for one Synthesis invocation."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -636,7 +508,7 @@ def prepare_synthesis(
     data_gaps: tuple[DataGapView, ...] = (),
     accepted_calculations: tuple[CalculationArtifact, ...] = (),
 ) -> PreparedSynthesis:
-    """Build the sole bounded Evidence projection Synthesis may receive."""
+    """Build the sole Evidence projection Synthesis may receive."""
     if len(accepted_evidence_ids) > _MAX_PREPARED_EVIDENCE:
         raise ValueError("Prepared Evidence count exceeds 64")
     if len(set(accepted_evidence_ids)) != len(accepted_evidence_ids):
@@ -679,7 +551,7 @@ def prepare_synthesis(
             artifact, evidence_hashes_by_id=evidence_hashes_by_id
         )
     if len(artifacts) > _MAX_PREPARED_CALCULATIONS:
-        raise PreparedSynthesisLimitExceeded("Prepared Calculation count exceeds 32")
+        raise ValueError("Prepared Calculation count exceeds 32")
     calculations = tuple(
         PreparedCalculation(
             alias=f"C:{index}",
@@ -693,11 +565,6 @@ def prepare_synthesis(
         )
         for index, artifact in enumerate(artifacts, start=1)
     )
-    if any(
-        calculation.canonical_json_size() > _MAX_PREPARED_CALCULATION_BYTES
-        for calculation in calculations
-    ):
-        raise PreparedSynthesisLimitExceeded("Prepared Calculation exceeds 2KiB")
     return PreparedSynthesis(
         standalone_query=standalone_query,
         intent=intent,

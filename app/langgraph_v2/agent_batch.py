@@ -17,7 +17,6 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.langgraph_v2.agent_evidence import (
     DataGapView,
-    EvidenceCacheCapacityExceeded,
     EvidenceEnvelope,
     EvidenceInvocationContext,
     EvidenceProvider,
@@ -29,8 +28,6 @@ from app.langgraph_v2.agent_evidence import (
     ToolUnavailabilityRecord,
     ToolUnavailableReason,
     bind_evidence_tool,
-    require_data_gap_identifier,
-    require_data_gap_text,
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
@@ -57,15 +54,7 @@ from app.langgraph_v2.specialist_retry import (
     specialist_usage_limits,
 )
 
-_SPECIALIST_OUTPUT_MAX_BYTES = 16 * 1024
 MAX_DISPATCH_BATCH_TASKS = 8
-MAX_TASK_OBJECTIVE_BYTES = 512
-_EMPTY_CONTEXT_JSON_BYTES = 2
-_EMPTY_CONTEXT_JSON_SHA256 = hashlib.sha256(b"[]").hexdigest()
-
-
-class StructuredOutputInvalid(ValueError):
-    """Reject an over-limit Specialist contract before contribution acceptance."""
 
 
 def _stable_id(prefix: str, value: Mapping[str, object]) -> str:
@@ -74,7 +63,7 @@ def _stable_id(prefix: str, value: Mapping[str, object]) -> str:
 
 
 def normalize_task_objective(value: str) -> str:
-    """Return one canonical, bounded single-line Task objective."""
+    """Return one canonical single-line Task objective."""
     normalized = unicodedata.normalize("NFC", value)
     single_line = "".join(
         " "
@@ -85,19 +74,7 @@ def normalize_task_objective(value: str) -> str:
     canonical = " ".join(single_line.split())
     if not canonical:
         raise ValueError("Task objective must not be blank")
-    if len(canonical.encode("utf-8")) > MAX_TASK_OBJECTIVE_BYTES:
-        raise ValueError("Task objective exceeds 512 UTF-8 bytes")
     return canonical
-
-
-def _canonical_json_size(value: BaseModel) -> int:
-    return len(
-        json.dumps(
-            value.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    )
 
 
 class TaskProposal(BaseModel):
@@ -129,15 +106,6 @@ class SpecialistFindingDraft(BaseModel):
     summary: str = Field(min_length=1)
     evidence_ids: tuple[str, ...] = Field(max_length=16, default=())
 
-    def canonical_json_size(self) -> int:
-        """Return canonical UTF-8 size used by the acceptance boundary."""
-        return _canonical_json_size(self)
-
-    def require_canonical_size(self) -> None:
-        """Reject an over-limit model output before it becomes a contribution."""
-        if self.canonical_json_size() > _SPECIALIST_OUTPUT_MAX_BYTES:
-            raise StructuredOutputInvalid("Specialist finding exceeds 16 KiB")
-
 
 class SpecialistResult(BaseModel):
     """Accepted minimal Result without Tool metadata or diagnostics."""
@@ -147,15 +115,6 @@ class SpecialistResult(BaseModel):
     summary: str
     evidence_ids: tuple[str, ...] = Field(max_length=16, default=())
     data_gaps: tuple[DataGap, ...] = Field(max_length=8, default=())
-
-    def canonical_json_size(self) -> int:
-        """Return the complete accepted Result's canonical UTF-8 size."""
-        return _canonical_json_size(self)
-
-    def require_canonical_size(self) -> None:
-        """Reject a Result that exceeds its complete accepted-state bound."""
-        if self.canonical_json_size() > _SPECIALIST_OUTPUT_MAX_BYTES:
-            raise StructuredOutputInvalid("Specialist result exceeds 16 KiB")
 
 
 class PriorResultView(BaseModel):
@@ -169,19 +128,6 @@ class PriorResultView(BaseModel):
     data_gaps: tuple[DataGapView, ...] = Field(max_length=8, default=())
 
 
-def canonical_context_json_details(
-    results: Sequence[PriorResultView],
-) -> tuple[int, str]:
-    """Return the sole canonical serialization used for Specialist context."""
-    payload = json.dumps(
-        [result.model_dump(mode="json") for result in results],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return len(payload), hashlib.sha256(payload).hexdigest()
-
-
 class GapProvenance(BaseModel):
     """Internal retained identity for one accepted unavailable Tool outcome."""
 
@@ -191,18 +137,6 @@ class GapProvenance(BaseModel):
     tool_id: str = Field(min_length=1)
     source: str | None = None
     observed_at: datetime
-
-    @field_validator("unavailability_id", "tool_id")
-    @classmethod
-    def _validate_identifier(cls, value: str) -> str:
-        return require_data_gap_identifier(value, label="Data Gap identifier")
-
-    @field_validator("source")
-    @classmethod
-    def _validate_source(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return require_data_gap_text(value, label="Data Gap source")
 
     @field_validator("observed_at")
     @classmethod
@@ -220,11 +154,6 @@ class DataGap(BaseModel):
     requested_coverage: str = Field(min_length=1)
     reason: ToolUnavailableReason
     provenance: GapProvenance
-
-    @field_validator("requested_coverage")
-    @classmethod
-    def _validate_requested_coverage(cls, value: str) -> str:
-        return require_data_gap_text(value, label="Data Gap coverage")
 
     def view(self) -> DataGapView:
         """Return the sole projection allowed outside accepted state."""
@@ -335,7 +264,6 @@ def _validate_attempt_calculations(
                 "Calculation Artifact provenance is invalid"
             )
         tool.executor.require_reproducible(artifact)
-        artifact.require_canonical_size()
         require_calculation_evidence_support(
             artifact,
             evidence_hashes_by_id=support_hashes_by_id,
@@ -463,8 +391,6 @@ class AcceptedTask:
     objective: str
     specialist_id: str
     context_task_ids: tuple[str, ...] = ()
-    context_json_bytes: int = _EMPTY_CONTEXT_JSON_BYTES
-    context_json_sha256: str = _EMPTY_CONTEXT_JSON_SHA256
 
 
 @dataclass(frozen=True)
@@ -713,8 +639,6 @@ class SpecialistTaskInput:
     task_id: str
     objective: str
     context_results: tuple[PriorResultView, ...] = ()
-    context_json_bytes: int = _EMPTY_CONTEXT_JSON_BYTES
-    context_json_sha256: str = _EMPTY_CONTEXT_JSON_SHA256
     validation_feedback: str | None = None
 
 
@@ -800,20 +724,8 @@ def validate_active_batch_manifest(
             raise ValueError("Active Batch Task objective is invalid") from error
         if task.objective != canonical_objective:
             raise ValueError("Active Batch Task objective is invalid")
-        if (
-            len(task.context_task_ids) > 8
-            or len(set(task.context_task_ids)) != len(task.context_task_ids)
-            or task.context_json_bytes < 0
-            or len(task.context_json_sha256) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in task.context_json_sha256
-            )
-        ):
-            raise ValueError("Active Batch Task context is invalid")
-        if not task.context_task_ids and (
-            task.context_json_bytes != _EMPTY_CONTEXT_JSON_BYTES
-            or task.context_json_sha256 != _EMPTY_CONTEXT_JSON_SHA256
+        if len(task.context_task_ids) > 8 or len(set(task.context_task_ids)) != len(
+            task.context_task_ids
         ):
             raise ValueError("Active Batch Task context is invalid")
         registry.resolve(task.specialist_id, scope_descriptors=scope_descriptors)
@@ -929,8 +841,6 @@ async def execute_specialist(
                     task_id=task.id,
                     objective=task.objective,
                     context_results=context_results,
-                    context_json_bytes=task.context_json_bytes,
-                    context_json_sha256=task.context_json_sha256,
                     validation_feedback=validation_feedback,
                 ),
                 usage=cumulative_usage,
@@ -982,32 +892,20 @@ async def execute_specialist(
         ):
             return failed_contribution(attempt_number)
 
-        try:
-            draft = attempt.finding
-            draft.require_canonical_size()
-            data_gaps = _derive_data_gaps(
-                attempt.unavailability,
-                context=attempt_context,
-                effective_tool_ids=registry.effective_tool_ids(
-                    registration,
-                    scope_tool_ids=context.allowed_tool_ids,
-                ),
-            )
-            result = SpecialistResult(
-                summary=draft.summary,
-                evidence_ids=draft.evidence_ids,
-                data_gaps=data_gaps,
-            )
-            result.require_canonical_size()
-        except StructuredOutputInvalid:
-            record_validation_failure(attempt_number, attempt)
-            if attempt_number == SPECIALIST_MAX_ATTEMPTS:
-                return failed_contribution(attempt_number)
-            validation_feedback = (
-                "Return one valid structured Specialist finding within all stated "
-                "output limits."
-            )
-            continue
+        draft = attempt.finding
+        data_gaps = _derive_data_gaps(
+            attempt.unavailability,
+            context=attempt_context,
+            effective_tool_ids=registry.effective_tool_ids(
+                registration,
+                scope_tool_ids=context.allowed_tool_ids,
+            ),
+        )
+        result = SpecialistResult(
+            summary=draft.summary,
+            evidence_ids=draft.evidence_ids,
+            data_gaps=data_gaps,
+        )
 
         if catalog is None:
             if attempt.evidence or draft.evidence_ids or attempt.calculations:
@@ -1020,8 +918,6 @@ async def execute_specialist(
                     finding_evidence_ids=draft.evidence_ids,
                     context=attempt_context,
                 )
-            except EvidenceCacheCapacityExceeded:
-                return failed_contribution(attempt_number)
             except EvidenceReferenceInvalid:
                 record_validation_failure(attempt_number, attempt)
                 if attempt_number == SPECIALIST_MAX_ATTEMPTS:

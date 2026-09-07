@@ -38,9 +38,7 @@ from app.langgraph_v2.agent_batch import (
     PriorResultView,
     SpecialistFindingDraft,
     SpecialistTaskInput,
-    canonical_context_json_details,
 )
-from app.langgraph_v2.agent_coordination import MAX_SPECIALIST_CONTEXT_BYTES
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
@@ -344,15 +342,11 @@ async def test_specialist_model_receives_only_materialized_prior_results() -> No
         summary="Stable prior finding.",
         evidence_ids=("evidence-1",),
     )
-    context_json_bytes, context_json_sha256 = canonical_context_json_details((prior,))
-
     await actor.run(
         SpecialistTaskInput(
             task_id="task-follow-up",
             objective="Assess implications.",
             context_results=(prior,),
-            context_json_bytes=context_json_bytes,
-            context_json_sha256=context_json_sha256,
         )
     )
 
@@ -368,9 +362,7 @@ async def test_specialist_model_receives_only_materialized_prior_results() -> No
 
 
 @pytest.mark.asyncio
-async def test_specialist_non_ascii_context_uses_the_accepted_utf8_serialization() -> (
-    None
-):
+async def test_specialist_non_ascii_context_uses_unescaped_json() -> None:
     prompts: list[str] = []
 
     def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -396,16 +388,12 @@ async def test_specialist_non_ascii_context_uses_the_accepted_utf8_serialization
         PriorResultView(task_id=f"task-{index}", summary="é" * 2_600)
         for index in range(8)
     )
-    context_json_bytes, context_json_sha256 = canonical_context_json_details(context)
     canonical_context = json.dumps(
         [result.model_dump(mode="json") for result in context],
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
-    assert context_json_bytes == len(canonical_context.encode("utf-8"))
-    assert context_json_bytes < MAX_SPECIALIST_CONTEXT_BYTES
-
     actor = PydanticAISpecialistActor(
         Agent(
             FunctionModel(model),
@@ -422,8 +410,6 @@ async def test_specialist_non_ascii_context_uses_the_accepted_utf8_serialization
             task_id="task-follow-up",
             objective="Assess implications.",
             context_results=context,
-            context_json_bytes=context_json_bytes,
-            context_json_sha256=context_json_sha256,
         )
     )
 

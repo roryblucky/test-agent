@@ -7,11 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.langgraph_v2.agent_batch import normalize_task_objective
 from app.langgraph_v2.agent_evidence import DataGapView
 from app.langgraph_v2.agent_termination import (
-    CALCULATION_STATE_LIMIT,
     COORDINATION_INVALID,
     COORDINATION_LIMIT,
-    COORDINATOR_CONTEXT_LIMIT,
-    PREPARED_SYNTHESIS_LIMIT,
     STRUCTURAL_REASON_ORDER,
     TASK_LIMIT,
     StructuralReason,
@@ -25,10 +22,7 @@ TASK_FAILURE_DISCLOSURE = "Incomplete research: one requested task could not com
 STRUCTURAL_LIMIT_DISCLOSURES = {
     TASK_LIMIT: "Incomplete research: the Task limit ended further work.",
     COORDINATION_LIMIT: "Incomplete research: the Coordination limit ended further work.",
-    COORDINATOR_CONTEXT_LIMIT: "Incomplete research: the Coordinator context limit ended further work.",
     COORDINATION_INVALID: "Incomplete research: the Coordinator could not produce a valid next decision.",
-    CALCULATION_STATE_LIMIT: "Incomplete research: the Calculation state limit ended further work.",
-    PREPARED_SYNTHESIS_LIMIT: "Incomplete research: the prepared Synthesis limit ended further work.",
 }
 _MARKDOWN_ESCAPED_CHARACTERS = frozenset("\\`*_{}[]<>()#+-.!|~")
 

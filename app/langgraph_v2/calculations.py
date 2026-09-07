@@ -14,18 +14,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic_ai import RunContext, ToolReturn
 
 MAX_CALCULATIONS_PER_CONTRIBUTION = 8
-MAX_CALCULATION_ARTIFACT_BYTES = 4 * 1024
-MAX_CALCULATION_STATE_BYTES = 1024 * 1024
-MAX_CALCULATION_TOOL_RETURN_BYTES = 4 * 1024
 _V1_DECIMAL_CONTEXT = Context(prec=50, rounding=ROUND_HALF_UP)
 
 
 class CalculationArtifactInvalid(ValueError):
     """Reject an Artifact that cannot enter accepted calculation state."""
-
-
-class CalculationStateLimitExceeded(ValueError):
-    """Reject an accepted-state Artifact collection above its hard run cap."""
 
 
 class CalculationMethod(StrEnum):
@@ -188,22 +181,6 @@ class CalculationArtifact(BaseModel):
         """Render the stored canonical Decimal with the registered v1 formatter."""
         return _format_percent(self.canonical_value, precision=self.precision)
 
-    def canonical_json_size(self) -> int:
-        """Return the exact UTF-8 size of this canonical Artifact record."""
-        return len(
-            json.dumps(
-                self.model_dump(mode="json"),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-
-    def require_canonical_size(self) -> None:
-        """Reject an Artifact exceeding Ticket 11's 4KiB item limit."""
-        if self.canonical_json_size() > MAX_CALCULATION_ARTIFACT_BYTES:
-            raise ValueError("Calculation Artifact exceeds 4KiB")
-
     def require_integrity(self) -> None:
         """Reject a record whose ID or rendered value no longer matches its value."""
         if self.id != _artifact_id(self.model_dump(mode="json", exclude={"id"})):
@@ -213,7 +190,7 @@ class CalculationArtifact(BaseModel):
 
 
 class CalculationToolResult(BaseModel):
-    """Bounded model-visible formatted result, never the canonical Decimal."""
+    """Model-visible formatted result, never the canonical Decimal."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -222,19 +199,6 @@ class CalculationToolResult(BaseModel):
     period_start: date
     period_end: date
     formatted_value: str
-
-    def require_canonical_size(self) -> None:
-        """Reject a model-visible Calculator result exceeding its 4KiB cap."""
-        size = len(
-            json.dumps(
-                self.model_dump(mode="json"),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        if size > MAX_CALCULATION_TOOL_RETURN_BYTES:
-            raise ValueError("Calculation Tool return exceeds 4KiB")
 
 
 class CalculationExecutor:
@@ -399,7 +363,6 @@ def bind_calculation_tool(
             period_end=artifact.period_end,
             formatted_value=artifact.formatted_value,
         )
-        result.require_canonical_size()
         return ToolReturn(
             return_value=result,
             metadata=artifact,
@@ -416,17 +379,13 @@ def accepted_calculation_artifacts(
     for artifact in artifacts:
         try:
             artifact.require_integrity()
-            artifact.require_canonical_size()
         except ValueError as error:
             raise CalculationArtifactInvalid(str(error)) from error
         existing = by_id.get(artifact.id)
         if existing is not None and existing != artifact:
             raise CalculationArtifactInvalid("Calculation Artifact ID conflicts")
         by_id[artifact.id] = artifact
-    accepted = tuple(by_id.values())
-    if calculation_state_json_size(accepted) > MAX_CALCULATION_STATE_BYTES:
-        raise CalculationStateLimitExceeded("Calculation state exceeds 1MiB")
-    return accepted
+    return tuple(by_id.values())
 
 
 def require_calculation_evidence_support(
@@ -444,22 +403,6 @@ def require_calculation_evidence_support(
         raise CalculationArtifactInvalid(
             "Calculation Artifact Evidence support is invalid"
         )
-
-
-def calculation_state_json_size(artifacts: tuple[CalculationArtifact, ...]) -> int:
-    """Measure the exact framed canonical Artifact state retained by the graph."""
-    return len(
-        json.dumps(
-            {
-                "calculation_artifacts": [
-                    item.model_dump(mode="json") for item in artifacts
-                ]
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
 
 
 def _artifact_id(values: dict[str, object]) -> str:

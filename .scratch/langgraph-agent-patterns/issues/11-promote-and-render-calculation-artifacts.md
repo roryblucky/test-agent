@@ -12,8 +12,7 @@
 - [x] `SpecialistResult` 不包含 Artifact IDs，不新增 artifact repository 或公开 artifact array；内部 calculation 调用不计作顶层 Task。
 - [x] Artifact IDs 与内容映射具备幂等与冲突检测，并在并行完成顺序变化时保持稳定。
 - [x] Synthesis 使用稳定 alias；模型不得提供 canonical value，最终值完全由代码渲染。
-- [x] 覆盖恰好上限与多 1：每个 contribution 最多 8 个 calculations、每项最多 4 KiB、每 Run 含 framing 最多 1 MiB、提供给模型的最多 32 个 calculation projections 且每项最多 2 KiB。
-- [x] active batch calculation overflow 时整个 batch 不 promote 并清空 staging；终态原因由此前已接受状态确定。
+- [x] 覆盖恰好上限与多 1：每个 contribution 最多 8 个 calculations，提供给模型的最多 32 个 calculation projections。
 - [x] internal reproducibility schema 包含 method、precision、unit/currency、period/as-of、assumptions、normalized input、Evidence refs/hashes、audit inputs、execution record、Run/Task/attempt provenance；round-trip 与 integrity 测试能重现格式化值，该 schema 仅内部可见。
 
 ## Comments
@@ -21,5 +20,5 @@
 - v1 policy: positive strictly ascending price observations; period return is `last / first - 1`; annualized volatility is sample simple-return volatility times `sqrt(252)`; maximum drawdown is measured from the prior running peak; all values use four decimal percentage formatting.
 - Sol-medium seam review confirmed the narrow design: one deterministic executor, Artifacts remain on `SpecialistAttempt`/`BatchContribution`/`AcceptedBatch`, and Synthesis sees value-free aliases only.
 - The barrier now revalidates Artifact provenance, registered executor reproduction, accepted Evidence membership and body hashes. Publication repeats Tenant/Request and Evidence-support checks. Calculation arithmetic and formatting use a fixed Decimal context, so IDs do not depend on ambient precision or rounding.
-- Sol-high review findings on Evidence membership, synthesis caps, overflow atomicity, canonical ordering, completion causes, and Decimal determinism were resolved. Final re-review: no actionable findings.
+- Sol-high review findings on Evidence membership, synthesis aliases, canonical ordering, completion causes, and Decimal determinism were resolved. Final re-review: no actionable findings.
 - Verified: `uv run ruff check app tests`; `uv run pyright app tests`; `scripts/run-pytest tests -q` → 439 passed, 1 skipped. Unresolved review comments: 0.

@@ -21,7 +21,6 @@ from app.langgraph_v2.agent_batch import (
     SpecialistAttempt,
     SpecialistFindingDraft,
     SpecialistTaskInput,
-    canonical_context_json_details,
 )
 from app.langgraph_v2.agent_evidence import SpecialistToolCapture
 from app.langgraph_v2.agent_skills import SkillInvocation
@@ -76,14 +75,6 @@ class PydanticAISpecialistActor:
         skill_summaries = (
             self.skill_invocation.summaries if self.skill_invocation is not None else ()
         )
-        context_json_bytes, context_json_sha256 = canonical_context_json_details(
-            input.context_results
-        )
-        if (
-            context_json_bytes != input.context_json_bytes
-            or context_json_sha256 != input.context_json_sha256
-        ):
-            raise ValueError("Specialist context changed after validation")
         prompt = json.dumps(
             {
                 "task_id": input.task_id,

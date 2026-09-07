@@ -83,11 +83,11 @@ revise the next research step after each batch.
   own repair. POC Tools do not raise PydanticAI `ModelRetry` or `ToolFailed`;
   each registered binding catches only its allowlisted expected inability to
   provide requested read, fetch, or Calculation data and returns a PydanticAI
-  `ToolReturn` whose model-visible `return_value` is a bounded, discriminated
+  `ToolReturn` whose model-visible `return_value` is a discriminated
   `ToolUnavailable` value. The binding applies its own per-call timeout and
   catches only that timeout plus explicitly registered expected-unavailability
   outcomes; it never uses a broad `except Exception`. The model-visible value
-  contains only an allowlisted stable code and a bounded sanitized
+  contains only an allowlisted stable code and a sanitized
   requested-coverage label. The complete POC code set is
   `source_unreachable`, `coverage_not_supported`, `stale_only`, `call_timeout`,
   and `response_unusable`; adding a code requires changing the registered Tool
@@ -205,12 +205,7 @@ revise the next research step after each batch.
   non-empty batch size,
   `context_task_ids` existence, current Tenant/Run ownership, earlier-Round
   membership and successful accepted Result status, maximum Round, total Task,
-  concurrency, bounded objective size, and the aggregate canonical UTF-8 JSON
-  size of the selected prior Results after materialization. This validation
-  occurs before `Send`; an oversized prior-Result context rejects the
-  Coordinator Decision through its same-round repair rather than consuming a
-  Specialist outer attempt. A different size observed after successful
-  validation is a fatal invariant failure. Per-actor
+  concurrency, and a normalized non-empty objective. Per-actor
   model-request, Tool-call, retry, and output limits are also checked at their
   owning adapter boundaries as loop-prevention guards. The current system has
   only read, fetch, and deterministic Calculation operations, so aggregate
@@ -239,16 +234,14 @@ revise the next research step after each batch.
   Do not add
   a separate model-authored `ResearchLedger`, provide only the latest batch, or
   pass Specialist internal messages, raw Tool payloads, or Evidence bodies.
-  Enforce both per-result and aggregate Coordinator-context limits. If the
-  bounded POC exceeds the aggregate limit, finish as incomplete rather than
-  silently replacing canonical results with a lossy summary. Keep context
-  construction behind a deterministic projection seam so later retrieval or
-  compaction can change model input without replacing checkpoint truth.
+  Keep context construction behind a deterministic projection seam so later
+  retrieval or compaction can change model input without replacing checkpoint
+  truth.
 - Let the injected LangGraph checkpointer naturally checkpoint lightweight
   Coordination Rounds, active batch control, staged contribution metadata,
   immutable accepted batches, status, and count/usage counters. An accepted
   batch contains its validated Task Outcomes,
-  Evidence IDs, and complete bounded Calculation Artifact records. Do not build
+  Evidence IDs, and complete Calculation Artifact records. Do not build
   a separate checkpoint model, repository, public identity, or recovery
   contract. Evidence bodies, raw Tool payloads, and Specialist internal messages
   remain request-local.
@@ -274,22 +267,15 @@ revise the next research step after each batch.
   | Coordination | At most `5` accepted Decisions: at most `4` `DispatchBatch` Decisions plus one terminal `Finish` |
   | Tasks | `32` accepted Tasks per Run; `8` Tasks per batch; Agent Graph `max_concurrency=8` |
   | Dependency context | At most `8` earlier accepted `context_task_ids` per Task |
-  | Task objective | At most `512` canonical UTF-8 bytes after single-line normalization; the same bounded value is used in incomplete disclosure |
   | Specialist outer attempts | `3` total: initial plus at most two eligible retries, all with the same Task ID and a fresh actor run |
   | Specialist actor work | `12` model requests and `8` completed Tool calls cumulative across all outer attempts; hidden Tool/output retries disabled |
   | Specialist calls | `60 s` per model request, binding-owned `20 s` per Tool call, model `max_tokens=2,000`; no whole-Specialist timeout |
   | Coordinator | At most `2` actor invocations per Decision, one model request each, no Tools, `60 s` per request, `max_tokens=1,500` |
   | Synthesis | At most `2` actor invocations total, one model request each, no Tools, `120 s` per request, `max_tokens=4,000` |
-  | Tool model-visible return | At most `4 KiB` canonical UTF-8 JSON per call |
-  | Specialist Result | At most `16 KiB` canonical UTF-8 JSON, `16` Evidence IDs, and `8` Data Gaps |
-  | Data Gap | At most `256` UTF-8 bytes of requested coverage plus one bounded `GapProvenance` |
-  | Gap provenance | Opaque unavailability ID and registered Tool ID at most `64` ASCII characters each; optional logical source ID at most `256` UTF-8 bytes; observation time is normalized UTC |
-  | Calculation Artifacts | At most `8` per Task contribution and `4 KiB` canonical UTF-8 JSON each; the complete accepted Run collection is at most `1 MiB` as one canonical UTF-8 JSON value including IDs and container framing; at most `32` projections of `2 KiB` each in Prepared Synthesis |
-  | Request-owned Evidence bodies | At most `16 KiB` each and `8 MiB` total; the cache rejects a write before either cap is exceeded |
-  | Specialist prior-Result context | At most the `8` referenced Results and `64 KiB` aggregate canonical UTF-8 JSON |
-  | Coordinator context | At most `16 KiB` per prior Result and `128 KiB` aggregate canonical UTF-8 JSON |
-  | Prepared Synthesis | At most `256 KiB` canonical UTF-8 JSON, `64` Evidence excerpts of at most `4 KiB` each, and `32` Calculation records of at most `2 KiB` each |
-  | Canonical final output | At most `192 KiB` UTF-8 including the code-owned incomplete disclosure |
+  | Specialist Result | At most `16` Evidence IDs and `8` Data Gaps |
+  | Calculation Artifacts | At most `8` per Task contribution and `32` projections in Prepared Synthesis |
+  | Specialist prior-Result context | At most the `8` referenced Results |
+  | Prepared Synthesis | At most `64` Evidence excerpts and `32` Calculation records |
   | LangGraph recursion | Explicit `recursion_limit=40`; overflow is fatal rather than bounded completion |
 
   Specialist request and Tool-call counters are Task-local and cumulative across
@@ -297,25 +283,11 @@ revise the next research step after each batch.
   counter. Aggregate model requests, Tool attempts, tokens, and cost across
   parallel Tasks are measured and reported, but are not atomically reserved.
   Exact cross-branch reservation is unnecessary in this read/fetch/calculate-only
-  system. Canonical byte limits are measured after normalized serialization. A
-  Tool that cannot form a valid bounded success projection returns the
-  allowlisted `response_unusable` unavailable outcome. Specialist output that
-  fails schema or size validation follows the structured-output-invalid retry
-  classification below. Coordinator aggregate-context
-  overflow stops further dispatch. At the barrier, an active batch that would
-  exceed the accepted Calculation-state cap is not promoted. In the same
-  terminal state update, the barrier records `calculation_state_limit`, clears
-  the reducer-backed staging map and scalar active-batch manifest, and routes to
-  completion from earlier accepted batches; no outcome or Artifact from the
-  rejected batch becomes canonical. An Evidence body
-  cache overflow stages a `TaskFailed` contribution without outer retry or
-  Evidence IDs; any body written before the overflow remains only as an
-  unreachable request-local orphan, so concurrent identical sibling writes are
-  never deleted. Successful siblings still reach the barrier.
-  Prepared Synthesis or final-Markdown overflow bypasses the candidate and
-  returns a deterministic bounded incomplete answer.
-  None of these paths silently truncates accepted Results, Evidence,
-  Calculations, gaps, or the disclosure; recursion overflow remains fatal.
+  system. A Tool response that cannot be normalized into the registered success
+  contract returns the allowlisted `response_unusable` unavailable outcome.
+  Specialist output that fails schema or deterministic output validation follows
+  the structured-output-invalid retry classification below. Recursion overflow
+  remains fatal.
 - Keep expected Tool unavailability inside the active Specialist run as the
   typed value described above. A Tool-call timeout is converted inside that Tool
   binding, so it neither aborts multi-hop work nor cancels successful internal
@@ -353,9 +325,8 @@ revise the next research step after each batch.
   | Adapter category | Outer retry | Terminal behavior |
   |---|---|---|
   | Allowlisted transient model timeout, connection failure, HTTP 429, or HTTP 5xx | Up to two retries after the initial attempt; each is a fresh actor run subject to the Task's cumulative actor-local limits | `TaskFailed` after the third total attempt |
-  | Structured output rejected by schema, size, or deterministic output validation | Up to two retries after the initial attempt; each is a fresh actor run with bounded deterministic validation feedback and unchanged Task input | `TaskFailed` after the third total attempt |
+  | Structured output rejected by schema or deterministic output validation | Up to two retries after the initial attempt; each is a fresh actor run with deterministic validation feedback and unchanged Task input | `TaskFailed` after the third total attempt |
   | Actor-local model-request or Tool-call count exhausted | None | `TaskFailed` |
-  | Request-owned Evidence-cache capacity exceeded while accepting a Tool success | None | `TaskFailed` with no Evidence IDs; retain any unreachable body only under the cache rule above |
   | Expected registered Tool unavailability | None | Return the typed `ToolReturn` and continue the same actor run |
   | Cancellation, authorization, configuration, invariant, programmer, or unknown failure | None | Re-raise and fail the Run |
 
@@ -386,8 +357,7 @@ revise the next research step after each batch.
   Tool, a `TimeoutError` escaping a business Tool, and any signal whose origin
   cannot be proven are fatal. Binding-owned business-Tool timeout remains the
   earlier typed `ToolUnavailable` path and does not reach this classifier.
-  Schema, canonical-size, and
-  deterministic domain validation performed after a returned draft use one
+  Schema and deterministic domain validation performed after a returned draft use one
   application-owned structured-output-invalid signal. No broad
   `UnexpectedModelBehavior` or `ModelAPIError` catch may convert failures from
   an unregistered provider or a different actor phase.
@@ -437,16 +407,11 @@ revise the next research step after each batch.
   Clarification and pre-moderation terminal paths do not enter research
   completion, do not construct `IncompleteResearch`, and are never marked
   insufficient merely because they have no Evidence.
-  The complete POC reason set is `task_limit`, `coordination_limit`,
-  `coordinator_context_limit`, `calculation_state_limit`,
-  `prepared_synthesis_limit`, and `final_markdown_limit`; adding a reason
-  requires a contract and test change. A
-  Synthesis candidate that would exceed the final-output cap is discarded; code
-  then constructs the projection with `final_markdown_limit` and renders the bounded
-  deterministic incomplete answer instead. It
-  resolves failed Task IDs to their accepted
-  bounded objectives for disclosure, but never includes a technical failure
-  reason. Ordering follows stable Round, Task, and unavailable-outcome identity.
+  The complete POC structural-reason set is `task_limit`, `coordination_limit`,
+  and `coordination_invalid`; adding a reason requires a contract and test change.
+  It resolves failed Task IDs to their accepted canonical objectives for
+  disclosure, but never includes a technical failure reason. Ordering follows
+  stable Round, Task, and unavailable-outcome identity.
   Any failed Task, Data Gap, structural reason, or true
   `insufficient_evidence` value makes the response incomplete. This POC is
   deliberately conservative and monotonic: later research does not clear an
@@ -456,7 +421,7 @@ revise the next research step after each batch.
   semantic completeness model.
 - PydanticAI builds role-configured actors with model abstraction, activated Skill instructions, approved tool bindings, structured outputs, and usage. The Coordinator Agent does not execute business Tools.
 - Treat configured count bounds as code-owned routing policy. When the maximum
-  Task, Coordination Round, or aggregate Coordinator-context count prevents
+  Task or Coordination Round count prevents
   further dispatch, finish research from already accepted outcomes. If eligible
   Evidence exists, invoke Synthesis; without eligible Evidence, skip Synthesis
   after setting `IncompleteResearch.insufficient_evidence` and return the
@@ -524,9 +489,7 @@ revise the next research step after each batch.
   validation errors; reconstructing it or changing catalog membership, ordering,
   or aliases between attempts is an invariant failure. No digest is added
   because this POC has no active-Run cross-process recovery or external digest
-  consumer. Count and byte overflows follow their owning adapter's explicit
-  failure or incomplete-completion path and never silently truncate canonical
-  accepted support.
+  consumer.
 - Invoke every registered Specialist through one generic
   `execute_specialist` LangGraph node. One `Send` Task is one complete
   invocation of that parent-Graph node: it resolves the trusted Specialist
@@ -700,8 +663,8 @@ revise the next research step after each batch.
 - Merge parallel Calculation Artifact updates by stable, content-bound Artifact
   ID. Identical duplicate writes are idempotent; the same ID with different
   content is an invariant failure. At the barrier, validate that every Artifact
-  belongs to the accepted attempt of a successful Task, enforce aggregate
-  limits without truncation, and assign aliases in stable Task/Artifact order,
+  belongs to the accepted attempt of a successful Task, enforce count limits,
+  and assign aliases in stable Task/Artifact order,
   never completion-time order. Reuse the exact alias mapping for Synthesis
   repair and publication.
 - Enforce Evidence eligibility, freshness, conflicts, Calculation Artifact
@@ -763,7 +726,7 @@ revise the next research step after each batch.
   runtime-context body cache, and keep raw Tool payloads request-local.
   Checkpoint Coordination Rounds, count/usage control state,
   active-batch staging metadata, immutable AcceptedBatch values containing Task
-  Outcomes and bounded Calculation Artifact records, and stable Evidence
+  Outcomes and Calculation Artifact records, and stable Evidence
   identifiers.
 - Configure the official `JsonPlusSerializer` explicitly as
   `JsonPlusSerializer(pickle_fallback=False, allowed_json_modules=None,
@@ -915,8 +878,8 @@ revise the next research step after each batch.
   and registered calculation contracts. Calculation tests must reject
   model-authored raw series, contribute metadata only with a validated successful
   Specialist outcome, prevent failed/retried-attempt leakage, remain stable
-  across parallel completion order, detect reducer collisions and aggregate
-  overflow, preserve aliases across Synthesis repair, and verify that code—not
+  across parallel completion order, detect reducer collisions, preserve aliases
+  across Synthesis repair, and verify that code—not
   Synthesis—renders each referenced Artifact's canonical value. Add an
   alternate-outcome coordination
   test in which the holdings Task returns no accepted finding or fails, and
@@ -962,20 +925,9 @@ revise the next research step after each batch.
   `ModelHTTPError` at `429`, `500`, and `599`
   as retryable and at `401`, `408`, and `600` as fatal. Exercise
   `UsageLimitExceeded` as count exhaustion only with request/Tool-call limits
-  configured for that invocation and all PydanticAI token limits unset. Prove an
-  oversized prior-Result context is rejected before `Send` and does not start or
-  retry a Specialist;
-  any post-validation size mismatch is fatal. A Specialist performs at most
-  three outer attempts under one cumulative actor-local limit policy.
-- Verify Calculation Artifact item and accepted-state caps at the barrier, plus
-  Evidence body item and request-cache caps during Tool collection. A
-  Calculation-state overflow leaves the active batch unaccepted and publishes
-  the structural disclosure from earlier accepted state; its terminal barrier
-  update leaves staging empty, clears the active manifest, and records
-  `calculation_state_limit`. Exercise a collection whose canonical serialization
-  fits exactly and one whose IDs/container framing make it exceed `1 MiB`. An Evidence-cache
-  overflow stages one `TaskFailed` without deleting identical sibling bodies or
-  making any orphan body eligible.
+  configured for that invocation and all PydanticAI token limits unset. A
+  Specialist performs at most three outer attempts under one cumulative
+  actor-local limit policy.
 - Verify the code-owned incomplete block is present in the canonical assistant
   Message, token stream, and `done.answer` whenever any accepted Task failed,
   any accepted Data Gap exists, a structural limit ended research, or no eligible

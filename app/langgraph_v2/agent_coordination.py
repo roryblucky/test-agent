@@ -20,7 +20,6 @@ from app.langgraph_v2.agent_batch import (
     SpecialistRegistry,
     TaskSucceeded,
     batch_id_for,
-    canonical_context_json_details,
     normalize_task_objective,
     task_id_for,
     validate_active_batch_manifest,
@@ -38,13 +37,7 @@ MAX_COORDINATION_DECISIONS = 5
 MAX_DISPATCH_ROUNDS = 4
 MAX_ACCEPTED_TASKS = 32
 MAX_TASK_CONTEXT_RESULTS = 8
-MAX_SPECIALIST_CONTEXT_BYTES = 64 * 1024
-MAX_COORDINATOR_RESULT_BYTES = 16 * 1024
-MAX_COORDINATOR_CONTEXT_BYTES = 128 * 1024
 AGENT_RECURSION_LIMIT = 40
-_EMPTY_CONTEXT_JSON = b"[]"
-_EMPTY_CONTEXT_JSON_BYTES = len(_EMPTY_CONTEXT_JSON)
-_EMPTY_CONTEXT_JSON_SHA256 = hashlib.sha256(_EMPTY_CONTEXT_JSON).hexdigest()
 
 StructuralStopReason = CoordinationStopReason
 
@@ -55,10 +48,6 @@ class CoordinationCandidateRejected(ValueError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-
-
-class CoordinationContextLimitExceeded(ValueError):
-    """Accepted state is too large to project to the Coordinator."""
 
 
 class CoordinationInvariantError(ValueError):
@@ -87,7 +76,7 @@ class PriorFailedTaskView(BaseModel):
 
 
 class CoordinatorInput(BaseModel):
-    """The complete bounded projection permitted to one Coordinator invocation."""
+    """The complete projection permitted to one Coordinator invocation."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -121,8 +110,6 @@ class CoordinationTask(BaseModel):
     context_task_ids: tuple[str, ...] = Field(
         max_length=MAX_TASK_CONTEXT_RESULTS, default=()
     )
-    context_json_bytes: int = Field(ge=0)
-    context_json_sha256: str = Field(min_length=64, max_length=64)
 
 
 class CoordinationRound(BaseModel):
@@ -161,15 +148,6 @@ class CoordinationStopped:
     """An exhausted same-round repair that must end coordination incomplete."""
 
     reason: StructuralStopReason
-
-
-def _canonical_json_bytes(value: object) -> int:
-    """Measure a deterministic JSON-native projection without lossy truncation."""
-    return len(
-        json.dumps(
-            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-    )
 
 
 def _round_id(*, request_id: str, revision: int) -> str:
@@ -238,17 +216,6 @@ def validate_coordination_rounds(
                 or not task.specialist_id
                 or len(task.context_task_ids) > MAX_TASK_CONTEXT_RESULTS
                 or len(set(task.context_task_ids)) != len(task.context_task_ids)
-                or task.context_json_bytes < 0
-                or len(task.context_json_sha256) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in task.context_json_sha256
-                )
-            ):
-                raise CoordinationInvariantError("Coordination Round Task is invalid")
-            if not task.context_task_ids and (
-                task.context_json_bytes != _EMPTY_CONTEXT_JSON_BYTES
-                or task.context_json_sha256 != _EMPTY_CONTEXT_JSON_SHA256
             ):
                 raise CoordinationInvariantError("Coordination Round Task is invalid")
     return ordered_rounds
@@ -285,11 +252,6 @@ def _prior_projection(
                 evidence_ids=outcome.result.evidence_ids,
                 data_gaps=tuple(gap.view() for gap in outcome.result.data_gaps),
             )
-            if (
-                _canonical_json_bytes(view.model_dump(mode="json"))
-                > MAX_COORDINATOR_RESULT_BYTES
-            ):
-                raise CoordinationContextLimitExceeded("coordinator_context_limit")
             projected.append(view)
     return tuple(projected), tuple(failed_tasks)
 
@@ -313,13 +275,6 @@ def project_coordinator_input(
     """Build the sole prompt-safe projection from complete accepted state."""
     prior_results, failed_tasks = _prior_projection(rounds, accepted_batches)
     data_gaps = tuple(gap for result in prior_results for gap in result.data_gaps)
-    projection = {
-        "prior_results": [result.model_dump(mode="json") for result in prior_results],
-        "failed_tasks": [task.model_dump(mode="json") for task in failed_tasks],
-        "data_gaps": [gap.model_dump(mode="json") for gap in data_gaps],
-    }
-    if _canonical_json_bytes(projection) > MAX_COORDINATOR_CONTEXT_BYTES:
-        raise CoordinationContextLimitExceeded("coordinator_context_limit")
     return CoordinatorInput(
         standalone_query=standalone_query,
         intent=intent,
@@ -335,7 +290,7 @@ def _select_context(
     *,
     prior_results: Sequence[PriorResultView],
     error_type: type[CoordinationCandidateRejected | CoordinationInvariantError],
-) -> tuple[tuple[PriorResultView, ...], int, str]:
+) -> tuple[PriorResultView, ...]:
     """Resolve one Task's explicit earlier successful Result references."""
     selected_ids = frozenset(context_task_ids)
     if len(context_task_ids) > MAX_TASK_CONTEXT_RESULTS or len(selected_ids) != len(
@@ -348,10 +303,7 @@ def _select_context(
     selected = tuple(
         result for result in prior_results if result.task_id in selected_ids
     )
-    size, digest = canonical_context_json_details(selected)
-    if size > MAX_SPECIALIST_CONTEXT_BYTES:
-        raise error_type("Specialist context exceeds 64 KiB")
-    return selected, size, digest
+    return selected
 
 
 def accept_coordination_dispatch(
@@ -385,7 +337,7 @@ def accept_coordination_dispatch(
             registry.resolve(
                 proposal.specialist_id, scope_descriptors=scope_descriptors
             )
-            _, context_json_bytes, context_json_sha256 = _select_context(
+            _select_context(
                 proposal.context_task_ids,
                 prior_results=prior_results,
                 error_type=CoordinationCandidateRejected,
@@ -404,8 +356,6 @@ def accept_coordination_dispatch(
                 objective=objective,
                 specialist_id=proposal.specialist_id,
                 context_task_ids=proposal.context_task_ids,
-                context_json_bytes=context_json_bytes,
-                context_json_sha256=context_json_sha256,
             )
         )
     active_batch = ActiveBatch(
@@ -430,8 +380,6 @@ def accept_coordination_dispatch(
                 objective=task.objective,
                 specialist_id=task.specialist_id,
                 context_task_ids=task.context_task_ids,
-                context_json_bytes=task.context_json_bytes,
-                context_json_sha256=task.context_json_sha256,
             )
             for task in active_batch.tasks
         ),
@@ -537,8 +485,6 @@ def validate_active_batch_coordination_round(
             objective=task.objective,
             specialist_id=task.specialist_id,
             context_task_ids=task.context_task_ids,
-            context_json_bytes=task.context_json_bytes,
-            context_json_sha256=task.context_json_sha256,
         )
         for task in batch.tasks
     )
@@ -553,15 +499,12 @@ def materialize_specialist_context(
     rounds: Sequence[CoordinationRound],
     accepted_batches: Mapping[str, AcceptedBatch],
 ) -> tuple[PriorResultView, ...]:
-    """Rebuild a previously accepted Task context or fail closed on TOCTOU."""
+    """Rebuild a previously accepted Task context from accepted prior results."""
     earlier_rounds = tuple(
         round_ for round_ in _ordered_rounds(rounds) if round_.revision < current_round
     )
-    selected, size, digest = _select_context(
+    return _select_context(
         task.context_task_ids,
         prior_results=_prior_results(earlier_rounds, accepted_batches),
         error_type=CoordinationInvariantError,
     )
-    if size != task.context_json_bytes or digest != task.context_json_sha256:
-        raise CoordinationInvariantError("Specialist context changed after validation")
-    return selected
