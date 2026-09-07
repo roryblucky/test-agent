@@ -1,41 +1,22 @@
-"""Public sequential-Run isolation coverage for Agent conversations."""
+"""Public sequential-Run isolation coverage using the financial golden fixture."""
 
 from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date
 from typing import Any, cast
 from uuid import UUID
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
-from app.langgraph_v2.agent_batch import (
-    DispatchBatch,
-    SpecialistAttempt,
-    SpecialistFindingDraft,
-    SpecialistRegistration,
-    SpecialistRegistry,
-    SpecialistTaskInput,
-    TaskProposal,
-)
+from app.langgraph_v2.agent_batch import DispatchBatch, TaskProposal
 from app.langgraph_v2.agent_coordination import CoordinatorInput, Finish
-from app.langgraph_v2.agent_evidence import (
-    EvidenceEnvelope,
-    FinancialResearchReport,
-    PreparedSynthesis,
-)
-from app.langgraph_v2.agent_runtime import build_agent_runtime
-from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
-from app.langgraph_v2.api import GraphRuntimeAdapter
-from app.langgraph_v2.authorization import TrustedRequestContext
+from app.langgraph_v2.agent_evidence import FinancialResearchReport, PreparedSynthesis
 from app.langgraph_v2.checkpointing import (
     AgentCheckpointStateAdapter,
     read_conversation_messages,
@@ -44,10 +25,11 @@ from app.langgraph_v2.checkpointing import (
 )
 from app.langgraph_v2.conversation_context import ConversationExchange
 from app.models.workflow import IntentResult, QueryUnderstandingOutput, ResolvedQuery
-from tests.integration.test_langgraph_v2_linear_core import (
-    parse_sse,
-    persistent_linear_app,
+from tests.integration.test_langgraph_v2_agent_financial_golden_path import (
+    FinancialFixture,
+    financial_app,
 )
+from tests.integration.test_langgraph_v2_linear_core import parse_sse
 
 _TENANT_ID = "tenant-a"
 _SUBJECT_ID = "subject-a"
@@ -55,18 +37,24 @@ _CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000151")
 _IDEMPOTENCY_CONVERSATION_ID = UUID("00000000-0000-0000-0000-000000000152")
 _RUN_ONE_ID = "consecutive-run-1"
 _RUN_TWO_ID = "consecutive-run-2"
-_RUN_ONE_QUERY = "Compare FUND-ONE with BENCHMARK-ONE."
-_RUN_TWO_QUERY = "How did it compare with the benchmark?"
-_RUN_ONE_STANDALONE = "Compare FUND-ONE with BENCHMARK-ONE as of 2026-09-06."
-_RUN_TWO_STANDALONE = "Compare FUND-ONE with BENCHMARK-ONE as of 2026-09-07."
-_RUN_ONE_ANSWER = "RUN-ONE canonical report. [[E:1]] [[E:2]]"
+_RUN_ONE_QUERY = "Compare FUND-ALPHA with BENCHMARK-OMEGA."
+_RUN_TWO_QUERY = "How did it report its holdings and disclosures?"
+_RUN_ONE_STANDALONE = "Compare FUND-ALPHA with BENCHMARK-OMEGA as of 2026-09-06."
+_RUN_TWO_STANDALONE = "Research FUND-ALPHA holdings and disclosures as of 2026-09-07."
+_RUN_ONE_REPORT = "RUN-ONE canonical report. [[E:1]]"
+_RUN_ONE_ANSWER = (
+    "Incomplete research: one requested task could not complete.\n"
+    "- Research FUND\\-ALPHA holdings and disclosures\\.\n\n" + _RUN_ONE_REPORT
+)
+_RETRY_DIAGNOSTIC = "RUN-ONE-RETRY-DIAGNOSTIC"
 _RUN_TWO_ANSWER = "RUN-TWO canonical report. [[E:1]] [[E:2]]"
+_INTENT = "financial_golden_path"
 _HEADERS = {"X-Application-Id": _TENANT_ID, "X-Subject-Id": _SUBJECT_ID}
 
 
 @dataclass
 class _SecondInitializerObserver:
-    """Capture the durable post-initializer state before any second-Run actor."""
+    """Capture durable second-initializer state before any second-Run actor."""
 
     snapshot: dict[str, Any] | None = None
 
@@ -93,7 +81,7 @@ class _SecondInitializerObserver:
 
 
 class _ObservingSaver(AsyncPostgresSaver):
-    """Observe the real PostgreSQL checkpoint only after it has committed."""
+    """Observe real PostgreSQL only after the checkpoint commit returns."""
 
     observer: _SecondInitializerObserver
 
@@ -113,19 +101,24 @@ class _ObservingSaver(AsyncPostgresSaver):
         return result
 
 
+@dataclass
 class _HistoryUnderstanding:
-    def __init__(self, observer: _SecondInitializerObserver) -> None:
-        self.observer = observer
-        self.histories: list[list[ConversationExchange]] = []
+    observer: _SecondInitializerObserver
+    financial_fixture: FinancialFixture
+    histories: list[list[ConversationExchange]] = field(
+        default_factory=list[list[ConversationExchange]]
+    )
 
     async def understand(
-        self,
-        query: str,
-        history: Sequence[ConversationExchange],
+        self, query: str, history: Sequence[ConversationExchange]
     ) -> QueryUnderstandingOutput:
         self.histories.append(list(history))
         if query == _RUN_ONE_QUERY:
             assert history == []
+            self.financial_fixture.configure_run(
+                request_id=_RUN_ONE_ID,
+                fund_task_dispatch_order=1,
+            )
             standalone_query = _RUN_ONE_STANDALONE
         else:
             assert query == _RUN_TWO_QUERY
@@ -133,13 +126,16 @@ class _HistoryUnderstanding:
             assert list(history) == [
                 ConversationExchange(user=_RUN_ONE_QUERY, assistant=_RUN_ONE_ANSWER)
             ]
+            self.financial_fixture.configure_run(
+                request_id=_RUN_TWO_ID,
+                fund_task_dispatch_order=0,
+            )
             standalone_query = _RUN_TWO_STANDALONE
         return QueryUnderstandingOutput(
             resolved_query=ResolvedQuery(
-                original_query=query,
-                standalone_query=standalone_query,
+                original_query=query, standalone_query=standalone_query
             ),
-            intent=IntentResult(intent="fund_comparison", confidence=1.0),
+            intent=IntentResult(intent=_INTENT, confidence=1.0),
         )
 
 
@@ -156,116 +152,33 @@ class _ShapeCoordinator:
                     kind="dispatch",
                     tasks=(
                         TaskProposal(
-                            specialist_id="fund-source",
-                            objective="Read FUND-ONE source.",
+                            specialist_id="market-analysis",
+                            objective="Analyze FUND-ALPHA against BENCHMARK-OMEGA.",
                         ),
                         TaskProposal(
-                            specialist_id="benchmark-source",
-                            objective="Read BENCHMARK-ONE source.",
+                            specialist_id="fund-research",
+                            objective="Research FUND-ALPHA holdings and disclosures.",
                         ),
                     ),
                 )
-            assert len(input.prior_results) == 2
+            assert len(input.prior_results) == 1
+            assert len(input.failed_tasks) == 1
             return Finish(kind="finish")
         assert input.standalone_query == _RUN_TWO_STANDALONE
         assert self.observer.second_initializer_committed
-        assert "RUN-ONE" not in input.model_dump_json()
+        assert _RUN_ONE_ID not in input.model_dump_json()
         if not input.prior_results:
             return DispatchBatch(
                 kind="dispatch",
                 tasks=(
                     TaskProposal(
-                        specialist_id="combined-comparison",
-                        objective="Read FUND-ONE, then compare it with BENCHMARK-ONE.",
+                        specialist_id="fund-research",
+                        objective="Research FUND-ALPHA holdings and disclosures.",
                     ),
                 ),
             )
         assert len(input.prior_results) == 1
         return Finish(kind="finish")
-
-
-@dataclass
-class _ShapeSpecialist:
-    observer: _SecondInitializerObserver
-    inputs: list[SpecialistTaskInput] = field(default_factory=list[SpecialistTaskInput])
-    combined_steps: list[str] = field(default_factory=list[str])
-
-    async def run(self, input: SpecialistTaskInput, **_: object) -> SpecialistAttempt:
-        self.inputs.append(input)
-        assert input.context_results == ()
-        if input.objective == "Read FUND-ONE source.":
-            return _attempt(
-                summary="RUN-ONE fund source.",
-                evidence=(
-                    _evidence(
-                        evidence_id="run-one-fund-evidence",
-                        request_id=_RUN_ONE_ID,
-                        task_id=input.task_id,
-                        source="fund",
-                    ),
-                ),
-            )
-        if input.objective == "Read BENCHMARK-ONE source.":
-            return _attempt(
-                summary="RUN-ONE benchmark source.",
-                evidence=(
-                    _evidence(
-                        evidence_id="run-one-benchmark-evidence",
-                        request_id=_RUN_ONE_ID,
-                        task_id=input.task_id,
-                        source="benchmark",
-                    ),
-                ),
-            )
-        assert input.objective == "Read FUND-ONE, then compare it with BENCHMARK-ONE."
-        assert self.observer.second_initializer_committed
-        self.combined_steps.extend(("read-fund", "read-benchmark"))
-        return _attempt(
-            summary="RUN-TWO combined comparison.",
-            evidence=(
-                _evidence(
-                    evidence_id="run-two-fund-evidence",
-                    request_id=_RUN_TWO_ID,
-                    task_id=input.task_id,
-                    source="fund",
-                ),
-                _evidence(
-                    evidence_id="run-two-benchmark-evidence",
-                    request_id=_RUN_TWO_ID,
-                    task_id=input.task_id,
-                    source="benchmark",
-                ),
-            ),
-        )
-
-
-def _attempt(
-    *, summary: str, evidence: tuple[EvidenceEnvelope, ...]
-) -> SpecialistAttempt:
-    return SpecialistAttempt(
-        finding=SpecialistFindingDraft(
-            summary=summary,
-            evidence_ids=tuple(item.id for item in evidence),
-        ),
-        evidence=evidence,
-    )
-
-
-def _evidence(
-    *, evidence_id: str, request_id: str, task_id: str, source: str
-) -> EvidenceEnvelope:
-    return EvidenceEnvelope(
-        id=evidence_id,
-        tenant_id=_TENANT_ID,
-        request_id=request_id,
-        task_id=task_id,
-        source=source,
-        source_url=f"https://fixture.test/{evidence_id}",
-        title=f"{source} fixture",
-        body=f"{request_id} request-local evidence body",
-        excerpt=f"{request_id} {source} evidence excerpt.",
-        as_of_date=date(2026, 9, 7),
-    )
 
 
 @dataclass
@@ -277,17 +190,20 @@ class _CapturingSynthesis:
 
     async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
         self.prepared_inputs.append(prepared)
+        assert prepared.intent == _INTENT
         if prepared.standalone_query == _RUN_ONE_STANDALONE:
-            assert tuple(item.id for item in prepared.evidence) == (
-                "run-one-fund-evidence",
-                "run-one-benchmark-evidence",
-            )
-            return FinancialResearchReport(markdown_report=_RUN_ONE_ANSWER)
+            assert tuple(item.id for item in prepared.evidence) == ("price-evidence",)
+            assert [item.alias for item in prepared.calculations] == [
+                "C:1",
+                "C:2",
+                "C:3",
+            ]
+            return FinancialResearchReport(markdown_report=_RUN_ONE_REPORT)
         assert prepared.standalone_query == _RUN_TWO_STANDALONE
         assert self.observer.second_initializer_committed
         assert tuple(item.id for item in prepared.evidence) == (
-            "run-two-fund-evidence",
-            "run-two-benchmark-evidence",
+            "holdings-evidence",
+            "report-evidence",
         )
         assert prepared.calculations == ()
         return FinancialResearchReport(markdown_report=_RUN_TWO_ANSWER)
@@ -302,83 +218,48 @@ class _CapturingSynthesis:
         return await self.synthesize(prepared)
 
 
-class _AgentTenantManager:
-    def get_tenant_config(self, tenant_id: str) -> TenantConfig:
-        assert tenant_id == _TENANT_ID
-        return TenantConfig(
-            kms_app_name="Sequential Agent Tenant",
-            application_id=_TENANT_ID,
-            ad_groups=[],
-            runtime_mode=LangGraphRuntimeMode.AGENT,
-            llm_config=LLMConfig(models={}),
-            flow_config=FlowConfig(),
-        )
-
-    def get_providers(self, tenant_id: str) -> object:
-        assert tenant_id == _TENANT_ID
-        return object()
+@dataclass
+class _ConsecutiveRunsFixture:
+    app: FastAPI
+    observer: _SecondInitializerObserver
+    understanding: _HistoryUnderstanding
+    coordinator: _ShapeCoordinator
+    financial_fixture: FinancialFixture
+    synthesis: _CapturingSynthesis
 
 
-def _app(
-    database_url: str,
-    *,
-    observer: _SecondInitializerObserver,
-    understanding: _HistoryUnderstanding,
-    coordinator: _ShapeCoordinator,
-    specialist: _ShapeSpecialist,
-    synthesis: _CapturingSynthesis,
-) -> FastAPI:
-    policy = AgentIntentPolicy(
-        intent="fund_comparison",
-        description="Compare a fund with its benchmark.",
-        specialist_descriptors=(
-            SpecialistDescriptor(id="fund-source", description="Fund source"),
-            SpecialistDescriptor(id="benchmark-source", description="Benchmark source"),
-            SpecialistDescriptor(
-                id="combined-comparison", description="Combined comparison"
-            ),
-        ),
+def _fixture(database_url: str) -> _ConsecutiveRunsFixture:
+    observer = _SecondInitializerObserver()
+    financial_fixture = FinancialFixture(
+        alternate_holdings_failure=True,
+        request_id=_RUN_ONE_ID,
+        failure_request_ids=frozenset({_RUN_ONE_ID}),
+        failure_diagnostic=_RETRY_DIAGNOSTIC,
     )
-    registry = SpecialistRegistry(
-        registrations=(
-            SpecialistRegistration(id="fund-source", actor=specialist),
-            SpecialistRegistration(id="benchmark-source", actor=specialist),
-            SpecialistRegistration(id="combined-comparison", actor=specialist),
-        ),
-        tenant_eligible_ids=frozenset(
-            {"fund-source", "benchmark-source", "combined-comparison"}
-        ),
-    )
-
-    def factory(
-        *,
-        app: FastAPI,
-        request_context: TrustedRequestContext,
-        checkpointer: BaseCheckpointSaver[Any],
-    ) -> GraphRuntimeAdapter:
-        return build_agent_runtime(
-            app,
-            request_context=request_context,
-            checkpointer=checkpointer,
-            query_understanding_actor=understanding,
-            coordinator_actor=coordinator,
-            specialist_registry=registry,
-            intent_policies={policy.intent: policy},
-            synthesis_actor=synthesis,
-        )
+    understanding = _HistoryUnderstanding(observer, financial_fixture)
+    coordinator = _ShapeCoordinator(observer)
+    synthesis = _CapturingSynthesis(observer)
 
     def saver_factory(conn: Any, *, serde: JsonPlusSerializer) -> _ObservingSaver:
         saver = _ObservingSaver(conn, serde=serde)
         saver.observer = observer
         return saver
 
-    app = persistent_linear_app(
-        database_url,
-        agent_runtime_factory=factory,
-        checkpointer_factory=saver_factory,
+    return _ConsecutiveRunsFixture(
+        app=financial_app(
+            database_url,
+            financial_fixture,
+            query_understanding_actor=understanding,
+            coordinator_actor=coordinator,
+            synthesis_actor=synthesis,
+            checkpointer_factory=saver_factory,
+        ),
+        observer=observer,
+        understanding=understanding,
+        coordinator=coordinator,
+        financial_fixture=financial_fixture,
+        synthesis=synthesis,
     )
-    app.state.tenant_manager = _AgentTenantManager()
-    return app
 
 
 def _post(
@@ -410,10 +291,7 @@ def _checkpoint(
         lambda: app.state.langgraph_v2_checkpointer.aget_tuple(
             thread_checkpoint_config(
                 thread_id=thread_id_for(
-                    _TENANT_ID,
-                    _SUBJECT_ID,
-                    "agent",
-                    str(conversation_id),
+                    _TENANT_ID, _SUBJECT_ID, "agent", str(conversation_id)
                 )
             )
         )
@@ -432,10 +310,7 @@ def _messages(
             app.state.langgraph_v2_checkpointer,
             thread_checkpoint_config(
                 thread_id=thread_id_for(
-                    _TENANT_ID,
-                    _SUBJECT_ID,
-                    "agent",
-                    str(conversation_id),
+                    _TENANT_ID, _SUBJECT_ID, "agent", str(conversation_id)
                 )
             ),
             state_adapter=AgentCheckpointStateAdapter(),
@@ -443,16 +318,24 @@ def _messages(
     )
 
 
+def _canonical_publication(
+    response: Any,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return public results without scheduler-dependent progress ordering."""
+    events = parse_sse(response.text)
+    return (
+        "".join(event["data"] for event in events if event["type"] == "token"),
+        [event for event in events if event["type"] == "done"],
+        [event for event in events if event["type"] == "citations"],
+    )
+
+
 def _assert_publication(response: Any, checkpoint: Any, *, answer: str) -> None:
     assert response.status_code == 200
-    events = parse_sse(response.text)
-    done = [event for event in events if event["type"] == "done"]
-    citations = [event for event in events if event["type"] == "citations"]
+    tokens, done, citations = _canonical_publication(response)
     assert len(done) == len(citations) == 1
     assert done[0]["data"]["answer"] == answer
-    assert (
-        "".join(event["data"] for event in events if event["type"] == "token") == answer
-    )
+    assert tokens == answer
     assert citations[0]["data"] == done[0]["data"]["citations"]
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
@@ -463,31 +346,19 @@ def _assert_publication(response: Any, checkpoint: Any, *, answer: str) -> None:
 def test_consecutive_agent_runs_reset_state_and_change_execution_shape(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    observer = _SecondInitializerObserver()
-    understanding = _HistoryUnderstanding(observer)
-    coordinator = _ShapeCoordinator(observer)
-    specialist = _ShapeSpecialist(observer)
-    synthesis = _CapturingSynthesis(observer)
-    app = _app(
-        langgraph_v2_migrated_database_url,
-        observer=observer,
-        understanding=understanding,
-        coordinator=coordinator,
-        specialist=specialist,
-        synthesis=synthesis,
-    )
+    fixture = _fixture(langgraph_v2_migrated_database_url)
 
-    with TestClient(app) as client:
+    with TestClient(fixture.app) as client:
         first = _post(client, query=_RUN_ONE_QUERY, request_id=_RUN_ONE_ID)
-        first_checkpoint = copy.deepcopy(_checkpoint(app, client))
+        first_checkpoint = copy.deepcopy(_checkpoint(fixture.app, client))
         second = _post(client, query=_RUN_TWO_QUERY, request_id=_RUN_TWO_ID)
-        second_checkpoint = _checkpoint(app, client)
-        messages = _messages(app, client)
+        second_checkpoint = _checkpoint(fixture.app, client)
+        messages = _messages(fixture.app, client)
 
     _assert_publication(first, first_checkpoint, answer=_RUN_ONE_ANSWER)
     _assert_publication(second, second_checkpoint, answer=_RUN_TWO_ANSWER)
-    assert observer.snapshot is not None
-    reset = observer.snapshot
+    assert fixture.observer.snapshot is not None
+    reset = fixture.observer.snapshot
     assert reset["query"] == _RUN_TWO_QUERY
     assert reset["conversation_id"] == str(_CONVERSATION_ID)
     assert reset["request_id"] == _RUN_TWO_ID
@@ -521,24 +392,42 @@ def test_consecutive_agent_runs_reset_state_and_change_execution_shape(
     ):
         assert reset[channel] is None
 
-    assert understanding.histories == [
+    assert fixture.understanding.histories == [
         [],
         [ConversationExchange(user=_RUN_ONE_QUERY, assistant=_RUN_ONE_ANSWER)],
     ]
-    assert specialist.combined_steps == ["read-fund", "read-benchmark"]
-    assert len(synthesis.prepared_inputs) == 2
+    assert fixture.financial_fixture.tools.provider_calls[-2:] == [
+        ("fund", "FUND-ALPHA holdings"),
+        ("fund", "FUND-ALPHA report"),
+    ]
+    assert len(fixture.synthesis.prepared_inputs) == 2
+    assert all(input.intent == _INTENT for input in fixture.coordinator.inputs)
+    assert all(
+        prepared.intent == _INTENT for prepared in fixture.synthesis.prepared_inputs
+    )
     assert all(
         "conversation_messages" not in input.model_dump_json()
-        for input in coordinator.inputs
+        for input in fixture.coordinator.inputs
     )
-    assert all(input.context_results == () for input in specialist.inputs)
     assert all(
-        "conversation_messages" not in repr(input) for input in specialist.inputs
+        set(input)
+        == {
+            "context_results",
+            "objective",
+            "skill_summaries",
+            "task_id",
+            "validation_feedback",
+        }
+        for input in fixture.financial_fixture.specialists.task_prompts
     )
     assert all(
         "conversation_messages" not in prepared.model_dump_json()
-        for prepared in synthesis.prepared_inputs
+        for prepared in fixture.synthesis.prepared_inputs
     )
+    second_task_input = fixture.financial_fixture.specialists.task_prompts[-1]
+    assert second_task_input["validation_feedback"] is None
+    assert _RUN_ONE_ID not in repr(second_task_input)
+    assert _RUN_ONE_ID not in fixture.synthesis.prepared_inputs[-1].model_dump_json()
     assert [(message.type, message.text) for message in messages] == [
         ("human", _RUN_ONE_QUERY),
         ("ai", _RUN_ONE_ANSWER),
@@ -551,6 +440,32 @@ def test_consecutive_agent_runs_reset_state_and_change_execution_shape(
         f"{_RUN_TWO_ID}:user",
         f"{_RUN_TWO_ID}:assistant",
     ]
+    assert first_checkpoint is not None
+    first_state = first_checkpoint.checkpoint["channel_values"]
+    first_batch = next(iter(first_state["accepted_batches"].values()))
+    assert [item["kind"] for item in first_batch["outcomes"]] == [
+        "succeeded",
+        "failed",
+    ]
+    assert (
+        fixture.financial_fixture.specialists.emitted_failure_diagnostics
+        == [_RETRY_DIAGNOSTIC] * 3
+    )
+    assert first_batch["usage"]["model_requests"] > 0
+    assert first_batch["usage"]["completed_tool_calls"] > 0
+    assert first_batch["usage"]["tool_attempts"] > 0
+    assert len(first_batch["calculations"]) == 3
+    assert {item["request_id"] for item in first_batch["calculations"]} == {_RUN_ONE_ID}
+    assert {
+        evidence_id
+        for item in first_batch["calculations"]
+        for evidence_id in item["evidence_refs"]
+    } == {"price-evidence"}
+    assert [
+        input["validation_feedback"]
+        for input in fixture.financial_fixture.specialists.task_prompts
+        if input["task_id"] == first_batch["outcomes"][0]["task_id"]
+    ] == [None]
     assert second_checkpoint is not None
     second_state = second_checkpoint.checkpoint["channel_values"]
     assert second_state["request_id"] == _RUN_TWO_ID
@@ -558,39 +473,37 @@ def test_consecutive_agent_runs_reset_state_and_change_execution_shape(
     assert second_state["active_batch"] is None
     assert second_state["dispatched_task"] is None
     assert len(second_state["accepted_batches"]) == 1
+    second_batch = next(iter(second_state["accepted_batches"].values()))
+    assert len(second_batch["outcomes"]) == 1
+    assert second_batch["calculations"] == []
+    assert (
+        second_batch["usage"]["model_requests"] < first_batch["usage"]["model_requests"]
+    )
+    assert (
+        second_batch["usage"]["tool_attempts"] < first_batch["usage"]["tool_attempts"]
+    )
     assert [
         round_["kind"] for round_ in second_state["coordination_rounds"].values()
-    ] == [
-        "dispatch",
-        "finish",
-    ]
+    ] == ["dispatch", "finish"]
     second_control_state = {
         key: value
         for key, value in second_state.items()
         if key != "conversation_messages"
     }
     assert _RUN_ONE_ID not in repr(second_control_state)
-    assert "run-one-" not in repr(second_control_state)
+    assert "price-evidence" not in repr(second_control_state)
+    assert "C:1" not in repr(second_control_state)
+    assert _RETRY_DIAGNOSTIC not in repr(second_control_state)
+    assert _RUN_ONE_ID not in second.text
+    assert _RETRY_DIAGNOSTIC not in second.text
 
 
 def test_agent_request_id_retry_converges_and_conflict_fails_closed(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    observer = _SecondInitializerObserver()
-    understanding = _HistoryUnderstanding(observer)
-    coordinator = _ShapeCoordinator(observer)
-    specialist = _ShapeSpecialist(observer)
-    synthesis = _CapturingSynthesis(observer)
-    app = _app(
-        langgraph_v2_migrated_database_url,
-        observer=observer,
-        understanding=understanding,
-        coordinator=coordinator,
-        specialist=specialist,
-        synthesis=synthesis,
-    )
+    fixture = _fixture(langgraph_v2_migrated_database_url)
 
-    with TestClient(app) as client:
+    with TestClient(fixture.app) as client:
         first = _post(
             client,
             query=_RUN_ONE_QUERY,
@@ -598,7 +511,11 @@ def test_agent_request_id_retry_converges_and_conflict_fails_closed(
             conversation_id=_IDEMPOTENCY_CONVERSATION_ID,
         )
         first_checkpoint = copy.deepcopy(
-            _checkpoint(app, client, conversation_id=_IDEMPOTENCY_CONVERSATION_ID)
+            _checkpoint(
+                fixture.app,
+                client,
+                conversation_id=_IDEMPOTENCY_CONVERSATION_ID,
+            )
         )
         retry = _post(
             client,
@@ -607,7 +524,9 @@ def test_agent_request_id_retry_converges_and_conflict_fails_closed(
             conversation_id=_IDEMPOTENCY_CONVERSATION_ID,
         )
         retry_checkpoint = _checkpoint(
-            app, client, conversation_id=_IDEMPOTENCY_CONVERSATION_ID
+            fixture.app,
+            client,
+            conversation_id=_IDEMPOTENCY_CONVERSATION_ID,
         )
         conflict = _post(
             client,
@@ -615,25 +534,29 @@ def test_agent_request_id_retry_converges_and_conflict_fails_closed(
             request_id=_RUN_ONE_ID,
             conversation_id=_IDEMPOTENCY_CONVERSATION_ID,
         )
-        messages = _messages(app, client, conversation_id=_IDEMPOTENCY_CONVERSATION_ID)
+        messages = _messages(
+            fixture.app,
+            client,
+            conversation_id=_IDEMPOTENCY_CONVERSATION_ID,
+        )
 
     _assert_publication(first, first_checkpoint, answer=_RUN_ONE_ANSWER)
     _assert_publication(retry, retry_checkpoint, answer=_RUN_ONE_ANSWER)
     assert first.headers["x-request-id"] == retry.headers["x-request-id"] == _RUN_ONE_ID
-    assert parse_sse(first.text) == parse_sse(retry.text)
+    assert _canonical_publication(first) == _canonical_publication(retry)
     assert conflict.status_code == 409
     assert conflict.json() == {
         "detail": "clientRequestId was already used for a different query"
     }
-    assert understanding.histories == [[], []]
-    assert len(specialist.inputs) == 4
-    assert len(synthesis.prepared_inputs) == 2
+    assert fixture.understanding.histories == [[], []]
+    assert len(fixture.financial_fixture.specialists.task_prompts) == 2
+    assert len(fixture.synthesis.prepared_inputs) == 2
     assert [(message.id, message.text) for message in messages] == [
         (f"{_RUN_ONE_ID}:user", _RUN_ONE_QUERY),
         (f"{_RUN_ONE_ID}:assistant", _RUN_ONE_ANSWER),
     ]
     assert first_checkpoint is not None and retry_checkpoint is not None
     assert (
-        first_checkpoint.checkpoint["channel_values"]["coordination_rounds"]
-        == retry_checkpoint.checkpoint["channel_values"]["coordination_rounds"]
+        first_checkpoint.checkpoint["channel_values"]
+        == retry_checkpoint.checkpoint["channel_values"]
     )

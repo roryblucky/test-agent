@@ -17,6 +17,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart
@@ -38,13 +39,18 @@ from app.langgraph_v2.agent_batch import (
     TaskProposal,
     task_id_for,
 )
-from app.langgraph_v2.agent_coordination import CoordinatorInput, Finish
+from app.langgraph_v2.agent_coordination import (
+    CoordinatorActor,
+    CoordinatorInput,
+    Finish,
+)
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     FinancialResearchReport,
     PreparedSynthesis,
     SpecialistToolCapture,
 )
+from app.langgraph_v2.agent_graph import QueryUnderstandingActor, SynthesisActor
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
@@ -75,6 +81,7 @@ from app.langgraph_v2.specialist_retry import (
 )
 from app.models.workflow import IntentResult, QueryUnderstandingOutput, ResolvedQuery
 from tests.integration.test_langgraph_v2_linear_core import (
+    CheckpointerFactory,
     parse_sse,
     persistent_linear_app,
 )
@@ -94,9 +101,9 @@ def disable_real_model_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pydantic_models, "ALLOW_MODEL_REQUESTS", False)
 
 
-def _task_id(*, round: int, dispatch_order: int) -> str:
+def _task_id(*, request_id: str = _REQUEST_ID, round: int, dispatch_order: int) -> str:
     return task_id_for(
-        request_id=_REQUEST_ID,
+        request_id=request_id,
         round=round,
         dispatch_order=dispatch_order,
     )
@@ -120,6 +127,8 @@ def _prompt_body(messages: Sequence[ModelMessage]) -> dict[str, Any]:
 class _FinancialTools:
     """Four fixed business-Tool providers and a deterministic fan-out barrier."""
 
+    request_id: str = _REQUEST_ID
+    fund_task_dispatch_order: int = 1
     synchronize_first_batch: bool = True
     price_entered: asyncio.Event = field(default_factory=asyncio.Event)
     holdings_entered: asyncio.Event = field(default_factory=asyncio.Event)
@@ -136,7 +145,12 @@ class _FinancialTools:
             await asyncio.wait_for(self.holdings_entered.wait(), timeout=1)
         return self._evidence(
             evidence_id="price-evidence",
-            task_id=_task_id(round=1, dispatch_order=0),
+            request_id=self.request_id,
+            task_id=_task_id(
+                request_id=self.request_id,
+                round=1,
+                dispatch_order=0,
+            ),
             source=source,
             query=query,
             body="fixed closes: 100, 110, 99",
@@ -150,7 +164,12 @@ class _FinancialTools:
             await asyncio.wait_for(self.price_entered.wait(), timeout=1)
         return self._evidence(
             evidence_id="holdings-evidence",
-            task_id=_task_id(round=1, dispatch_order=1),
+            request_id=self.request_id,
+            task_id=_task_id(
+                request_id=self.request_id,
+                round=1,
+                dispatch_order=self.fund_task_dispatch_order,
+            ),
             source=source,
             query=query,
             body="fixed holdings: ALPHA 60%, BETA 40%",
@@ -161,7 +180,12 @@ class _FinancialTools:
         self.provider_calls.append((source, query))
         return self._evidence(
             evidence_id="report-evidence",
-            task_id=_task_id(round=1, dispatch_order=1),
+            request_id=self.request_id,
+            task_id=_task_id(
+                request_id=self.request_id,
+                round=1,
+                dispatch_order=self.fund_task_dispatch_order,
+            ),
             source=source,
             query=query,
             body="fixed disclosure: quarterly report",
@@ -172,7 +196,12 @@ class _FinancialTools:
         self.provider_calls.append((source, query))
         return self._evidence(
             evidence_id="news-evidence",
-            task_id=_task_id(round=2, dispatch_order=0),
+            request_id=self.request_id,
+            task_id=_task_id(
+                request_id=self.request_id,
+                round=2,
+                dispatch_order=0,
+            ),
             source=source,
             query=query,
             body="fixed news: portfolio company announced earnings",
@@ -182,6 +211,7 @@ class _FinancialTools:
     def _evidence(
         *,
         evidence_id: str,
+        request_id: str,
         task_id: str,
         source: str,
         query: str,
@@ -190,7 +220,7 @@ class _FinancialTools:
         return EvidenceEnvelope(
             id=evidence_id,
             tenant_id="tenant-a",
-            request_id=_REQUEST_ID,
+            request_id=request_id,
             task_id=task_id,
             source=source,
             source_url=f"https://fixture.test/{evidence_id}",
@@ -273,6 +303,9 @@ class _FailingHoldingsActor:
     """Produce the spec's stronger alternate TaskFailed outcome."""
 
     fallback: SpecialistActor
+    failing_task_ids: frozenset[str]
+    diagnostic_message: str
+    emitted_diagnostics: list[str]
 
     async def run(
         self,
@@ -281,12 +314,16 @@ class _FailingHoldingsActor:
         usage: RunUsage | None = None,
         usage_limits: UsageLimits | None = None,
     ) -> Any:
-        if input.objective != _FUND_OBJECTIVE:
+        if (
+            input.objective != _FUND_OBJECTIVE
+            or input.task_id not in self.failing_task_ids
+        ):
             return await self.fallback.run(
                 input, usage=usage, usage_limits=usage_limits
             )
         assert usage is not None
         usage.incr(RunUsage(requests=1))
+        self.emitted_diagnostics.append(self.diagnostic_message)
         raise SpecialistInvocationFailure(
             ModelHTTPError(429, "fixture holdings boundary"),
             facts=SpecialistFailureFacts(
@@ -297,7 +334,7 @@ class _FailingHoldingsActor:
                 unreturned_model_requests=0,
                 usage_limits=specialist_usage_limits(),
             ),
-            messages=("fixture holdings retry",),
+            messages=(self.diagnostic_message,),
         )
 
 
@@ -306,10 +343,14 @@ class _FinancialSpecialists:
     """FunctionModel-backed Specialists for the two fixed roster entries."""
 
     alternate_holdings_failure: bool = False
+    failing_task_ids: frozenset[str] = frozenset()
+    failure_diagnostic: str = "fixture holdings retry"
+    emitted_failure_diagnostics: list[str] = field(default_factory=list[str])
     skill_views: list[tuple[str, tuple[str, ...]]] = field(
         default_factory=list[tuple[str, tuple[str, ...]]]
     )
     activated_instruction_views: list[str] = field(default_factory=list[str])
+    task_prompts: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
     def market_analysis(
         self,
@@ -337,7 +378,14 @@ class _FinancialSpecialists:
             skill_invocation=skill_invocation,
         )
         return (
-            _FailingHoldingsActor(actor) if self.alternate_holdings_failure else actor
+            _FailingHoldingsActor(
+                actor,
+                failing_task_ids=self.failing_task_ids,
+                diagnostic_message=self.failure_diagnostic,
+                emitted_diagnostics=self.emitted_failure_diagnostics,
+            )
+            if self.alternate_holdings_failure
+            else actor
         )
 
     def _actor(
@@ -354,6 +402,8 @@ class _FinancialSpecialists:
             nonlocal calls
             calls += 1
             prompt = _prompt_body(messages)
+            if calls == 1:
+                self.task_prompts.append(prompt)
             objective = prompt["objective"]
             assert isinstance(objective, str)
             summaries = prompt["skill_summaries"]
@@ -582,18 +632,42 @@ class _FinancialTenantManager:
 
 
 @dataclass
-class _FinancialFixture:
+class FinancialFixture:
     alternate_holdings_failure: bool = False
+    request_id: str = _REQUEST_ID
+    failure_request_ids: frozenset[str] | None = None
+    failure_diagnostic: str = "fixture holdings retry"
     tools: _FinancialTools = field(default_factory=_FinancialTools)
     coordinator: _FinancialCoordinator = field(default_factory=_FinancialCoordinator)
     specialists: _FinancialSpecialists = field(init=False)
     synthesis: _FinancialSynthesis = field(default_factory=_FinancialSynthesis)
 
     def __post_init__(self) -> None:
+        self.configure_run(request_id=self.request_id, fund_task_dispatch_order=1)
         self.tools.synchronize_first_batch = not self.alternate_holdings_failure
-        self.specialists = _FinancialSpecialists(
-            alternate_holdings_failure=self.alternate_holdings_failure
+        failure_request_ids = (
+            self.failure_request_ids
+            if self.failure_request_ids is not None
+            else frozenset({self.request_id})
         )
+        self.specialists = _FinancialSpecialists(
+            alternate_holdings_failure=self.alternate_holdings_failure,
+            failing_task_ids=frozenset(
+                _task_id(request_id=request_id, round=1, dispatch_order=1)
+                for request_id in failure_request_ids
+            ),
+            failure_diagnostic=self.failure_diagnostic,
+        )
+
+    def configure_run(
+        self,
+        *,
+        request_id: str,
+        fund_task_dispatch_order: int,
+    ) -> None:
+        """Bind the reusable fixture's Tool provenance to one scripted Run."""
+        self.tools.request_id = request_id
+        self.tools.fund_task_dispatch_order = fund_task_dispatch_order
 
     def registry(self) -> SpecialistRegistry:
         price_body = "fixed closes: 100, 110, 99"
@@ -757,7 +831,16 @@ class _FinancialFixture:
         )
 
 
-def _financial_app(database_url: str, fixture: _FinancialFixture) -> FastAPI:
+def financial_app(
+    database_url: str,
+    fixture: FinancialFixture,
+    *,
+    query_understanding_actor: QueryUnderstandingActor | None = None,
+    coordinator_actor: CoordinatorActor | None = None,
+    synthesis_actor: SynthesisActor | None = None,
+    checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
+) -> FastAPI:
+    """Assemble the golden fixture with optional request-shape scripting."""
     registry = fixture.registry()
     policy = fixture.policy()
 
@@ -771,14 +854,19 @@ def _financial_app(database_url: str, fixture: _FinancialFixture) -> FastAPI:
             app,
             request_context=request_context,
             checkpointer=checkpointer,
-            query_understanding_actor=_FinancialUnderstanding(),
-            coordinator_actor=fixture.coordinator,
+            query_understanding_actor=query_understanding_actor
+            or _FinancialUnderstanding(),
+            coordinator_actor=coordinator_actor or fixture.coordinator,
             specialist_registry=registry,
             intent_policies={policy.intent: policy},
-            synthesis_actor=fixture.synthesis.actor(),
+            synthesis_actor=synthesis_actor or fixture.synthesis.actor(),
         )
 
-    app = persistent_linear_app(database_url, agent_runtime_factory=factory)
+    app = persistent_linear_app(
+        database_url,
+        agent_runtime_factory=factory,
+        checkpointer_factory=checkpointer_factory,
+    )
     app.state.tenant_manager = _FinancialTenantManager()
     return app
 
@@ -827,8 +915,8 @@ def _messages(app: FastAPI, client: TestClient, conversation_id: UUID) -> list[A
 def test_financial_golden_path_commits_one_validated_report_per_conversation(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    fixture = _FinancialFixture()
-    app = _financial_app(langgraph_v2_migrated_database_url, fixture)
+    fixture = FinancialFixture()
+    app = financial_app(langgraph_v2_migrated_database_url, fixture)
     conversation_ids = (
         UUID("00000000-0000-0000-0000-000000000141"),
         UUID("00000000-0000-0000-0000-000000000142"),
@@ -1006,8 +1094,8 @@ def test_financial_golden_path_commits_one_validated_report_per_conversation(
 def test_failed_holdings_changes_the_next_decision_and_still_finishes_bounded(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
-    fixture = _FinancialFixture(alternate_holdings_failure=True)
-    app = _financial_app(langgraph_v2_migrated_database_url, fixture)
+    fixture = FinancialFixture(alternate_holdings_failure=True)
+    app = financial_app(langgraph_v2_migrated_database_url, fixture)
     conversation_id = UUID("00000000-0000-0000-0000-000000000143")
 
     with TestClient(app) as client:
