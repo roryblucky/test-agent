@@ -194,7 +194,6 @@ def create_specialist_agent(
         output_type=SpecialistFindingDraft,
         instructions=SPECIALIST_INSTRUCTIONS,
         tools=tools,
-        retries=0,
         tool_retries=0,
         output_retries=SPECIALIST_OUTPUT_RETRIES,
         end_strategy="early",

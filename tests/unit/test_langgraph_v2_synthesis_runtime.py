@@ -80,7 +80,6 @@ def test_synthesis_factory_instructs_evidence_markers() -> None:
     assert registry.kwargs is not None
     assert registry.kwargs["instructions"] == SYNTHESIS_INSTRUCTIONS
     assert registry.kwargs["tools"] == ()
-    assert registry.kwargs["retries"] == 0
     assert registry.kwargs["tool_retries"] == 0
     assert registry.kwargs["deps_type"] is PreparedSynthesis
     assert registry.kwargs["output_retries"] == SYNTHESIS_OUTPUT_RETRIES

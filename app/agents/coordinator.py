@@ -125,7 +125,6 @@ def create_coordinator_agent(
             output_type=cast(type[Any], CoordinatorDecision),
             instructions=COORDINATOR_INSTRUCTIONS,
             tools=(),
-            retries=0,
             tool_retries=0,
             output_retries=COORDINATOR_OUTPUT_RETRIES,
             end_strategy="early",

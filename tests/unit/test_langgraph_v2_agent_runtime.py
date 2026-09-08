@@ -89,7 +89,6 @@ def test_coordinator_factory_enables_only_one_output_retry() -> None:
         "output_type": CoordinatorDecision,
         "instructions": registry.kwargs["instructions"],
         "tools": (),
-        "retries": 0,
         "tool_retries": 0,
         "output_retries": COORDINATOR_OUTPUT_RETRIES,
         "end_strategy": "early",

@@ -76,7 +76,6 @@ def create_synthesis_agent(
             output_type=cast(type[Any], FinancialResearchReport),
             instructions=SYNTHESIS_INSTRUCTIONS,
             tools=(),
-            retries=0,
             tool_retries=0,
             output_retries=SYNTHESIS_OUTPUT_RETRIES,
             end_strategy="early",
