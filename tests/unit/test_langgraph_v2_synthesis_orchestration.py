@@ -1,4 +1,4 @@
-"""Synthesis repair orchestration coverage."""
+"""Synthesis publication orchestration coverage."""
 
 import pytest
 from pydantic import ValidationError
@@ -39,47 +39,30 @@ def test_prepared_synthesis_rejects_noncanonical_input_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_gate_rejection_repairs_the_same_frozen_prepared_value_once() -> None:
-    class _RepairingSynthesis:
+async def test_synthesize_report_publishes_one_actor_candidate() -> None:
+    class _Synthesis:
         def __init__(self) -> None:
-            self.first_inputs: list[PreparedSynthesis] = []
-            self.repair_inputs: list[PreparedSynthesis] = []
-            self.validation_errors: tuple[str, ...] | None = None
+            self.inputs: list[PreparedSynthesis] = []
 
         async def synthesize(
             self, prepared: PreparedSynthesis
         ) -> FinancialResearchReport:
-            self.first_inputs.append(prepared)
-            return FinancialResearchReport(
-                markdown_report="Apple grew. [[E:1]] [[E:1]]"
-            )
-
-        async def repair(
-            self,
-            prepared: PreparedSynthesis,
-            *,
-            validation_errors: tuple[str, ...],
-        ) -> FinancialResearchReport:
-            self.repair_inputs.append(prepared)
-            self.validation_errors = validation_errors
+            self.inputs.append(prepared)
             return FinancialResearchReport(markdown_report="Apple grew. [[E:1]]")
 
     prepared = _prepared()
-    actor = _RepairingSynthesis()
+    actor = _Synthesis()
 
     published = await synthesize_report(actor, prepared)
 
     assert published.answer == "Apple grew. [[E:1]]"
-    assert actor.first_inputs == [prepared]
-    assert actor.repair_inputs == [prepared]
-    assert actor.first_inputs[0] is prepared
-    assert actor.repair_inputs[0] is prepared
-    assert actor.validation_errors == ("Evidence marker is duplicated",)
+    assert actor.inputs == [prepared]
+    assert actor.inputs[0] is prepared
 
 
 @pytest.mark.asyncio
-async def test_second_rejected_candidate_is_fatal_without_a_third_invocation() -> None:
-    class _StillInvalidSynthesis:
+async def test_rejected_candidate_is_not_repaired_by_orchestration() -> None:
+    class _InvalidSynthesis:
         def __init__(self) -> None:
             self.calls = 0
 
@@ -90,19 +73,9 @@ async def test_second_rejected_candidate_is_fatal_without_a_third_invocation() -
             self.calls += 1
             return FinancialResearchReport(markdown_report="Apple grew.")
 
-        async def repair(
-            self,
-            prepared: PreparedSynthesis,
-            *,
-            validation_errors: tuple[str, ...],
-        ) -> FinancialResearchReport:
-            del prepared, validation_errors
-            self.calls += 1
-            return FinancialResearchReport(markdown_report="Apple grew.")
-
-    actor = _StillInvalidSynthesis()
+    actor = _InvalidSynthesis()
 
     with pytest.raises(SynthesisCandidateRejected, match="Evidence marker is missing"):
         await synthesize_report(actor, _prepared())
 
-    assert actor.calls == 2
+    assert actor.calls == 1

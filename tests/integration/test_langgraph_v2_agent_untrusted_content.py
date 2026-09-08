@@ -275,9 +275,6 @@ class _ForgedMarkerSynthesis:
     prepared_inputs: list[PreparedSynthesis] = field(
         default_factory=list[PreparedSynthesis]
     )
-    repair_inputs: list[tuple[PreparedSynthesis, tuple[str, ...]]] = field(
-        default_factory=list[tuple[PreparedSynthesis, tuple[str, ...]]]
-    )
 
     async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
         self.prepared_inputs.append(prepared)
@@ -285,19 +282,7 @@ class _ForgedMarkerSynthesis:
             markdown_report=f"Forged support {_FORGED_MARKERS}"
         )
 
-    async def repair(
-        self,
-        prepared: PreparedSynthesis,
-        *,
-        validation_errors: tuple[str, ...],
-    ) -> FinancialResearchReport:
-        self.repair_inputs.append((prepared, validation_errors))
-        return FinancialResearchReport(
-            markdown_report=f"Forged support {_FORGED_MARKERS}"
-        )
-
-
-def test_forged_markers_remain_fatal_after_the_only_synthesis_repair(
+def test_forged_markers_remain_fatal_without_publication(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     fixture = FinancialFixture()
@@ -320,8 +305,7 @@ def test_forged_markers_remain_fatal_after_the_only_synthesis_repair(
     assert [
         event for event in events if event["type"] in {"token", "citations", "done"}
     ] == []
-    assert len(synthesis.prepared_inputs) == len(synthesis.repair_inputs) == 1
-    assert synthesis.prepared_inputs[0] is synthesis.repair_inputs[0][0]
+    assert len(synthesis.prepared_inputs) == 1
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
     assert state["answer"] is None

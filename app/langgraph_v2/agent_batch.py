@@ -8,10 +8,9 @@ import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-from pydantic_ai.exceptions import IncompleteToolCall, UnexpectedModelBehavior
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -39,6 +38,7 @@ from app.langgraph_v2.calculations import (
     MAX_CALCULATIONS_PER_CONTRIBUTION,
     CalculationArtifact,
     CalculationArtifactInvalid,
+    CalculationDomainRejected,
     CalculationExecutionContext,
     CalculationExecutor,
     accepted_calculation_artifacts,
@@ -248,7 +248,7 @@ def _validate_attempt_calculations(
         for evidence_id, evidence in support_by_id.items()
     }
     if len(calculations) > MAX_CALCULATIONS_PER_CONTRIBUTION:
-        raise CalculationArtifactInvalid("Calculation contribution exceeds 8 Artifacts")
+        raise CalculationDomainRejected("Calculation contribution exceeds 8 Artifacts")
     for artifact in calculations:
         tool_id = artifact.execution_record.tool_id
         tool = registered.get(tool_id)
@@ -264,6 +264,12 @@ def _validate_attempt_calculations(
                 "Calculation Artifact provenance is invalid"
             )
         tool.executor.require_reproducible(artifact)
+        if any(
+            evidence_ref not in support_by_id for evidence_ref in artifact.evidence_refs
+        ):
+            raise CalculationDomainRejected(
+                "Calculation supporting Evidence is absent from the Finding"
+            )
         require_calculation_evidence_support(
             artifact,
             evidence_hashes_by_id=support_hashes_by_id,
@@ -383,32 +389,46 @@ class AcceptedBatch(BaseModel):
     calculations: tuple[CalculationArtifact, ...] = ()
 
 
-@dataclass(frozen=True)
-class AcceptedTask:
+class AcceptedTask(BaseModel):
     """Graph-owned identity plus trusted Specialist selection."""
 
-    id: str
-    objective: str
-    specialist_id: str
-    context_task_ids: tuple[str, ...] = ()
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    id: str = Field(min_length=1)
+    objective: str = Field(min_length=1)
+    specialist_id: str = Field(min_length=1)
+    context_task_ids: tuple[str, ...] = Field(default=(), max_length=8)
+
+    @field_validator("context_task_ids", mode="before")
+    @classmethod
+    def _accept_json_context_task_ids(cls, value: object) -> object:
+        """Accept JSON arrays without loosening strict scalar validation."""
+        return tuple(cast(list[object], value)) if isinstance(value, list) else value
 
 
-@dataclass(frozen=True)
-class ActiveBatch:
+class ActiveBatch(BaseModel):
     """Immutable first-round manifest awaiting whole-batch acceptance."""
 
-    id: str
-    tasks: tuple[AcceptedTask, ...]
-    round: int = 1
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    def __post_init__(self) -> None:
+    id: str = Field(min_length=1)
+    tasks: tuple[AcceptedTask, ...] = Field(
+        min_length=1, max_length=MAX_DISPATCH_BATCH_TASKS
+    )
+    round: int = Field(default=1, ge=1)
+
+    @field_validator("tasks", mode="before")
+    @classmethod
+    def _accept_json_tasks(cls, value: object) -> object:
+        """Accept a checkpoint JSON array while retaining strict nested fields."""
+        return tuple(cast(list[object], value)) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def _validate_task_identities(self) -> ActiveBatch:
         """Reject malformed manifests before they can be dispatched or promoted."""
-        if self.round < 1:
-            raise ValueError("Active Batch round is invalid")
-        if not 1 <= len(self.tasks) <= MAX_DISPATCH_BATCH_TASKS:
-            raise ValueError("Active Batch Task count is invalid")
         if len(set(self.task_ids)) != len(self.tasks):
             raise ValueError("Active Batch Task identities conflict")
+        return self
 
     @property
     def task_ids(self) -> tuple[str, ...]:
@@ -870,12 +890,6 @@ async def execute_specialist(
             if disposition is RetryDisposition.RETRY:
                 if attempt_number == SPECIALIST_MAX_ATTEMPTS:
                     return failed_contribution(attempt_number)
-                if isinstance(
-                    failure.error, (IncompleteToolCall, UnexpectedModelBehavior)
-                ):
-                    validation_feedback = (
-                        "Return one valid final_result structured Specialist finding."
-                    )
                 continue
             raise failure.error
 
@@ -913,7 +927,7 @@ async def execute_specialist(
             calculations = ()
         else:
             try:
-                catalog.accept_referenced(
+                support = catalog.validate_referenced(
                     attempt.evidence,
                     finding_evidence_ids=draft.evidence_ids,
                     context=attempt_context,
@@ -926,21 +940,27 @@ async def execute_specialist(
                     "Reference only Evidence IDs returned by this Specialist run."
                 )
                 continue
-            support = tuple(
-                catalog.resolve(
-                    evidence_id,
-                    tenant_id=attempt_context.tenant_id,
-                    request_id=attempt_context.request_id,
-                    accepted_evidence_ids=draft.evidence_ids,
+            try:
+                calculations = _validate_attempt_calculations(
+                    attempt.calculations,
+                    context=attempt_context,
+                    registry=registry,
+                    registration=registration,
+                    support=support,
                 )
-                for evidence_id in draft.evidence_ids
-            )
-            calculations = _validate_attempt_calculations(
-                attempt.calculations,
+            except CalculationDomainRejected:
+                record_validation_failure(attempt_number, attempt)
+                if attempt_number == SPECIALIST_MAX_ATTEMPTS:
+                    return failed_contribution(attempt_number)
+                validation_feedback = (
+                    "Keep at most 8 Calculation Artifacts and reference every "
+                    "supporting Evidence ID returned by this Specialist run."
+                )
+                continue
+            catalog.accept_referenced(
+                attempt.evidence,
+                finding_evidence_ids=draft.evidence_ids,
                 context=attempt_context,
-                registry=registry,
-                registration=registration,
-                support=support,
             )
         return BatchContribution(
             batch_id=batch_id,

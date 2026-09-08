@@ -17,6 +17,7 @@ from langgraph.graph.message import (  # pyright: ignore[reportMissingTypeStubs]
     add_messages,
 )
 from langgraph.types import Overwrite, Send
+from pydantic import ValidationError
 
 from app.langgraph_v2.agent_batch import (
     AcceptedBatch,
@@ -880,93 +881,25 @@ def _accepted_round_batches(
 
 def _active_batch_dump(batch: ActiveBatch) -> dict[str, Any]:
     """Serialize the scalar active-batch manifest for checkpoint state."""
-    return {
-        "id": batch.id,
-        "round": batch.round,
-        "tasks": [
-            {
-                "id": task.id,
-                "objective": task.objective,
-                "specialist_id": task.specialist_id,
-                "context_task_ids": list(task.context_task_ids),
-            }
-            for task in batch.tasks
-        ],
-    }
+    return batch.model_dump(mode="json")
 
 
 def _active_batch_load(value: Mapping[str, object]) -> ActiveBatch:
     """Validate one scalar active-batch manifest from checkpoint state."""
-    raw_tasks = value.get("tasks")
-    batch_id = value.get("id")
-    round_value = value.get("round")
-    if (
-        not isinstance(batch_id, str)
-        or not isinstance(round_value, int)
-        or not isinstance(raw_tasks, list)
-    ):
-        raise TypeError("Agent active batch is invalid")
-    tasks: list[AcceptedTask] = []
-    for raw_task in cast(list[object], raw_tasks):
-        if not isinstance(raw_task, Mapping):
-            raise TypeError("Agent active batch is invalid")
-        record = cast(Mapping[str, object], raw_task)
-        task_id = record.get("id")
-        objective = record.get("objective")
-        specialist_id = record.get("specialist_id")
-        context_task_ids = record.get("context_task_ids")
-        if (
-            not isinstance(task_id, str)
-            or not isinstance(objective, str)
-            or not isinstance(specialist_id, str)
-            or not isinstance(context_task_ids, list)
-            or not all(
-                isinstance(context_task_id, str)
-                for context_task_id in cast(list[object], context_task_ids)
-            )
-        ):
-            raise TypeError("Agent active batch is invalid")
-        tasks.append(
-            AcceptedTask(
-                id=task_id,
-                objective=objective,
-                specialist_id=specialist_id,
-                context_task_ids=tuple(cast(list[str], context_task_ids)),
-            )
-        )
-    return ActiveBatch(id=batch_id, tasks=tuple(tasks), round=round_value)
+    try:
+        return ActiveBatch.model_validate(value)
+    except ValidationError as error:
+        raise TypeError("Agent active batch is invalid") from error
 
 
 def _accepted_task_dump(task: AcceptedTask) -> dict[str, Any]:
     """Serialize one Send branch's trusted Task manifest entry."""
-    return {
-        "id": task.id,
-        "objective": task.objective,
-        "specialist_id": task.specialist_id,
-        "context_task_ids": list(task.context_task_ids),
-    }
+    return task.model_dump(mode="json")
 
 
 def _accepted_task_load(value: Mapping[str, object]) -> AcceptedTask:
     """Validate one Send branch's trusted Task manifest entry."""
-    task_id = value.get("id")
-    objective = value.get("objective")
-    specialist_id = value.get("specialist_id")
-    context_task_ids = value.get("context_task_ids")
-    if (
-        not isinstance(task_id, str)
-        or not isinstance(objective, str)
-        or not isinstance(specialist_id, str)
-        or not isinstance(context_task_ids, list)
-        or not all(
-            isinstance(context_task_id, str)
-            for context_task_id in cast(list[object], context_task_ids)
-        )
-    ):
-        raise TypeError("Agent dispatched Task is invalid")
-    return AcceptedTask(
-        id=task_id,
-        objective=objective,
-        specialist_id=specialist_id,
-        context_task_ids=tuple(cast(list[str], context_task_ids)),
-    )
+    try:
+        return AcceptedTask.model_validate(value)
+    except ValidationError as error:
+        raise TypeError("Agent dispatched Task is invalid") from error

@@ -145,6 +145,8 @@ def test_agent_first_finish_publishes_one_insufficient_evidence_answer(
             specialist_descriptors=(
                 SpecialistDescriptor(id="market-data", description="Market data"),
             ),
+            remaining_task_slots=32,
+            dispatch_allowed=True,
         )
     ]
     assert [(message.type, message.text) for message in messages] == [

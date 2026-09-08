@@ -49,6 +49,12 @@ from app.langgraph_v2.agent_evidence import (
     ToolUnavailabilityRecord,
     ToolUnavailableReason,
 )
+from app.langgraph_v2.agent_graph import (
+    _accepted_task_dump,  # pyright: ignore[reportPrivateUsage]
+    _accepted_task_load,  # pyright: ignore[reportPrivateUsage]
+    _active_batch_dump,  # pyright: ignore[reportPrivateUsage]
+    _active_batch_load,  # pyright: ignore[reportPrivateUsage]
+)
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
     SkillInvocation,
@@ -222,6 +228,40 @@ def _dispatch(*, context_task_ids: tuple[str, ...] = ()) -> DispatchBatch:
     )
 
 
+def _calculation_executor() -> CalculationExecutor:
+    return CalculationExecutor(
+        (
+            TrustedPriceSeries(
+                ref="apple-series",
+                instrument_id="AAPL",
+                currency="USD",
+                unit="price",
+                observations=(
+                    PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
+                    PriceObservation(as_of=date(2026, 1, 3), value=Decimal("110")),
+                ),
+                evidence_refs=("evidence-1",),
+                evidence_hashes=(hashlib.sha256(b"Apple price evidence.").hexdigest(),),
+            ),
+        )
+    )
+
+
+def _calculation_evidence(*, task_id: str, title: str) -> EvidenceEnvelope:
+    return EvidenceEnvelope(
+        id="evidence-1",
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id=task_id,
+        source="filing",
+        source_url="https://example.test/filing",
+        title=title,
+        body="Apple price evidence.",
+        excerpt="Apple price evidence.",
+        as_of_date=date(2026, 1, 3),
+    )
+
+
 def _retry_failure(*, messages: tuple[object, ...] = ()) -> SpecialistInvocationFailure:
     return SpecialistInvocationFailure(
         ModelHTTPError(429, "specialist"),
@@ -335,8 +375,75 @@ def test_active_batch_rejects_recovered_manifest_larger_than_eight_tasks() -> No
         for index in range(9)
     )
 
-    with pytest.raises(ValueError, match="Active Batch Task count is invalid"):
+    with pytest.raises(ValidationError, match="at most 8 items"):
         ActiveBatch(id="batch-1", tasks=tasks)
+
+
+def test_active_batch_checkpoint_json_round_trips_with_tuple_containers() -> None:
+    task = AcceptedTask(
+        id="task-1",
+        objective="Assess market outlook.",
+        specialist_id="market-data",
+        context_task_ids=("prior-1",),
+    )
+    batch = ActiveBatch(id="batch-1", tasks=(task,), round=1)
+
+    task_payload = _accepted_task_dump(task)
+    batch_payload = _active_batch_dump(batch)
+
+    assert task_payload == {
+        "id": "task-1",
+        "objective": "Assess market outlook.",
+        "specialist_id": "market-data",
+        "context_task_ids": ["prior-1"],
+    }
+    assert batch_payload == {
+        "id": "batch-1",
+        "tasks": [task_payload],
+        "round": 1,
+    }
+    assert _accepted_task_load(task_payload) == task
+    assert _active_batch_load(batch_payload) == batch
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"round": "1"},
+        {"round": True},
+        {"unexpected": "field"},
+        {"tasks": [{"id": "task-1"}]},
+        {
+            "tasks": [
+                {
+                    "id": "task-1",
+                    "objective": "Assess market outlook.",
+                    "specialist_id": "market-data",
+                    "context_task_ids": [1],
+                }
+            ]
+        },
+    ],
+)
+def test_active_batch_checkpoint_contamination_fails_closed(
+    update: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "id": "batch-1",
+        "tasks": [
+            {
+                "id": "task-1",
+                "objective": "Assess market outlook.",
+                "specialist_id": "market-data",
+                "context_task_ids": [],
+            }
+        ],
+        "round": 1,
+    }
+    payload.update(update)
+
+    with pytest.raises(TypeError, match="Agent active batch is invalid"):
+        _active_batch_load(payload)
 
 
 def test_recovered_active_batch_is_validated_before_specialist_fanout() -> None:
@@ -854,23 +961,9 @@ async def test_execute_specialist_promotes_only_the_accepted_attempt_calculation
     scope_descriptors = (
         SpecialistDescriptor(id="market-data", description="Market data"),
     )
-    executor = CalculationExecutor(
-        (
-            TrustedPriceSeries(
-                ref="apple-series",
-                instrument_id="AAPL",
-                currency="USD",
-                unit="price",
-                observations=(
-                    PriceObservation(as_of=date(2026, 1, 2), value=Decimal("100")),
-                    PriceObservation(as_of=date(2026, 1, 3), value=Decimal("110")),
-                ),
-                evidence_refs=("evidence-1",),
-                evidence_hashes=(hashlib.sha256(b"Apple price evidence.").hexdigest(),),
-            ),
-        )
-    )
+    executor = _calculation_executor()
     actor_count = 0
+    inputs: list[SpecialistTaskInput] = []
 
     class _RetryingCalculationActor:
         def __init__(self, attempt: int) -> None:
@@ -884,6 +977,7 @@ async def test_execute_specialist_promotes_only_the_accepted_attempt_calculation
             usage_limits: UsageLimits | None = None,
         ) -> SpecialistAttempt:
             del usage, usage_limits
+            inputs.append(input)
             calculation = executor.execute(
                 CalculationRequest(
                     method=CalculationMethod.PERIOD_RETURN,
@@ -901,25 +995,19 @@ async def test_execute_specialist_promotes_only_the_accepted_attempt_calculation
             return SpecialistAttempt(
                 finding=SpecialistFindingDraft(
                     summary="accepted",
-                    evidence_ids=("missing",) if self.attempt == 1 else ("evidence-1",),
+                    evidence_ids=() if self.attempt == 1 else ("evidence-1",),
                 ),
                 calculations=(calculation,),
                 evidence=(
-                    EvidenceEnvelope(
-                        id="evidence-1",
-                        tenant_id="tenant-a",
-                        request_id="request-1",
+                    _calculation_evidence(
                         task_id=input.task_id,
-                        source="filing",
-                        source_url="https://example.test/filing",
-                        title="Price evidence",
-                        body="Apple price evidence.",
-                        excerpt="Apple price evidence.",
-                        as_of_date=date(2026, 1, 3),
+                        title=(
+                            "Abandoned price evidence"
+                            if self.attempt == 1
+                            else "Accepted price evidence"
+                        ),
                     ),
-                )
-                if self.attempt == 2
-                else (),
+                ),
             )
 
     def factory(
@@ -952,6 +1040,7 @@ async def test_execute_specialist_promotes_only_the_accepted_attempt_calculation
         registry=registry,
         scope_descriptors=scope_descriptors,
     )
+    catalog = RequestEvidenceCatalog()
 
     contribution = await execute_specialist(
         batch.tasks[0],
@@ -961,17 +1050,242 @@ async def test_execute_specialist_promotes_only_the_accepted_attempt_calculation
         context=_context(task_id=batch.tasks[0].id).model_copy(
             update={"allowed_tool_ids": frozenset({"calculator"})}
         ),
-        catalog=RequestEvidenceCatalog(),
+        catalog=catalog,
     )
 
     assert actor_count == 2
     assert contribution.attempt == 2
     assert len(contribution.calculations) == 1
     assert contribution.calculations[0].attempt == 2
+    assert inputs[0].validation_feedback is None
+    assert inputs[1].validation_feedback == (
+        "Keep at most 8 Calculation Artifacts and reference every supporting "
+        "Evidence ID returned by this Specialist run."
+    )
+    accepted_evidence = catalog.resolve(
+        "evidence-1",
+        tenant_id="tenant-a",
+        request_id="request-1",
+        accepted_evidence_ids=("evidence-1",),
+    )
+    assert accepted_evidence.title == "Accepted price evidence"
 
 
 @pytest.mark.asyncio
-async def test_execute_specialist_feeds_sdk_output_rejection_to_a_fresh_attempt() -> (
+async def test_execute_specialist_returns_task_failed_after_calculation_rejection_exhaustion() -> (
+    None
+):
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    executor = _calculation_executor()
+    actor_count = 0
+    inputs: list[SpecialistTaskInput] = []
+
+    class _CalculationDomainRejectedActor:
+        def __init__(self, attempt: int) -> None:
+            self.attempt = attempt
+
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del usage, usage_limits
+            inputs.append(input)
+            calculation = executor.execute(
+                CalculationRequest(
+                    method=CalculationMethod.PERIOD_RETURN,
+                    version="v1",
+                    series_ref="apple-series",
+                ),
+                context=CalculationExecutionContext(
+                    tenant_id="tenant-a",
+                    request_id="request-1",
+                    task_id=input.task_id,
+                    attempt=self.attempt,
+                    tool_id="calculator",
+                ),
+            )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(summary="missing calculation support"),
+                calculations=(calculation,),
+                evidence=(
+                    _calculation_evidence(
+                        task_id=input.task_id,
+                        title=f"Abandoned attempt {self.attempt}",
+                    ),
+                ),
+            )
+
+    def factory(
+        tools: tuple[object, ...],
+        tool_capture: object,
+        skill_invocation: object,
+    ) -> _CalculationDomainRejectedActor:
+        nonlocal actor_count
+        del tools, tool_capture, skill_invocation
+        actor_count += 1
+        return _CalculationDomainRejectedActor(actor_count)
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=factory,
+                allowed_tool_ids=frozenset({"calculator"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        calculation_tool_registrations=(
+            CalculationToolRegistration(id="calculator", executor=executor),
+        ),
+        tenant_eligible_tool_ids=frozenset({"calculator"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+    catalog = RequestEvidenceCatalog()
+
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+        context=_context(task_id=batch.tasks[0].id).model_copy(
+            update={"allowed_tool_ids": frozenset({"calculator"})}
+        ),
+        catalog=catalog,
+    )
+
+    assert actor_count == 3
+    assert contribution.attempt == 3
+    assert contribution.outcome == TaskFailed(task_id=batch.tasks[0].id)
+    assert contribution.calculations == ()
+    assert tuple(item.validation_feedback for item in inputs) == (
+        None,
+        "Keep at most 8 Calculation Artifacts and reference every supporting "
+        "Evidence ID returned by this Specialist run.",
+        "Keep at most 8 Calculation Artifacts and reference every supporting "
+        "Evidence ID returned by this Specialist run.",
+    )
+    with pytest.raises(ValueError, match="Evidence is not accepted"):
+        catalog.resolve(
+            "evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_evidence_ids=("evidence-1",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_does_not_retry_calculation_provenance_failure() -> (
+    None
+):
+    scope_descriptors = (
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    executor = _calculation_executor()
+    actor_count = 0
+
+    class _InvalidCalculationProvenanceActor:
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del usage, usage_limits
+            calculation = executor.execute(
+                CalculationRequest(
+                    method=CalculationMethod.PERIOD_RETURN,
+                    version="v1",
+                    series_ref="apple-series",
+                ),
+                context=CalculationExecutionContext(
+                    tenant_id="tenant-b",
+                    request_id="request-1",
+                    task_id=input.task_id,
+                    attempt=1,
+                    tool_id="calculator",
+                ),
+            )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(
+                    summary="invalid provenance",
+                    evidence_ids=("evidence-1",),
+                ),
+                calculations=(calculation,),
+                evidence=(
+                    _calculation_evidence(
+                        task_id=input.task_id,
+                        title="Staged price evidence",
+                    ),
+                ),
+            )
+
+    def factory(
+        tools: tuple[object, ...],
+        tool_capture: object,
+        skill_invocation: object,
+    ) -> _InvalidCalculationProvenanceActor:
+        nonlocal actor_count
+        del tools, tool_capture, skill_invocation
+        actor_count += 1
+        return _InvalidCalculationProvenanceActor()
+
+    registry = SpecialistRegistry(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                actor_factory=factory,
+                allowed_tool_ids=frozenset({"calculator"}),
+            ),
+        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        calculation_tool_registrations=(
+            CalculationToolRegistration(id="calculator", executor=executor),
+        ),
+        tenant_eligible_tool_ids=frozenset({"calculator"}),
+    )
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
+    catalog = RequestEvidenceCatalog()
+
+    with pytest.raises(CalculationArtifactInvalid, match="provenance is invalid"):
+        await execute_specialist(
+            batch.tasks[0],
+            batch_id=batch.id,
+            registry=registry,
+            scope_descriptors=scope_descriptors,
+            context=_context(task_id=batch.tasks[0].id).model_copy(
+                update={"allowed_tool_ids": frozenset({"calculator"})}
+            ),
+            catalog=catalog,
+        )
+
+    assert actor_count == 1
+    with pytest.raises(ValueError, match="Evidence is not accepted"):
+        catalog.resolve(
+            "evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            accepted_evidence_ids=("evidence-1",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_execute_specialist_maps_native_output_exhaustion_to_task_failed() -> (
     None
 ):
     scope_descriptors = (
@@ -1042,10 +1356,11 @@ async def test_execute_specialist_feeds_sdk_output_rejection_to_a_fresh_attempt(
         context=_context(task_id=batch.tasks[0].id),
     )
 
-    assert contribution.attempt == 2
-    assert inputs[1].validation_feedback == (
-        "Return one valid final_result structured Specialist finding."
-    )
+    assert contribution.attempt == 1
+    assert isinstance(contribution.outcome, TaskFailed)
+    assert actor_count == 1
+    assert len(inputs) == 1
+    assert inputs[0].validation_feedback is None
 
 
 @pytest.mark.asyncio

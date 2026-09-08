@@ -37,6 +37,7 @@ from app.langgraph_v2.agent_batch import (
 )
 from app.langgraph_v2.agent_coordination import (
     CoordinationRound,
+    CoordinatorDecisionExhausted,
     CoordinatorInput,
     Finish,
 )
@@ -64,6 +65,7 @@ from app.langgraph_v2.agent_skills import (
     SkillRegistration,
     SpecialistSkillRegistry,
 )
+from app.langgraph_v2.agent_termination import COORDINATION_LIMIT
 from app.langgraph_v2.calculations import (
     CalculationArtifactInvalid,
     CalculationExecutionContext,
@@ -259,7 +261,9 @@ class _Coordinator:
         default_factory=lambda: list[CoordinatorInput]()
     )
 
-    async def decide(self, input: CoordinatorInput) -> DispatchBatch | Finish:
+    async def decide(
+        self, input: CoordinatorInput
+    ) -> DispatchBatch | Finish | CoordinatorDecisionExhausted:
         self.inputs.append(input)
         number = len(self.inputs)
         if self.scenario in {"golden", "authoritative_empty"}:
@@ -279,11 +283,10 @@ class _Coordinator:
                 _dispatch(("market", _MARKET_OBJECTIVE)),
                 _dispatch(("fund", _FUND_OBJECTIVE)),
             )
-            return (
-                decisions[number - 1]
-                if number <= 4
-                else _dispatch(("news", _NEWS_OBJECTIVE))
-            )
+            if number <= 4:
+                return decisions[number - 1]
+            assert input.dispatch_allowed is False
+            return CoordinatorDecisionExhausted(reason=COORDINATION_LIMIT)
         assert self.scenario == "finish_without_evidence"
         return Finish(kind="finish")
 
@@ -313,18 +316,6 @@ class _Synthesis:
                 if item
             )
         )
-
-    async def repair(
-        self,
-        prepared: PreparedSynthesis,
-        *,
-        validation_errors: tuple[str, ...],
-    ) -> FinancialResearchReport:
-        del prepared
-        raise AssertionError(
-            f"Fixture report should pass first gate: {validation_errors}"
-        )
-
 
 @dataclass
 class _Harness:

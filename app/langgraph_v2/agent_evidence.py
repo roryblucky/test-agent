@@ -34,20 +34,13 @@ _MAX_PREPARED_CALCULATIONS = 32
 
 
 class SynthesisCandidateRejected(ValueError):
-    """A schema or publication-gate rejection eligible for one repair."""
+    """A model-correctable marker rejection eligible for native retry."""
 
     def __init__(self, validation_errors: tuple[str, ...]) -> None:
         if not validation_errors:
             raise ValueError("Synthesis validation errors are required")
         self.validation_errors = validation_errors
         super().__init__("; ".join(validation_errors))
-
-
-class SynthesisOutputInvalid(SynthesisCandidateRejected):
-    """Keep model output failure separate from fatal runtime failures."""
-
-    def __init__(self) -> None:
-        super().__init__(("Synthesis report is invalid",))
 
 
 class ToolUnavailableReason(StrEnum):
@@ -341,6 +334,23 @@ class RequestEvidenceCatalog:
     )
     _lock: Any = field(default_factory=threading.RLock, repr=False)
 
+    def validate_referenced(
+        self,
+        returned: Iterable[EvidenceEnvelope],
+        *,
+        finding_evidence_ids: tuple[str, ...],
+        context: EvidenceInvocationContext,
+    ) -> tuple[EvidenceEnvelope, ...]:
+        """Validate staged Evidence without changing the accepted catalog."""
+        returned_items = tuple(returned)
+        with self._lock:
+            returned_by_id = self._validate_referenced(
+                returned_items,
+                finding_evidence_ids=finding_evidence_ids,
+                context=context,
+            )
+            return tuple(returned_by_id[item] for item in finding_evidence_ids)
+
     def accept_referenced(
         self,
         returned: Iterable[EvidenceEnvelope],
@@ -351,39 +361,49 @@ class RequestEvidenceCatalog:
         """Cache returned bodies after validating one staged Finding reference."""
         returned_items = tuple(returned)
         with self._lock:
-            returned_by_id: dict[str, EvidenceEnvelope] = {}
+            self._validate_referenced(
+                returned_items,
+                finding_evidence_ids=finding_evidence_ids,
+                context=context,
+            )
             for evidence in returned_items:
-                existing_returned = returned_by_id.get(evidence.id)
-                if existing_returned is not None and not _same_canonical_evidence(
-                    existing_returned, evidence
-                ):
-                    raise ValueError("Evidence provenance conflicts")
-                returned_by_id[evidence.id] = evidence
-            for evidence_id in finding_evidence_ids:
-                evidence = returned_by_id.get(evidence_id)
-                if evidence is None:
-                    raise EvidenceReferenceInvalid("Evidence provenance is missing")
-                if (
-                    evidence.tenant_id != context.tenant_id
-                    or evidence.request_id != context.request_id
-                    or evidence.task_id != context.task_id
-                ):
-                    raise ValueError("Evidence provenance is not eligible")
-            for evidence in returned_items:
-                if (
-                    evidence.tenant_id != context.tenant_id
-                    or evidence.request_id != context.request_id
-                    or evidence.task_id != context.task_id
-                ):
-                    raise ValueError("Evidence provenance is not eligible")
                 existing = self._evidence.get(evidence.id)
-                if existing is not None and not _same_canonical_evidence(
-                    existing, evidence
-                ):
-                    raise ValueError("Evidence body conflicts")
                 stored = evidence.model_copy(update={"raw_provider_payload": None})
                 if existing is None or stored.task_id < existing.task_id:
                     self._evidence[evidence.id] = stored
+
+    def _validate_referenced(
+        self,
+        returned_items: tuple[EvidenceEnvelope, ...],
+        *,
+        finding_evidence_ids: tuple[str, ...],
+        context: EvidenceInvocationContext,
+    ) -> dict[str, EvidenceEnvelope]:
+        """Return staged Evidence by ID after all non-mutating checks pass."""
+        returned_by_id: dict[str, EvidenceEnvelope] = {}
+        for evidence in returned_items:
+            existing_returned = returned_by_id.get(evidence.id)
+            if existing_returned is not None and not _same_canonical_evidence(
+                existing_returned, evidence
+            ):
+                raise ValueError("Evidence provenance conflicts")
+            returned_by_id[evidence.id] = evidence
+        for evidence_id in finding_evidence_ids:
+            if evidence_id not in returned_by_id:
+                raise EvidenceReferenceInvalid("Evidence provenance is missing")
+        for evidence in returned_items:
+            if (
+                evidence.tenant_id != context.tenant_id
+                or evidence.request_id != context.request_id
+                or evidence.task_id != context.task_id
+            ):
+                raise ValueError("Evidence provenance is not eligible")
+            existing = self._evidence.get(evidence.id)
+            if existing is not None and not _same_canonical_evidence(
+                existing, evidence
+            ):
+                raise ValueError("Evidence body conflicts")
+        return returned_by_id
 
     def resolve(
         self,
@@ -479,19 +499,10 @@ class PublishedReport(BaseModel):
 
 
 class SynthesisActor(Protocol):
-    """Produce a candidate and its one permitted frozen-input repair."""
+    """Produce one candidate from a frozen Synthesis input."""
 
     async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
-        """Produce the first candidate without repair feedback."""
-        ...
-
-    async def repair(
-        self,
-        prepared: PreparedSynthesis,
-        *,
-        validation_errors: tuple[str, ...],
-    ) -> FinancialResearchReport:
-        """Produce a repaired candidate from deterministic gate errors only."""
+        """Produce a candidate; native output retry owns marker correction."""
         ...
 
 
@@ -580,29 +591,10 @@ def publish_report(
     prepared: PreparedSynthesis,
 ) -> PublishedReport:
     """Validate every Evidence marker and derive public citations in code."""
-    _validate_calculation_projection(prepared)
-    calculation_markers = _CALCULATION_MARKER.findall(candidate.markdown_report)
+    validate_synthesis_projection(prepared)
+    validate_synthesis_candidate(candidate, prepared)
     evidence_markers = _EVIDENCE_MARKER.findall(candidate.markdown_report)
-    validation_errors = (
-        *_marker_errors(
-            marker_name="Evidence",
-            markers=evidence_markers,
-            marker_remainder=_EVIDENCE_MARKER.sub("", candidate.markdown_report),
-            marker_like=_MARKER_LIKE,
-            catalog_size=len(prepared.evidence),
-            require_all=True,
-        ),
-        *_marker_errors(
-            marker_name="Calculation",
-            markers=calculation_markers,
-            marker_remainder=_CALCULATION_MARKER.sub("", candidate.markdown_report),
-            marker_like=_CALCULATION_MARKER_LIKE,
-            catalog_size=len(prepared.calculation_artifacts),
-            require_all=False,
-        ),
-    )
-    if validation_errors:
-        raise SynthesisCandidateRejected(validation_errors)
+
     answer = _CALCULATION_MARKER.sub(
         lambda match: _render_calculation(
             prepared.calculation_artifacts[int(match.group(1)) - 1]
@@ -626,18 +618,42 @@ def publish_report(
     return PublishedReport(answer=answer, citations=tuple(citations))
 
 
+def validate_synthesis_candidate(
+    candidate: FinancialResearchReport,
+    prepared: PreparedSynthesis,
+) -> FinancialResearchReport:
+    """Validate only model-correctable marker syntax and eligibility."""
+    calculation_markers = _CALCULATION_MARKER.findall(candidate.markdown_report)
+    evidence_markers = _EVIDENCE_MARKER.findall(candidate.markdown_report)
+    validation_errors = (
+        *_marker_errors(
+            marker_name="Evidence",
+            markers=evidence_markers,
+            marker_remainder=_EVIDENCE_MARKER.sub("", candidate.markdown_report),
+            marker_like=_MARKER_LIKE,
+            catalog_size=len(prepared.evidence),
+            require_all=True,
+        ),
+        *_marker_errors(
+            marker_name="Calculation",
+            markers=calculation_markers,
+            marker_remainder=_CALCULATION_MARKER.sub("", candidate.markdown_report),
+            marker_like=_CALCULATION_MARKER_LIKE,
+            catalog_size=len(prepared.calculation_artifacts),
+            require_all=False,
+        ),
+    )
+    if validation_errors:
+        raise SynthesisCandidateRejected(validation_errors)
+    return candidate
+
+
 async def synthesize_report(
     actor: SynthesisActor,
     prepared: PreparedSynthesis,
 ) -> PublishedReport:
-    """Own the one allowed repair while preserving one frozen Synthesis value."""
-    try:
-        return publish_report(await actor.synthesize(prepared), prepared)
-    except SynthesisCandidateRejected as rejection:
-        return publish_report(
-            await actor.repair(prepared, validation_errors=rejection.validation_errors),
-            prepared,
-        )
+    """Publish the actor's natively validated candidate."""
+    return publish_report(await actor.synthesize(prepared), prepared)
 
 
 def _marker_errors(
@@ -663,7 +679,7 @@ def _marker_errors(
     return tuple(errors)
 
 
-def _validate_calculation_projection(prepared: PreparedSynthesis) -> None:
+def validate_synthesis_projection(prepared: PreparedSynthesis) -> None:
     """Reject a reconstructed or misaligned value-free Calculation alias map."""
     if len(prepared.calculations) != len(prepared.calculation_artifacts):
         raise ValueError("Prepared Calculation projection is invalid")

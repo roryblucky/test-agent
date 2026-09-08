@@ -1,7 +1,6 @@
 """Rolling Coordination Round acceptance and projection coverage."""
 
 from collections.abc import Callable
-from dataclasses import replace
 
 import pytest
 
@@ -19,13 +18,12 @@ from app.langgraph_v2.agent_batch import (
     task_id_for,
 )
 from app.langgraph_v2.agent_coordination import (
-    AcceptedCoordinationDispatch,
     CoordinationCandidateRejected,
     CoordinationInvariantError,
     CoordinationRound,
     CoordinationStopped,
+    CoordinatorDecisionExhausted,
     CoordinatorInput,
-    CoordinatorOutputInvalid,
     accept_coordination_dispatch,
     accept_coordination_finish,
     decide_coordination_round,
@@ -33,6 +31,7 @@ from app.langgraph_v2.agent_coordination import (
     project_coordinator_input,
     validate_active_batch_coordination_round,
     validate_coordination_rounds,
+    validate_coordinator_decision,
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 
@@ -166,6 +165,8 @@ def test_follow_up_dispatch_projects_and_materializes_only_prior_successes() -> 
     assert (
         coordinator_input.prior_results[0].summary == "The first-round market finding."
     )
+    assert coordinator_input.remaining_task_slots == 31
+    assert coordinator_input.dispatch_allowed is True
     assert context == coordinator_input.prior_results
 
 
@@ -203,150 +204,52 @@ def test_failed_prior_task_is_projected_without_diagnostics() -> None:
     assert input.prior_results == ()
     assert input.failed_tasks[0].task_id == first.active_batch.tasks[0].id
     assert input.failed_tasks[0].objective == "Assess market conditions."
+    assert input.remaining_task_slots == 31
+    assert input.dispatch_allowed is True
 
 
-@pytest.mark.asyncio
-async def test_rejected_candidate_uses_one_frozen_input_repair_without_revision_gap() -> (
-    None
-):
-    class _RepairingCoordinator:
-        def __init__(self) -> None:
-            self.inputs: list[CoordinatorInput] = []
-            self.repair_inputs: list[CoordinatorInput] = []
-
-        async def decide(self, input: CoordinatorInput) -> DispatchBatch:
-            self.inputs.append(input)
-            return DispatchBatch(
-                kind="dispatch",
-                tasks=(
-                    TaskProposal(
-                        specialist_id="market-data",
-                        objective="Invalid dependency.",
-                        context_task_ids=("missing",),
-                    ),
-                ),
-            )
-
-        async def repair(
-            self,
-            input: CoordinatorInput,
-            *,
-            rejection: str,
-        ) -> DispatchBatch:
-            assert rejection == "Task context is not an accepted prior success"
-            self.repair_inputs.append(input)
-            return DispatchBatch(
-                kind="dispatch",
-                tasks=(
-                    TaskProposal(
-                        specialist_id="market-data",
-                        objective="Valid repaired objective.",
-                    ),
-                ),
-            )
-
-    actor = _RepairingCoordinator()
+def test_prompt_visible_validation_rejects_unknown_context_without_accepting() -> None:
     input = CoordinatorInput(
         standalone_query="Market outlook",
         intent="market_outlook",
         specialist_descriptors=(
             SpecialistDescriptor(id="market-data", description="Market data"),
         ),
+        remaining_task_slots=32,
+        dispatch_allowed=True,
     )
-    result = await decide_coordination_round(
-        actor,
-        input,
-        request_id="request-1",
-        rounds=(),
-        accepted_batches={},
-        registry=_registry(),
-        scope_descriptors=input.specialist_descriptors,
-    )
-
-    assert isinstance(result, AcceptedCoordinationDispatch)
-    assert result.round.revision == 1
-    assert actor.inputs == [input]
-    assert actor.repair_inputs == [input]
-
-
-@pytest.mark.asyncio
-async def test_second_rejected_candidate_stops_without_an_accepted_round() -> None:
-    class _InvalidCoordinator:
-        async def decide(self, input: CoordinatorInput) -> DispatchBatch:
-            del input
-            return DispatchBatch(
-                kind="dispatch",
-                tasks=(
-                    TaskProposal(
-                        specialist_id="market-data",
-                        objective="Invalid dependency.",
-                        context_task_ids=("missing",),
-                    ),
-                ),
-            )
-
-        async def repair(
-            self,
-            input: CoordinatorInput,
-            *,
-            rejection: str,
-        ) -> DispatchBatch:
-            del input, rejection
-            return DispatchBatch(
-                kind="dispatch",
-                tasks=(
-                    TaskProposal(
-                        specialist_id="market-data",
-                        objective="Still invalid.",
-                        context_task_ids=("missing",),
-                    ),
-                ),
-            )
-
-    result = await decide_coordination_round(
-        _InvalidCoordinator(),
-        CoordinatorInput(
-            standalone_query="Market outlook",
-            intent="market_outlook",
-            specialist_descriptors=(
-                SpecialistDescriptor(id="market-data", description="Market data"),
+    decision = DispatchBatch(
+        kind="dispatch",
+        tasks=(
+            TaskProposal(
+                specialist_id="market-data",
+                objective="Invalid dependency.",
+                context_task_ids=("missing",),
             ),
         ),
-        request_id="request-1",
-        rounds=(),
-        accepted_batches={},
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
 
-    assert result == CoordinationStopped("coordination_invalid")
+    with pytest.raises(
+        CoordinationCandidateRejected,
+        match="Task context is not an accepted prior success",
+    ):
+        validate_coordinator_decision(input, decision)
 
 
 @pytest.mark.asyncio
-async def test_schema_invalid_actor_output_gets_one_repair_then_stops() -> None:
-    class _SchemaInvalidCoordinator:
+async def test_actor_output_exhaustion_stops_without_an_accepted_round() -> None:
+    class _ExhaustedCoordinator:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def decide(self, input: CoordinatorInput) -> DispatchBatch:
+        async def decide(self, input: CoordinatorInput) -> CoordinatorDecisionExhausted:
             del input
             self.calls += 1
-            raise CoordinatorOutputInvalid("invalid output")
+            return CoordinatorDecisionExhausted(
+                reason="Task context is not an accepted prior success"
+            )
 
-        async def repair(
-            self,
-            input: CoordinatorInput,
-            *,
-            rejection: str,
-        ) -> DispatchBatch:
-            del input
-            assert rejection == "Coordinator decision is invalid"
-            self.calls += 1
-            raise CoordinatorOutputInvalid("still invalid")
-
-    actor = _SchemaInvalidCoordinator()
+    actor = _ExhaustedCoordinator()
     result = await decide_coordination_round(
         actor,
         CoordinatorInput(
@@ -355,6 +258,8 @@ async def test_schema_invalid_actor_output_gets_one_repair_then_stops() -> None:
             specialist_descriptors=(
                 SpecialistDescriptor(id="market-data", description="Market data"),
             ),
+            remaining_task_slots=32,
+            dispatch_allowed=True,
         ),
         request_id="request-1",
         rounds=(),
@@ -366,7 +271,7 @@ async def test_schema_invalid_actor_output_gets_one_repair_then_stops() -> None:
     )
 
     assert result == CoordinationStopped("coordination_invalid")
-    assert actor.calls == 2
+    assert actor.calls == 1
 
 
 def test_coordination_acceptance_persists_canonical_objectives_and_round_manifest() -> (
@@ -401,7 +306,9 @@ def test_coordination_acceptance_persists_canonical_objectives_and_round_manifes
         id=accepted.active_batch.id,
         round=accepted.active_batch.round,
         tasks=(
-            replace(accepted.active_batch.tasks[0], objective="Different objective."),
+            accepted.active_batch.tasks[0].model_copy(
+                update={"objective": "Different objective."}
+            ),
         ),
     )
     with pytest.raises(CoordinationInvariantError, match="Active Batch Coordination"):
@@ -411,66 +318,34 @@ def test_coordination_acceptance_persists_canonical_objectives_and_round_manifes
         )
 
 
-@pytest.mark.asyncio
-async def test_fourth_dispatch_only_allows_finish_and_fifth_dispatch_stops() -> None:
+def test_fourth_dispatch_projects_finish_only_policy() -> None:
     rounds, accepted_batches = _accepted_rounds(tasks_per_round=7, count=4)
     finish = accept_coordination_finish(request_id="request-1", rounds=rounds)
 
     assert finish.revision == 5
-
-    class _FifthDispatchCoordinator:
-        def __init__(self) -> None:
-            self.repairs = 0
-
-        async def decide(self, input: CoordinatorInput) -> DispatchBatch:
-            del input
-            return DispatchBatch(
-                kind="dispatch",
-                tasks=(
-                    TaskProposal(
-                        specialist_id="market-data",
-                        objective="Illegal fifth dispatch.",
-                    ),
-                ),
-            )
-
-        async def repair(
-            self, input: CoordinatorInput, *, rejection: str
-        ) -> DispatchBatch:
-            del input
-            assert rejection == "coordination_limit"
-            self.repairs += 1
-            return DispatchBatch(
-                kind="dispatch",
-                tasks=(
-                    TaskProposal(
-                        specialist_id="market-data",
-                        objective="Illegal fifth dispatch.",
-                    ),
-                ),
-            )
-
-    actor = _FifthDispatchCoordinator()
-    stopped = await decide_coordination_round(
-        actor,
-        CoordinatorInput(
-            standalone_query="Market outlook",
-            intent="market_outlook",
-            specialist_descriptors=(
-                SpecialistDescriptor(id="market-data", description="Market data"),
-            ),
+    input = project_coordinator_input(
+        standalone_query="Market outlook",
+        intent="market_outlook",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
         ),
-        request_id="request-1",
         rounds=rounds,
         accepted_batches=accepted_batches,
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
+    )
+    decision = DispatchBatch(
+        kind="dispatch",
+        tasks=(
+            TaskProposal(
+                specialist_id="market-data",
+                objective="Illegal fifth dispatch.",
+            ),
         ),
     )
 
-    assert stopped == CoordinationStopped("coordination_limit")
-    assert actor.repairs == 1
+    assert input.remaining_task_slots == 4
+    assert input.dispatch_allowed is False
+    with pytest.raises(CoordinationCandidateRejected, match="coordination_limit"):
+        validate_coordinator_decision(input, decision)
 
 
 def test_task_limit_takes_precedence_when_all_32_tasks_are_accepted() -> None:

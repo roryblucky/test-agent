@@ -208,16 +208,6 @@ class _CapturingSynthesis:
         assert prepared.calculations == ()
         return FinancialResearchReport(markdown_report=_RUN_TWO_ANSWER)
 
-    async def repair(
-        self,
-        prepared: PreparedSynthesis,
-        *,
-        validation_errors: tuple[str, ...],
-    ) -> FinancialResearchReport:
-        del validation_errors
-        return await self.synthesize(prepared)
-
-
 @dataclass
 class _ConsecutiveRunsFixture:
     app: FastAPI

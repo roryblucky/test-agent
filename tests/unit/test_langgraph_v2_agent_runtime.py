@@ -1,7 +1,6 @@
 """Coordinator actor construction coverage."""
 
 import json
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pydantic_ai.models as models
@@ -10,10 +9,12 @@ from fastapi import FastAPI
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
 from pydantic_ai import Agent, capture_run_messages
+from pydantic_ai.exceptions import ContentFilterError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     ToolCallPart,
     UserPromptPart,
 )
@@ -22,6 +23,7 @@ from pydantic_ai.models.test import TestModel
 
 from app.agents.coordinator import (
     COORDINATOR_MAX_TOKENS,
+    COORDINATOR_OUTPUT_RETRIES,
     COORDINATOR_TIMEOUT_SECONDS,
     PydanticAICoordinatorActor,
     create_coordinator_agent,
@@ -35,10 +37,15 @@ from app.config.models import (
     TenantConfig,
 )
 from app.core.model_registry import ModelRegistry
-from app.langgraph_v2.agent_batch import SpecialistRegistry
+from app.langgraph_v2.agent_batch import (
+    SpecialistRegistration,
+    SpecialistRegistry,
+)
 from app.langgraph_v2.agent_coordination import (
+    AcceptedCoordinationDispatch,
     CoordinationRound,
     CoordinatorDecision,
+    CoordinatorDecisionExhausted,
     CoordinatorInput,
     Finish,
     decide_coordination_round,
@@ -59,7 +66,7 @@ class _Registry:
         return object()
 
 
-def test_coordinator_factory_disables_tools_and_builtin_retries() -> None:
+def test_coordinator_factory_enables_only_one_output_retry() -> None:
     registry = _Registry()
 
     create_coordinator_agent(cast(ModelRegistry, registry), model_name="coordinator")
@@ -67,12 +74,13 @@ def test_coordinator_factory_disables_tools_and_builtin_retries() -> None:
     assert registry.name == "coordinator"
     assert registry.kwargs is not None
     assert registry.kwargs == {
+        "deps_type": CoordinatorInput,
         "output_type": CoordinatorDecision,
         "instructions": registry.kwargs["instructions"],
         "tools": (),
         "retries": 0,
         "tool_retries": 0,
-        "output_retries": 0,
+        "output_retries": COORDINATOR_OUTPUT_RETRIES,
         "end_strategy": "early",
     }
 
@@ -83,10 +91,11 @@ async def test_coordinator_runs_real_pydantic_actor_with_fixed_limits() -> None:
         Agent(
             TestModel(),
             output_type=Finish,
+            deps_type=CoordinatorInput,
             tools=(),
             retries=0,
             tool_retries=0,
-            output_retries=0,
+            output_retries=COORDINATOR_OUTPUT_RETRIES,
         )
     )
 
@@ -97,47 +106,14 @@ async def test_coordinator_runs_real_pydantic_actor_with_fixed_limits() -> None:
             specialist_descriptors=(
                 SpecialistDescriptor(id="market-data", description="Market data"),
             ),
+            remaining_task_slots=32,
+            dispatch_allowed=True,
         )
     )
 
     assert decision == Finish(kind="finish")
     assert COORDINATOR_TIMEOUT_SECONDS == 60
     assert COORDINATOR_MAX_TOKENS == 1500
-
-
-@pytest.mark.asyncio
-async def test_coordinator_repair_reuses_the_frozen_input_with_only_feedback() -> None:
-    prompts: list[dict[str, object]] = []
-
-    class _RecordingAgent:
-        async def run(
-            self,
-            prompt: str,
-            *,
-            model_settings: dict[str, int],
-        ) -> SimpleNamespace:
-            assert model_settings == {"max_tokens": COORDINATOR_MAX_TOKENS}
-            prompts.append(json.loads(prompt))
-            return SimpleNamespace(output=Finish(kind="finish"))
-
-    input = CoordinatorInput(
-        standalone_query="Apple outlook",
-        intent="market_outlook",
-        specialist_descriptors=(),
-    )
-    actor = PydanticAICoordinatorActor(cast(Any, _RecordingAgent()))
-
-    assert await actor.decide(input) == Finish(kind="finish")
-    assert await actor.repair(input, rejection="Task context is invalid") == Finish(
-        kind="finish"
-    )
-    assert prompts == [
-        {"input": input.model_dump(mode="json"), "validation_feedback": None},
-        {
-            "input": input.model_dump(mode="json"),
-            "validation_feedback": "Task context is invalid",
-        },
-    ]
 
 
 @pytest.mark.asyncio
@@ -151,7 +127,10 @@ async def test_coordinator_function_model_captures_one_toolless_overrideable_tra
         calls.append("default")
         assert len(messages) == 1
         assert info.function_tools == []
-        assert info.model_settings == {"max_tokens": COORDINATOR_MAX_TOKENS}
+        assert info.model_settings == {
+            "max_tokens": COORDINATOR_MAX_TOKENS,
+            "timeout": COORDINATOR_TIMEOUT_SECONDS,
+        }
         return ModelResponse(
             parts=[
                 ToolCallPart(
@@ -175,11 +154,12 @@ async def test_coordinator_function_model_captures_one_toolless_overrideable_tra
 
     agent = Agent(
         FunctionModel(finish_response),
+        deps_type=CoordinatorInput,
         output_type=cast(type[Any], CoordinatorDecision),
         tools=(),
         retries=0,
         tool_retries=0,
-        output_retries=0,
+        output_retries=COORDINATOR_OUTPUT_RETRIES,
         end_strategy="early",
     )
     actor = PydanticAICoordinatorActor(agent)
@@ -187,6 +167,8 @@ async def test_coordinator_function_model_captures_one_toolless_overrideable_tra
         standalone_query="Apple outlook",
         intent="market_outlook",
         specialist_descriptors=(),
+        remaining_task_slots=32,
+        dispatch_allowed=True,
     )
 
     with capture_run_messages() as messages:
@@ -201,13 +183,16 @@ async def test_coordinator_function_model_captures_one_toolless_overrideable_tra
 
 
 @pytest.mark.asyncio
-async def test_coordinator_repairs_a_real_pydantic_invalid_output_once(
+async def test_coordinator_uses_builtin_retry_with_schema_feedback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
-    prompts: list[dict[str, object]] = []
+    calls = 0
+    retry_parts: list[RetryPromptPart] = []
 
     def response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
         prompt = next(
             part.content
             for message in messages
@@ -216,8 +201,15 @@ async def test_coordinator_repairs_a_real_pydantic_invalid_output_once(
             if isinstance(part, UserPromptPart)
         )
         assert isinstance(prompt, str)
-        prompts.append(json.loads(prompt))
-        args: dict[str, str] = {"kind": "invalid" if len(prompts) == 1 else "finish"}
+        assert json.loads(prompt) == {"input": input.model_dump(mode="json")}
+        retry_parts.extend(
+            part
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, RetryPromptPart)
+        )
+        args: dict[str, str] = {"kind": "invalid" if calls == 1 else "finish"}
         return ModelResponse(
             parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=args)]
         )
@@ -226,15 +218,18 @@ async def test_coordinator_repairs_a_real_pydantic_invalid_output_once(
         standalone_query="Apple outlook",
         intent="market_outlook",
         specialist_descriptors=(),
+        remaining_task_slots=32,
+        dispatch_allowed=True,
     )
     actor = PydanticAICoordinatorActor(
         Agent(
             FunctionModel(response),
+            deps_type=CoordinatorInput,
             output_type=cast(type[Any], CoordinatorDecision),
             tools=(),
             retries=0,
             tool_retries=0,
-            output_retries=0,
+            output_retries=COORDINATOR_OUTPUT_RETRIES,
             end_strategy="early",
         )
     )
@@ -251,13 +246,176 @@ async def test_coordinator_repairs_a_real_pydantic_invalid_output_once(
 
     assert isinstance(decision, CoordinationRound)
     assert decision.kind == "finish"
-    assert prompts == [
-        {"input": input.model_dump(mode="json"), "validation_feedback": None},
-        {
-            "input": input.model_dump(mode="json"),
-            "validation_feedback": "Coordinator decision is invalid",
-        },
-    ]
+    assert calls == 2
+    assert len(retry_parts) == 1
+    assert "literal_error" in str(retry_parts[0].content)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_uses_builtin_retry_with_actionable_policy_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
+    calls = 0
+    retry_parts: list[RetryPromptPart] = []
+
+    def response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        retry_parts.extend(
+            part
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, RetryPromptPart)
+        )
+        context_task_ids = ["missing"] if calls == 1 else []
+        dispatch_tool = next(
+            tool for tool in info.output_tools if tool.name.endswith("DispatchBatch")
+        )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=dispatch_tool.name,
+                    args={
+                        "kind": "dispatch",
+                        "tasks": [
+                            {
+                                "specialist_id": "market-data",
+                                "objective": "Assess the market.",
+                                "context_task_ids": context_task_ids,
+                            }
+                        ],
+                    },
+                )
+            ]
+        )
+
+    input = CoordinatorInput(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
+        remaining_task_slots=32,
+        dispatch_allowed=True,
+    )
+    actor = PydanticAICoordinatorActor(
+        Agent(
+            FunctionModel(response),
+            deps_type=CoordinatorInput,
+            output_type=cast(type[Any], CoordinatorDecision),
+            tools=(),
+            retries=0,
+            tool_retries=0,
+            output_retries=COORDINATOR_OUTPUT_RETRIES,
+            end_strategy="early",
+        )
+    )
+
+    decision = await decide_coordination_round(
+        actor,
+        input,
+        request_id="request-1",
+        rounds=(),
+        accepted_batches={},
+        registry=SpecialistRegistry(
+            registrations=(SpecialistRegistration(id="market-data"),),
+            tenant_eligible_ids=frozenset({"market-data"}),
+        ),
+        scope_descriptors=input.specialist_descriptors,
+    )
+
+    assert isinstance(decision, AcceptedCoordinationDispatch)
+    assert calls == 2
+    assert len(retry_parts) == 1
+    assert retry_parts[0].content == (
+        "Task context is not an accepted prior success"
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_returns_typed_exhaustion_after_builtin_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
+    calls = 0
+
+    def response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        del messages
+        calls += 1
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={"kind": "invalid"},
+                )
+            ]
+        )
+
+    input = CoordinatorInput(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        specialist_descriptors=(),
+        remaining_task_slots=32,
+        dispatch_allowed=True,
+    )
+    actor = PydanticAICoordinatorActor(
+        Agent(
+            FunctionModel(response),
+            deps_type=CoordinatorInput,
+            output_type=cast(type[Any], CoordinatorDecision),
+            tools=(),
+            retries=0,
+            tool_retries=0,
+            output_retries=COORDINATOR_OUTPUT_RETRIES,
+            end_strategy="early",
+        )
+    )
+
+    result = await actor.decide(input)
+
+    assert result == CoordinatorDecisionExhausted(
+        reason="Coordinator decision is invalid"
+    )
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_coordinator_does_not_reclassify_non_output_model_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(models, "ALLOW_MODEL_REQUESTS", False)
+
+    def response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        raise ContentFilterError(
+            f"Exceeded maximum output retries ({COORDINATOR_OUTPUT_RETRIES})"
+        )
+
+    input = CoordinatorInput(
+        standalone_query="Apple outlook",
+        intent="market_outlook",
+        specialist_descriptors=(),
+        remaining_task_slots=32,
+        dispatch_allowed=True,
+    )
+    actor = PydanticAICoordinatorActor(
+        Agent(
+            FunctionModel(response),
+            deps_type=CoordinatorInput,
+            output_type=cast(type[Any], CoordinatorDecision),
+            tools=(),
+            retries=0,
+            tool_retries=0,
+            output_retries=COORDINATOR_OUTPUT_RETRIES,
+            end_strategy="early",
+        )
+    )
+
+    with pytest.raises(ContentFilterError, match="maximum output retries"):
+        await actor.decide(input)
 
 
 def test_finish_requires_its_discriminator() -> None:

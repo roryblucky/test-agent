@@ -21,6 +21,10 @@ class CalculationArtifactInvalid(ValueError):
     """Reject an Artifact that cannot enter accepted calculation state."""
 
 
+class CalculationDomainRejected(CalculationArtifactInvalid):
+    """Reject model-correctable calculation selection after one actor run."""
+
+
 class CalculationMethod(StrEnum):
     """The registered deterministic calculation methods."""
 

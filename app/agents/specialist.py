@@ -35,6 +35,7 @@ from app.langgraph_v2.specialist_retry import (
 
 SPECIALIST_TIMEOUT_SECONDS = 60
 SPECIALIST_MAX_TOKENS = 2000
+SPECIALIST_OUTPUT_RETRIES = 2
 
 SPECIALIST_INSTRUCTIONS = """\
 You are a Specialist Agent. Complete only the assigned objective.
@@ -47,7 +48,7 @@ execution diagnostics.
 
 @dataclass(frozen=True)
 class PydanticAISpecialistActor:
-    """Run one bounded Specialist invocation with fixed actor-local limits."""
+    """Run one Specialist attempt with native structured-output correction."""
 
     agent: Agent[None, SpecialistFindingDraft]
     tool_capture: SpecialistToolCapture = field(default_factory=SpecialistToolCapture)
@@ -195,7 +196,7 @@ def create_specialist_agent(
         tools=tools,
         retries=0,
         tool_retries=0,
-        output_retries=0,
+        output_retries=SPECIALIST_OUTPUT_RETRIES,
         end_strategy="early",
     )
 

@@ -16,58 +16,74 @@ Common use-cases:
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 
 from pydantic_ai.messages import (
     ModelMessage,
+    ModelRequest,
     ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
 )
 
 HistoryProcessor = Callable[[list[ModelMessage]], list[ModelMessage]]
 
 
 def trim_history(max_messages: int = 20) -> HistoryProcessor:
-    """Return a processor that keeps only the last *max_messages* messages.
+    """Return a processor that targets the last *max_messages* messages.
 
-    Always preserves the first message (system prompt / initial query).
-    Crucially, ensures that ToolCallPart and ToolReturnPart pairs are not
-    orphaned or split during truncation, avoiding Pydantic-AI errors.
+    Always preserves the complete first turn and never splits an ordinary turn
+    or Tool call/return chain. An atomic turn may make the result exceed the
+    target rather than leave an orphaned protocol message.
     """
 
     def _processor(messages: list[ModelMessage]) -> list[ModelMessage]:
         if len(messages) <= max_messages:
             return messages
 
-        # Always keep the first message
-        kept: list[ModelMessage] = [messages[0]]
+        groups: list[list[ModelMessage]] = []
+        for message in messages:
+            starts_group = isinstance(message, ModelRequest) and not (
+                groups
+                and isinstance(groups[-1][-1], ModelResponse)
+                and _is_tool_exchange(groups[-1][-1], message)
+            )
+            if not groups or starts_group:
+                groups.append([])
+            groups[-1].append(message)
 
-        # Start looking backwards to gather up to max_messages - 1
-        # We process backwards and accumulate, then reverse at the end.
-        tail: list[ModelMessage] = []
-        i = len(messages) - 1
-
-        while i > 0 and len(tail) < (max_messages - 1):
-            msg = messages[i]
-            tail.append(msg)
-
-            # If this message contains a ToolReturnPart, we MUST also include
-            # the corresponding ModelRequest that contained the ToolCallPart.
-            # In pydantic-ai, typical flow: ModelRequest(ToolCall) -> ModelResponse(ToolReturn)
-            import pydantic_ai.messages as p_msg
-
-            if isinstance(msg, p_msg.ModelResponse) and any(
-                isinstance(p, p_msg.ToolReturnPart) for p in msg.parts
+        kept_groups = [groups[0]]
+        kept_count = len(groups[0])
+        tail_groups: list[list[ModelMessage]] = []
+        for group in reversed(groups[1:]):
+            if (
+                tail_groups
+                and kept_count
+                + sum(len(item) for item in tail_groups)
+                + len(group)
+                > max_messages
             ):
-                # We need the preceding ModelRequest that has the tool calls
-                if i - 1 > 0 and isinstance(messages[i - 1], p_msg.ModelRequest):
-                    i -= 1
-                    tail.append(messages[i])
-
-            i -= 1
-
-        tail.reverse()
-        return kept + tail
+                break
+            tail_groups.append(group)
+        kept_groups.extend(reversed(tail_groups))
+        return [message for group in kept_groups for message in group]
 
     return _processor
+
+
+def _is_tool_exchange(response: ModelResponse, request: ModelRequest) -> bool:
+    """Return whether adjacent messages are a Tool call and its return."""
+    calls = {
+        part.tool_call_id
+        for part in response.parts
+        if isinstance(part, ToolCallPart)
+    }
+    returns = {
+        part.tool_call_id
+        for part in request.parts
+        if isinstance(part, ToolReturnPart)
+    }
+    return bool(calls & returns)
 
 
 def filter_thinking() -> HistoryProcessor:
@@ -86,13 +102,7 @@ def filter_thinking() -> HistoryProcessor:
                     p for p in msg.parts if not isinstance(p, ThinkingPart)
                 ]
                 if filtered_parts:
-                    # Create a new ModelResponse with filtered parts
-                    new_msg = ModelResponse(
-                        parts=filtered_parts,
-                        model_name=msg.model_name,
-                        timestamp=msg.timestamp,
-                    )
-                    result.append(new_msg)
+                    result.append(replace(msg, parts=filtered_parts))
             else:
                 result.append(msg)
         return result

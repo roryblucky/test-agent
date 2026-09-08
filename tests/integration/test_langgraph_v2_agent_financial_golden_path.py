@@ -24,8 +24,14 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Tool
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage, UsageLimits
 
-from app.agents.specialist import PydanticAISpecialistActor
-from app.agents.synthesis import PydanticAISynthesisActor
+from app.agents.specialist import (
+    SPECIALIST_OUTPUT_RETRIES,
+    PydanticAISpecialistActor,
+)
+from app.agents.synthesis import (
+    SYNTHESIS_OUTPUT_RETRIES,
+    PydanticAISynthesisActor,
+)
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
 from app.langgraph_v2.agent_batch import (
     CalculationToolRegistration,
@@ -585,7 +591,7 @@ class _FinancialSpecialists:
                 output_type=SpecialistFindingDraft,
                 tools=tools,
                 tool_retries=0,
-                output_retries=0,
+                output_retries=SPECIALIST_OUTPUT_RETRIES,
                 end_strategy="early",
             ),
             tool_capture=tool_capture,
@@ -635,10 +641,11 @@ class _FinancialSynthesis:
         return PydanticAISynthesisActor(
             Agent(
                 FunctionModel(model),
+                deps_type=PreparedSynthesis,
                 output_type=FinancialResearchReport,
                 tools=(),
                 tool_retries=0,
-                output_retries=0,
+                output_retries=SYNTHESIS_OUTPUT_RETRIES,
                 end_strategy="early",
             )
         )

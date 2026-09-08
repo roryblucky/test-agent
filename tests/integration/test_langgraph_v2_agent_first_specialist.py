@@ -22,7 +22,10 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Tool
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage, UsageLimits
 
-from app.agents.specialist import PydanticAISpecialistActor
+from app.agents.specialist import (
+    SPECIALIST_OUTPUT_RETRIES,
+    PydanticAISpecialistActor,
+)
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
 from app.langgraph_v2 import agent_graph
 from app.langgraph_v2.agent_batch import (
@@ -40,8 +43,8 @@ from app.langgraph_v2.agent_batch import (
 )
 from app.langgraph_v2.agent_completion import IncompleteResearch
 from app.langgraph_v2.agent_coordination import (
+    CoordinatorDecisionExhausted,
     CoordinatorInput,
-    CoordinatorOutputInvalid,
     Finish,
 )
 from app.langgraph_v2.agent_evidence import (
@@ -247,21 +250,10 @@ class _InvalidCoordinator:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def decide(self, input: CoordinatorInput) -> DispatchBatch:
+    async def decide(self, input: CoordinatorInput) -> CoordinatorDecisionExhausted:
         del input
         self.calls += 1
-        raise CoordinatorOutputInvalid("invalid output")
-
-    async def repair(
-        self,
-        input: CoordinatorInput,
-        *,
-        rejection: str,
-    ) -> DispatchBatch:
-        del input
-        assert rejection == "Coordinator decision is invalid"
-        self.calls += 1
-        raise CoordinatorOutputInvalid("still invalid")
+        return CoordinatorDecisionExhausted(reason="Coordinator decision is invalid")
 
 
 class _ContextSpecialist:
@@ -584,7 +576,7 @@ def _specialist_factory(
                 tools=tools,
                 retries=0,
                 tool_retries=0,
-                output_retries=0,
+                output_retries=SPECIALIST_OUTPUT_RETRIES,
                 end_strategy="early",
             ),
             tool_capture=tool_capture,
@@ -650,7 +642,7 @@ def _skill_specialist_factory(
             tools=tools,
             retries=0,
             tool_retries=0,
-            output_retries=0,
+            output_retries=SPECIALIST_OUTPUT_RETRIES,
             end_strategy="early",
         ),
         tool_capture=tool_capture,
@@ -680,26 +672,12 @@ class _Synthesis:
         del prepared
         return FinancialResearchReport(markdown_report="Apple revenue grew. [[E:1]]")
 
-    async def repair(
-        self, prepared: object, *, validation_errors: tuple[str, ...]
-    ) -> FinancialResearchReport:
-        del validation_errors
-        return await self.synthesize(prepared)
-
-
 class _EmptySynthesis:
     async def synthesize(self, prepared: object) -> FinancialResearchReport:
         del prepared
         return FinancialResearchReport(
             markdown_report="No matching filing records were found. [[E:1]]"
         )
-
-    async def repair(
-        self, prepared: object, *, validation_errors: tuple[str, ...]
-    ) -> FinancialResearchReport:
-        del validation_errors
-        return await self.synthesize(prepared)
-
 
 class _TenantManager:
     def get_tenant_config(self, tenant_id: str) -> TenantConfig:
@@ -1212,7 +1190,7 @@ def test_rejected_candidates_leave_no_checkpoint_coordination_round(
     done = [event for event in parse_sse(response.text) if event["type"] == "done"]
     assert response.status_code == 200
     assert len(done) == 1
-    assert coordinator.calls == 2
+    assert coordinator.calls == 1
     assert specialist.inputs == []
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
@@ -1381,15 +1359,6 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
                     "[[E:5]] [[E:6]] [[E:7]] [[E:8]]"
                 )
             )
-
-        async def repair(
-            self,
-            prepared: PreparedSynthesis,
-            *,
-            validation_errors: tuple[str, ...],
-        ) -> FinancialResearchReport:
-            del validation_errors
-            return await self.synthesize(prepared)
 
     def run_batch(
         *, reverse_completion: bool, conversation_id: str
@@ -1854,15 +1823,6 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
                 markdown_report="Apple revenue grew. [[E:1]]"
             )
 
-        async def repair(
-            self,
-            prepared: PreparedSynthesis,
-            *,
-            validation_errors: tuple[str, ...],
-        ) -> FinancialResearchReport:
-            del validation_errors
-            return await self.synthesize(prepared)
-
     monkeypatch.setattr(agent_graph, "prepare_synthesis", barrier_prepare)
     monkeypatch.setattr(agent_graph, "synthesize_report", barrier_synthesize)
     policy = AgentIntentPolicy(
@@ -2042,7 +2002,7 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
                 tools=tools,
                 retries=0,
                 tool_retries=0,
-                output_retries=0,
+                output_retries=SPECIALIST_OUTPUT_RETRIES,
                 end_strategy="early",
             ),
             tool_capture=tool_capture,
@@ -2058,15 +2018,6 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
             return FinancialResearchReport(
                 markdown_report="Apple revenue grew. [[E:1]]"
             )
-
-        async def repair(
-            self,
-            prepared: PreparedSynthesis,
-            *,
-            validation_errors: tuple[str, ...],
-        ) -> FinancialResearchReport:
-            del validation_errors
-            return await self.synthesize(prepared)
 
     policy = AgentIntentPolicy(
         intent="market_outlook",

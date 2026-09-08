@@ -166,9 +166,17 @@ def classify_specialist_failure(
             return RetryDisposition.RETRY
         return None
     if isinstance(error, IncompleteToolCall):
-        return RetryDisposition.RETRY if facts.terminal_output_tool_rejected else None
+        return (
+            RetryDisposition.TASK_FAILED
+            if facts.terminal_output_tool_rejected
+            else None
+        )
     if isinstance(error, UnexpectedModelBehavior):
-        return RetryDisposition.RETRY if facts.terminal_output_tool_rejected else None
+        return (
+            RetryDisposition.TASK_FAILED
+            if facts.terminal_output_tool_rejected
+            else None
+        )
     if isinstance(error, UsageLimitExceeded):
         return (
             RetryDisposition.TASK_FAILED

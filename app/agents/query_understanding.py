@@ -183,11 +183,8 @@ def create_query_understanding_agent(
     instructions: str | None = None,
 ) -> Agent[None, QueryUnderstandingOutput]:
     """Create a query-understanding agent with the given model."""
-    from app.agents.history_processors import filter_thinking, trim_history
-
     return registry.create_agent(
         model_name,
         output_type=QueryUnderstandingOutput,
         instructions=instructions or DEFAULT_INSTRUCTIONS,
-        history_processors=[trim_history(20), filter_thinking()],
     )

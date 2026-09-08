@@ -79,8 +79,11 @@ revise the next research step after each batch.
 ## Implementation Decisions
 
 - Make retry ownership explicit at every PydanticAI actor boundary. Coordinator
-  and Synthesis disable PydanticAI Tool and output retries because their adapters
-  own repair. POC Tools do not raise PydanticAI `ModelRetry` or `ToolFailed`;
+  and Synthesis disable PydanticAI Tool retries and each delegates exactly one
+  structured-output correction to PydanticAI in the same actor invocation.
+  Specialist disables Tool retries and delegates at most two structured-output
+  corrections to PydanticAI in the same outer attempt. POC Tools do not raise
+  PydanticAI `ModelRetry` or `ToolFailed`;
   each registered binding catches only its allowlisted expected inability to
   provide requested read, fetch, or Calculation data and returns a PydanticAI
   `ToolReturn` whose model-visible `return_value` is a discriminated
@@ -152,7 +155,10 @@ revise the next research step after each batch.
   scalar channels.
 - Use the existing PydanticAI Query Understanding actor as the only Agent-mode
   actor that receives bounded complete prior user/final-assistant Conversation
-  pairs. In one typed result it resolves the current query to a non-empty
+  pairs. `select_conversation_context` is the sole Agent-mode history-budget
+  owner; the shared Agent factory adds no second history processor. Linear mode
+  continues to embed its sanitized bounded history in the runtime prompt and
+  passes no native `message_history`. In one typed result it resolves the current query to a non-empty
   `standalone_query` and selects one Business Intent from the Tenant's compact
   Intent Catalog. Coordinator, Specialist, and Synthesis actors do not receive
   Conversation history or prior actor transcripts.
@@ -213,10 +219,12 @@ revise the next research step after each batch.
   business budget requiring atomic reservation across parallel branches.
   Tasks in one Dispatch Batch are mutually independent and may reference only
   Results completed before that batch; same-batch references are invalid.
-  The Coordinator adapter is the sole owner of one explicit same-round repair:
-  it makes at most two complete actor invocations with equivalent built-in
-  output retry disabled, and a rejected attempt is not an accepted Coordination
-  Round. After validation, the Agent Graph assigns each
+  The Coordinator adapter configures exactly one PydanticAI output retry inside
+  one actor invocation, for at most two model requests against the same frozen
+  input. Pydantic schema errors retain their field-level retry details, while a
+  code-owned output validator returns deterministic candidate-policy feedback
+  through `ModelRetry`. A rejected attempt is not an accepted Coordination Round.
+  After validation, the Agent Graph assigns each
   accepted Task a stable ID from Graph-owned Run, Round, and dispatch-order
   identity; model output never controls identity or retry correlation.
 - Record every accepted Coordinator Decision as an immutable Coordination Round
@@ -258,9 +266,16 @@ revise the next research step after each batch.
   it would exceed one. The first four accepted Coordination Rounds may dispatch
   batches: one initial batch and up to three follow-up batches. After a fourth
   dispatch, the next Coordinator Decision may only be `Finish`; an invalid
-  dispatch candidate receives the one allowed same-round repair, after which
-  code finishes as incomplete. A rejected candidate consumes its adapter
-  invocation allowance but is not an accepted Coordination Round.
+  dispatch candidate receives the one allowed output retry with an actionable
+  instruction to return `Finish`, after which code finishes as incomplete. A
+  rejected candidate consumes the output-retry allowance but is not an accepted
+  Coordination Round.
+
+  An **actor invocation** is one application call to an actor method and one
+  PydanticAI `Agent.run`; a **model request** is one provider call within that
+  run, including native output correction; a Specialist **outer attempt** is
+  one fresh actor instance and actor invocation created only for an allowlisted
+  provider transient or post-run domain rejection.
 
   | Limit | POC value and semantics |
   |---|---|
@@ -268,10 +283,10 @@ revise the next research step after each batch.
   | Tasks | `32` accepted Tasks per Run; `8` Tasks per batch; Agent Graph `max_concurrency=8` |
   | Dependency context | At most `8` earlier accepted `context_task_ids` per Task |
   | Specialist outer attempts | `3` total: initial plus at most two eligible retries, all with the same Task ID and a fresh actor run |
-  | Specialist actor work | `12` model requests and `8` completed Tool calls cumulative across all outer attempts; hidden Tool/output retries disabled |
+  | Specialist actor work | `12` model requests and `8` completed Tool calls cumulative across all outer attempts; exactly `2` native output retries per outer attempt, no Tool retry |
   | Specialist calls | `60 s` per model request, binding-owned `20 s` per Tool call, model `max_tokens=2,000`; no whole-Specialist timeout |
-  | Coordinator | At most `2` actor invocations per Decision, one model request each, no Tools, `60 s` per request, `max_tokens=1,500` |
-  | Synthesis | At most `2` actor invocations total, one model request each, no Tools, `120 s` per request, `max_tokens=4,000` |
+  | Coordinator | One actor invocation per Decision with at most `2` model requests, no Tools, `60 s` per request, `max_tokens=1,500` |
+  | Synthesis | One actor invocation total with at most `2` model requests, no Tools, `120 s` per request, `max_tokens=4,000` |
   | Specialist Result | At most `16` Evidence IDs and `8` Data Gaps |
   | Calculation Artifacts | At most `8` per Task contribution and `32` projections in Prepared Synthesis |
   | Specialist prior-Result context | At most the `8` referenced Results |
@@ -285,9 +300,11 @@ revise the next research step after each batch.
   Exact cross-branch reservation is unnecessary in this read/fetch/calculate-only
   system. A Tool response that cannot be normalized into the registered success
   contract returns the allowlisted `response_unusable` unavailable outcome.
-  Specialist output that fails schema or deterministic output validation follows
-  the structured-output-invalid retry classification below. Recursion overflow
-  remains fatal.
+  Specialist output that fails Pydantic schema validation is corrected inside
+  the same actor run. Exhausting that native output budget becomes `TaskFailed`
+  directly and never starts a fresh outer attempt. Post-run Evidence-reference
+  or Calculation domain rejection may start a fresh outer attempt. Recursion
+  overflow remains fatal.
 - Keep expected Tool unavailability inside the active Specialist run as the
   typed value described above. A Tool-call timeout is converted inside that Tool
   binding, so it neither aborts multi-hop work nor cancels successful internal
@@ -295,10 +312,9 @@ revise the next research step after each batch.
   adapter returns `TaskSucceeded` with the available Evidence and the canonical
   Data Gaps derived from the accepted attempt's unavailable Tool metadata; this
   includes partially successful and successful negative research. Only an
-  allowlisted failure that prevents the Specialist run itself from producing a
-  valid terminal result—including exhausted provider/model request failure or
-  exhausted model-output validation—may become `TaskFailed` after outer retry
-  policy is exhausted. Deterministic collection still waits for one terminal
+  allowlisted provider/model request failure may become `TaskFailed` after outer
+  retry policy is exhausted. Exhausted native output validation and actor-local
+  count limits become `TaskFailed` immediately. Deterministic collection still waits for one terminal
   outcome per Task, then the Coordinator may request substitute research,
   accept the disclosed gaps, or finish. External cancellation, programmer
   errors, reducer conflicts, authorization-boundary violations, and corrupted
@@ -325,7 +341,8 @@ revise the next research step after each batch.
   | Adapter category | Outer retry | Terminal behavior |
   |---|---|---|
   | Allowlisted transient model timeout, connection failure, HTTP 429, or HTTP 5xx | Up to two retries after the initial attempt; each is a fresh actor run subject to the Task's cumulative actor-local limits | `TaskFailed` after the third total attempt |
-  | Structured output rejected by schema or deterministic output validation | Up to two retries after the initial attempt; each is a fresh actor run with deterministic validation feedback and unchanged Task input | `TaskFailed` after the third total attempt |
+  | Structured output rejected by Pydantic schema | No outer retry; up to two corrections remain inside the same actor run and preserve native validation feedback | `TaskFailed` when the native output budget is exhausted |
+  | Post-run Evidence-reference or Calculation domain rejection | Up to two retries after the initial attempt; each is a fresh actor run with deterministic validation feedback and unchanged Task input | `TaskFailed` after the third total attempt |
   | Actor-local model-request or Tool-call count exhausted | None | `TaskFailed` |
   | Expected registered Tool unavailability | None | Return the typed `ToolReturn` and continue the same actor run |
   | Cancellation, authorization, configuration, invariant, programmer, or unknown failure | None | Re-raise and fail the Run |
@@ -340,8 +357,8 @@ revise the next research step after each batch.
   | Any other `ModelHTTPError` | Fatal; re-raise |
   | A non-HTTP `pydantic_ai.exceptions.ModelAPIError` whose typed direct cause is `openai.APIConnectionError`, including its timeout subtype, at a configured Azure/OpenAI model-call boundary | Allowlisted transient connection failure |
   | `httpx.ConnectError` or `httpx.TimeoutException` escaping directly from the configured Google model-call boundary | Allowlisted transient connection or model timeout |
-  | `pydantic_ai.exceptions.IncompleteToolCall`, but only when the dedicated invocation capture proves that the truncated call is that actor's registered terminal output Tool | Structured-output invalid |
-  | `UnexpectedModelBehavior` for which the dedicated invocation capture proves rejection of that actor's terminal structured output | Structured-output invalid |
+  | `pydantic_ai.exceptions.IncompleteToolCall`, but only when the dedicated invocation capture proves that the truncated call is that actor's registered terminal output Tool after native output exhaustion | Actor-local output exhausted; `TaskFailed` without outer retry |
+  | `UnexpectedModelBehavior` for which the dedicated invocation capture proves native rejection exhaustion of that actor's terminal structured output | Actor-local output exhausted; `TaskFailed` without outer retry |
   | `pydantic_ai.exceptions.UsageLimitExceeded` raised by limits configured for this invocation's model-request or Tool-call counts, with PydanticAI token limits left unset | Actor-local count exhausted |
   | `ContentFilterError`, any other `UnexpectedModelBehavior`, or any unlisted PydanticAI/provider exception | Fatal; re-raise |
 
@@ -357,8 +374,8 @@ revise the next research step after each batch.
   Tool, a `TimeoutError` escaping a business Tool, and any signal whose origin
   cannot be proven are fatal. Binding-owned business-Tool timeout remains the
   earlier typed `ToolUnavailable` path and does not reach this classifier.
-  Schema and deterministic domain validation performed after a returned draft use one
-  application-owned structured-output-invalid signal. No broad
+  Deterministic domain validation performed after a returned draft uses one
+  application-owned retryable domain-rejection path. No broad
   `UnexpectedModelBehavior` or `ModelAPIError` catch may convert failures from
   an unregistered provider or a different actor phase.
 
@@ -438,7 +455,8 @@ revise the next research step after each batch.
   is added.
 - Configure the Agent Graph with an explicit recursion limit of 40. This limit
   counts LangGraph supersteps, not model requests, Tool calls, Specialist outer
-  attempts, or Coordinator/Synthesis repairs performed inside an owning node.
+  attempts, Coordinator model requests inside one output-retried actor run, or
+  Synthesis native output-retry requests performed inside an owning node.
   The longest intended application-node route has at most 31 supersteps: four
   fixed entry steps; four dispatch cycles of at most five steps each for
   coordinate, validate, dispatch, Specialist fan-out, and barrier; two steps for
@@ -483,11 +501,13 @@ revise the next research step after each batch.
   deterministic answer sets the code-owned insufficient-Evidence signal and
   uses the same incomplete disclosure rather than exposing raw Tool or Task
   failures.
-- Build one frozen `PreparedSynthesis` value before the first Synthesis call.
+- Build one frozen `PreparedSynthesis` value before the Synthesis invocation.
   It owns the exact model input, deterministic Evidence and Calculation alias
-  maps. A repair receives that same value unchanged plus deterministic
-  validation errors; reconstructing it or changing catalog membership, ordering,
-  or aliases between attempts is an invariant failure. No digest is added
+  maps. The output validator receives that same value as typed dependencies and
+  returns only marker-format, presence, duplication, and eligibility errors as
+  `ModelRetry` feedback. Reconstructing it or changing catalog membership,
+  ordering, or aliases is a fatal invariant failure that consumes no output
+  retry. No digest is added
   because this POC has no active-Run cross-process recovery or external digest
   consumer.
 - Invoke every registered Specialist through one generic
@@ -705,12 +725,11 @@ revise the next research step after each batch.
   answer replay, or an atomic transaction spanning PostgreSQL and the network;
   it promises only that canonical state exists before the first answer frame.
   Absence of `done` does not imply absence of a committed canonical response.
-- If strict Synthesis output or support-marker validation rejects the complete
-  candidate, the Synthesis adapter owns one explicit bounded repair by the same
-  Agent with deterministic validation errors and the unchanged support catalog.
-  It makes at most two complete actor invocations with equivalent built-in
-  output retry disabled. This is not a new Task, Coordination Round, or research
-  step. If the repaired candidate still fails, fail the Run without publishing answer tokens,
+- If strict Synthesis schema or support-marker validation rejects the complete
+  candidate, PydanticAI owns one bounded output retry inside the same actor run,
+  with native schema feedback or deterministic marker errors and the unchanged
+  support catalog. This is not a new actor invocation, Task, Coordination Round,
+  or research step. If the second candidate still fails, fail the Run without publishing answer tokens,
   citations, a final answer, or an assistant Conversation Message. Never delete
   invalid markers and publish the remaining prose.
 - Stream planning, Task, Tool, gate, warning, citation, and final progress through existing SSE event types. Do not expose chain-of-thought.
@@ -879,7 +898,7 @@ revise the next research step after each batch.
   model-authored raw series, contribute metadata only with a validated successful
   Specialist outcome, prevent failed/retried-attempt leakage, remain stable
   across parallel completion order, detect reducer collisions, preserve aliases
-  across Synthesis repair, and verify that code—not
+  across Synthesis native output retry, and verify that code—not
   Synthesis—renders each referenced Artifact's canonical value. Add an
   alternate-outcome coordination
   test in which the holdings Task returns no accepted finding or fails, and
@@ -894,8 +913,8 @@ revise the next research step after each batch.
   retain the messages from its dedicated capture context. The adapter-test
   harness may aggregate those per-invocation snapshots for assertions, but an
   abandoned attempt's messages or metadata must never enter an accepted result.
-  Coordinator and Synthesis invalid output produces one actor request before
-  the adapter-owned repair; expected POC Tool unavailability produces a typed
+  Coordinator and Synthesis invalid output produces a second model request in
+  the same actor invocation; expected POC Tool unavailability produces a typed
   result with no hidden
   `ToolFailed` adaptation turn. A multi-hop test proves the same PydanticAI run
   can call an allowed fallback and finish; the accepted Result still contains
@@ -913,7 +932,8 @@ revise the next research step after each batch.
   and assert `pydantic-ai==1.93.0`. Include origin-sensitive negative cases: an
   adapter-owned model timeout is retryable while the same exception escaping a
   business Tool is fatal; an `IncompleteToolCall` for the registered terminal
-  output Tool is retryable while a truncated business-Tool call is fatal; a
+  output Tool becomes `TaskFailed` after the third native response without a
+  fresh outer attempt, while a truncated business-Tool call is fatal; a
   `ModelAPIError` with an `openai.APIConnectionError` cause and the allowlisted
   raw Google `httpx` transport signals are retryable while a bare
   `ModelAPIError` is fatal; and `ContentFilterError` remains fatal before its
@@ -936,8 +956,9 @@ revise the next research step after each batch.
   Evidence statement appears at most once, and partial/limit causes retain their
   existing reason precedence. With no accepted incompleteness signal, no block
   is added and code does not claim global completeness.
-- Verify Synthesis repair receives the same frozen `PreparedSynthesis` value and
-  alias maps. Rebuilding or mutating it is an invariant failure, and no unused
+- Verify Synthesis native output validation receives the same frozen
+  `PreparedSynthesis` value and alias maps. Rebuilding or mutating it is an
+  invariant failure, and no unused
   catalog digest exists in the POC contract.
 - Add serializer tests that use the explicit strict constructor and shared saver:
   approved JSON-native checkpoint state and framework Messages round-trip;
@@ -946,7 +967,7 @@ revise the next research step after each batch.
   rejected by the typed checkpoint-state boundary. Add recursion tests that
   enumerate the compiled application-node route and inspect checkpoint history
   or `langgraph_step` to prove the longest legal route remains below 40.
-  Specialist attempts, actor repairs, model requests, and Tool calls are asserted
+  Specialist outer attempts, native output retries, model requests, and Tool calls are asserted
   independently rather than counted as Graph steps. An intentional Graph loop
   must raise a recursion failure without publishing a successful terminal event.
 - Add adversarial data fixtures in which Evidence, Tool output, Specialist
@@ -1006,6 +1027,22 @@ revise the next research step after each batch.
   deterministic business reduction.
 
 ## Further Notes
+
+- 2026-09-08 retry/checkpoint audit dispositions: (1) Coordinator manual
+  invocation retry was replaced by one native output retry with per-request
+  timeout; (2) Synthesis manual repair and broad output-error remapping were
+  replaced by one native marker retry while projection invariants and non-output
+  failures remain fatal; (3) Agent-mode Query Understanding now has exactly one
+  history-budget owner and the retained legacy processor preserves complete
+  ordinary and Tool turns; (4) Specialist schema correction stays in one run,
+  native output exhaustion becomes `TaskFailed` without a fresh outer attempt,
+  and only allowlisted provider/post-run domain failures retain outer retry;
+  (5) `AcceptedTask` and `ActiveBatch` now use strict frozen Pydantic checkpoint
+  contracts with the existing JSON shape. No finding was deferred or dismissed.
+- 2026-09-08 final Standards/Spec re-review approved all five dispositions and
+  the calculation-domain follow-up. Verification: 467 passed, 1 skipped;
+  `ruff check app tests`, `pyright app tests`, and `git diff --check` passed.
+  Unresolved review comments: 0.
 
 - This spec starts after the `langgraph-orchestration-core` contracts and Linear
   graph are available. It intentionally does not prescribe or schedule the

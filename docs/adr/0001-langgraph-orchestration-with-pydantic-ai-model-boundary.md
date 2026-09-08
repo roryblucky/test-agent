@@ -12,12 +12,20 @@ Superseded Agent-mode detail, retained only as decision history:
 PydanticAI constructs the LLM-facing actors with model-provider abstraction, instructions, activated Skills, structured outputs, usage tracking, and approved tool bindings. Planner actors return typed Task DAGs instead of executing business tools. LangGraph schedules top-level Retrieval, Rerank, Reduction, Calculation, and Specialist Tasks; a Specialist may use a restricted read-only PydanticAI toolset internally, but every binding delegates to the platform Tool Executor for typed outcomes, Evidence, audit, and events. Deterministic Calculation remains an explicit LangGraph Task rather than a hidden free-form tool call.
 
 The accepted actor boundary is version-independent: LangGraph and application
-adapters own coordination, technical retry, and repair; actor configuration
-therefore makes Tool/output retry, end strategy, Tool execution ordering, MCP
-execution location, and provider selection explicit rather than inheriting
-library defaults. PydanticAI dependency migration and version-specific
-compatibility are owned by a separate migration spec. POC Tools do not use
-PydanticAI model-adaptation exceptions for expected failures.
+adapters own coordination and retry policy. The Coordinator adapter delegates
+one structured-output correction to PydanticAI so schema errors and deterministic
+candidate-policy errors stay in one model-visible history; all retry budgets,
+end strategy, Tool execution ordering, MCP execution location, and provider
+selection remain explicit rather than inheriting library defaults. PydanticAI
+dependency migration and version-specific compatibility are owned by a separate
+migration spec. POC Tools do not use PydanticAI model-adaptation exceptions for
+expected failures.
+The Synthesis adapter likewise delegates one marker-correction retry to the same
+PydanticAI run while treating a changed Evidence/Calculation projection as a
+fatal invariant. A Specialist delegates up to two schema corrections to one
+PydanticAI run; exhausted native output validation becomes `TaskFailed` without
+a fresh outer attempt. Only allowlisted provider transients and post-run domain
+rejections may create a fresh Specialist actor attempt.
 Registered Tool bindings return expected read/fetch/Calculation unavailability
 as bounded typed values, allowing the same Specialist run to continue multi-hop
 or collect partial internal fan-out results. Fatal authorization, invariant,

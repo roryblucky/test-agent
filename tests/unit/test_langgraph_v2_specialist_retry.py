@@ -163,7 +163,7 @@ def test_raw_google_transport_errors_are_fatal_outside_the_google_model_boundary
         (
             IncompleteToolCall("truncated"),
             _facts(terminal_output_tool_rejected=True),
-            RetryDisposition.RETRY,
+            RetryDisposition.TASK_FAILED,
         ),
         (
             IncompleteToolCall("business tool"),
@@ -173,7 +173,7 @@ def test_raw_google_transport_errors_are_fatal_outside_the_google_model_boundary
         (
             UnexpectedModelBehavior("output rejected"),
             _facts(terminal_output_tool_rejected=True),
-            RetryDisposition.RETRY,
+            RetryDisposition.TASK_FAILED,
         ),
         (
             ContentFilterError("blocked"),

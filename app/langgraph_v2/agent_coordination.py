@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.langgraph_v2.agent_batch import (
     MAX_DISPATCH_BATCH_TASKS,
@@ -43,7 +43,7 @@ StructuralStopReason = CoordinationStopReason
 
 
 class CoordinationCandidateRejected(ValueError):
-    """A Coordinator candidate that may consume the one same-round repair."""
+    """A typed Coordinator candidate rejected by deterministic policy."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -52,10 +52,6 @@ class CoordinationCandidateRejected(ValueError):
 
 class CoordinationInvariantError(ValueError):
     """A post-validation state change invalidated a frozen dispatch decision."""
-
-
-class CoordinatorOutputInvalid(ValueError):
-    """A model output that may consume the one same-round repair."""
 
 
 class Finish(BaseModel):
@@ -83,6 +79,8 @@ class CoordinatorInput(BaseModel):
     standalone_query: str
     intent: str
     specialist_descriptors: tuple[SpecialistDescriptor, ...]
+    remaining_task_slots: int = Field(ge=0, le=MAX_ACCEPTED_TASKS)
+    dispatch_allowed: bool
     prior_results: tuple[PriorResultView, ...] = ()
     failed_tasks: tuple[PriorFailedTaskView, ...] = ()
     data_gaps: tuple[DataGapView, ...] = ()
@@ -91,11 +89,21 @@ class CoordinatorInput(BaseModel):
 CoordinatorDecision = Finish | DispatchBatch
 
 
+@dataclass(frozen=True)
+class CoordinatorDecisionExhausted:
+    """Expected exhaustion of the actor's single structured-output retry."""
+
+    reason: str
+
+
+CoordinatorActorResult = CoordinatorDecision | CoordinatorDecisionExhausted
+
+
 class CoordinatorActor(Protocol):
     """Propose one bounded Coordinator decision."""
 
-    async def decide(self, input: CoordinatorInput) -> CoordinatorDecision:
-        """Return the next candidate decision from the frozen projection."""
+    async def decide(self, input: CoordinatorInput) -> CoordinatorActorResult:
+        """Return one validated decision or expected output exhaustion."""
         ...
 
 
@@ -145,7 +153,7 @@ class AcceptedCoordinationDispatch:
 
 @dataclass(frozen=True)
 class CoordinationStopped:
-    """An exhausted same-round repair that must end coordination incomplete."""
+    """Exhausted structured-output retry that ends coordination incomplete."""
 
     reason: StructuralStopReason
 
@@ -273,12 +281,26 @@ def project_coordinator_input(
     accepted_batches: Mapping[str, AcceptedBatch],
 ) -> CoordinatorInput:
     """Build the sole prompt-safe projection from complete accepted state."""
+    ordered_rounds = _ordered_rounds(rounds)
     prior_results, failed_tasks = _prior_projection(rounds, accepted_batches)
     data_gaps = tuple(gap for result in prior_results for gap in result.data_gaps)
+    accepted_task_count = sum(
+        len(round_.tasks) for round_ in ordered_rounds if round_.kind == "dispatch"
+    )
+    if accepted_task_count > MAX_ACCEPTED_TASKS:
+        raise CoordinationInvariantError("Accepted Task limit is invalid")
+    dispatch_rounds = sum(
+        round_.kind == "dispatch" for round_ in ordered_rounds
+    )
     return CoordinatorInput(
         standalone_query=standalone_query,
         intent=intent,
         specialist_descriptors=specialist_descriptors,
+        remaining_task_slots=MAX_ACCEPTED_TASKS - accepted_task_count,
+        dispatch_allowed=(
+            len(ordered_rounds) < MAX_COORDINATION_DECISIONS
+            and dispatch_rounds < MAX_DISPATCH_ROUNDS
+        ),
         prior_results=prior_results,
         failed_tasks=failed_tasks,
         data_gaps=data_gaps,
@@ -306,6 +328,51 @@ def _select_context(
     return selected
 
 
+def _validate_dispatch_candidate(
+    decision: DispatchBatch,
+    *,
+    remaining_task_slots: int,
+    dispatch_allowed: bool,
+    eligible_specialist_ids: frozenset[str],
+    prior_results: Sequence[PriorResultView],
+) -> None:
+    """Validate prompt-visible dispatch policy without accepting any state."""
+    if len(decision.tasks) > remaining_task_slots:
+        raise CoordinationCandidateRejected(TASK_LIMIT)
+    if not dispatch_allowed:
+        raise CoordinationCandidateRejected(COORDINATION_LIMIT)
+    for proposal in decision.tasks:
+        try:
+            normalize_task_objective(proposal.objective)
+            if proposal.specialist_id not in eligible_specialist_ids:
+                raise ValueError("Specialist is not eligible")
+            _select_context(
+                proposal.context_task_ids,
+                prior_results=prior_results,
+                error_type=CoordinationCandidateRejected,
+            )
+        except ValueError as error:
+            raise CoordinationCandidateRejected(str(error)) from error
+
+
+def validate_coordinator_decision(
+    input: CoordinatorInput,
+    decision: CoordinatorDecision,
+) -> CoordinatorDecision:
+    """Validate one typed decision against its frozen prompt-visible policy."""
+    if isinstance(decision, DispatchBatch):
+        _validate_dispatch_candidate(
+            decision,
+            remaining_task_slots=input.remaining_task_slots,
+            dispatch_allowed=input.dispatch_allowed,
+            eligible_specialist_ids=frozenset(
+                descriptor.id for descriptor in input.specialist_descriptors
+            ),
+            prior_results=input.prior_results,
+        )
+    return decision
+
+
 def accept_coordination_dispatch(
     decision: DispatchBatch,
     *,
@@ -323,12 +390,20 @@ def accept_coordination_dispatch(
     accepted_task_count = sum(
         len(round_.tasks) for round_ in ordered_rounds if round_.kind == "dispatch"
     )
-    if accepted_task_count + len(proposals) > MAX_ACCEPTED_TASKS:
-        raise CoordinationCandidateRejected("task_limit")
     dispatch_rounds = sum(round_.kind == "dispatch" for round_ in ordered_rounds)
-    if dispatch_rounds >= MAX_DISPATCH_ROUNDS:
-        raise CoordinationCandidateRejected("coordination_limit")
     prior_results = _prior_results(ordered_rounds, accepted_batches)
+    _validate_dispatch_candidate(
+        decision,
+        remaining_task_slots=MAX_ACCEPTED_TASKS - accepted_task_count,
+        dispatch_allowed=(
+            len(ordered_rounds) < MAX_COORDINATION_DECISIONS
+            and dispatch_rounds < MAX_DISPATCH_ROUNDS
+        ),
+        eligible_specialist_ids=frozenset(
+            descriptor.id for descriptor in scope_descriptors
+        ),
+        prior_results=prior_results,
+    )
     revision = len(ordered_rounds) + 1
     active_tasks: list[AcceptedTask] = []
     for dispatch_order, proposal in enumerate(proposals):
@@ -337,14 +412,7 @@ def accept_coordination_dispatch(
             registry.resolve(
                 proposal.specialist_id, scope_descriptors=scope_descriptors
             )
-            _select_context(
-                proposal.context_task_ids,
-                prior_results=prior_results,
-                error_type=CoordinationCandidateRejected,
-            )
         except ValueError as error:
-            if isinstance(error, CoordinationCandidateRejected):
-                raise
             raise CoordinationCandidateRejected(str(error)) from error
         active_tasks.append(
             AcceptedTask(
@@ -416,42 +484,23 @@ async def decide_coordination_round(
     registry: SpecialistRegistry,
     scope_descriptors: Sequence[SpecialistDescriptor],
 ) -> AcceptedCoordinationDispatch | CoordinationRound | CoordinationStopped:
-    """Own exactly one same-round repair without changing the frozen input."""
-    rejection_reason: str | None = None
-    for attempt in range(2):
-        try:
-            if attempt == 0:
-                candidate = await actor.decide(input)
-            else:
-                assert rejection_reason is not None
-                repair = cast(
-                    Callable[..., Awaitable[CoordinatorDecision]] | None,
-                    getattr(actor, "repair", None),
-                )
-                candidate = (
-                    await repair(input, rejection=rejection_reason)
-                    if repair is not None
-                    else await actor.decide(input)
-                )
-            if isinstance(candidate, Finish):
-                return accept_coordination_finish(
-                    request_id=request_id,
-                    rounds=rounds,
-                )
-            return accept_coordination_dispatch(
-                DispatchBatch.model_validate(candidate),
-                request_id=request_id,
-                rounds=rounds,
-                accepted_batches=accepted_batches,
-                registry=registry,
-                scope_descriptors=scope_descriptors,
-            )
-        except (CoordinatorOutputInvalid, ValidationError):
-            rejection_reason = "Coordinator decision is invalid"
-        except CoordinationCandidateRejected as error:
-            rejection_reason = error.reason
-    assert rejection_reason is not None
-    return CoordinationStopped(reason=_stopped_reason(rejection_reason))
+    """Accept one actor-validated decision against authoritative current state."""
+    candidate = await actor.decide(input)
+    if isinstance(candidate, CoordinatorDecisionExhausted):
+        return CoordinationStopped(reason=_stopped_reason(candidate.reason))
+    if isinstance(candidate, Finish):
+        return accept_coordination_finish(
+            request_id=request_id,
+            rounds=rounds,
+        )
+    return accept_coordination_dispatch(
+        candidate,
+        request_id=request_id,
+        rounds=rounds,
+        accepted_batches=accepted_batches,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
 
 
 def _stopped_reason(rejection: str) -> StructuralStopReason:

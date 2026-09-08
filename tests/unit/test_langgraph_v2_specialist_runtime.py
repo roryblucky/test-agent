@@ -9,11 +9,16 @@ import httpx
 import pydantic_ai.models as models
 import pytest
 from pydantic_ai import Agent, capture_run_messages
-from pydantic_ai.exceptions import ModelHTTPError, UsageLimitExceeded
+from pydantic_ai.exceptions import (
+    IncompleteToolCall,
+    ModelHTTPError,
+    UsageLimitExceeded,
+)
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -28,6 +33,7 @@ import app.agents.specialist as specialist_module
 import app.langgraph_v2.agent_evidence as agent_evidence
 from app.agents.specialist import (
     SPECIALIST_MAX_TOKENS,
+    SPECIALIST_OUTPUT_RETRIES,
     SPECIALIST_TIMEOUT_SECONDS,
     PydanticAISpecialistActor,
     create_bound_specialist_actor,
@@ -91,7 +97,7 @@ class _Registry:
         return object()
 
 
-def test_specialist_factory_disables_tools_and_builtin_retries() -> None:
+def test_specialist_factory_enables_only_native_output_retries() -> None:
     registry = _Registry()
 
     create_specialist_agent(cast(ModelRegistry, registry), model_name="specialist")
@@ -104,7 +110,7 @@ def test_specialist_factory_disables_tools_and_builtin_retries() -> None:
         "tools": (),
         "retries": 0,
         "tool_retries": 0,
-        "output_retries": 0,
+        "output_retries": SPECIALIST_OUTPUT_RETRIES,
         "end_strategy": "early",
     }
     instructions = registry.kwargs["instructions"]
@@ -501,6 +507,129 @@ async def test_specialist_accepts_tool_metadata_only_after_terminal_finding() ->
     assert attempt.finding.evidence_ids == ("evidence-1",)
     assert attempt.evidence[0].id == "evidence-1"
     assert capture.evidence == []
+
+
+@pytest.mark.asyncio
+async def test_specialist_schema_retry_keeps_same_run_tools_and_feedback() -> None:
+    capture = SpecialistToolCapture()
+
+    async def provider(source: str, query: str) -> EvidenceEnvelope:
+        assert (source, query) == ("filing", "Apple revenue")
+        return EvidenceEnvelope(
+            id="evidence-1",
+            tenant_id="tenant-a",
+            request_id="request-1",
+            task_id="task-1",
+            source="filing",
+            source_url="https://example.test/filing",
+            title="Annual filing",
+            body="BODY-SENTINEL",
+            excerpt="Apple revenue grew.",
+            as_of_date=date(2026, 9, 6),
+        )
+
+    tool = bind_evidence_tool(provider, context=_context(), capture=capture)
+    calls = 0
+    retry_parts: list[RetryPromptPart] = []
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        retry_parts.extend(
+            part
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, RetryPromptPart)
+        )
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="read_evidence",
+                        args={"source": "filing", "query": "Apple revenue"},
+                    )
+                ]
+            )
+        args = (
+            {"unexpected": "invalid"}
+            if calls == 2
+            else {
+                "summary": "Apple revenue grew.",
+                "evidence_ids": ["evidence-1"],
+            }
+        )
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name=info.output_tools[0].name, args=args)]
+        )
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(tool,),
+            retries=0,
+            tool_retries=0,
+            output_retries=SPECIALIST_OUTPUT_RETRIES,
+            end_strategy="early",
+        ),
+        tool_capture=capture,
+    )
+
+    attempt = await actor.run(
+        SpecialistTaskInput(task_id="task-1", objective="Assess Apple revenue.")
+    )
+
+    assert calls == 3
+    assert len(retry_parts) == 1
+    assert "Field required" in str(retry_parts[0].content)
+    assert attempt.finding.evidence_ids == ("evidence-1",)
+    assert tuple(item.id for item in attempt.evidence) == ("evidence-1",)
+    assert capture.evidence == []
+
+
+@pytest.mark.asyncio
+async def test_pinned_incomplete_output_contract_exhausts_one_native_run() -> None:
+    calls = 0
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        del messages
+        calls += 1
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args='{"summary":',
+                )
+            ],
+            finish_reason="length",
+        )
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(),
+            retries=0,
+            tool_retries=0,
+            output_retries=SPECIALIST_OUTPUT_RETRIES,
+            end_strategy="early",
+        )
+    )
+
+    with pytest.raises(SpecialistInvocationFailure) as raised:
+        await actor.run(
+            SpecialistTaskInput(task_id="task-1", objective="Assess Apple revenue.")
+        )
+
+    assert isinstance(raised.value.error, IncompleteToolCall)
+    assert raised.value.facts.terminal_output_tool_rejected is True
+    assert (
+        classify_specialist_failure(raised.value.error, facts=raised.value.facts)
+        is RetryDisposition.TASK_FAILED
+    )
+    assert calls == 3
 
 
 @pytest.mark.asyncio
