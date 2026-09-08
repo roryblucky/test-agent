@@ -78,13 +78,9 @@ def _validate_output(
 
 @dataclass(frozen=True)
 class PydanticAICoordinatorActor:
-    """Run one policy-bounded Coordinator decision with one output retry."""
+    """Run one policy-bounded, already-configured Coordinator Agent."""
 
     agent: Agent[CoordinatorInput, CoordinatorDecision]
-
-    def __post_init__(self) -> None:
-        """Install semantic validation behind the actor interface."""
-        self.agent.output_validator(_validate_output)
 
     async def decide(self, input: CoordinatorInput) -> CoordinatorActorResult:
         """Run one Agent invocation whose retry preserves validation history."""
@@ -121,7 +117,7 @@ def create_coordinator_agent(
     model_name: str,
 ) -> Agent[CoordinatorInput, CoordinatorDecision]:
     """Create Coordinator with one structured-output retry and no Tools."""
-    return cast(
+    agent = cast(
         Agent[CoordinatorInput, CoordinatorDecision],
         registry.create_agent(
             model_name,
@@ -135,3 +131,5 @@ def create_coordinator_agent(
             end_strategy="early",
         ),
     )
+    agent.output_validator(_validate_output)
+    return agent

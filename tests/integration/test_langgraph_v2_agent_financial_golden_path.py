@@ -29,10 +29,11 @@ from app.agents.specialist import (
     PydanticAISpecialistActor,
 )
 from app.agents.synthesis import (
-    SYNTHESIS_OUTPUT_RETRIES,
     PydanticAISynthesisActor,
+    create_synthesis_agent,
 )
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
+from app.core.model_registry import ModelRegistry
 from app.langgraph_v2.agent_batch import (
     CalculationToolRegistration,
     DispatchBatch,
@@ -52,7 +53,6 @@ from app.langgraph_v2.agent_coordination import (
 )
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
-    FinancialResearchReport,
     PreparedSynthesis,
     SpecialistToolCapture,
 )
@@ -599,6 +599,15 @@ class _FinancialSpecialists:
         )
 
 
+class _SynthesisModelRegistry:
+    def __init__(self, model: FunctionModel) -> None:
+        self.model = model
+
+    def create_agent(self, model_name: str, **kwargs: Any) -> object:
+        assert model_name == "synthesis"
+        return Agent(self.model, **kwargs)
+
+
 @dataclass
 class _FinancialSynthesis:
     prepared_inputs: list[PreparedSynthesis] = field(
@@ -638,15 +647,10 @@ class _FinancialSynthesis:
                 ]
             )
 
+        model_registry = _SynthesisModelRegistry(FunctionModel(model))
         return PydanticAISynthesisActor(
-            Agent(
-                FunctionModel(model),
-                deps_type=PreparedSynthesis,
-                output_type=FinancialResearchReport,
-                tools=(),
-                tool_retries=0,
-                output_retries=SYNTHESIS_OUTPUT_RETRIES,
-                end_strategy="early",
+            create_synthesis_agent(
+                cast(ModelRegistry, model_registry), model_name="synthesis"
             )
         )
 

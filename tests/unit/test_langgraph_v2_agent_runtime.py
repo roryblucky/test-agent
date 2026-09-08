@@ -56,20 +56,31 @@ from app.langgraph_v2.authorization import TrustedRequestContext
 
 
 class _Registry:
-    def __init__(self) -> None:
+    def __init__(self, model: models.Model | None = None) -> None:
         self.name: str | None = None
         self.kwargs: dict[str, Any] | None = None
+        self.model = model if model is not None else TestModel()
 
     def create_agent(self, name: str, **kwargs: Any) -> object:
         self.name = name
         self.kwargs = kwargs
-        return object()
+        return Agent(self.model, **kwargs)
+
+
+def _coordinator_agent(
+    model: models.Model,
+) -> Agent[CoordinatorInput, CoordinatorDecision]:
+    return create_coordinator_agent(
+        cast(ModelRegistry, _Registry(model)), model_name="coordinator"
+    )
 
 
 def test_coordinator_factory_enables_only_one_output_retry() -> None:
     registry = _Registry()
 
-    create_coordinator_agent(cast(ModelRegistry, registry), model_name="coordinator")
+    agent = create_coordinator_agent(
+        cast(ModelRegistry, registry), model_name="coordinator"
+    )
 
     assert registry.name == "coordinator"
     assert registry.kwargs is not None
@@ -83,21 +94,22 @@ def test_coordinator_factory_enables_only_one_output_retry() -> None:
         "output_retries": COORDINATOR_OUTPUT_RETRIES,
         "end_strategy": "early",
     }
+    assert isinstance(agent, Agent)
+
+
+def test_coordinator_actor_construction_does_not_configure_agent() -> None:
+    agent = cast(Agent[CoordinatorInput, CoordinatorDecision], object())
+
+    first = PydanticAICoordinatorActor(agent)
+    second = PydanticAICoordinatorActor(agent)
+
+    assert first.agent is agent
+    assert second.agent is agent
 
 
 @pytest.mark.asyncio
 async def test_coordinator_runs_real_pydantic_actor_with_fixed_limits() -> None:
-    actor = PydanticAICoordinatorActor(
-        Agent(
-            TestModel(),
-            output_type=Finish,
-            deps_type=CoordinatorInput,
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=COORDINATOR_OUTPUT_RETRIES,
-        )
-    )
+    actor = PydanticAICoordinatorActor(_coordinator_agent(TestModel()))
 
     decision = await actor.decide(
         CoordinatorInput(
@@ -152,16 +164,7 @@ async def test_coordinator_function_model_captures_one_toolless_overrideable_tra
             ]
         )
 
-    agent = Agent(
-        FunctionModel(finish_response),
-        deps_type=CoordinatorInput,
-        output_type=cast(type[Any], CoordinatorDecision),
-        tools=(),
-        retries=0,
-        tool_retries=0,
-        output_retries=COORDINATOR_OUTPUT_RETRIES,
-        end_strategy="early",
-    )
+    agent = _coordinator_agent(FunctionModel(finish_response))
     actor = PydanticAICoordinatorActor(agent)
     input = CoordinatorInput(
         standalone_query="Apple outlook",
@@ -222,16 +225,7 @@ async def test_coordinator_uses_builtin_retry_with_schema_feedback(
         dispatch_allowed=True,
     )
     actor = PydanticAICoordinatorActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=CoordinatorInput,
-            output_type=cast(type[Any], CoordinatorDecision),
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=COORDINATOR_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
+        _coordinator_agent(FunctionModel(response))
     )
 
     decision = await decide_coordination_round(
@@ -301,16 +295,7 @@ async def test_coordinator_uses_builtin_retry_with_actionable_policy_feedback(
         dispatch_allowed=True,
     )
     actor = PydanticAICoordinatorActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=CoordinatorInput,
-            output_type=cast(type[Any], CoordinatorDecision),
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=COORDINATOR_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
+        _coordinator_agent(FunctionModel(response))
     )
 
     decision = await decide_coordination_round(
@@ -362,16 +347,7 @@ async def test_coordinator_returns_typed_exhaustion_after_builtin_retry(
         dispatch_allowed=True,
     )
     actor = PydanticAICoordinatorActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=CoordinatorInput,
-            output_type=cast(type[Any], CoordinatorDecision),
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=COORDINATOR_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
+        _coordinator_agent(FunctionModel(response))
     )
 
     result = await actor.decide(input)
@@ -402,16 +378,7 @@ async def test_coordinator_does_not_reclassify_non_output_model_failures(
         dispatch_allowed=True,
     )
     actor = PydanticAICoordinatorActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=CoordinatorInput,
-            output_type=cast(type[Any], CoordinatorDecision),
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=COORDINATOR_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
+        _coordinator_agent(FunctionModel(response))
     )
 
     with pytest.raises(ContentFilterError, match="maximum output retries"):

@@ -1,7 +1,7 @@
 """Bounded Synthesis actor coverage."""
 
 from datetime import date
-from typing import cast
+from typing import Any, cast
 
 import pydantic_ai.models as models
 import pytest
@@ -36,13 +36,14 @@ from app.langgraph_v2.agent_evidence import (
 
 
 class _Registry:
-    def __init__(self) -> None:
-        self.kwargs: dict[str, object] | None = None
+    def __init__(self, model: models.Model | None = None) -> None:
+        self.kwargs: dict[str, Any] | None = None
+        self.model = model if model is not None else TestModel()
 
-    def create_agent(self, model_name: str, **kwargs: object) -> object:
+    def create_agent(self, model_name: str, **kwargs: Any) -> object:
         assert model_name == "synthesis"
         self.kwargs = kwargs
-        return object()
+        return Agent(self.model, **kwargs)
 
 
 def _prepared() -> PreparedSynthesis:
@@ -61,10 +62,20 @@ def _prepared() -> PreparedSynthesis:
     )
 
 
+def _synthesis_agent(
+    model: models.Model,
+) -> Agent[PreparedSynthesis, FinancialResearchReport]:
+    return create_synthesis_agent(
+        cast(ModelRegistry, _Registry(model)), model_name="synthesis"
+    )
+
+
 def test_synthesis_factory_instructs_evidence_markers() -> None:
     registry = _Registry()
 
-    create_synthesis_agent(cast(ModelRegistry, registry), model_name="synthesis")
+    agent = create_synthesis_agent(
+        cast(ModelRegistry, registry), model_name="synthesis"
+    )
 
     assert registry.kwargs is not None
     assert registry.kwargs["instructions"] == SYNTHESIS_INSTRUCTIONS
@@ -74,23 +85,27 @@ def test_synthesis_factory_instructs_evidence_markers() -> None:
     assert registry.kwargs["deps_type"] is PreparedSynthesis
     assert registry.kwargs["output_retries"] == SYNTHESIS_OUTPUT_RETRIES
     assert registry.kwargs["end_strategy"] == "early"
+    assert isinstance(agent, Agent)
+
+
+def test_synthesis_actor_construction_does_not_configure_agent() -> None:
+    agent = cast(Agent[PreparedSynthesis, FinancialResearchReport], object())
+
+    first = PydanticAISynthesisActor(agent)
+    second = PydanticAISynthesisActor(agent)
+
+    assert first.agent is agent
+    assert second.agent is agent
 
 
 @pytest.mark.asyncio
 async def test_synthesis_returns_marked_report_with_fixed_request_limits() -> None:
     actor = PydanticAISynthesisActor(
-        Agent(
+        _synthesis_agent(
             TestModel(
                 call_tools=[],
                 custom_output_args={"markdown_report": "Apple grew. [[E:1]]"},
-            ),
-            output_type=FinancialResearchReport,
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            deps_type=PreparedSynthesis,
-            output_retries=SYNTHESIS_OUTPUT_RETRIES,
-            end_strategy="early",
+            )
         )
     )
     result = await actor.synthesize(
@@ -153,16 +168,7 @@ async def test_synthesis_function_model_captures_one_toolless_overrideable_trace
             ]
         )
 
-    agent = Agent(
-        FunctionModel(report_response),
-        output_type=FinancialResearchReport,
-        tools=(),
-        retries=0,
-        tool_retries=0,
-        deps_type=PreparedSynthesis,
-        output_retries=SYNTHESIS_OUTPUT_RETRIES,
-        end_strategy="early",
-    )
+    agent = _synthesis_agent(FunctionModel(report_response))
     actor = PydanticAISynthesisActor(agent)
     prepared = PreparedSynthesis(
         standalone_query="Apple",
@@ -241,18 +247,7 @@ async def test_synthesis_marker_retry_stays_in_one_native_run() -> None:
             ),
         ),
     )
-    actor = PydanticAISynthesisActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=PreparedSynthesis,
-            output_type=FinancialResearchReport,
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=SYNTHESIS_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
-    )
+    actor = PydanticAISynthesisActor(_synthesis_agent(FunctionModel(response)))
 
     with capture_run_messages() as messages:
         published = await synthesize_report(actor, prepared)
@@ -305,18 +300,7 @@ async def test_schema_invalid_synthesis_output_uses_one_native_retry() -> None:
             ),
         ),
     )
-    actor = PydanticAISynthesisActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=PreparedSynthesis,
-            output_type=FinancialResearchReport,
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=SYNTHESIS_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
-    )
+    actor = PydanticAISynthesisActor(_synthesis_agent(FunctionModel(response)))
 
     published = await synthesize_report(actor, prepared)
 
@@ -343,18 +327,7 @@ async def test_synthesis_second_marker_rejection_fails_without_publication() -> 
             ]
         )
 
-    actor = PydanticAISynthesisActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=PreparedSynthesis,
-            output_type=FinancialResearchReport,
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=SYNTHESIS_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
-    )
+    actor = PydanticAISynthesisActor(_synthesis_agent(FunctionModel(response)))
     prepared = _prepared()
 
     with pytest.raises(UnexpectedModelBehavior, match="maximum output retries"):
@@ -369,18 +342,7 @@ async def test_synthesis_propagates_non_output_model_failures() -> None:
         del messages, info
         raise ContentFilterError("blocked")
 
-    actor = PydanticAISynthesisActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=PreparedSynthesis,
-            output_type=FinancialResearchReport,
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=SYNTHESIS_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
-    )
+    actor = PydanticAISynthesisActor(_synthesis_agent(FunctionModel(response)))
     prepared = _prepared()
 
     with pytest.raises(ContentFilterError, match="blocked"):
@@ -397,18 +359,7 @@ async def test_synthesis_projection_invariant_fails_before_model_request() -> No
         calls += 1
         raise AssertionError("model must not be called")
 
-    actor = PydanticAISynthesisActor(
-        Agent(
-            FunctionModel(response),
-            deps_type=PreparedSynthesis,
-            output_type=FinancialResearchReport,
-            tools=(),
-            retries=0,
-            tool_retries=0,
-            output_retries=SYNTHESIS_OUTPUT_RETRIES,
-            end_strategy="early",
-        )
-    )
+    actor = PydanticAISynthesisActor(_synthesis_agent(FunctionModel(response)))
     prepared = _prepared().model_copy(
         update={
             "calculations": (

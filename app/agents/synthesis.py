@@ -43,13 +43,9 @@ def _validate_output(
 
 @dataclass(frozen=True)
 class PydanticAISynthesisActor:
-    """Run one no-Tool report candidate from a frozen Evidence projection."""
+    """Run one already-configured Agent from a frozen Evidence projection."""
 
     agent: Agent[PreparedSynthesis, FinancialResearchReport]
-
-    def __post_init__(self) -> None:
-        """Install model-correctable marker validation at the Agent boundary."""
-        self.agent.output_validator(_validate_output)
 
     async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
         """Return a report after at most two requests in one native Agent run."""
@@ -72,7 +68,7 @@ def create_synthesis_agent(
     registry: ModelRegistry, *, model_name: str
 ) -> Agent[PreparedSynthesis, FinancialResearchReport]:
     """Create Synthesis with one marker-correction retry and no Tools."""
-    return cast(
+    agent = cast(
         Agent[PreparedSynthesis, FinancialResearchReport],
         registry.create_agent(
             model_name,
@@ -86,3 +82,5 @@ def create_synthesis_agent(
             end_strategy="early",
         ),
     )
+    agent.output_validator(_validate_output)
+    return agent
