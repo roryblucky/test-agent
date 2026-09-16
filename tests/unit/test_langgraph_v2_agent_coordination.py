@@ -8,8 +8,8 @@ from app.langgraph_v2.agent_batch import (
     AcceptedBatch,
     ActiveBatch,
     DispatchBatch,
+    SpecialistCatalog,
     SpecialistRegistration,
-    SpecialistRegistry,
     SpecialistResult,
     TaskFailed,
     TaskProposal,
@@ -36,10 +36,11 @@ from app.langgraph_v2.agent_coordination import (
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 
 
-def _registry() -> SpecialistRegistry:
-    return SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data"),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+def _registry() -> SpecialistCatalog:
+    return SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(id="market-data", description="market-data"),
+        ),
     )
 
 
@@ -67,7 +68,6 @@ def _accepted_rounds(
     ),
 ) -> tuple[tuple[CoordinationRound, ...], dict[str, AcceptedBatch]]:
     """Build accepted dispatch rounds through the public acceptance boundary."""
-    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
     rounds: tuple[CoordinationRound, ...] = ()
     accepted_batches: dict[str, AcceptedBatch] = {}
     for round_index in range(count):
@@ -85,8 +85,7 @@ def _accepted_rounds(
             request_id="request-1",
             rounds=rounds,
             accepted_batches=accepted_batches,
-            registry=_registry(),
-            scope_descriptors=scope,
+            specialist_catalog=_registry(),
         )
         rounds += (accepted.round,)
         accepted_batches[accepted.active_batch.id] = AcceptedBatch(
@@ -119,8 +118,7 @@ def test_follow_up_dispatch_projects_and_materializes_only_prior_successes() -> 
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        registry=_registry(),
-        scope_descriptors=scope,
+        specialist_catalog=_registry(),
     )
     accepted_batches = {
         first.active_batch.id: _accepted_batch(
@@ -141,8 +139,7 @@ def test_follow_up_dispatch_projects_and_materializes_only_prior_successes() -> 
         request_id="request-1",
         rounds=(first.round,),
         accepted_batches=accepted_batches,
-        registry=_registry(),
-        scope_descriptors=scope,
+        specialist_catalog=_registry(),
     )
 
     coordinator_input = project_coordinator_input(
@@ -185,8 +182,7 @@ def test_failed_prior_task_is_projected_without_diagnostics() -> None:
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        registry=_registry(),
-        scope_descriptors=scope,
+        specialist_catalog=_registry(),
     )
     failed = AcceptedBatch(
         id=first.active_batch.id,
@@ -264,10 +260,7 @@ async def test_actor_output_exhaustion_stops_without_an_accepted_round() -> None
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
+        specialist_catalog=_registry(),
     )
 
     assert result == CoordinationStopped("coordination_invalid")
@@ -277,7 +270,6 @@ async def test_actor_output_exhaustion_stops_without_an_accepted_round() -> None
 def test_coordination_acceptance_persists_canonical_objectives_and_round_manifest() -> (
     None
 ):
-    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
     accepted = accept_coordination_dispatch(
         DispatchBatch(
             kind="dispatch",
@@ -291,8 +283,7 @@ def test_coordination_acceptance_persists_canonical_objectives_and_round_manifes
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        registry=_registry(),
-        scope_descriptors=scope,
+        specialist_catalog=_registry(),
     )
 
     assert accepted.active_batch.tasks[0].objective == "Café analysis"
@@ -365,10 +356,7 @@ def test_task_limit_takes_precedence_when_all_32_tasks_are_accepted() -> None:
             request_id="request-1",
             rounds=rounds,
             accepted_batches=accepted_batches,
-            registry=_registry(),
-            scope_descriptors=(
-                SpecialistDescriptor(id="market-data", description="Market data"),
-            ),
+            specialist_catalog=_registry(),
         )
 
 
@@ -397,7 +385,6 @@ def test_checkpoint_round_validation_rejects_a_fifth_dispatch_round() -> None:
 
 
 def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() -> None:
-    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
     first, accepted_batches = _accepted_rounds(tasks_per_round=8, count=1)
     first_round = first[0]
     first_batch = accepted_batches[first_round.batch_id or ""]
@@ -416,8 +403,7 @@ def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() ->
         request_id="request-1",
         rounds=first,
         accepted_batches=accepted_batches,
-        registry=_registry(),
-        scope_descriptors=scope,
+        specialist_catalog=_registry(),
     )
 
     assert accepted.active_batch.tasks[0].context_task_ids == context_ids
@@ -449,6 +435,5 @@ def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() ->
             request_id="request-1",
             rounds=first,
             accepted_batches=accepted_batches,
-            registry=_registry(),
-            scope_descriptors=scope,
+            specialist_catalog=_registry(),
         )

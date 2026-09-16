@@ -23,14 +23,15 @@ from pydantic_evals.evaluators import Evaluator, EvaluatorContext
 
 from app.langgraph_v2.agent_batch import (
     AcceptedBatch,
+    AgentToolRegistry,
     CalculationToolRegistration,
     DispatchBatch,
     EvidenceToolRegistration,
     SpecialistActor,
     SpecialistAttempt,
+    SpecialistCatalog,
     SpecialistFindingDraft,
     SpecialistRegistration,
-    SpecialistRegistry,
     SpecialistTaskInput,
     TaskProposal,
     accept_initial_dispatch,
@@ -58,7 +59,6 @@ from app.langgraph_v2.agent_graph import build_agent_graph
 from app.langgraph_v2.agent_scope import (
     AgentIntentPolicy,
     SpecialistDescriptor,
-    resolve_research_scope,
 )
 from app.langgraph_v2.agent_skills import (
     SkillInvocation,
@@ -317,6 +317,7 @@ class _Synthesis:
             )
         )
 
+
 @dataclass
 class _Harness:
     scenario: str
@@ -345,7 +346,6 @@ class _Harness:
         return AgentIntentPolicy(
             intent=_INTENT,
             description="Fixed financial evaluation scope.",
-            specialist_descriptors=self.descriptors,
             allowed_tool_ids=frozenset(
                 {"market-reader", "fund-reader", "news-reader", "calculator"}
             ),
@@ -412,7 +412,7 @@ class _Harness:
 
         return provider
 
-    def registry(self) -> SpecialistRegistry:
+    def registry(self) -> SpecialistCatalog:
         skills = SpecialistSkillRegistry(
             registrations=(
                 SkillRegistration(
@@ -427,50 +427,53 @@ class _Harness:
             ),
             tenant_eligible_names=frozenset({"financial-analysis"}),
         )
-        return SpecialistRegistry(
+        return SpecialistCatalog(
             registrations=tuple(
                 SpecialistRegistration(
                     id=role,
+                    description=f"{role.title()} analysis",
                     actor_factory=self._factory(role),
-                    allowed_tool_ids=frozenset(tool_ids),
                     allowed_skill_names=frozenset({"financial-analysis"}),
                 )
-                for role, tool_ids in (
+                for role, _tool_ids in (
                     ("market", ("market-reader", "calculator")),
                     ("fund", ("fund-reader",)),
                     ("news", ("news-reader",)),
                 )
             ),
-            tenant_eligible_ids=frozenset({"market", "fund", "news"}),
-            tool_registrations=tuple(
-                EvidenceToolRegistration(
-                    id=tool_id,
-                    provider=self._provider(tool_id, source),
-                    allowed_sources=frozenset({source}),
-                    allowed_queries=frozenset({query}),
-                    expected_unavailability=(
-                        ExpectedToolUnavailability(
-                            exception_type=_FixtureUnavailable,
-                            reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-                        ),
+            tool_registry=AgentToolRegistry(
+                evidence_registrations=tuple(
+                    EvidenceToolRegistration(
+                        id=tool_id,
+                        provider=self._provider(tool_id, source),
+                        allowed_sources=frozenset({source}),
+                        allowed_queries=frozenset({query}),
+                        expected_unavailability=(
+                            ExpectedToolUnavailability(
+                                exception_type=_FixtureUnavailable,
+                                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                            ),
+                        )
+                        if tool_id == "fund-reader"
+                        else (),
                     )
-                    if tool_id == "fund-reader"
-                    else (),
-                )
-                for tool_id, source, query in (
-                    (
-                        "market-reader",
-                        "market",
-                        "FUND-ALPHA versus BENCHMARK-OMEGA",
+                    for tool_id, source, query in (
+                        (
+                            "market-reader",
+                            "market",
+                            "FUND-ALPHA versus BENCHMARK-OMEGA",
+                        ),
+                        ("fund-reader", "fund", "FUND-ALPHA holdings"),
+                        ("news-reader", "news", "FUND-ALPHA company news"),
+                    )
+                ),
+                calculation_registrations=(
+                    CalculationToolRegistration(
+                        id="calculator", executor=self.calculator
                     ),
-                    ("fund-reader", "fund", "FUND-ALPHA holdings"),
-                    ("news-reader", "news", "FUND-ALPHA company news"),
-                )
+                ),
             ),
-            calculation_tool_registrations=(
-                CalculationToolRegistration(id="calculator", executor=self.calculator),
-            ),
-            tenant_eligible_tool_ids=frozenset(
+            tenant_allowed_tool_ids=frozenset(
                 {"market-reader", "fund-reader", "news-reader", "calculator"}
             ),
             skill_registry=skills,
@@ -595,7 +598,7 @@ async def _graph_observation(harness: _Harness) -> FinancialObservation:
         InMemorySaver(),
         query_understanding_actor=_Understanding(harness.scenario),
         coordinator_actor=harness.coordinator,
-        specialist_registry=harness.registry(),
+        specialist_catalog=harness.registry(),
         intent_policies={_INTENT: harness.policy},
         moderation_provider=MockModerationProvider(),
         tenant_id=_TENANT_ID,
@@ -717,26 +720,19 @@ async def _graph_observation(harness: _Harness) -> FinancialObservation:
 
 def _gate_observation(case: FinancialCase) -> FinancialObservation:
     if case.scenario == "scope_permission_gate":
-        scope = resolve_research_scope(
-            IntentResult(intent=_INTENT, confidence=1.0),
-            {
-                _INTENT: AgentIntentPolicy(
-                    intent=_INTENT,
-                    description="Market-only fixed scope.",
-                    specialist_descriptors=(
-                        SpecialistDescriptor(
-                            id="market", description="Market analysis"
-                        ),
-                    ),
-                )
-            },
+        market_only_catalog = SpecialistCatalog(
+            registrations=(
+                SpecialistRegistration(
+                    id="market",
+                    description="Market analysis",
+                ),
+            ),
         )
         with pytest.raises(ValueError, match="Specialist is not eligible"):
             accept_initial_dispatch(
                 _dispatch(("fund", _FUND_OBJECTIVE)),
                 request_id=_REQUEST_ID,
-                registry=_Harness("golden").registry(),
-                scope_descriptors=scope.specialist_descriptors,
+                specialist_catalog=market_only_catalog,
             )
         return FinancialObservation(gates=GateObservation(scope_rejected=True))
     catalog = RequestEvidenceCatalog()

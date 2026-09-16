@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -17,7 +17,7 @@ from app.agents.query_understanding import (
 )
 from app.agents.synthesis import PydanticAISynthesisActor, create_synthesis_agent
 from app.config.models import AgentResearchConfig, LangGraphRuntimeMode
-from app.langgraph_v2.agent_batch import SpecialistRegistry
+from app.langgraph_v2.agent_batch import SpecialistCatalog
 from app.langgraph_v2.agent_coordination import (
     CoordinatorActor,
     CoordinatorInput,
@@ -29,7 +29,7 @@ from app.langgraph_v2.agent_graph import (
     SynthesisActor,
     build_agent_graph,
 )
-from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
+from app.langgraph_v2.agent_scope import AgentIntentPolicy
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.checkpointing import (
     AgentCheckpointStateAdapter,
@@ -72,7 +72,7 @@ class AgentGraphRuntimeAdapter:
     checkpointer: BaseCheckpointSaver[Any]
     query_understanding_actor: QueryUnderstandingActor
     coordinator_actor: CoordinatorActor
-    specialist_registry: SpecialistRegistry
+    specialist_catalog: SpecialistCatalog
     intent_policies: Mapping[str, AgentIntentPolicy]
     moderation_provider: ModerationProvider
     tenant_id: str
@@ -95,7 +95,7 @@ class AgentGraphRuntimeAdapter:
             self.checkpointer,
             query_understanding_actor=self.query_understanding_actor,
             coordinator_actor=self.coordinator_actor,
-            specialist_registry=self.specialist_registry,
+            specialist_catalog=self.specialist_catalog,
             intent_policies=self.intent_policies,
             moderation_provider=self.moderation_provider,
             tenant_id=self.tenant_id,
@@ -121,7 +121,7 @@ def build_agent_runtime(
     checkpointer: BaseCheckpointSaver[Any],
     query_understanding_actor: QueryUnderstandingActor | None = None,
     coordinator_actor: CoordinatorActor | None = None,
-    specialist_registry: SpecialistRegistry | None = None,
+    specialist_catalog: SpecialistCatalog | None = None,
     intent_policies: Mapping[str, AgentIntentPolicy] | None = None,
     moderation_provider: ModerationProvider | None = None,
     synthesis_actor: SynthesisActor | None = None,
@@ -139,13 +139,8 @@ def build_agent_runtime(
     coordinator = coordinator_actor or _resolve_coordinator_actor(
         app, request_context.tenant_id
     )
-    configured_specialists = getattr(
-        app.state, "langgraph_v2_specialist_registry", None
-    )
-    specialists = (
-        specialist_registry
-        or configured_specialists
-        or SpecialistRegistry(registrations=(), tenant_eligible_ids=frozenset())
+    specialists = specialist_catalog or _resolve_specialist_catalog(
+        app, request_context.tenant_id
     )
     moderation = moderation_provider or getattr(
         app.state, "langgraph_v2_moderation_provider", None
@@ -157,7 +152,7 @@ def build_agent_runtime(
         checkpointer=checkpointer,
         query_understanding_actor=actor,
         coordinator_actor=coordinator,
-        specialist_registry=specialists,
+        specialist_catalog=specialists,
         intent_policies=policies,
         moderation_provider=moderation or MockModerationProvider(),
         tenant_id=request_context.tenant_id,
@@ -235,13 +230,6 @@ def _resolve_intent_policies(
         policy.intent: AgentIntentPolicy(
             intent=policy.intent,
             description=policy.description,
-            specialist_descriptors=tuple(
-                SpecialistDescriptor(
-                    id=descriptor.id,
-                    description=descriptor.description,
-                )
-                for descriptor in policy.specialist_descriptors
-            ),
             allowed_tool_ids=frozenset(policy.allowed_tool_ids),
             allowed_skill_names=frozenset(policy.allowed_skill_names),
             allowed_sources=frozenset(policy.allowed_sources),
@@ -251,6 +239,21 @@ def _resolve_intent_policies(
         )
         for policy in config.intents
     }
+
+
+def _resolve_specialist_catalog(app: FastAPI, tenant_id: str) -> SpecialistCatalog:
+    """Select exactly one trusted Tenant Catalog for this request runtime."""
+    catalogs = getattr(app.state, "langgraph_v2_specialist_catalogs", None)
+    if catalogs is None:
+        return SpecialistCatalog(registrations=())
+    if not isinstance(catalogs, Mapping):
+        raise RuntimeError("Agent Specialist Catalogs are invalid")
+    catalog = cast(Mapping[str, object], catalogs).get(tenant_id)
+    if catalog is None:
+        return SpecialistCatalog(registrations=())
+    if not isinstance(catalog, SpecialistCatalog):
+        raise RuntimeError("Agent Specialist Catalog is invalid")
+    return catalog
 
 
 def _agent_research_config(

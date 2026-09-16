@@ -38,8 +38,8 @@ from app.config.models import (
 )
 from app.core.model_registry import ModelRegistry
 from app.langgraph_v2.agent_batch import (
+    SpecialistCatalog,
     SpecialistRegistration,
-    SpecialistRegistry,
 )
 from app.langgraph_v2.agent_coordination import (
     AcceptedCoordinationDispatch,
@@ -223,9 +223,7 @@ async def test_coordinator_uses_builtin_retry_with_schema_feedback(
         remaining_task_slots=32,
         dispatch_allowed=True,
     )
-    actor = PydanticAICoordinatorActor(
-        _coordinator_agent(FunctionModel(response))
-    )
+    actor = PydanticAICoordinatorActor(_coordinator_agent(FunctionModel(response)))
 
     decision = await decide_coordination_round(
         actor,
@@ -233,8 +231,7 @@ async def test_coordinator_uses_builtin_retry_with_schema_feedback(
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        registry=SpecialistRegistry(registrations=(), tenant_eligible_ids=frozenset()),
-        scope_descriptors=(),
+        specialist_catalog=SpecialistCatalog(registrations=()),
     )
 
     assert isinstance(decision, CoordinationRound)
@@ -293,9 +290,7 @@ async def test_coordinator_uses_builtin_retry_with_actionable_policy_feedback(
         remaining_task_slots=32,
         dispatch_allowed=True,
     )
-    actor = PydanticAICoordinatorActor(
-        _coordinator_agent(FunctionModel(response))
-    )
+    actor = PydanticAICoordinatorActor(_coordinator_agent(FunctionModel(response)))
 
     decision = await decide_coordination_round(
         actor,
@@ -303,19 +298,17 @@ async def test_coordinator_uses_builtin_retry_with_actionable_policy_feedback(
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        registry=SpecialistRegistry(
-            registrations=(SpecialistRegistration(id="market-data"),),
-            tenant_eligible_ids=frozenset({"market-data"}),
+        specialist_catalog=SpecialistCatalog(
+            registrations=(
+                SpecialistRegistration(id="market-data", description="market-data"),
+            ),
         ),
-        scope_descriptors=input.specialist_descriptors,
     )
 
     assert isinstance(decision, AcceptedCoordinationDispatch)
     assert calls == 2
     assert len(retry_parts) == 1
-    assert retry_parts[0].content == (
-        "Task context is not an accepted prior success"
-    )
+    assert retry_parts[0].content == ("Task context is not an accepted prior success")
 
 
 @pytest.mark.asyncio
@@ -345,9 +338,7 @@ async def test_coordinator_returns_typed_exhaustion_after_builtin_retry(
         remaining_task_slots=32,
         dispatch_allowed=True,
     )
-    actor = PydanticAICoordinatorActor(
-        _coordinator_agent(FunctionModel(response))
-    )
+    actor = PydanticAICoordinatorActor(_coordinator_agent(FunctionModel(response)))
 
     result = await actor.decide(input)
 
@@ -376,9 +367,7 @@ async def test_coordinator_does_not_reclassify_non_output_model_failures(
         remaining_task_slots=32,
         dispatch_allowed=True,
     )
-    actor = PydanticAICoordinatorActor(
-        _coordinator_agent(FunctionModel(response))
-    )
+    actor = PydanticAICoordinatorActor(_coordinator_agent(FunctionModel(response)))
 
     with pytest.raises(ContentFilterError, match="maximum output retries"):
         await actor.decide(input)
@@ -391,7 +380,9 @@ def test_finish_requires_its_discriminator() -> None:
     assert Finish.model_validate({"kind": "finish"}) == Finish(kind="finish")
 
 
-def test_runtime_resolves_intent_policy_from_trusted_tenant_config() -> None:
+def test_runtime_resolves_intent_policy_and_catalog_from_separate_tenant_sources() -> (
+    None
+):
     class _TenantManager:
         def get_tenant_config(self, tenant_id: str) -> TenantConfig:
             assert tenant_id == "tenant-a"
@@ -419,6 +410,24 @@ def test_runtime_resolves_intent_policy_from_trusted_tenant_config() -> None:
 
     app = FastAPI()
     app.state.tenant_manager = _TenantManager()
+    app.state.langgraph_v2_specialist_catalogs = {
+        "tenant-a": SpecialistCatalog(
+            registrations=(
+                SpecialistRegistration(
+                    id="legal-risk",
+                    description="Analyze legal risk.",
+                ),
+            ),
+        ),
+        "tenant-b": SpecialistCatalog(
+            registrations=(
+                SpecialistRegistration(
+                    id="foreign",
+                    description="Foreign Tenant Specialist.",
+                ),
+            ),
+        ),
+    }
     runtime = build_agent_runtime(
         app,
         request_context=TrustedRequestContext(
@@ -429,8 +438,13 @@ def test_runtime_resolves_intent_policy_from_trusted_tenant_config() -> None:
         coordinator_actor=cast(Any, object()),
     )
 
-    assert runtime.intent_policies["market_outlook"].specialist_descriptors == (
-        SpecialistDescriptor(id="market-data", description="Market data"),
+    assert runtime.specialist_catalog.descriptors == (
+        SpecialistDescriptor(id="legal-risk", description="Analyze legal risk."),
+    )
+    with pytest.raises(ValueError, match="Specialist is not eligible"):
+        runtime.specialist_catalog.resolve("foreign")
+    assert not hasattr(
+        runtime.intent_policies["market_outlook"], "specialist_descriptors"
     )
     assert runtime.intent_policies["market_outlook"].allowed_skill_names == frozenset(
         {"filing-analysis"}

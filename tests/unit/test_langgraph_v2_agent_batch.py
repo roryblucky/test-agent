@@ -17,6 +17,7 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 from app.langgraph_v2.agent_batch import (
     AcceptedTask,
     ActiveBatch,
+    AgentToolRegistry,
     BatchContribution,
     CalculationToolRegistration,
     DataGap,
@@ -24,9 +25,9 @@ from app.langgraph_v2.agent_batch import (
     EvidenceToolRegistration,
     GapProvenance,
     SpecialistAttempt,
+    SpecialistCatalog,
     SpecialistFindingDraft,
     SpecialistRegistration,
-    SpecialistRegistry,
     SpecialistResult,
     SpecialistTaskInput,
     SpecialistUsage,
@@ -110,6 +111,54 @@ class _Specialist:
         )
 
 
+def test_catalog_projects_registration_descriptions_and_rejects_foreign_ids() -> None:
+    tenant_a = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                description="Analyze market data.",
+                actor=_Specialist(),
+            ),
+        ),
+    )
+    tenant_b = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="legal-risk",
+                description="Analyze legal risk.",
+                actor=_Specialist(),
+            ),
+        ),
+    )
+
+    assert tenant_a.descriptors == (
+        SpecialistDescriptor(id="market-data", description="Analyze market data."),
+    )
+    assert tenant_b.descriptors == (
+        SpecialistDescriptor(id="legal-risk", description="Analyze legal risk."),
+    )
+    with pytest.raises(ValueError, match="Specialist is not eligible"):
+        tenant_a.resolve("legal-risk")
+
+
+def test_catalog_rejects_duplicate_specialist_ids() -> None:
+    with pytest.raises(ValueError, match="Specialist registration conflicts"):
+        SpecialistCatalog(
+            registrations=(
+                SpecialistRegistration(
+                    id="market-data",
+                    description="First definition.",
+                    actor=_Specialist(),
+                ),
+                SpecialistRegistration(
+                    id="market-data",
+                    description="Second definition.",
+                    actor=_Specialist(),
+                ),
+            ),
+        )
+
+
 def _context(*, task_id: str = "task-1") -> EvidenceInvocationContext:
     return EvidenceInvocationContext(
         tenant_id="tenant-a",
@@ -135,15 +184,17 @@ def _registry(
     *,
     tenant_eligible_ids: frozenset[str] = frozenset({"market-data"}),
     finding: SpecialistFindingDraft | None = None,
-) -> SpecialistRegistry:
-    return SpecialistRegistry(
+) -> SpecialistCatalog:
+    return SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor=_Specialist(finding),
             ),
-        ),
-        tenant_eligible_ids=tenant_eligible_ids,
+        )
+        if "market-data" in tenant_eligible_ids
+        else (),
     )
 
 
@@ -170,7 +221,7 @@ def _gap_registry(
     records: tuple[ToolUnavailabilityRecord, ...],
     *,
     finding: SpecialistFindingDraft | None = None,
-) -> SpecialistRegistry:
+) -> SpecialistCatalog:
     actor_attempt = 0
 
     async def provider(source: str, query: str) -> EvidenceEnvelope:
@@ -195,23 +246,24 @@ def _gap_registry(
         )
         return _Specialist(finding=finding, unavailability=attempt_records)
 
-    return SpecialistRegistry(
+    return SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor_factory=factory,
-                allowed_tool_ids=frozenset({"filing-tool"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(
-            EvidenceToolRegistration(
-                id="filing-tool",
-                provider=provider,
-                allowed_sources=frozenset({"filing"}),
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing-tool",
+                    provider=provider,
+                    allowed_sources=frozenset({"filing"}),
+                ),
             ),
         ),
-        tenant_eligible_tool_ids=frozenset({"filing-tool"}),
+        tenant_allowed_tool_ids=frozenset({"filing-tool"}),
     )
 
 
@@ -281,10 +333,7 @@ def test_initial_dispatch_intersects_registered_tenant_and_scope_eligibility() -
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
+        specialist_catalog=_registry(),
     )
 
     assert batch.task_ids == ("task_90fff3e68e9a59d229d7982b65c5fe8b",)
@@ -310,10 +359,7 @@ def test_initial_dispatch_accepts_eight_independent_tasks_in_manifest_order() ->
     batch = accept_initial_dispatch(
         decision,
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
+        specialist_catalog=_registry(),
     )
 
     assert len(batch.tasks) == 8
@@ -341,10 +387,7 @@ def test_initial_dispatch_rejects_ninth_task_even_if_model_validation_was_bypass
         accept_initial_dispatch(
             decision,
             request_id="request-1",
-            registry=_registry(),
-            scope_descriptors=(
-                SpecialistDescriptor(id="market-data", description="Market data"),
-            ),
+            specialist_catalog=_registry(),
         )
 
     with pytest.raises(ValidationError):
@@ -450,10 +493,7 @@ def test_recovered_active_batch_is_validated_before_specialist_fanout() -> None:
     valid = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
+        specialist_catalog=_registry(),
     )
     task = valid.tasks[0]
     invalid_batches = (
@@ -503,10 +543,7 @@ def test_recovered_active_batch_is_validated_before_specialist_fanout() -> None:
             validate_active_batch_manifest(
                 batch,
                 request_id="request-1",
-                registry=_registry(),
-                scope_descriptors=(
-                    SpecialistDescriptor(id="market-data", description="Market data"),
-                ),
+                specialist_catalog=_registry(),
             )
 
 
@@ -515,21 +552,18 @@ def test_initial_dispatch_rejects_specialist_outside_tenant_eligibility() -> Non
         accept_initial_dispatch(
             _dispatch(),
             request_id="request-1",
-            registry=_registry(tenant_eligible_ids=frozenset()),
-            scope_descriptors=(
-                SpecialistDescriptor(id="market-data", description="Market data"),
-            ),
+            specialist_catalog=_registry(tenant_eligible_ids=frozenset()),
         )
 
 
-def test_initial_dispatch_rejects_specialist_outside_scope_eligibility() -> None:
-    with pytest.raises(ValueError, match="Specialist is not eligible"):
-        accept_initial_dispatch(
-            _dispatch(),
-            request_id="request-1",
-            registry=_registry(),
-            scope_descriptors=(SpecialistDescriptor(id="other", description="Other"),),
-        )
+def test_initial_dispatch_uses_current_catalog_not_stale_scope_descriptors() -> None:
+    batch = accept_initial_dispatch(
+        _dispatch(),
+        request_id="request-1",
+        specialist_catalog=_registry(),
+    )
+
+    assert batch.tasks[0].specialist_id == "market-data"
 
 
 def test_initial_dispatch_rejects_context_and_model_authority_fields() -> None:
@@ -539,10 +573,7 @@ def test_initial_dispatch_rejects_context_and_model_authority_fields() -> None:
         accept_initial_dispatch(
             _dispatch(context_task_ids=("earlier",)),
             request_id="request-1",
-            registry=_registry(),
-            scope_descriptors=(
-                SpecialistDescriptor(id="market-data", description="Market data"),
-            ),
+            specialist_catalog=_registry(),
         )
 
     for field in ("task_id", "tool", "skill", "limit"):
@@ -558,27 +589,21 @@ def test_initial_dispatch_rejects_context_and_model_authority_fields() -> None:
 
 def test_task_identity_is_stable_and_changes_with_request_identity() -> None:
     registry = _registry()
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
 
     first = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
     repeated = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
     changed = accept_initial_dispatch(
         _dispatch(),
         request_id="request-2",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
 
     assert first.task_ids == repeated.task_ids
@@ -589,10 +614,7 @@ def test_barrier_promotes_exact_immutable_contribution_and_clears_staging() -> N
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
+        specialist_catalog=_registry(),
     )
     contribution = BatchContribution(
         batch_id=batch.id,
@@ -639,10 +661,7 @@ def test_barrier_rejects_contributions_staged_under_another_task_identity() -> N
             ),
         ),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
+        specialist_catalog=_registry(),
     )
     contributions = {
         task.id: BatchContribution(
@@ -671,10 +690,7 @@ def test_calculation_contribution_enforces_eight_items_and_idempotent_ids() -> N
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
+        specialist_catalog=_registry(),
     )
     executor = CalculationExecutor(
         (
@@ -741,17 +757,19 @@ def test_calculation_contribution_enforces_eight_items_and_idempotent_ids() -> N
         finding_evidence_ids=("evidence-1",),
         context=_context(task_id=contribution.task_id),
     )
-    barrier_registry = SpecialistRegistry(
+    barrier_registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
-                id="market-data", allowed_tool_ids=frozenset({"calculator"})
+                id="market-data",
+                description="market-data",
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        calculation_tool_registrations=(
-            CalculationToolRegistration(id="calculator", executor=executor),
+        tool_registry=AgentToolRegistry(
+            calculation_registrations=(
+                CalculationToolRegistration(id="calculator", executor=executor),
+            ),
         ),
-        tenant_eligible_tool_ids=frozenset({"calculator"}),
+        tenant_allowed_tool_ids=frozenset({"calculator"}),
     )
 
     def validate_at_barrier(item: BatchContribution) -> None:
@@ -760,12 +778,9 @@ def test_calculation_contribution_enforces_eight_items_and_idempotent_ids() -> N
             task=batch.tasks[0],
             tenant_id="tenant-a",
             request_id="request-1",
-            registry=barrier_registry,
-            scope_descriptors=(
-                SpecialistDescriptor(id="market-data", description="Market data"),
-            ),
+            specialist_catalog=barrier_registry,
             scope_tool_ids=frozenset({"calculator"}),
-            catalog=catalog,
+            evidence_catalog=catalog,
         )
 
     with pytest.raises(CalculationArtifactInvalid, match="provenance is invalid"):
@@ -829,9 +844,6 @@ def test_specialist_finding_accepts_exactly_16_evidence_ids() -> None:
 async def test_execute_specialist_retries_fresh_actors_and_keeps_only_last_attempt() -> (
     None
 ):
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     build_count = 0
 
     class _RetryingActor:
@@ -863,25 +875,24 @@ async def test_execute_specialist_retries_fresh_actors_and_keeps_only_last_attem
         build_count += 1
         return _RetryingActor(build_count)
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
-            SpecialistRegistration(id="market-data", actor_factory=factory),
+            SpecialistRegistration(
+                id="market-data", description="market-data", actor_factory=factory
+            ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
     )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
     diagnostics = SpecialistExecutionDiagnostics()
 
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
         context=_context(task_id=batch.tasks[0].id),
         diagnostics=diagnostics,
     )
@@ -899,9 +910,6 @@ async def test_execute_specialist_retries_fresh_actors_and_keeps_only_last_attem
 
 @pytest.mark.asyncio
 async def test_execute_specialist_returns_task_failed_after_third_retry() -> None:
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     build_count = 0
 
     class _AlwaysRetryingActor:
@@ -927,24 +935,23 @@ async def test_execute_specialist_returns_task_failed_after_third_retry() -> Non
         build_count += 1
         return _AlwaysRetryingActor()
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
-            SpecialistRegistration(id="market-data", actor_factory=factory),
+            SpecialistRegistration(
+                id="market-data", description="market-data", actor_factory=factory
+            ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
     )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
 
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
         context=_context(task_id=batch.tasks[0].id),
     )
 
@@ -958,9 +965,6 @@ async def test_execute_specialist_returns_task_failed_after_third_retry() -> Non
 async def test_execute_specialist_promotes_only_the_accepted_attempt_calculations() -> (
     None
 ):
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     executor = _calculation_executor()
     actor_count = 0
     inputs: list[SpecialistTaskInput] = []
@@ -1020,33 +1024,32 @@ async def test_execute_specialist_promotes_only_the_accepted_attempt_calculation
         actor_count += 1
         return _RetryingCalculationActor(actor_count)
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor_factory=factory,
-                allowed_tool_ids=frozenset({"calculator"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        calculation_tool_registrations=(
-            CalculationToolRegistration(id="calculator", executor=executor),
+        tool_registry=AgentToolRegistry(
+            calculation_registrations=(
+                CalculationToolRegistration(id="calculator", executor=executor),
+            ),
         ),
-        tenant_eligible_tool_ids=frozenset({"calculator"}),
+        tenant_allowed_tool_ids=frozenset({"calculator"}),
     )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
     catalog = RequestEvidenceCatalog()
 
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
         context=_context(task_id=batch.tasks[0].id).model_copy(
             update={"allowed_tool_ids": frozenset({"calculator"})}
         ),
@@ -1075,9 +1078,6 @@ async def test_execute_specialist_promotes_only_the_accepted_attempt_calculation
 async def test_execute_specialist_returns_task_failed_after_calculation_rejection_exhaustion() -> (
     None
 ):
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     executor = _calculation_executor()
     actor_count = 0
     inputs: list[SpecialistTaskInput] = []
@@ -1130,33 +1130,32 @@ async def test_execute_specialist_returns_task_failed_after_calculation_rejectio
         actor_count += 1
         return _CalculationDomainRejectedActor(actor_count)
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor_factory=factory,
-                allowed_tool_ids=frozenset({"calculator"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        calculation_tool_registrations=(
-            CalculationToolRegistration(id="calculator", executor=executor),
+        tool_registry=AgentToolRegistry(
+            calculation_registrations=(
+                CalculationToolRegistration(id="calculator", executor=executor),
+            ),
         ),
-        tenant_eligible_tool_ids=frozenset({"calculator"}),
+        tenant_allowed_tool_ids=frozenset({"calculator"}),
     )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
     catalog = RequestEvidenceCatalog()
 
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
         context=_context(task_id=batch.tasks[0].id).model_copy(
             update={"allowed_tool_ids": frozenset({"calculator"})}
         ),
@@ -1187,9 +1186,6 @@ async def test_execute_specialist_returns_task_failed_after_calculation_rejectio
 async def test_execute_specialist_does_not_retry_calculation_provenance_failure() -> (
     None
 ):
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     executor = _calculation_executor()
     actor_count = 0
 
@@ -1240,25 +1236,25 @@ async def test_execute_specialist_does_not_retry_calculation_provenance_failure(
         actor_count += 1
         return _InvalidCalculationProvenanceActor()
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor_factory=factory,
-                allowed_tool_ids=frozenset({"calculator"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        calculation_tool_registrations=(
-            CalculationToolRegistration(id="calculator", executor=executor),
+        tool_registry=AgentToolRegistry(
+            calculation_registrations=(
+                CalculationToolRegistration(id="calculator", executor=executor),
+            ),
         ),
-        tenant_eligible_tool_ids=frozenset({"calculator"}),
+        tenant_allowed_tool_ids=frozenset({"calculator"}),
     )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
     catalog = RequestEvidenceCatalog()
 
@@ -1266,8 +1262,7 @@ async def test_execute_specialist_does_not_retry_calculation_provenance_failure(
         await execute_specialist(
             batch.tasks[0],
             batch_id=batch.id,
-            registry=registry,
-            scope_descriptors=scope_descriptors,
+            specialist_catalog=registry,
             context=_context(task_id=batch.tasks[0].id).model_copy(
                 update={"allowed_tool_ids": frozenset({"calculator"})}
             ),
@@ -1288,9 +1283,6 @@ async def test_execute_specialist_does_not_retry_calculation_provenance_failure(
 async def test_execute_specialist_maps_native_output_exhaustion_to_task_failed() -> (
     None
 ):
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     inputs: list[SpecialistTaskInput] = []
 
     class _StructuredOutputRetryingActor:
@@ -1335,24 +1327,23 @@ async def test_execute_specialist_maps_native_output_exhaustion_to_task_failed()
         actor_count += 1
         return _StructuredOutputRetryingActor(actor_count)
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
-            SpecialistRegistration(id="market-data", actor_factory=factory),
+            SpecialistRegistration(
+                id="market-data", description="market-data", actor_factory=factory
+            ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
     )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
 
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
         context=_context(task_id=batch.tasks[0].id),
     )
 
@@ -1367,9 +1358,6 @@ async def test_execute_specialist_maps_native_output_exhaustion_to_task_failed()
 async def test_execute_specialist_reports_priced_model_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
 
     class _Price:
         total_price = Decimal("1.25")
@@ -1396,22 +1384,23 @@ async def test_execute_specialist_reports_priced_model_usage(
                 messages=(response,),
             )
 
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=_PricedActor()),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", description="market-data", actor=_PricedActor()
+            ),
+        ),
     )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
     )
 
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
         context=_context(task_id=batch.tasks[0].id),
     )
     accepted = promote_batch(batch, {contribution.task_id: contribution})
@@ -1425,35 +1414,30 @@ async def test_execute_specialist_reports_priced_model_usage(
 
 @pytest.mark.asyncio
 async def test_execute_specialist_persists_only_activated_skill_pins() -> None:
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=_registry(),
     )
     pin = SkillPin(
         name="filing-analysis",
         version="1",
         content_hash="a" * 64,
     )
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor=_Specialist(skill_pins=(pin,)),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
         context=_context(task_id=batch.tasks[0].id),
     )
     accepted = promote_batch(batch, {contribution.task_id: contribution})
@@ -1468,14 +1452,10 @@ async def test_execute_specialist_persists_only_activated_skill_pins() -> None:
 async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record() -> (
     None
 ):
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=_registry(),
     )
     record = _unavailability_record(task_id=batch.tasks[0].id)
     registry = _gap_registry((record, record))
@@ -1483,8 +1463,7 @@ async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record(
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=registry,
         context=_context(task_id=batch.tasks[0].id),
     )
 
@@ -1499,14 +1478,10 @@ async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record(
 
 @pytest.mark.asyncio
 async def test_execute_specialist_rejects_conflicting_tool_call_provenance() -> None:
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=_registry(),
     )
     record = _unavailability_record(task_id=batch.tasks[0].id)
 
@@ -1514,24 +1489,19 @@ async def test_execute_specialist_rejects_conflicting_tool_call_provenance() -> 
         await execute_specialist(
             batch.tasks[0],
             batch_id=batch.id,
-            registry=_gap_registry(
+            specialist_catalog=_gap_registry(
                 (record, record.model_copy(update={"id": "unavailable-2"}))
             ),
-            scope_descriptors=scope_descriptors,
             context=_context(task_id=batch.tasks[0].id),
         )
 
 
 @pytest.mark.asyncio
 async def test_execute_specialist_rejects_missing_tool_call_provenance() -> None:
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=_registry(),
     )
     record = _unavailability_record(task_id=batch.tasks[0].id).model_copy(
         update={"tool_call_id": ""}
@@ -1541,8 +1511,7 @@ async def test_execute_specialist_rejects_missing_tool_call_provenance() -> None
         await execute_specialist(
             batch.tasks[0],
             batch_id=batch.id,
-            registry=_gap_registry((record,)),
-            scope_descriptors=scope_descriptors,
+            specialist_catalog=_gap_registry((record,)),
             context=_context(task_id=batch.tasks[0].id),
         )
 
@@ -1562,14 +1531,10 @@ async def test_execute_specialist_rejects_missing_tool_call_provenance() -> None
 async def test_execute_specialist_rejects_ineligible_data_gap_provenance(
     overrides: dict[str, object], message: str
 ) -> None:
-    scope_descriptors = (
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    )
     batch = accept_initial_dispatch(
         _dispatch(),
         request_id="request-1",
-        registry=_registry(),
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=_registry(),
     )
     record_values = {"task_id": batch.tasks[0].id, **overrides}
     record_task_id = record_values.pop("task_id")
@@ -1580,8 +1545,7 @@ async def test_execute_specialist_rejects_ineligible_data_gap_provenance(
         await execute_specialist(
             batch.tasks[0],
             batch_id=batch.id,
-            registry=_gap_registry((record,)),
-            scope_descriptors=scope_descriptors,
+            specialist_catalog=_gap_registry((record,)),
             context=_context(task_id=batch.tasks[0].id),
         )
 
@@ -1654,31 +1618,29 @@ async def test_registry_freezes_tool_and_source_intersection_before_provider_acc
         captured.extend(tools)
         return _Specialist()
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor_factory=factory,
-                allowed_tool_ids=frozenset({"filing-tool"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(
-            EvidenceToolRegistration(
-                id="filing-tool",
-                provider=provider,
-                allowed_sources=frozenset({"filing", "private"}),
-                allowed_queries=frozenset({"Apple"}),
-                audit=record_audit,
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing-tool",
+                    provider=provider,
+                    allowed_sources=frozenset({"filing", "private"}),
+                    allowed_queries=frozenset({"Apple"}),
+                    audit=record_audit,
+                ),
             ),
         ),
-        tenant_eligible_tool_ids=frozenset({"filing-tool"}),
+        tenant_allowed_tool_ids=frozenset({"filing-tool"}),
     )
     registration = registry.resolve(
         "market-data",
-        scope_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
 
     actor = registry.bind_actor(
@@ -1717,17 +1679,15 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
         captured.append(tools)
         return _Specialist()
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor_factory=factory,
-                allowed_tool_ids=frozenset({"filing-tool"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(),
-        tenant_eligible_tool_ids=frozenset(),
+        tenant_allowed_tool_ids=frozenset(),
     )
     actor = registry.bind_actor(
         registry.registrations[0],
@@ -1746,9 +1706,12 @@ def test_registry_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
 
 def test_registry_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> None:
     direct_actor = _Specialist()
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=direct_actor),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", description="market-data", actor=direct_actor
+            ),
+        ),
         skill_registry=SpecialistSkillRegistry(
             registrations=(
                 SkillRegistration(
@@ -1798,25 +1761,26 @@ def test_registry_binds_skill_activation_without_expanding_frozen_business_tools
         captured_invocation.append(skill_invocation)
         return _Specialist()
 
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="market-data",
                 actor_factory=factory,
-                allowed_tool_ids=frozenset({"filing-tool"}),
                 allowed_skill_names=frozenset({"market-skill"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(
-            EvidenceToolRegistration(
-                id="filing-tool",
-                provider=provider,
-                allowed_sources=frozenset({"filing"}),
-                allowed_queries=frozenset({"Apple"}),
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing-tool",
+                    provider=provider,
+                    allowed_sources=frozenset({"filing"}),
+                    allowed_queries=frozenset({"Apple"}),
+                ),
             ),
         ),
-        tenant_eligible_tool_ids=frozenset({"filing-tool"}),
+        tenant_allowed_tool_ids=frozenset({"filing-tool"}),
         skill_registry=SpecialistSkillRegistry(
             registrations=(
                 SkillRegistration(

@@ -17,7 +17,7 @@ from app.langgraph_v2.agent_batch import (
     ActiveBatch,
     DispatchBatch,
     PriorResultView,
-    SpecialistRegistry,
+    SpecialistCatalog,
     TaskSucceeded,
     batch_id_for,
     normalize_task_objective,
@@ -289,9 +289,7 @@ def project_coordinator_input(
     )
     if accepted_task_count > MAX_ACCEPTED_TASKS:
         raise CoordinationInvariantError("Accepted Task limit is invalid")
-    dispatch_rounds = sum(
-        round_.kind == "dispatch" for round_ in ordered_rounds
-    )
+    dispatch_rounds = sum(round_.kind == "dispatch" for round_ in ordered_rounds)
     return CoordinatorInput(
         standalone_query=standalone_query,
         intent=intent,
@@ -379,8 +377,7 @@ def accept_coordination_dispatch(
     request_id: str,
     rounds: Sequence[CoordinationRound],
     accepted_batches: Mapping[str, AcceptedBatch],
-    registry: SpecialistRegistry,
-    scope_descriptors: Sequence[SpecialistDescriptor],
+    specialist_catalog: SpecialistCatalog,
 ) -> AcceptedCoordinationDispatch:
     """Validate one candidate Dispatch before it can create any graph Send."""
     ordered_rounds = validate_coordination_rounds(rounds, request_id=request_id)
@@ -400,7 +397,7 @@ def accept_coordination_dispatch(
             and dispatch_rounds < MAX_DISPATCH_ROUNDS
         ),
         eligible_specialist_ids=frozenset(
-            descriptor.id for descriptor in scope_descriptors
+            descriptor.id for descriptor in specialist_catalog.descriptors
         ),
         prior_results=prior_results,
     )
@@ -409,9 +406,7 @@ def accept_coordination_dispatch(
     for dispatch_order, proposal in enumerate(proposals):
         try:
             objective = normalize_task_objective(proposal.objective)
-            registry.resolve(
-                proposal.specialist_id, scope_descriptors=scope_descriptors
-            )
+            specialist_catalog.resolve(proposal.specialist_id)
         except ValueError as error:
             raise CoordinationCandidateRejected(str(error)) from error
         active_tasks.append(
@@ -434,8 +429,7 @@ def accept_coordination_dispatch(
     validate_active_batch_manifest(
         active_batch,
         request_id=request_id,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=specialist_catalog,
     )
     round_ = CoordinationRound(
         id=_round_id(request_id=request_id, revision=revision),
@@ -481,8 +475,7 @@ async def decide_coordination_round(
     request_id: str,
     rounds: Sequence[CoordinationRound],
     accepted_batches: Mapping[str, AcceptedBatch],
-    registry: SpecialistRegistry,
-    scope_descriptors: Sequence[SpecialistDescriptor],
+    specialist_catalog: SpecialistCatalog,
 ) -> AcceptedCoordinationDispatch | CoordinationRound | CoordinationStopped:
     """Accept one actor-validated decision against authoritative current state."""
     candidate = await actor.decide(input)
@@ -498,8 +491,7 @@ async def decide_coordination_round(
         request_id=request_id,
         rounds=rounds,
         accepted_batches=accepted_batches,
-        registry=registry,
-        scope_descriptors=scope_descriptors,
+        specialist_catalog=specialist_catalog,
     )
 
 

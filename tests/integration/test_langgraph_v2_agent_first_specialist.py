@@ -29,15 +29,16 @@ from app.agents.specialist import (
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
 from app.langgraph_v2 import agent_graph
 from app.langgraph_v2.agent_batch import (
+    AgentToolRegistry,
     CalculationToolRegistration,
     DispatchBatch,
     EvidenceToolRegistration,
     SpecialistActor,
     SpecialistActorFactory,
     SpecialistAttempt,
+    SpecialistCatalog,
     SpecialistFindingDraft,
     SpecialistRegistration,
-    SpecialistRegistry,
     SpecialistTaskInput,
     TaskProposal,
 )
@@ -59,7 +60,7 @@ from app.langgraph_v2.agent_evidence import (
     ToolUnavailableReason,
 )
 from app.langgraph_v2.agent_runtime import build_agent_runtime
-from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
+from app.langgraph_v2.agent_scope import AgentIntentPolicy
 from app.langgraph_v2.agent_skills import (
     SkillInvocation,
     SkillReference,
@@ -360,9 +361,6 @@ class _ConcurrentBatchSpecialist:
 _CONCURRENT_BATCH_POLICY = AgentIntentPolicy(
     intent="market_outlook",
     description="Assess market conditions.",
-    specialist_descriptors=(
-        SpecialistDescriptor(id="market-data", description="Market data"),
-    ),
 )
 _TENANT_HEADERS = {"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
 
@@ -374,9 +372,12 @@ def _concurrent_batch_app(
     specialist: SpecialistActor,
     checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
 ) -> FastAPI:
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", description="Market data", actor=specialist
+            ),
+        ),
     )
 
     def factory(
@@ -391,7 +392,7 @@ def _concurrent_batch_app(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={_CONCURRENT_BATCH_POLICY.intent: _CONCURRENT_BATCH_POLICY},
         )
 
@@ -670,12 +671,14 @@ class _Synthesis:
         del prepared
         return FinancialResearchReport(markdown_report="Apple revenue grew. [[E:1]]")
 
+
 class _EmptySynthesis:
     async def synthesize(self, prepared: object) -> FinancialResearchReport:
         del prepared
         return FinancialResearchReport(
             markdown_report="No matching filing records were found. [[E:1]]"
         )
+
 
 class _TenantManager:
     def get_tenant_config(self, tenant_id: str) -> TenantConfig:
@@ -698,13 +701,13 @@ def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", description="Market data", actor=specialist
+            ),
+        ),
     )
 
     def factory(
@@ -719,7 +722,7 @@ def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -768,13 +771,13 @@ def test_maximum_legal_rolling_path_completes_within_recursion_limit(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", description="Market data", actor=specialist
+            ),
+        ),
     )
 
     def factory(
@@ -789,7 +792,7 @@ def test_maximum_legal_rolling_path_completes_within_recursion_limit(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -838,13 +841,13 @@ def test_next_request_in_one_conversation_resets_rolling_coordination_state(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", description="Market data", actor=specialist
+            ),
+        ),
     )
 
     def factory(
@@ -859,7 +862,7 @@ def test_next_request_in_one_conversation_resets_rolling_coordination_state(
             checkpointer=checkpointer,
             query_understanding_actor=_ConversationUnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -901,24 +904,52 @@ def test_next_request_in_one_conversation_resets_rolling_coordination_state(
     assert [len(input.prior_results) for input in coordinator.inputs] == [0, 1, 0, 1]
 
 
-def test_first_no_tool_specialist_is_accepted_before_conservative_done(
+def test_http_scope_excludes_platform_tool_before_specialist_construction(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     coordinator = _Coordinator()
     specialist = _Specialist()
+    bound_tool_names: list[tuple[str, ...]] = []
+    provider_calls: list[tuple[str, str]] = []
+
+    async def out_of_scope_provider(source: str, query: str) -> EvidenceEnvelope:
+        provider_calls.append((source, query))
+        raise AssertionError("Research Scope must reject this Tool before execution")
+
+    def specialist_factory(
+        tools: tuple[Callable[..., object], ...],
+        tool_capture: SpecialistToolCapture,
+        skill_invocation: SkillInvocation | None,
+    ) -> SpecialistActor:
+        del tool_capture, skill_invocation
+        bound_tool_names.append(tuple(tool.__name__ for tool in tools))
+        return specialist
+
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-        allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data",
+                description="Market data",
+                actor_factory=specialist_factory,
+            ),
+        ),
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing_reader",
+                    provider=out_of_scope_provider,
+                    allowed_sources=frozenset({"filing"}),
+                    allowed_queries=frozenset({"Apple revenue"}),
+                ),
+            ),
+        ),
+        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
     )
 
     def factory(
@@ -933,7 +964,7 @@ def test_first_no_tool_specialist_is_accepted_before_conservative_done(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -965,6 +996,8 @@ def test_first_no_tool_specialist_is_accepted_before_conservative_done(
     assert response.status_code == 200
     assert len(done) == 1
     assert done[0]["data"]["metadata"]["termination_reason"] == "insufficient_evidence"
+    assert bound_tool_names == [()]
+    assert provider_calls == []
     assert len(coordinator.inputs) == 2
     assert specialist.inputs[0].objective == "Assess Apple market outlook."
     assert specialist.inputs[0].task_id.startswith("task_")
@@ -983,13 +1016,13 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", description="Market data", actor=specialist
+            ),
+        ),
     )
 
     def factory(
@@ -1004,7 +1037,7 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -1068,17 +1101,17 @@ def test_prior_outcome_changes_the_follow_up_execution_shape(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
 
     def run_scenario(*, fail_premise: bool, conversation_id: str) -> dict[str, object]:
         coordinator = _OutcomeDrivenCoordinator()
         specialist = _OutcomeDrivenSpecialist(fail_premise=fail_premise)
-        registry = SpecialistRegistry(
-            registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-            tenant_eligible_ids=frozenset({"market-data"}),
+        registry = SpecialistCatalog(
+            registrations=(
+                SpecialistRegistration(
+                    id="market-data", description="Market data", actor=specialist
+                ),
+            ),
         )
 
         def factory(
@@ -1093,7 +1126,7 @@ def test_prior_outcome_changes_the_follow_up_execution_shape(
                 checkpointer=checkpointer,
                 query_understanding_actor=_UnderstandingActor(),
                 coordinator_actor=coordinator,
-                specialist_registry=registry,
+                specialist_catalog=registry,
                 intent_policies={policy.intent: policy},
             )
 
@@ -1146,13 +1179,13 @@ def test_rejected_candidates_leave_no_checkpoint_coordination_round(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
-        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
-        tenant_eligible_ids=frozenset({"market-data"}),
+    registry = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id="market-data", description="Market data", actor=specialist
+            ),
+        ),
     )
 
     def factory(
@@ -1167,7 +1200,7 @@ def test_rejected_candidates_leave_no_checkpoint_coordination_round(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -1379,24 +1412,22 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
             intent="market_outlook",
             description="Assess market conditions.",
             allowed_tool_ids=frozenset({"calculator"}),
-            specialist_descriptors=(
-                SpecialistDescriptor(id="market-data", description="Market data"),
-            ),
             as_of_date=date(2026, 9, 6),
         )
-        registry = SpecialistRegistry(
+        registry = SpecialistCatalog(
             registrations=(
                 SpecialistRegistration(
                     id="market-data",
+                    description="Market data",
                     actor_factory=factory,
-                    allowed_tool_ids=frozenset({"calculator"}),
                 ),
             ),
-            tenant_eligible_ids=frozenset({"market-data"}),
-            calculation_tool_registrations=(
-                CalculationToolRegistration(id="calculator", executor=executor),
+            tool_registry=AgentToolRegistry(
+                calculation_registrations=(
+                    CalculationToolRegistration(id="calculator", executor=executor),
+                ),
             ),
-            tenant_eligible_tool_ids=frozenset({"calculator"}),
+            tenant_allowed_tool_ids=frozenset({"calculator"}),
         )
 
         def app_factory(
@@ -1411,7 +1442,7 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
                 checkpointer=checkpointer,
                 query_understanding_actor=_UnderstandingActor(),
                 coordinator_actor=coordinator,
-                specialist_registry=registry,
+                specialist_catalog=registry,
                 intent_policies={policy.intent: policy},
                 synthesis_actor=synthesis,
             )
@@ -1657,28 +1688,26 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
         allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="Market data",
                 actor_factory=_evidence_specialist_factory,
-                allowed_tool_ids=frozenset({"filing_reader"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(
-            EvidenceToolRegistration(
-                id="filing_reader",
-                provider=_evidence_provider,
-                allowed_sources=frozenset({"filing"}),
-                allowed_queries=frozenset({"Apple revenue"}),
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing_reader",
+                    provider=_evidence_provider,
+                    allowed_sources=frozenset({"filing"}),
+                    allowed_queries=frozenset({"Apple revenue"}),
+                ),
             ),
         ),
-        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
     )
 
     def factory(
@@ -1693,7 +1722,7 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=_Synthesis(),
         )
@@ -1741,15 +1770,18 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
     assert response.status_code == 200
     assert done[0]["data"]["answer"] == "Apple revenue grew. [[E:1]]"
     assert done[0]["data"]["citations"][0]["evidence_id"] == "evidence-1"
-    assert "".join(event["data"] for event in events if event["type"] == "token") == done[
-        0
-    ]["data"]["answer"]
+    assert (
+        "".join(event["data"] for event in events if event["type"] == "token")
+        == done[0]["data"]["answer"]
+    )
     assert [event["data"] for event in events if event["type"] == "citations"] == [
         done[0]["data"]["citations"]
     ]
     event_types = [event["type"] for event in events]
-    assert event_types.index("token") < event_types.index("citations") < event_types.index(
-        "done"
+    assert (
+        event_types.index("token")
+        < event_types.index("citations")
+        < event_types.index("done")
     )
     assert any(
         event["type"] == "step_start" and event.get("step") == "specialist"
@@ -1811,7 +1843,9 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
         return published
 
     class _BarrierSynthesis:
-        async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
+        async def synthesize(
+            self, prepared: PreparedSynthesis
+        ) -> FinancialResearchReport:
             del prepared
             if phase == "synthesis":
                 entered.set()
@@ -1829,28 +1863,26 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
         allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="Market data",
                 actor_factory=_evidence_specialist_factory,
-                allowed_tool_ids=frozenset({"filing_reader"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(
-            EvidenceToolRegistration(
-                id="filing_reader",
-                provider=_evidence_provider,
-                allowed_sources=frozenset({"filing"}),
-                allowed_queries=frozenset({"Apple revenue"}),
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing_reader",
+                    provider=_evidence_provider,
+                    allowed_sources=frozenset({"filing"}),
+                    allowed_queries=frozenset({"Apple revenue"}),
+                ),
             ),
         ),
-        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
     )
 
     def factory(
@@ -1865,7 +1897,7 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=_BarrierSynthesis(),
         )
@@ -1882,7 +1914,9 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
         agent_runtime_factory=factory,
     )
     app.state.tenant_manager = _TenantManager()
-    request_context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
+    request_context = TrustedRequestContext(
+        tenant_id="tenant-a", subject_id="subject-a"
+    )
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
@@ -2022,34 +2056,32 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
         allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="Market data",
                 actor_factory=specialist_factory,
-                allowed_tool_ids=frozenset({"filing_reader"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(
-            EvidenceToolRegistration(
-                id="filing_reader",
-                provider=provider,
-                allowed_sources=frozenset({"filing"}),
-                allowed_queries=frozenset({"Apple revenue"}),
-                expected_unavailability=(
-                    ExpectedToolUnavailability(
-                        exception_type=SourceUnreachable,
-                        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing_reader",
+                    provider=provider,
+                    allowed_sources=frozenset({"filing"}),
+                    allowed_queries=frozenset({"Apple revenue"}),
+                    expected_unavailability=(
+                        ExpectedToolUnavailability(
+                            exception_type=SourceUnreachable,
+                            reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
+                        ),
                     ),
                 ),
             ),
         ),
-        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
     )
     synthesis = PartialSynthesis()
 
@@ -2065,7 +2097,7 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=synthesis,
         )
@@ -2131,29 +2163,27 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
         allowed_skill_names=frozenset({"filing-analysis"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="Market data",
                 actor_factory=_skill_specialist_factory,
-                allowed_tool_ids=frozenset({"filing_reader"}),
                 allowed_skill_names=frozenset({"filing-analysis"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(
-            EvidenceToolRegistration(
-                id="filing_reader",
-                provider=_evidence_provider,
-                allowed_sources=frozenset({"filing"}),
-                allowed_queries=frozenset({"Apple revenue"}),
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing_reader",
+                    provider=_evidence_provider,
+                    allowed_sources=frozenset({"filing"}),
+                    allowed_queries=frozenset({"Apple revenue"}),
+                ),
             ),
         ),
-        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
         skill_registry=SpecialistSkillRegistry(
             registrations=(
                 SkillRegistration(
@@ -2187,7 +2217,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=_Synthesis(),
         )
@@ -2246,32 +2276,30 @@ def test_authoritative_empty_result_still_publishes_evidence_backed_report(
         allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple litigation"}),
-        specialist_descriptors=(
-            SpecialistDescriptor(id="market-data", description="Market data"),
-        ),
     )
-    registry = SpecialistRegistry(
+    registry = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
+                description="Market data",
                 actor_factory=_specialist_factory(
                     query="Apple litigation",
                     summary="The authoritative search returned no matching records.",
                     evidence_id="evidence-empty-1",
                 ),
-                allowed_tool_ids=frozenset({"filing_reader"}),
             ),
         ),
-        tenant_eligible_ids=frozenset({"market-data"}),
-        tool_registrations=(
-            EvidenceToolRegistration(
-                id="filing_reader",
-                provider=_empty_evidence_provider,
-                allowed_sources=frozenset({"filing"}),
-                allowed_queries=frozenset({"Apple litigation"}),
+        tool_registry=AgentToolRegistry(
+            evidence_registrations=(
+                EvidenceToolRegistration(
+                    id="filing_reader",
+                    provider=_empty_evidence_provider,
+                    allowed_sources=frozenset({"filing"}),
+                    allowed_queries=frozenset({"Apple litigation"}),
+                ),
             ),
         ),
-        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
     )
 
     def factory(
@@ -2286,7 +2314,7 @@ def test_authoritative_empty_result_still_publishes_evidence_backed_report(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=_EmptySynthesis(),
         )

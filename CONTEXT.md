@@ -8,6 +8,10 @@ This context defines the language for a tenant-isolated platform that produces e
 The isolation boundary for an organization's data, configuration, credentials, conversations, and runs within one deployment.
 _Avoid_: App, workspace, account
 
+**Tenant Administrator**:
+A person or trusted publishing principal authorized to manage one Tenant's Agent and Skill definitions and policies. It is distinct from a User acting through a Conversation.
+_Avoid_: User, end user
+
 **Subject**:
 The authenticated security principal identity within a Tenant, supplied by the
 trusted authentication boundary and used to scope checkpoint access; distinct
@@ -52,10 +56,18 @@ descriptions for classification; only trusted platform code may use the
 associated execution constraints.
 _Avoid_: Skill catalog, Tool registry, prompt library
 
+**Intent Policy**:
+The trusted Tenant-controlled maximum authority associated with one Business
+Intent, including eligible Tools, data sources, search constraints, and Evidence
+freshness. It narrows Tenant authority and is never authored or expanded by an
+Agent; it does not filter the Tenant's Specialist or Skill Catalogs.
+_Avoid_: Intent Catalog entry, Coordinator Decision, Research Scope
+
 **Research Scope**:
-The immutable boundary on Specialists, Tools, data sources, and search
-constraints for one Run. It is derived from Tenant policy and the selected
-Business Intent, and may only narrow—not expand—the Tenant's authority.
+The trusted boundary on Specialists, Tools, data sources, and search constraints
+for one Run. Tool, source, query, and freshness constraints remain fixed for the
+Run, while the Specialist boundary is the current process's successfully loaded
+Tenant Specialist Catalog.
 _Avoid_: Intent, query, authorization grant
 
 **Task**:
@@ -172,6 +184,24 @@ A bounded Agent that performs one domain-specific responsibility delegated by
 the Coordinator Agent through the Agent Graph.
 _Avoid_: Sub-agent, worker agent
 
+**Specialist Definition**:
+A Tenant-owned declarative definition of one Specialist Agent's identity,
+description, instructions, approved model profile, and eligible Skills. It
+cannot grant Tools or widen Research Scope.
+_Avoid_: Specialist Descriptor, Skill, Tool policy
+
+**Specialist Definition Pin**:
+The content hash of the Specialist Definition actually used for one Specialist
+attempt. It identifies observed execution configuration but does not embed the
+definition or guarantee that historical content remains available for replay.
+_Avoid_: Specialist Definition, catalog version
+
+**Specialist Catalog**:
+The Tenant-scoped collection of successfully loaded Specialist Definitions that
+the Coordinator may consider for every Business Intent in that Tenant. Invalid
+definitions are not members of the catalog.
+_Avoid_: Specialist Registry, Agent list
+
 **Specialist Descriptor**:
 A compact, prompt-visible statement of a Specialist Agent's identity and
 capabilities that a Coordinator Agent uses for delegation. It is not a function
@@ -196,9 +226,9 @@ _Avoid_: Error, exception, Task failure
 
 **Tool**:
 A registered executable capability with an explicit input contract and
-permission policy. A Specialist Agent may invoke a Tool only when Tenant
-policy, the current Research Scope, and the Specialist's own allowlist all
-permit it; a Skill cannot grant Tool authority. The platform's Tool scope is
+permission policy. A Specialist Agent may invoke a Tool only when Tenant policy
+and the current Research Scope permit it; neither a Specialist Definition nor a
+Skill can grant Tool authority. The platform's Tool scope is
 limited to reading or fetching data and deterministic Calculation; Tools do not
 mutate external business state, transfer assets, execute orders, or consume a
 business budget or quota that requires atomic reservation. An expected inability
@@ -212,16 +242,37 @@ A package of instructions and reference material that an Agent may activate on
 demand. It guides use of already-authorized capabilities and cannot grant a Tool.
 _Avoid_: Tool, prompt template, plugin
 
+**Skill Pin**:
+The recorded identity of the Skill Definition used for one activation: its name,
+optional declared version, and content hash. The hash identifies the actual
+cached definition; live reference contents are excluded.
+_Avoid_: Skill version, reference snapshot
+
+**Skill Catalog**:
+The Tenant-scoped collection of successfully loaded Skills. Multiple Specialist
+Definitions may reference the same Skill; invalid Skills, including Skills that
+name an unregistered Tool in `required-tools` or `allowed-tools`, are not members
+of the catalog.
+_Avoid_: Intent Catalog, Specialist Catalog, per-Agent Skill copy
+
 **Eligible Skill**:
-A Skill that trusted Tenant policy and either shared or Specialist-scoped
-registration permit one Specialist Agent to discover and activate. Eligibility
-does not mean its full instructions have been loaded and does not grant Tools.
+A Skill in the Tenant's Skill Catalog that one Specialist Definition names for
+discovery and whose `required-tools` dependencies the current Research Scope
+permits. The eligible set is fixed when the Specialist invocation starts; it
+does not mean full instructions have been loaded and does not grant Tools.
 _Avoid_: Available Skill, activated Skill
 
 **Activated Skill**:
 An Eligible Skill whose full instructions have been loaded for one Specialist
-Agent invocation.
+Agent invocation. The invocation may progressively add zero or more members of
+its fixed Eligible Skill set, and each activation remains effective for the rest
+of that invocation.
 _Avoid_: Cached Skill, registered Skill
+
+**Skill Conflict**:
+An irreconcilable contradiction between peer Activated Skill instructions. It is
+a Tenant-authored content defect, not a condition the runtime detects or resolves.
+_Avoid_: Skill priority, runtime policy violation
 
 **Calculation Executor**:
 The component that evaluates approved deterministic numerical operations and produces Calculation Artifacts.

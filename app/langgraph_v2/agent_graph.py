@@ -24,7 +24,7 @@ from app.langgraph_v2.agent_batch import (
     AcceptedTask,
     ActiveBatch,
     BatchContribution,
-    SpecialistRegistry,
+    SpecialistCatalog,
     SpecialistUsage,
     TaskSucceeded,
     execute_specialist,
@@ -229,7 +229,7 @@ def build_agent_graph(
     *,
     query_understanding_actor: QueryUnderstandingActor,
     coordinator_actor: CoordinatorActor,
-    specialist_registry: SpecialistRegistry,
+    specialist_catalog: SpecialistCatalog,
     intent_policies: Mapping[str, AgentIntentPolicy],
     moderation_provider: ModerationProvider,
     tenant_id: str,
@@ -320,7 +320,11 @@ def build_agent_graph(
         if not isinstance(intent_value, dict):
             raise TypeError("Agent Intent is invalid")
         intent = IntentResult.model_validate(intent_value)
-        scope = resolve_research_scope(intent, intent_policies)
+        scope = resolve_research_scope(
+            intent,
+            intent_policies,
+            specialist_descriptors=specialist_catalog.descriptors,
+        )
         return {"research_scope": scope.model_dump(mode="json")}
 
     async def coordinator(state: AgentGraphState) -> AgentGraphStateUpdate:
@@ -336,7 +340,7 @@ def build_agent_graph(
         input = project_coordinator_input(
             standalone_query=standalone_query,
             intent=scope.intent,
-            specialist_descriptors=scope.specialist_descriptors,
+            specialist_descriptors=specialist_catalog.descriptors,
             rounds=rounds,
             accepted_batches=accepted_batches,
         )
@@ -347,8 +351,7 @@ def build_agent_graph(
             request_id=state["request_id"],
             rounds=rounds,
             accepted_batches=accepted_batches,
-            registry=specialist_registry,
-            scope_descriptors=scope.specialist_descriptors,
+            specialist_catalog=specialist_catalog,
         )
         _emit((LiveStreamEvent(type="step_completed", step="coordinator"),))
         if isinstance(decision, CoordinationStopped):
@@ -387,8 +390,7 @@ def build_agent_graph(
         validate_active_batch_manifest(
             active_batch,
             request_id=state["request_id"],
-            registry=specialist_registry,
-            scope_descriptors=scope.specialist_descriptors,
+            specialist_catalog=specialist_catalog,
         )
         validate_active_batch_coordination_round(
             active_batch,
@@ -415,8 +417,7 @@ def build_agent_graph(
         contribution = await execute_specialist(
             task,
             batch_id=active_batch.id,
-            registry=specialist_registry,
-            scope_descriptors=scope.specialist_descriptors,
+            specialist_catalog=specialist_catalog,
             catalog=catalog,
             context=invocation_context,
             scope_skill_names=scope.allowed_skill_names,
@@ -471,10 +472,9 @@ def build_agent_graph(
                     task=tasks_by_id[contribution.task_id],
                     tenant_id=tenant_id,
                     request_id=state["request_id"],
-                    registry=specialist_registry,
-                    scope_descriptors=scope.specialist_descriptors,
+                    specialist_catalog=specialist_catalog,
                     scope_tool_ids=scope.allowed_tool_ids,
-                    catalog=catalog,
+                    evidence_catalog=catalog,
                 )
             ),
         )
@@ -535,9 +535,7 @@ def build_agent_graph(
                 failed_task_ids=tuple(task.task_id for task in failed_tasks),
                 structural_reasons=(stop_reason,) if stop_reason is not None else (),
             )
-            if data_gaps
-            or failed_tasks
-            or stop_reason is not None
+            if data_gaps or failed_tasks or stop_reason is not None
             else None
         )
         return {
@@ -641,7 +639,10 @@ def build_agent_graph(
             events.append(
                 LiveStreamEvent(
                     type="citations",
-                    data=[citation.model_dump(mode="json") for citation in response.citations],
+                    data=[
+                        citation.model_dump(mode="json")
+                        for citation in response.citations
+                    ],
                 )
             )
         events.append(
@@ -673,12 +674,11 @@ def build_agent_graph(
             if not isinstance(scope_value, dict):
                 raise TypeError("Agent Research Scope is invalid")
             active_batch = _active_batch_load(cast(Mapping[str, object], active_value))
-            scope = ResearchScope.model_validate(scope_value)
+            ResearchScope.model_validate(scope_value)
             validate_active_batch_manifest(
                 active_batch,
                 request_id=state["request_id"],
-                registry=specialist_registry,
-                scope_descriptors=scope.specialist_descriptors,
+                specialist_catalog=specialist_catalog,
             )
             validate_active_batch_coordination_round(
                 active_batch,

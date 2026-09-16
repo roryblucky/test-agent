@@ -35,13 +35,14 @@ from app.agents.synthesis import (
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
 from app.core.model_registry import ModelRegistry
 from app.langgraph_v2.agent_batch import (
+    AgentToolRegistry,
     CalculationToolRegistration,
     DispatchBatch,
     EvidenceToolRegistration,
     SpecialistActor,
+    SpecialistCatalog,
     SpecialistFindingDraft,
     SpecialistRegistration,
-    SpecialistRegistry,
     SpecialistTaskInput,
     TaskProposal,
     task_id_for,
@@ -58,7 +59,7 @@ from app.langgraph_v2.agent_evidence import (
 )
 from app.langgraph_v2.agent_graph import QueryUnderstandingActor, SynthesisActor
 from app.langgraph_v2.agent_runtime import build_agent_runtime
-from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
+from app.langgraph_v2.agent_scope import AgentIntentPolicy
 from app.langgraph_v2.agent_skills import (
     SkillInvocation,
     SkillReference,
@@ -716,7 +717,7 @@ class FinancialFixture:
         self.tools.request_id = request_id
         self.tools.fund_task_dispatch_order = fund_task_dispatch_order
 
-    def registry(self) -> SpecialistRegistry:
+    def registry(self) -> SpecialistCatalog:
         price_body = "fixed closes: 100, 110, 99"
         calculator = CalculationExecutor(
             (
@@ -737,62 +738,56 @@ class FinancialFixture:
                 ),
             )
         )
-        return SpecialistRegistry(
+        return SpecialistCatalog(
             registrations=(
                 SpecialistRegistration(
                     id="market-analysis",
+                    description="Market analysis",
                     actor_factory=self.specialists.market_analysis,
-                    allowed_tool_ids=frozenset(
-                        {
-                            "price_series",
-                            CalculationMethod.PERIOD_RETURN,
-                            CalculationMethod.ANNUALIZED_VOLATILITY,
-                            CalculationMethod.MAXIMUM_DRAWDOWN,
-                        }
-                    ),
                     allowed_skill_names=frozenset({"market-methodology"}),
                 ),
                 SpecialistRegistration(
                     id="fund-research",
+                    description="Fund research",
                     actor_factory=self.specialists.fund_research,
-                    allowed_tool_ids=frozenset(
-                        {"fund_holdings", "fund_reports", "company_news"}
-                    ),
                     allowed_skill_names=frozenset({"fund-disclosure"}),
                 ),
             ),
-            tenant_eligible_ids=frozenset({"market-analysis", "fund-research"}),
-            tool_registrations=(
-                EvidenceToolRegistration(
-                    id="price_series",
-                    provider=self.tools.price_series,
-                    allowed_sources=frozenset({"market"}),
-                    allowed_queries=frozenset({f"{_FUND_ID} versus {_BENCHMARK_ID}"}),
+            tool_registry=AgentToolRegistry(
+                evidence_registrations=(
+                    EvidenceToolRegistration(
+                        id="price_series",
+                        provider=self.tools.price_series,
+                        allowed_sources=frozenset({"market"}),
+                        allowed_queries=frozenset(
+                            {f"{_FUND_ID} versus {_BENCHMARK_ID}"}
+                        ),
+                    ),
+                    EvidenceToolRegistration(
+                        id="fund_holdings",
+                        provider=self.tools.fund_holdings,
+                        allowed_sources=frozenset({"fund"}),
+                        allowed_queries=frozenset({f"{_FUND_ID} holdings"}),
+                    ),
+                    EvidenceToolRegistration(
+                        id="fund_reports",
+                        provider=self.tools.fund_reports,
+                        allowed_sources=frozenset({"fund"}),
+                        allowed_queries=frozenset({f"{_FUND_ID} report"}),
+                    ),
+                    EvidenceToolRegistration(
+                        id="company_news",
+                        provider=self.tools.company_news,
+                        allowed_sources=frozenset({"news"}),
+                        allowed_queries=frozenset({f"{_FUND_ID} company news"}),
+                    ),
                 ),
-                EvidenceToolRegistration(
-                    id="fund_holdings",
-                    provider=self.tools.fund_holdings,
-                    allowed_sources=frozenset({"fund"}),
-                    allowed_queries=frozenset({f"{_FUND_ID} holdings"}),
-                ),
-                EvidenceToolRegistration(
-                    id="fund_reports",
-                    provider=self.tools.fund_reports,
-                    allowed_sources=frozenset({"fund"}),
-                    allowed_queries=frozenset({f"{_FUND_ID} report"}),
-                ),
-                EvidenceToolRegistration(
-                    id="company_news",
-                    provider=self.tools.company_news,
-                    allowed_sources=frozenset({"news"}),
-                    allowed_queries=frozenset({f"{_FUND_ID} company news"}),
+                calculation_registrations=tuple(
+                    CalculationToolRegistration(id=method, executor=calculator)
+                    for method in CalculationMethod
                 ),
             ),
-            calculation_tool_registrations=tuple(
-                CalculationToolRegistration(id=method, executor=calculator)
-                for method in CalculationMethod
-            ),
-            tenant_eligible_tool_ids=frozenset(
+            tenant_allowed_tool_ids=frozenset(
                 {
                     "price_series",
                     "fund_holdings",
@@ -853,12 +848,6 @@ class FinancialFixture:
         return AgentIntentPolicy(
             intent="financial_golden_path",
             description="Fixed financial fan-out/fan-in fixture.",
-            specialist_descriptors=(
-                SpecialistDescriptor(
-                    id="market-analysis", description="Market analysis"
-                ),
-                SpecialistDescriptor(id="fund-research", description="Fund research"),
-            ),
             allowed_tool_ids=frozenset(
                 {
                     "price_series",
@@ -910,7 +899,7 @@ def financial_app(
             query_understanding_actor=query_understanding_actor
             or fixture.understanding,
             coordinator_actor=coordinator_actor or fixture.coordinator,
-            specialist_registry=registry,
+            specialist_catalog=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=synthesis_actor or fixture.synthesis.actor(),
         )

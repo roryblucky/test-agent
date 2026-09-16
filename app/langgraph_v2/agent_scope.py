@@ -26,7 +26,6 @@ class AgentIntentPolicy(BaseModel):
 
     intent: str = Field(min_length=1)
     description: str = Field(min_length=1)
-    specialist_descriptors: tuple[SpecialistDescriptor, ...] = ()
     allowed_tool_ids: frozenset[str] = frozenset()
     allowed_skill_names: frozenset[str] = frozenset()
     allowed_sources: frozenset[str] = frozenset()
@@ -53,14 +52,16 @@ class ResearchScope(BaseModel):
 def resolve_research_scope(
     intent: IntentResult,
     policies: Mapping[str, AgentIntentPolicy],
+    *,
+    specialist_descriptors: tuple[SpecialistDescriptor, ...],
 ) -> ResearchScope:
-    """Resolve a model-selected Intent through trusted policy only."""
+    """Combine a trusted Intent policy with the current Tenant Catalog."""
     policy = policies.get(intent.intent)
     if policy is None:
         raise ValueError("Agent Intent is not configured")
     return ResearchScope(
         intent=policy.intent,
-        specialist_descriptors=policy.specialist_descriptors,
+        specialist_descriptors=specialist_descriptors,
         allowed_tool_ids=policy.allowed_tool_ids,
         allowed_skill_names=policy.allowed_skill_names,
         allowed_sources=policy.allowed_sources,
