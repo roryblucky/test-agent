@@ -1,7 +1,7 @@
 """Public Agent Finish-first coverage."""
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -85,6 +85,7 @@ def _factory(
             SpecialistRegistration(
                 id="market-data",
                 description="Market data",
+                actor=cast(Any, object()),
             ),
         ),
     )

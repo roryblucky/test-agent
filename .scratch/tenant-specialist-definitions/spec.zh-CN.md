@@ -336,7 +336,7 @@ instructions。
   被删除 Specialist 对应的合法 Task 必须在不调用模型的情况下产生失败 Task Outcome，
   有效 sibling 正常运行，barrier 收集两个 outcomes。另行验证伪造 Specialist ID 或损坏
   Batch manifest 仍然触发整批 invariant validation failure，而不是普通 Task failure。
-- 在现有 Specialist Registry/binding seam 测试 Tool authority。一个 Tool 只有在全局已
+- 在现有 Specialist Catalog/Tool binding seam 测试 Tool authority。一个 Tool 只有在全局已
   注册、Tenant 允许且 Research Scope 允许时才能被调用。改变 Specialist 或 Skill
   metadata 永远不能增加 Tool。现有 Evidence、expected unavailability、Calculation、
   Data Gap 和 telemetry tests 继续作为 Tool-result 语义的权威测试。

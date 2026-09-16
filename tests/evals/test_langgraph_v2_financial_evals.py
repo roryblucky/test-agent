@@ -56,10 +56,7 @@ from app.langgraph_v2.agent_evidence import (
     publish_report,
 )
 from app.langgraph_v2.agent_graph import build_agent_graph
-from app.langgraph_v2.agent_scope import (
-    AgentIntentPolicy,
-    SpecialistDescriptor,
-)
+from app.langgraph_v2.agent_scope import AgentIntentPolicy
 from app.langgraph_v2.agent_skills import (
     SkillInvocation,
     SkillRegistration,
@@ -334,14 +331,6 @@ class _Harness:
         self.coordinator = _Coordinator(self.scenario)
 
     @property
-    def descriptors(self) -> tuple[SpecialistDescriptor, ...]:
-        return (
-            SpecialistDescriptor(id="market", description="Market analysis"),
-            SpecialistDescriptor(id="fund", description="Fund research"),
-            SpecialistDescriptor(id="news", description="Company news"),
-        )
-
-    @property
     def policy(self) -> AgentIntentPolicy:
         return AgentIntentPolicy(
             intent=_INTENT,
@@ -412,7 +401,7 @@ class _Harness:
 
         return provider
 
-    def registry(self) -> SpecialistCatalog:
+    def catalog(self) -> SpecialistCatalog:
         skills = SpecialistSkillRegistry(
             registrations=(
                 SkillRegistration(
@@ -435,11 +424,7 @@ class _Harness:
                     actor_factory=self._factory(role),
                     allowed_skill_names=frozenset({"financial-analysis"}),
                 )
-                for role, _tool_ids in (
-                    ("market", ("market-reader", "calculator")),
-                    ("fund", ("fund-reader",)),
-                    ("news", ("news-reader",)),
-                )
+                for role in ("market", "fund", "news")
             ),
             tool_registry=AgentToolRegistry(
                 evidence_registrations=tuple(
@@ -598,7 +583,7 @@ async def _graph_observation(harness: _Harness) -> FinancialObservation:
         InMemorySaver(),
         query_understanding_actor=_Understanding(harness.scenario),
         coordinator_actor=harness.coordinator,
-        specialist_catalog=harness.registry(),
+        specialist_catalog=harness.catalog(),
         intent_policies={_INTENT: harness.policy},
         moderation_provider=MockModerationProvider(),
         tenant_id=_TENANT_ID,
@@ -725,6 +710,7 @@ def _gate_observation(case: FinancialCase) -> FinancialObservation:
                 SpecialistRegistration(
                     id="market",
                     description="Market analysis",
+                    actor=cast(SpecialistActor, object()),
                 ),
             ),
         )

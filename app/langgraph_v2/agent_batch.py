@@ -630,6 +630,8 @@ class SpecialistCatalog:
         if len(set(ids)) != len(ids):
             raise ValueError("Specialist registration conflicts")
         for registration in self.registrations:
+            if (registration.actor is None) == (registration.actor_factory is None):
+                raise ValueError("Specialist actor definition is invalid")
             SpecialistDescriptor(
                 id=registration.id,
                 description=registration.description,
@@ -676,6 +678,10 @@ class SpecialistCatalog:
         tool_telemetry: ToolTelemetry | None = None,
     ) -> SpecialistActor:
         """Create one actor with a frozen Scope-narrowed Tool surface."""
+        if registration.actor is not None:
+            return registration.actor
+        actor_factory = registration.actor_factory
+        assert actor_factory is not None
         effective_ids = self.effective_tool_ids(scope_tool_ids=context.allowed_tool_ids)
         skill_invocation = (
             self.skill_registry.begin_invocation(
@@ -689,17 +695,6 @@ class SpecialistCatalog:
         has_skill_activation = bool(
             skill_invocation is not None and skill_invocation.summaries
         )
-        if (
-            not effective_ids
-            and not has_skill_activation
-            and registration.actor_factory is None
-        ):
-            if registration.actor is not None:
-                return registration.actor
-            raise ValueError("Specialist actor factory is not configured")
-        actor_factory = registration.actor_factory
-        if actor_factory is None:
-            raise AssertionError("Specialist actor factory is required")
         bound_tools = self.tool_registry.bind(
             context=context,
             tenant_tool_ids=self.tenant_allowed_tool_ids,

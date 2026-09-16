@@ -396,7 +396,7 @@ Tenant-authored Specialist and Skill instructions.
   barrier collects both outcomes. Separate cases must prove that a forged
   Specialist ID or damaged Batch manifest still fails invariant validation for
   the Batch rather than becoming an ordinary Task failure.
-- Test Tool authority at the existing Specialist Registry/binding seam. A Tool
+- Test Tool authority at the existing Specialist Catalog/Tool binding seam. A Tool
   must be callable only when globally registered, Tenant-permitted, and
   Research-Scope-permitted. Changing Specialist or Skill metadata must never add
   a Tool. Existing Evidence, expected-unavailability, Calculation, Data Gap, and

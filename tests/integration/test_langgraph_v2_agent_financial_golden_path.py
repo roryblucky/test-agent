@@ -717,7 +717,7 @@ class FinancialFixture:
         self.tools.request_id = request_id
         self.tools.fund_task_dispatch_order = fund_task_dispatch_order
 
-    def registry(self) -> SpecialistCatalog:
+    def catalog(self) -> SpecialistCatalog:
         price_body = "fixed closes: 100, 110, 99"
         calculator = CalculationExecutor(
             (
@@ -883,7 +883,7 @@ def financial_app(
     checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
 ) -> FastAPI:
     """Assemble the golden fixture with optional request-shape scripting."""
-    registry = fixture.registry()
+    catalog = fixture.catalog()
     policy = fixture.policy()
 
     def factory(
@@ -899,7 +899,7 @@ def financial_app(
             query_understanding_actor=query_understanding_actor
             or fixture.understanding,
             coordinator_actor=coordinator_actor or fixture.coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
             synthesis_actor=synthesis_actor or fixture.synthesis.actor(),
         )

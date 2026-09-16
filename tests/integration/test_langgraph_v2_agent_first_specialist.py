@@ -372,7 +372,7 @@ def _concurrent_batch_app(
     specialist: SpecialistActor,
     checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
 ) -> FastAPI:
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data", description="Market data", actor=specialist
@@ -392,7 +392,7 @@ def _concurrent_batch_app(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={_CONCURRENT_BATCH_POLICY.intent: _CONCURRENT_BATCH_POLICY},
         )
 
@@ -702,7 +702,7 @@ def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
         intent="market_outlook",
         description="Assess market conditions.",
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data", description="Market data", actor=specialist
@@ -722,7 +722,7 @@ def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
         )
 
@@ -772,7 +772,7 @@ def test_maximum_legal_rolling_path_completes_within_recursion_limit(
         intent="market_outlook",
         description="Assess market conditions.",
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data", description="Market data", actor=specialist
@@ -792,7 +792,7 @@ def test_maximum_legal_rolling_path_completes_within_recursion_limit(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
         )
 
@@ -842,7 +842,7 @@ def test_next_request_in_one_conversation_resets_rolling_coordination_state(
         intent="market_outlook",
         description="Assess market conditions.",
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data", description="Market data", actor=specialist
@@ -862,7 +862,7 @@ def test_next_request_in_one_conversation_resets_rolling_coordination_state(
             checkpointer=checkpointer,
             query_understanding_actor=_ConversationUnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
         )
 
@@ -931,7 +931,7 @@ def test_http_scope_excludes_platform_tool_before_specialist_construction(
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
@@ -964,7 +964,7 @@ def test_http_scope_excludes_platform_tool_before_specialist_construction(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
         )
 
@@ -1017,7 +1017,7 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
         intent="market_outlook",
         description="Assess market conditions.",
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data", description="Market data", actor=specialist
@@ -1037,7 +1037,7 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
         )
 
@@ -1106,7 +1106,7 @@ def test_prior_outcome_changes_the_follow_up_execution_shape(
     def run_scenario(*, fail_premise: bool, conversation_id: str) -> dict[str, object]:
         coordinator = _OutcomeDrivenCoordinator()
         specialist = _OutcomeDrivenSpecialist(fail_premise=fail_premise)
-        registry = SpecialistCatalog(
+        catalog = SpecialistCatalog(
             registrations=(
                 SpecialistRegistration(
                     id="market-data", description="Market data", actor=specialist
@@ -1126,7 +1126,7 @@ def test_prior_outcome_changes_the_follow_up_execution_shape(
                 checkpointer=checkpointer,
                 query_understanding_actor=_UnderstandingActor(),
                 coordinator_actor=coordinator,
-                specialist_catalog=registry,
+                specialist_catalog=catalog,
                 intent_policies={policy.intent: policy},
             )
 
@@ -1180,7 +1180,7 @@ def test_rejected_candidates_leave_no_checkpoint_coordination_round(
         intent="market_outlook",
         description="Assess market conditions.",
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data", description="Market data", actor=specialist
@@ -1200,7 +1200,7 @@ def test_rejected_candidates_leave_no_checkpoint_coordination_round(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
         )
 
@@ -1414,7 +1414,7 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
             allowed_tool_ids=frozenset({"calculator"}),
             as_of_date=date(2026, 9, 6),
         )
-        registry = SpecialistCatalog(
+        catalog = SpecialistCatalog(
             registrations=(
                 SpecialistRegistration(
                     id="market-data",
@@ -1442,7 +1442,7 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
                 checkpointer=checkpointer,
                 query_understanding_actor=_UnderstandingActor(),
                 coordinator_actor=coordinator,
-                specialist_catalog=registry,
+                specialist_catalog=catalog,
                 intent_policies={policy.intent: policy},
                 synthesis_actor=synthesis,
             )
@@ -1689,7 +1689,7 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
@@ -1722,7 +1722,7 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
             synthesis_actor=_Synthesis(),
         )
@@ -1864,7 +1864,7 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
@@ -1897,7 +1897,7 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
             synthesis_actor=_BarrierSynthesis(),
         )
@@ -2057,7 +2057,7 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
@@ -2097,7 +2097,7 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
             synthesis_actor=synthesis,
         )
@@ -2164,7 +2164,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
@@ -2217,7 +2217,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
             synthesis_actor=_Synthesis(),
         )
@@ -2277,7 +2277,7 @@ def test_authoritative_empty_result_still_publishes_evidence_backed_report(
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple litigation"}),
     )
-    registry = SpecialistCatalog(
+    catalog = SpecialistCatalog(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
@@ -2314,7 +2314,7 @@ def test_authoritative_empty_result_still_publishes_evidence_backed_report(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_catalog=registry,
+            specialist_catalog=catalog,
             intent_policies={policy.intent: policy},
             synthesis_actor=_EmptySynthesis(),
         )

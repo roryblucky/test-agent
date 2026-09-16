@@ -1,6 +1,7 @@
 """Rolling Coordination Round acceptance and projection coverage."""
 
 from collections.abc import Callable
+from typing import Any, cast
 
 import pytest
 
@@ -36,10 +37,14 @@ from app.langgraph_v2.agent_coordination import (
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 
 
-def _registry() -> SpecialistCatalog:
+def _catalog() -> SpecialistCatalog:
     return SpecialistCatalog(
         registrations=(
-            SpecialistRegistration(id="market-data", description="market-data"),
+            SpecialistRegistration(
+                id="market-data",
+                description="market-data",
+                actor=cast(Any, object()),
+            ),
         ),
     )
 
@@ -85,7 +90,7 @@ def _accepted_rounds(
             request_id="request-1",
             rounds=rounds,
             accepted_batches=accepted_batches,
-            specialist_catalog=_registry(),
+            specialist_catalog=_catalog(),
         )
         rounds += (accepted.round,)
         accepted_batches[accepted.active_batch.id] = AcceptedBatch(
@@ -118,7 +123,7 @@ def test_follow_up_dispatch_projects_and_materializes_only_prior_successes() -> 
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        specialist_catalog=_registry(),
+        specialist_catalog=_catalog(),
     )
     accepted_batches = {
         first.active_batch.id: _accepted_batch(
@@ -139,7 +144,7 @@ def test_follow_up_dispatch_projects_and_materializes_only_prior_successes() -> 
         request_id="request-1",
         rounds=(first.round,),
         accepted_batches=accepted_batches,
-        specialist_catalog=_registry(),
+        specialist_catalog=_catalog(),
     )
 
     coordinator_input = project_coordinator_input(
@@ -182,7 +187,7 @@ def test_failed_prior_task_is_projected_without_diagnostics() -> None:
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        specialist_catalog=_registry(),
+        specialist_catalog=_catalog(),
     )
     failed = AcceptedBatch(
         id=first.active_batch.id,
@@ -260,7 +265,7 @@ async def test_actor_output_exhaustion_stops_without_an_accepted_round() -> None
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        specialist_catalog=_registry(),
+        specialist_catalog=_catalog(),
     )
 
     assert result == CoordinationStopped("coordination_invalid")
@@ -283,7 +288,7 @@ def test_coordination_acceptance_persists_canonical_objectives_and_round_manifes
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        specialist_catalog=_registry(),
+        specialist_catalog=_catalog(),
     )
 
     assert accepted.active_batch.tasks[0].objective == "Café analysis"
@@ -356,7 +361,7 @@ def test_task_limit_takes_precedence_when_all_32_tasks_are_accepted() -> None:
             request_id="request-1",
             rounds=rounds,
             accepted_batches=accepted_batches,
-            specialist_catalog=_registry(),
+            specialist_catalog=_catalog(),
         )
 
 
@@ -403,7 +408,7 @@ def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() ->
         request_id="request-1",
         rounds=first,
         accepted_batches=accepted_batches,
-        specialist_catalog=_registry(),
+        specialist_catalog=_catalog(),
     )
 
     assert accepted.active_batch.tasks[0].context_task_ids == context_ids
@@ -435,5 +440,5 @@ def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() ->
             request_id="request-1",
             rounds=first,
             accepted_batches=accepted_batches,
-            specialist_catalog=_registry(),
+            specialist_catalog=_catalog(),
         )

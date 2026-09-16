@@ -300,7 +300,11 @@ async def test_coordinator_uses_builtin_retry_with_actionable_policy_feedback(
         accepted_batches={},
         specialist_catalog=SpecialistCatalog(
             registrations=(
-                SpecialistRegistration(id="market-data", description="market-data"),
+                SpecialistRegistration(
+                    id="market-data",
+                    description="market-data",
+                    actor=cast(Any, object()),
+                ),
             ),
         ),
     )
@@ -416,6 +420,7 @@ def test_runtime_resolves_intent_policy_and_catalog_from_separate_tenant_sources
                 SpecialistRegistration(
                     id="legal-risk",
                     description="Analyze legal risk.",
+                    actor=cast(Any, object()),
                 ),
             ),
         ),
@@ -424,6 +429,7 @@ def test_runtime_resolves_intent_policy_and_catalog_from_separate_tenant_sources
                 SpecialistRegistration(
                     id="foreign",
                     description="Foreign Tenant Specialist.",
+                    actor=cast(Any, object()),
                 ),
             ),
         ),
