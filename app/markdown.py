@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, cast
 
 import yaml
+
+
+def is_safe_path_segment(value: str) -> bool:
+    """Return whether a storage identity is one non-traversing path segment."""
+    return bool(value) and Path(value).parts == (value,) and value not in {".", ".."}
 
 
 def parse_frontmatter_and_body(

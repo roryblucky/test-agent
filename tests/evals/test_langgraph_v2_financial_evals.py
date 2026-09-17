@@ -57,10 +57,7 @@ from app.langgraph_v2.agent_evidence import (
 )
 from app.langgraph_v2.agent_graph import build_agent_graph
 from app.langgraph_v2.agent_scope import AgentIntentPolicy
-from app.langgraph_v2.agent_skills import (
-    SkillCatalog,
-    SkillInvocation,
-)
+from app.langgraph_v2.agent_skills import SkillInvocation
 from app.langgraph_v2.agent_termination import COORDINATION_LIMIT
 from app.langgraph_v2.calculations import (
     CalculationArtifactInvalid,
@@ -91,6 +88,7 @@ from app.models.workflow import (
     ResolvedQuery,
 )
 from app.skills.schema import SkillDefinition, SkillMetadata
+from tests.skill_fakes import static_skill_catalog
 
 _AS_OF = date(2026, 9, 6)
 _TENANT_ID = "financial-evals-tenant"
@@ -402,8 +400,8 @@ class _Harness:
         return provider
 
     def catalog(self) -> SpecialistCatalog:
-        skills = SkillCatalog(
-            definitions=(
+        skills = static_skill_catalog(
+            (
                 SkillDefinition(
                     metadata=SkillMetadata(
                         name="financial-analysis",
@@ -518,7 +516,7 @@ class _Specialist:
                 messages=(),
             )
         assert self.skills is not None
-        self.skills.activate("financial-analysis")
+        await self.skills.activate("financial-analysis")
         tool_calls_before = len(self.harness.tool_calls)
         tool_id, source, query = {
             "market": (

@@ -54,9 +54,6 @@ from app.langgraph_v2.agent_evidence import (
     ToolUnavailableReason,
     bind_evidence_tool,
 )
-from app.langgraph_v2.agent_skills import (
-    SkillCatalog,
-)
 from app.langgraph_v2.specialist_retry import (
     RetryDisposition,
     SpecialistInvocationFailure,
@@ -66,6 +63,7 @@ from app.langgraph_v2.specialist_retry import (
     specialist_usage_limits,
 )
 from app.skills.schema import SkillDefinition, SkillMetadata
+from tests.skill_fakes import static_skill_catalog
 
 
 def _context() -> EvidenceInvocationContext:
@@ -139,8 +137,8 @@ def test_bound_specialist_factory_uses_exact_frozen_tools() -> None:
 async def test_specialist_interleaves_multiple_skill_activations_with_business_tools() -> (
     None
 ):
-    skill_catalog = SkillCatalog(
-        definitions=tuple(
+    skill_catalog = static_skill_catalog(
+        tuple(
             SkillDefinition(
                 metadata=SkillMetadata(
                     name=name,

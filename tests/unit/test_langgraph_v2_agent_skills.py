@@ -1,9 +1,18 @@
 """Specialist-owned progressive Skill activation contracts."""
 
+from collections.abc import Sequence
+
 import pytest
 
 from app.langgraph_v2.agent_skills import SkillCatalog
-from app.skills.schema import ReferenceDocument, SkillDefinition, SkillMetadata
+from app.skills.loader import SkillDiscoveryResult
+from app.skills.registry import TenantSkillRegistry
+from app.skills.schema import (
+    ReferenceDocument,
+    SkillDefinition,
+    SkillMetadata,
+    SkillSummary,
+)
 
 
 def _skill(
@@ -31,12 +40,51 @@ def _skill(
     )
 
 
+class _SkillLoader:
+    def __init__(self, definitions: Sequence[SkillDefinition]) -> None:
+        self.definitions = {item.metadata.name: item for item in definitions}
+
+    async def discover_skills(self, tenant_id: str) -> SkillDiscoveryResult:
+        return SkillDiscoveryResult(
+            summaries=tuple(
+                definition.to_summary()
+                for definition in self.definitions.values()
+                if definition.tenant_id == tenant_id
+            )
+        )
+
+    async def activate_skill(self, summary: SkillSummary) -> SkillDefinition:
+        return self.definitions[summary.name].model_copy(deep=True)
+
+    async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
+        return list(skill.references)
+
+    async def list_resource_files(self, summary: SkillSummary) -> list[str]:
+        del summary
+        return []
+
+
+async def _catalog(
+    definitions: Sequence[SkillDefinition],
+    *,
+    tenant_id: str = "tenant-a",
+) -> SkillCatalog:
+    registry = TenantSkillRegistry(_SkillLoader(definitions))
+    await registry.discover(tenant_id)
+    return SkillCatalog(
+        registry=registry,
+        tenant_id=tenant_id,
+        summaries=registry.get_summaries(tenant_id),
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("declared_count", [20, 21])
-def test_summaries_preserve_specialist_declaration_order_and_cap_at_twenty(
+async def test_summaries_preserve_specialist_declaration_order_and_cap_at_twenty(
     declared_count: int,
 ) -> None:
     names = tuple(f"skill-{index:02d}" for index in range(declared_count))
-    catalog = SkillCatalog(definitions=tuple(_skill(name) for name in reversed(names)))
+    catalog = await _catalog(tuple(_skill(name) for name in reversed(names)))
 
     invocation = catalog.begin_invocation(
         specialist_skill_names=names,
@@ -50,12 +98,15 @@ def test_summaries_preserve_specialist_declaration_order_and_cap_at_twenty(
     )
     if declared_count == 21:
         with pytest.raises(ValueError, match="Skill is not eligible"):
-            invocation.activate("skill-20")
+            await invocation.activate("skill-20")
 
 
-def test_multiple_activations_are_idempotent_ordered_and_do_not_expand_tools() -> None:
-    catalog = SkillCatalog(
-        definitions=(
+@pytest.mark.asyncio
+async def test_multiple_activations_are_idempotent_ordered_and_do_not_expand_tools() -> (
+    None
+):
+    catalog = await _catalog(
+        (
             _skill(
                 "filing-skill",
                 required_tool_ids=("filing-reader",),
@@ -63,15 +114,15 @@ def test_multiple_activations_are_idempotent_ordered_and_do_not_expand_tools() -
             ),
             _skill("market-skill", version=None),
             _skill("undeclared-skill"),
-        )
+        ),
     )
     invocation = catalog.begin_invocation(
         specialist_skill_names=("market-skill", "filing-skill"),
         effective_tool_ids=frozenset({"filing-reader"}),
     )
 
-    market = invocation.activate("market-skill")
-    filing = invocation.activate("filing-skill")
+    market = await invocation.activate("market-skill")
+    filing = await invocation.activate("filing-skill")
     activation_tool = invocation.activation_tool()
 
     assert market.instructions == "market-skill full-instructions-sentinel"
@@ -79,21 +130,22 @@ def test_multiple_activations_are_idempotent_ordered_and_do_not_expand_tools() -
     assert filing.pin.version == "2026.09"
     assert invocation.pins == (market.pin, filing.pin)
     assert invocation.effective_tool_ids == frozenset({"filing-reader"})
-    assert invocation.activate("market-skill") == market
-    assert activation_tool("market-skill") == ""
+    assert await invocation.activate("market-skill") == market
+    assert await activation_tool("market-skill") == ""
     assert invocation.pins == (market.pin, filing.pin)
     with pytest.raises(ValueError, match="Skill is not eligible"):
-        invocation.activate("undeclared-skill")
+        await invocation.activate("undeclared-skill")
     with pytest.raises(ValueError, match="Skill is not eligible"):
-        invocation.activate("missing-skill")
+        await invocation.activate("missing-skill")
 
 
-def test_required_tools_filter_summaries_but_allowed_tools_do_not() -> None:
-    catalog = SkillCatalog(
-        definitions=(
+@pytest.mark.asyncio
+async def test_required_tools_filter_summaries_but_allowed_tools_do_not() -> None:
+    catalog = await _catalog(
+        (
             _skill("requires-news", required_tool_ids=("news-reader",)),
             _skill("suggests-news", allowed_tool_ids=("news-reader",)),
-        )
+        ),
     )
 
     invocation = catalog.begin_invocation(
@@ -103,18 +155,47 @@ def test_required_tools_filter_summaries_but_allowed_tools_do_not() -> None:
 
     assert [summary.name for summary in invocation.summaries] == ["suggests-news"]
     with pytest.raises(ValueError, match="Skill is not eligible"):
-        invocation.activate("requires-news")
+        await invocation.activate("requires-news")
 
 
-def test_activation_tool_discloses_only_instructions_once() -> None:
-    invocation = SkillCatalog(definitions=(_skill("market-skill"),)).begin_invocation(
+@pytest.mark.asyncio
+async def test_activation_does_not_recompute_frozen_eligibility_from_live_metadata() -> (
+    None
+):
+    definition = _skill("market-skill", instructions="CURRENT-INSTRUCTIONS")
+    loader = _SkillLoader((definition,))
+    registry = TenantSkillRegistry(loader)
+    await registry.discover("tenant-a")
+    catalog = SkillCatalog(
+        registry=registry,
+        tenant_id="tenant-a",
+        summaries=registry.get_summaries("tenant-a"),
+    )
+    invocation = catalog.begin_invocation(
+        specialist_skill_names=("market-skill",),
+        effective_tool_ids=frozenset(),
+    )
+    loader.definitions["market-skill"] = _skill(
+        "market-skill",
+        instructions="UPDATED-INSTRUCTIONS",
+        required_tool_ids=("new-live-tool",),
+    )
+
+    activated = await invocation.activate("market-skill")
+
+    assert activated.instructions == "UPDATED-INSTRUCTIONS"
+
+
+@pytest.mark.asyncio
+async def test_activation_tool_discloses_only_instructions_once() -> None:
+    invocation = (await _catalog((_skill("market-skill"),))).begin_invocation(
         specialist_skill_names=("market-skill",),
         effective_tool_ids=frozenset(),
     )
     activate_skill = invocation.activation_tool()
 
-    first_result = activate_skill("market-skill")
-    repeated_result = activate_skill("market-skill")
+    first_result = await activate_skill("market-skill")
+    repeated_result = await activate_skill("market-skill")
 
     assert first_result == "market-skill full-instructions-sentinel"
     assert "content_hash" not in first_result
@@ -122,7 +203,8 @@ def test_activation_tool_discloses_only_instructions_once() -> None:
     assert [pin.name for pin in invocation.pins] == ["market-skill"]
 
 
-def test_pin_hashes_cached_definition_but_excludes_references_and_storage_identity() -> (
+@pytest.mark.asyncio
+async def test_pin_hashes_activated_definition_but_excludes_references_and_storage_identity() -> (
     None
 ):
     original = _skill("filing-analysis", version=None)
@@ -145,33 +227,25 @@ def test_pin_hashes_cached_definition_but_excludes_references_and_storage_identi
         instructions="changed instructions",
     )
 
-    original_pin = (
-        SkillCatalog(definitions=(original,))
-        .begin_invocation(
-            specialist_skill_names=(original.metadata.name,),
-            effective_tool_ids=frozenset(),
-        )
-        .activate(original.metadata.name)
-        .pin
+    original_invocation = (await _catalog((original,))).begin_invocation(
+        specialist_skill_names=(original.metadata.name,),
+        effective_tool_ids=frozenset(),
     )
+    same_invocation = (
+        await _catalog((same_content_elsewhere,), tenant_id="tenant-b")
+    ).begin_invocation(
+        specialist_skill_names=(same_content_elsewhere.metadata.name,),
+        effective_tool_ids=frozenset(),
+    )
+    changed_invocation = (await _catalog((changed,))).begin_invocation(
+        specialist_skill_names=(changed.metadata.name,),
+        effective_tool_ids=frozenset(),
+    )
+    original_pin = (await original_invocation.activate(original.metadata.name)).pin
     same_pin = (
-        SkillCatalog(definitions=(same_content_elsewhere,))
-        .begin_invocation(
-            specialist_skill_names=(same_content_elsewhere.metadata.name,),
-            effective_tool_ids=frozenset(),
-        )
-        .activate(same_content_elsewhere.metadata.name)
-        .pin
-    )
-    changed_pin = (
-        SkillCatalog(definitions=(changed,))
-        .begin_invocation(
-            specialist_skill_names=(changed.metadata.name,),
-            effective_tool_ids=frozenset(),
-        )
-        .activate(changed.metadata.name)
-        .pin
-    )
+        await same_invocation.activate(same_content_elsewhere.metadata.name)
+    ).pin
+    changed_pin = (await changed_invocation.activate(changed.metadata.name)).pin
 
     assert original_pin.version is None
     assert original_pin.content_hash == same_pin.content_hash

@@ -60,7 +60,6 @@ from app.langgraph_v2.agent_graph import (
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
-    SkillCatalog,
     SkillInvocation,
     SkillPin,
 )
@@ -81,6 +80,7 @@ from app.langgraph_v2.specialist_retry import (
     specialist_usage_limits,
 )
 from app.skills.schema import SkillDefinition, SkillMetadata
+from tests.skill_fakes import static_skill_catalog
 
 
 def _skill_definition(
@@ -1764,8 +1764,8 @@ def test_catalog_keeps_a_direct_no_tool_actor_when_skills_are_declared() -> None
                 id="market-data", description="market-data", actor=direct_actor
             ),
         ),
-        skill_catalog=SkillCatalog(
-            definitions=(
+        skill_catalog=static_skill_catalog(
+            (
                 _skill_definition(
                     "market-skill", instructions="MARKET-FULL-INSTRUCTIONS"
                 ),
@@ -1816,7 +1816,8 @@ def test_catalog_keeps_a_direct_actor_when_scope_has_an_effective_tool() -> None
     assert actor is direct_actor
 
 
-def test_catalog_binds_skill_activation_without_expanding_frozen_business_tools() -> (
+@pytest.mark.asyncio
+async def test_catalog_binds_skill_activation_without_expanding_frozen_business_tools() -> (
     None
 ):
     captured_tools: list[Callable[..., object]] = []
@@ -1857,8 +1858,8 @@ def test_catalog_binds_skill_activation_without_expanding_frozen_business_tools(
             ),
         ),
         tenant_allowed_tool_ids=frozenset({"filing-tool"}),
-        skill_catalog=SkillCatalog(
-            definitions=(
+        skill_catalog=static_skill_catalog(
+            (
                 _skill_definition(
                     "shared-skill",
                     instructions="SHARED-FULL-INSTRUCTIONS",
@@ -1884,10 +1885,10 @@ def test_catalog_binds_skill_activation_without_expanding_frozen_business_tools(
     invocation = captured_invocation[0]
     assert [summary.name for summary in invocation.summaries] == ["market-skill"]
     assert (
-        invocation.activate("market-skill").instructions == "MARKET-FULL-INSTRUCTIONS"
-    )
+        await invocation.activate("market-skill")
+    ).instructions == "MARKET-FULL-INSTRUCTIONS"
     with pytest.raises(ValueError, match="Skill is not eligible"):
-        invocation.activate("shared-skill")
+        await invocation.activate("shared-skill")
 
 
 def _tool_name(tool: Callable[..., object]) -> str:

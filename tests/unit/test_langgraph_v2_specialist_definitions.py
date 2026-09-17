@@ -54,6 +54,8 @@ from app.langgraph_v2.specialist_retry import (
     SpecialistModelBoundary,
     specialist_usage_limits,
 )
+from app.skills.loader import LocalSkillLoader
+from app.skills.registry import TenantSkillRegistry
 
 
 class _ModelRegistry:
@@ -166,6 +168,125 @@ skills: {skills}
 {extra_frontmatter}---
 {instructions}
 """
+
+
+@pytest.mark.asyncio
+async def test_specialist_skill_activation_reads_full_definition_on_demand(
+    tmp_path: Path,
+) -> None:
+    skill_path = _write_skill(
+        tmp_path,
+        tenant_id="tenant-a",
+        skill_name="market-analysis",
+        content="""---
+name: market-analysis
+description: Analyze markets when assigned.
+---
+DISCOVERY-TIME-INSTRUCTIONS
+""",
+    )
+    _write_agent(
+        tmp_path,
+        tenant_id="tenant-a",
+        filename="market-data.agent.md",
+        content=_agent_document(skills="[market-analysis]"),
+    )
+
+    catalog = await build_specialist_catalog(
+        LocalTenantDefinitionLoader(tmp_path),
+        tenant_id="tenant-a",
+        model_registry=cast(ModelRegistry, _ModelRegistry("specialist")),
+        skill_registry=TenantSkillRegistry(LocalSkillLoader(tmp_path)),
+    )
+    skill_path.write_text(
+        """---
+name: market-analysis
+description: Analyze markets when assigned.
+---
+ACTIVATION-TIME-INSTRUCTIONS
+""",
+        encoding="utf-8",
+    )
+
+    assert catalog.skill_catalog is not None
+    invocation = catalog.skill_catalog.begin_invocation(
+        specialist_skill_names=("market-analysis",),
+        effective_tool_ids=frozenset(),
+    )
+    activated = await invocation.activate("market-analysis")
+
+    assert activated.instructions == "ACTIVATION-TIME-INSTRUCTIONS"
+
+
+@pytest.mark.asyncio
+async def test_skill_references_are_read_fresh_on_every_request(tmp_path: Path) -> None:
+    skill_path = _write_skill(
+        tmp_path,
+        tenant_id="tenant-a",
+        skill_name="market-analysis",
+        content="""---
+name: market-analysis
+description: Analyze a market.
+---
+MARKET-INSTRUCTIONS
+""",
+    )
+    references = skill_path.parent / "references"
+    references.mkdir()
+    guide = references / "guide.md"
+    guide.write_text("FIRST-REFERENCE", encoding="utf-8")
+    registry = TenantSkillRegistry(LocalSkillLoader(tmp_path))
+    await registry.discover("tenant-a")
+    skill = await registry.activate("tenant-a", "market-analysis")
+    assert skill is not None
+
+    first_files = await registry.get_resource_files("tenant-a", "market-analysis")
+    first_references = await registry.load_references(skill)
+    guide.write_text("SECOND-REFERENCE", encoding="utf-8")
+    (references / "new.md").write_text("NEW-REFERENCE", encoding="utf-8")
+    second_files = await registry.get_resource_files("tenant-a", "market-analysis")
+    second_references = await registry.load_references(skill)
+
+    assert first_files == ["guide.md"]
+    assert [(item.filename, item.content) for item in first_references] == [
+        ("guide.md", "FIRST-REFERENCE")
+    ]
+    assert second_files == ["guide.md", "new.md"]
+    assert [(item.filename, item.content) for item in second_references] == [
+        ("guide.md", "SECOND-REFERENCE"),
+        ("new.md", "NEW-REFERENCE"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_skill_discovery_failures_are_counted_without_logging_content(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _write_skill(
+        tmp_path,
+        tenant_id="tenant-a",
+        skill_name="broken",
+        content="""---
+name: broken
+description: [SECRET-DISCOVERY-CONTENT
+---
+SECRET-INSTRUCTIONS
+""",
+    )
+    caplog.set_level(logging.INFO)
+
+    await build_specialist_catalog(
+        LocalTenantDefinitionLoader(tmp_path),
+        tenant_id="tenant-a",
+        model_registry=cast(ModelRegistry, _ModelRegistry("specialist")),
+        skill_registry=TenantSkillRegistry(LocalSkillLoader(tmp_path)),
+    )
+
+    assert "kind=skill loaded=0 skipped=1" in caplog.text
+    assert "reason=invalid-definition" in caplog.text
+    assert "SECRET-DISCOVERY-CONTENT" not in caplog.text
+    assert "SECRET-INSTRUCTIONS" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -314,7 +435,7 @@ async def test_markdown_specialist_uses_instruction_precedence_and_persists_pin(
 
 
 @pytest.mark.asyncio
-async def test_startup_loads_full_skills_without_references_and_validates_dependencies(
+async def test_startup_discovers_skill_summaries_and_validates_dependencies(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -391,10 +512,12 @@ INVALID-SKILL-INSTRUCTIONS-SENTINEL
     )
     caplog.set_level(logging.INFO)
 
+    skill_registry = TenantSkillRegistry(LocalSkillLoader(tmp_path))
     catalog = await build_specialist_catalog(
         LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-a",
         model_registry=cast(ModelRegistry, _ModelRegistry("specialist")),
+        skill_registry=skill_registry,
         tool_registry=tool_registry,
         tenant_allowed_tool_ids=tool_registry.registered_ids,
     )
@@ -407,7 +530,7 @@ INVALID-SKILL-INSTRUCTIONS-SENTINEL
         specialist_skill_names=registration.skill_names,
         effective_tool_ids=frozenset({"filing-reader"}),
     )
-    assert invocation.activate("filing-analysis").instructions == (
+    assert (await invocation.activate("filing-analysis")).instructions == (
         "FULL-SKILL-INSTRUCTIONS-SENTINEL"
     )
     assert "kind=skill loaded=1 skipped=1" in caplog.text
@@ -480,7 +603,7 @@ async def test_catalog_snapshot_stays_fixed_until_a_new_startup_load(
 
 
 @pytest.mark.asyncio
-async def test_skill_snapshot_and_versionless_pin_change_only_after_new_startup(
+async def test_activated_skill_cache_and_versionless_pin_reset_on_new_startup(
     tmp_path: Path,
 ) -> None:
     skill_path = _write_skill(
@@ -501,11 +624,13 @@ FIRST-SKILL-INSTRUCTIONS
         content=_agent_document(skills="[market-analysis]"),
     )
     loader = LocalTenantDefinitionLoader(tmp_path)
-    registry = cast(ModelRegistry, _ModelRegistry("specialist"))
+    model_registry = cast(ModelRegistry, _ModelRegistry("specialist"))
+    first_skill_registry = TenantSkillRegistry(LocalSkillLoader(tmp_path))
     first = await build_specialist_catalog(
         loader,
         tenant_id="tenant-a",
-        model_registry=registry,
+        model_registry=model_registry,
+        skill_registry=first_skill_registry,
     )
     first_registration = first.resolve("market-data")
     assert first.skill_catalog is not None
@@ -513,7 +638,7 @@ FIRST-SKILL-INSTRUCTIONS
         specialist_skill_names=first_registration.skill_names,
         effective_tool_ids=frozenset(),
     )
-    first_activation = first_invocation.activate("market-analysis")
+    first_activation = await first_invocation.activate("market-analysis")
 
     skill_path.write_text(
         """---
@@ -524,15 +649,17 @@ SECOND-SKILL-INSTRUCTIONS
 """,
         encoding="utf-8",
     )
-    repeated_activation = first_invocation.activate("market-analysis")
+    repeated_activation = await first_invocation.activate("market-analysis")
+    second_skill_registry = TenantSkillRegistry(LocalSkillLoader(tmp_path))
     second = await build_specialist_catalog(
         loader,
         tenant_id="tenant-a",
-        model_registry=registry,
+        model_registry=model_registry,
+        skill_registry=second_skill_registry,
     )
     second_registration = second.resolve("market-data")
     assert second.skill_catalog is not None
-    second_activation = second.skill_catalog.begin_invocation(
+    second_activation = await second.skill_catalog.begin_invocation(
         specialist_skill_names=second_registration.skill_names,
         effective_tool_ids=frozenset(),
     ).activate("market-analysis")
@@ -552,7 +679,7 @@ SECOND-SKILL-INSTRUCTIONS
             usage_limits: UsageLimits | None = None,
         ) -> SpecialistAttempt:
             del input, usage, usage_limits
-            self.invocation.activate("market-analysis")
+            await self.invocation.activate("market-analysis")
             if self.attempt == 1:
                 raise SpecialistInvocationFailure(
                     ModelHTTPError(429, "specialist"),
@@ -709,10 +836,6 @@ async def test_catalog_rejects_a_loader_document_owned_by_another_tenant(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class ForeignTenantLoader:
-        async def load_skills(self, tenant_id: str) -> TenantSourceLoad:
-            assert tenant_id == "tenant-a"
-            return TenantSourceLoad()
-
         async def load_specialists(self, tenant_id: str) -> TenantSourceLoad:
             assert tenant_id == "tenant-a"
             return TenantSourceLoad(
@@ -752,6 +875,38 @@ async def test_local_loader_rejects_a_tenant_id_that_can_escape_its_prefix(
     assert loaded.documents == ()
     assert len(loaded.failures) == 1
     assert loaded.failures[0].reason == "invalid-tenant-id"
+
+
+@pytest.mark.asyncio
+async def test_local_skill_loader_rejects_tenant_escape_and_symlink(
+    tmp_path: Path,
+) -> None:
+    foreign_skill = _write_skill(
+        tmp_path,
+        tenant_id="tenant-b",
+        skill_name="foreign",
+        content="""---
+name: foreign
+description: Foreign tenant Skill.
+---
+FOREIGN-INSTRUCTIONS
+""",
+    )
+    tenant_a_skills = tmp_path / "tenants" / "tenant-a" / "skills"
+    tenant_a_skills.mkdir(parents=True)
+    (tenant_a_skills / "foreign").symlink_to(
+        foreign_skill.parent,
+        target_is_directory=True,
+    )
+    loader = LocalSkillLoader(tmp_path)
+
+    escaped = await loader.discover_skills("../tenant-b")
+    symlinked = await loader.discover_skills("tenant-a")
+
+    assert escaped.summaries == ()
+    assert [failure.reason for failure in escaped.failures] == ["invalid-tenant-id"]
+    assert symlinked.summaries == ()
+    assert [failure.reason for failure in symlinked.failures] == ["symlink-not-allowed"]
 
 
 @pytest.mark.asyncio

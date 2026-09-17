@@ -1,26 +1,26 @@
-"""Invocation-local progressive access to startup-cached Agent Skills."""
+"""Invocation-local progressive access to shared Agent Skills."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.skills.schema import SkillDefinition
+from app.skills.schema import SkillDefinition, SkillSummary
 
 _MAX_SKILL_SUMMARIES = 20
 
 
-class SkillSummary(BaseModel):
-    """Prompt-visible discovery metadata without full instructions."""
+class SkillActivationRegistry(Protocol):
+    """Tier 2 portion of the shared Agent Skills registry contract."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    name: str = Field(min_length=1)
-    description: str = Field(min_length=1)
+    async def activate(self, tenant_id: str, skill_name: str) -> SkillDefinition | None:
+        """Load or return the activated Tier 2 definition."""
+        ...
 
 
 class SkillPin(BaseModel):
@@ -71,8 +71,10 @@ class SkillInvocation:
     """One Specialist's fixed eligible Skill view and activation state."""
 
     summaries: tuple[SkillSummary, ...]
-    _eligible: dict[str, SkillDefinition]
+    _eligible: dict[str, SkillSummary]
     _effective_tool_ids: frozenset[str]
+    _registry: SkillActivationRegistry
+    _tenant_id: str
     _activated: dict[str, ActivatedSkill] = field(
         default_factory=lambda: dict[str, ActivatedSkill]()
     )
@@ -87,13 +89,16 @@ class SkillInvocation:
         """Expose the unchanged frozen business Tool set for contract tests."""
         return self._effective_tool_ids
 
-    def activate(self, skill_name: str) -> ActivatedSkill:
-        """Disclose one eligible cached Skill without rebinding any Tool."""
-        definition = self._eligible.get(skill_name)
-        if definition is None:
+    async def activate(self, skill_name: str) -> ActivatedSkill:
+        """Load and disclose one eligible Skill without rebinding any Tool."""
+        summary = self._eligible.get(skill_name)
+        if summary is None:
             raise ValueError("Skill is not eligible")
         activated = self._activated.get(skill_name)
         if activated is None:
+            definition = await self._registry.activate(self._tenant_id, skill_name)
+            if definition is None or definition.metadata.name != skill_name:
+                raise ValueError("Skill is not eligible")
             activated = ActivatedSkill(
                 pin=_skill_pin(definition),
                 instructions=definition.instructions,
@@ -101,13 +106,13 @@ class SkillInvocation:
             self._activated[skill_name] = activated
         return activated
 
-    def activation_tool(self) -> Callable[[str], str]:
+    def activation_tool(self) -> Callable[[str], Awaitable[str]]:
         """Expose activation to this invocation's PydanticAI actor only."""
 
-        def activate_skill(skill_name: str) -> str:
+        async def activate_skill(skill_name: str) -> str:
             """Activate an eligible Skill by name for the current task."""
             already_activated = skill_name in self._activated
-            activated = self.activate(skill_name)
+            activated = await self.activate(skill_name)
             return "" if already_activated else activated.instructions
 
         return activate_skill
@@ -115,27 +120,25 @@ class SkillInvocation:
 
 @dataclass(frozen=True)
 class SkillCatalog:
-    """Adapt startup-cached Agent Skills into fixed invocation-local views."""
+    """Adapt discovered Agent Skills into fixed invocation-local views."""
 
-    definitions: Sequence[SkillDefinition]
+    registry: SkillActivationRegistry
+    tenant_id: str
+    summaries: Sequence[SkillSummary]
 
     def __post_init__(self) -> None:
-        definitions = tuple(
-            definition.model_copy(deep=True) for definition in self.definitions
-        )
-        object.__setattr__(self, "definitions", definitions)
-        names = tuple(definition.metadata.name for definition in definitions)
+        summaries = tuple(summary.model_copy(deep=True) for summary in self.summaries)
+        object.__setattr__(self, "summaries", summaries)
+        names = tuple(summary.name for summary in summaries)
         if len(set(names)) != len(names):
-            raise ValueError("Skill definition names must be unique")
-        for definition in definitions:
-            if not definition.instructions.strip():
-                raise ValueError("Skill instructions must not be blank")
-            _skill_pin(definition)
+            raise ValueError("Skill summary names must be unique")
+        if any(summary.tenant_id != self.tenant_id for summary in summaries):
+            raise ValueError("Skill summary Tenant does not match")
 
     @property
     def names(self) -> frozenset[str]:
         """Return every valid Skill name in this Tenant catalog."""
-        return frozenset(definition.metadata.name for definition in self.definitions)
+        return frozenset(summary.name for summary in self.summaries)
 
     def begin_invocation(
         self,
@@ -144,31 +147,22 @@ class SkillCatalog:
         effective_tool_ids: frozenset[str],
     ) -> SkillInvocation:
         """Freeze eligible Skills in Specialist declaration order."""
-        definitions_by_name = {
-            definition.metadata.name: definition for definition in self.definitions
-        }
-        eligible_definitions: list[SkillDefinition] = []
+        summaries_by_name = {summary.name: summary for summary in self.summaries}
+        eligible_summaries: list[SkillSummary] = []
         for name in specialist_skill_names:
-            definition = definitions_by_name.get(name)
-            if definition is None:
+            summary = summaries_by_name.get(name)
+            if summary is None:
                 continue
-            if not set(definition.metadata.required_tools) <= effective_tool_ids:
+            if not set(summary.required_tools) <= effective_tool_ids:
                 continue
-            eligible_definitions.append(definition)
-            if len(eligible_definitions) == _MAX_SKILL_SUMMARIES:
+            eligible_summaries.append(summary)
+            if len(eligible_summaries) == _MAX_SKILL_SUMMARIES:
                 break
-        eligible = {
-            definition.metadata.name: definition for definition in eligible_definitions
-        }
-        summaries = tuple(
-            SkillSummary(
-                name=definition.metadata.name,
-                description=definition.metadata.description,
-            )
-            for definition in eligible_definitions
-        )
+        eligible = {summary.name: summary for summary in eligible_summaries}
         return SkillInvocation(
-            summaries=summaries,
+            summaries=tuple(eligible_summaries),
             _eligible=eligible,
             _effective_tool_ids=effective_tool_ids,
+            _registry=self.registry,
+            _tenant_id=self.tenant_id,
         )

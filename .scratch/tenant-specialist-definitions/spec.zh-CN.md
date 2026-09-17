@@ -29,9 +29,11 @@ Catalog。
 
 `.agent.md` 文档提供 Specialist 的身份、描述、经过批准的 model profile、Skill 名称
 以及 instruction body。Tenant ID 由文档所在路径提供。标准 `SKILL.md` 文档提供 Skill
-的 discovery metadata、instructions 和 Tool dependencies。完整的 Agent 和 Skill
-definition 在启动时完成校验并缓存于当前进程；Skill reference 文件保持实时，只在
-Activated Skill 调用 `load_reference` 时读取。
+的 discovery metadata、instructions 和 Tool dependencies。runtime 对 Skills 复用现有
+Agent Skills 三层加载：启动时缓存完整 Agent definition 和 Skill discovery
+metadata/Tool dependencies；首次 activation 才重新读取并缓存完整
+`SKILL.md` instructions；Skill reference 文件不缓存，只在 Activated Skill 调用
+`load_reference` 时实时读取。
 
 Coordinator Agent 可以看到当前 Tenant Specialist Catalog 中的全部有效 Specialist
 Descriptor，并根据 ID 和 description 做选择。Business Intent 继续选择可信的 scope
@@ -146,9 +148,10 @@ instructions。
 - 应用启动时，先建立可信 Tenant 配置和 Model Registries，再加载每个已知 Tenant，且
   必须在接收 request traffic 前完成。启动 composition 把 Tenant-scoped catalogs
   安装到 Agent runtime 可以根据可信 request context 解析的位置。
-- 完整的 `.agent.md` 和 `SKILL.md` definitions 在启动时读取、解析、校验并缓存。
-  Progressive disclosure 只描述模型能够看到什么，不表示 Skill definitions 从存储中
-  lazy load。
+- 完整的 `.agent.md` definitions 在启动时读取、解析、校验并缓存。Skills 直接复用现有
+  Agent Skills 物理三层加载：启动 discovery 只保留 `SKILL.md` metadata summary 和 Tool
+  dependencies；activation 通过共同 Skill Registry 从存储重新读取完整 `SKILL.md`
+  instructions，并按该 Registry 的进程内 activation cache 语义复用。
 - 启动时既不读取也不缓存 reference 文件内容。catalog 只保留足够可信的 source
   identity，以便后续定位 Activated Skill 的 reference directory。
 - 一个无效 Specialist 或 Skill 不会回滚同一 Tenant 的其他有效 definitions。错误日志
@@ -158,8 +161,10 @@ instructions。
   不在成功加载的 Skill Catalog 中，则该
   Specialist Definition 无效并从 Specialist Catalog 排除；runtime 不会静默改写管理员
   声明的 Skill 列表。
-- Catalog membership 在进程生命周期内不可变。Agent 或 Skill 修改需要重启。存储失败
-  不得复用另一个 Tenant 的 catalog，也不得扩大 catalog membership。
+- Catalog membership 在进程生命周期内不可变。Agent definition 或 Skill discovery
+  metadata 修改需要重启。尚未激活的 Skill 在 activation 时读取当前 `SKILL.md`；已经激活
+  的完整 definition 按共同 Skill Registry 缓存到重启或显式 invalidation。存储失败不得
+  复用另一个 Tenant 的 catalog，也不得扩大 catalog membership。
 - 现有 Agent Skills parsing 以及 Local/GCS storage implementations 是可复用的先例，
   在合同一致时应复用或深化。Agent Graph 不应维护第二套持久化 Skill schema 或 parser。
   当前 FlowEngine Agent Handler 在本阶段仍是另一个调用者，但不能要求 Specialist
@@ -317,10 +322,10 @@ instructions。
   `required-tools`、可选的 `allowed-tools`，以及被 Research Scope 排除的 Tools。不增加
   `max_activated_skills` 测试，因为该配置不存在。
 - Local 和 GCS implementations 使共同 Loader 成为真实 seam。用共享 Adapter contract
-  fixture 证明两者针对同一个 Tenant 相对目录返回等价的 Agent 和 Skill source
-  documents、隔离 Tenant prefix、启动时读取完整 Agent 和 Skill definitions、启动时不
-  读取 references，并且每次调用都返回最新 reference 内容。GCS 使用内存 fake；确定性
-  测试不得依赖网络。
+  fixture 证明两者针对同一个 Tenant 相对目录返回等价的 Agent definitions 和 Skill
+  discovery summaries、隔离 Tenant prefix、只在 activation 读取完整 `SKILL.md`、启动和
+  activation 都不读取 references，并且每次 reference 调用都返回最新内容。GCS 使用内存
+  fake；确定性测试不得依赖网络。
 - 通过 catalog 的 public interface 测试有效和无效 definitions 混合存在的情况。验证无效
   条目不在 catalog 中、有效 sibling 保留、未知 model profile 以及 `required-tools` 或
   `allowed-tools` 中的未知 Tool 名称被拒绝、引用缺失 Skill 的 Specialist 被拒绝、
@@ -348,8 +353,9 @@ instructions。
   保持第一次 activation 的顺序，并携带缓存 Skill Definition 的 content hash；即使缺少
   version，definition 内容变化也必须改变 hash。
 - 使用两个独立构建的 catalogs 测试重启语义，不实现 hot reload。第一个 catalog 继续
-  使用已缓存的 Agent 和 Skill definitions；第二次启动能够看到修改。第二个 runtime 中
-  重试的 Task 记录第二个 pin，并且不请求历史内容。
+  使用已缓存的 Agent definition 和已激活 Skill definition；第二次启动重新 discovery，
+  并在 activation 时看到修改。第二个 runtime 中重试的 Task 记录第二个 pin，并且不请求
+  历史内容。
 - 实现过程中先运行聚焦的确定性 unit 和 integration suites，再运行完整测试套件。
   PostgreSQL-backed tests 使用仓库标准 PostgreSQL test runner 和 fixture safety rules。
 

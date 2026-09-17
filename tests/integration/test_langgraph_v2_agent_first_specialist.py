@@ -64,10 +64,7 @@ from app.langgraph_v2.agent_evidence import (
 )
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy
-from app.langgraph_v2.agent_skills import (
-    SkillCatalog,
-    SkillInvocation,
-)
+from app.langgraph_v2.agent_skills import SkillInvocation
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.calculations import (
@@ -102,6 +99,7 @@ from tests.integration.test_langgraph_v2_linear_core import (
     stream_request,
     v2_stream_endpoint,
 )
+from tests.skill_fakes import static_skill_catalog
 
 
 class _UnderstandingActor:
@@ -2463,8 +2461,8 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
             ),
         ),
         tenant_allowed_tool_ids=frozenset({"filing_reader"}),
-        skill_catalog=SkillCatalog(
-            definitions=(
+        skill_catalog=static_skill_catalog(
+            (
                 SkillDefinition(
                     metadata=SkillMetadata(
                         name="filing-analysis",

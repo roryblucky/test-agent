@@ -25,9 +25,10 @@ from app.langgraph_v2.agent_batch import (
 from app.langgraph_v2.agent_evidence import SpecialistToolCapture
 from app.langgraph_v2.agent_skills import SkillCatalog as RuntimeSkillCatalog
 from app.langgraph_v2.agent_skills import SkillInvocation
-from app.markdown import parse_frontmatter_and_body
-from app.skills.loader import parse_skill_definition
-from app.skills.schema import SkillDefinition
+from app.markdown import is_safe_path_segment, parse_frontmatter_and_body
+from app.skills.loader import LocalSkillLoader
+from app.skills.registry import TenantSkillRegistry
+from app.skills.schema import SkillSummary
 
 logger = logging.getLogger(__name__)
 
@@ -61,14 +62,10 @@ class TenantSourceLoad:
 
 
 class TenantDefinitionLoader(Protocol):
-    """Return Tenant-isolated source documents from one storage adapter."""
+    """Return Tenant-isolated Specialist documents from one storage adapter."""
 
     async def load_specialists(self, tenant_id: str) -> TenantSourceLoad:
         """Load complete Specialist documents for exactly one known Tenant."""
-        ...
-
-    async def load_skills(self, tenant_id: str) -> TenantSourceLoad:
-        """Load complete Skill documents for exactly one known Tenant."""
         ...
 
 
@@ -117,31 +114,6 @@ class LocalTenantDefinitionLoader:
             ),
         )
 
-    async def load_skills(self, tenant_id: str) -> TenantSourceLoad:
-        """Read `SKILL.md` files without opening references or other resources."""
-        directory, failure = self._definition_directory(tenant_id, "skills")
-        if failure is not None:
-            return TenantSourceLoad(failures=(failure,))
-        if not directory.exists():
-            return TenantSourceLoad()
-        candidates: list[_LocalDefinitionFile] = []
-        for skill_directory in sorted(directory.iterdir()):
-            if not skill_directory.is_dir():
-                continue
-            skill_path = skill_directory / "SKILL.md"
-            if not skill_path.is_file() and not skill_path.is_symlink():
-                continue
-            candidates.append(
-                _LocalDefinitionFile(
-                    path=skill_path,
-                    source_identity=(
-                        f"tenants/{tenant_id}/skills/{skill_directory.name}/SKILL.md"
-                    ),
-                    guarded_paths=(skill_directory, skill_path),
-                )
-            )
-        return self._read_documents(tenant_id, tuple(candidates))
-
     def _definition_directory(
         self,
         tenant_id: str,
@@ -149,11 +121,7 @@ class LocalTenantDefinitionLoader:
     ) -> tuple[Path, TenantSourceFailure | None]:
         tenant_directory = self.root / "tenants" / tenant_id
         directory = tenant_directory / kind
-        if (
-            not tenant_id
-            or Path(tenant_id).parts != (tenant_id,)
-            or tenant_id in {".", ".."}
-        ):
+        if not is_safe_path_segment(tenant_id):
             return directory, TenantSourceFailure(
                 tenant_id=tenant_id,
                 source_identity="tenant-definition-root",
@@ -217,6 +185,7 @@ async def load_local_specialist_catalogs(
 ) -> dict[str, SpecialistCatalog]:
     """Build one immutable local Specialist Catalog per configured Tenant."""
     loader = LocalTenantDefinitionLoader(root)
+    skill_registry = TenantSkillRegistry(LocalSkillLoader(root))
     tenant_tool_policy = tenant_allowed_tool_ids or {}
     catalogs: dict[str, SpecialistCatalog] = {}
     for tenant_id in tenant_manager.tenant_ids:
@@ -224,6 +193,7 @@ async def load_local_specialist_catalogs(
             loader,
             tenant_id=tenant_id,
             model_registry=tenant_manager.get_model_registry(tenant_id),
+            skill_registry=skill_registry,
             tool_registry=tool_registry,
             tenant_allowed_tool_ids=tenant_tool_policy.get(tenant_id, frozenset()),
         )
@@ -266,52 +236,56 @@ async def build_specialist_catalog(
     *,
     tenant_id: str,
     model_registry: ModelRegistry,
+    skill_registry: TenantSkillRegistry | None = None,
     tool_registry: AgentToolRegistry | None = None,
     tenant_allowed_tool_ids: frozenset[str] = frozenset(),
 ) -> SpecialistCatalog:
     """Load, validate, and index one immutable Tenant Specialist Catalog."""
     effective_tool_registry = tool_registry or AgentToolRegistry()
-    skill_load = await loader.load_skills(tenant_id)
-    skill_definitions: list[SkillDefinition] = []
+    if skill_registry is not None:
+        await skill_registry.discover(tenant_id)
+        discovered_skills = skill_registry.get_summaries(tenant_id)
+        discovery_failures = skill_registry.get_discovery_failures(tenant_id)
+    else:
+        discovered_skills = []
+        discovery_failures = ()
+    skill_summaries: list[SkillSummary] = []
     seen_skill_names: set[str] = set()
-    skipped_skills = len(skill_load.failures)
-    for failure in skill_load.failures:
-        reason = failure.reason if failure.tenant_id == tenant_id else "tenant-mismatch"
-        _log_skill_skip(tenant_id, failure.source_identity, reason)
-    for document in skill_load.documents:
-        if document.tenant_id != tenant_id:
+    skipped_skills = len(discovery_failures)
+    for summary in discovered_skills:
+        if summary.tenant_id != tenant_id:
             skipped_skills += 1
-            _log_skill_skip(tenant_id, document.source_identity, "tenant-mismatch")
+            _log_skill_skip(tenant_id, summary.source_path, "tenant-mismatch")
             continue
         try:
-            definition = parse_skill_definition(
-                document.content,
-                tenant_id,
-                document.source_identity,
-            )
-            if definition.metadata.name in seen_skill_names:
+            if summary.name in seen_skill_names:
                 raise ValueError("duplicate-name")
-            declared_tool_ids = set(definition.metadata.required_tools) | set(
-                definition.metadata.allowed_tools
-            )
+            declared_tool_ids = set(summary.required_tools) | set(summary.allowed_tools)
             if not declared_tool_ids <= effective_tool_registry.registered_ids:
                 raise ValueError("unknown-tool")
-            RuntimeSkillCatalog(definitions=(definition,))
-        except (ValueError, ValidationError) as error:
+        except ValueError as error:
             skipped_skills += 1
             _log_skill_skip(
                 tenant_id,
-                document.source_identity,
+                summary.source_path,
                 _skill_error_reason(error),
             )
             continue
-        seen_skill_names.add(definition.metadata.name)
-        skill_definitions.append(definition)
-    skill_catalog = RuntimeSkillCatalog(definitions=tuple(skill_definitions))
+        seen_skill_names.add(summary.name)
+        skill_summaries.append(summary)
+    skill_catalog = (
+        RuntimeSkillCatalog(
+            registry=skill_registry,
+            tenant_id=tenant_id,
+            summaries=tuple(skill_summaries),
+        )
+        if skill_registry is not None
+        else None
+    )
     logger.info(
-        "Skill definitions loaded tenant=%s kind=skill loaded=%d skipped=%d",
+        "Skill summaries discovered tenant=%s kind=skill loaded=%d skipped=%d",
         tenant_id,
-        len(skill_definitions),
+        len(skill_summaries),
         skipped_skills,
     )
 
@@ -347,7 +321,10 @@ async def build_specialist_catalog(
             skipped += 1
             _log_skip(tenant_id, document.source_identity, "unknown-model-profile")
             continue
-        if not set(definition.metadata.skills) <= skill_catalog.names:
+        skill_names: frozenset[str] = (
+            skill_catalog.names if skill_catalog is not None else frozenset()
+        )
+        if not set(definition.metadata.skills) <= skill_names:
             skipped += 1
             _log_skip(tenant_id, document.source_identity, "invalid-skill")
             continue

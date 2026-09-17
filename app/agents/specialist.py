@@ -91,7 +91,12 @@ class PydanticAISpecialistActor:
                 ],
                 "validation_feedback": input.validation_feedback,
                 "skill_summaries": [
-                    summary.model_dump(mode="json") for summary in skill_summaries
+                    {
+                        "name": summary.name,
+                        "description": summary.description,
+                        "location": summary.source_path,
+                    }
+                    for summary in skill_summaries
                 ],
             },
             ensure_ascii=False,

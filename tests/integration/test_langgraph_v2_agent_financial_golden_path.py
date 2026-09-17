@@ -60,10 +60,7 @@ from app.langgraph_v2.agent_evidence import (
 from app.langgraph_v2.agent_graph import QueryUnderstandingActor, SynthesisActor
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy
-from app.langgraph_v2.agent_skills import (
-    SkillCatalog,
-    SkillInvocation,
-)
+from app.langgraph_v2.agent_skills import SkillInvocation
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.calculations import (
@@ -91,6 +88,7 @@ from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
 )
+from tests.skill_fakes import static_skill_catalog
 
 _AS_OF_DATE = date(2026, 9, 6)
 _FUND_ID = "FUND-ALPHA"
@@ -437,6 +435,10 @@ class _FinancialSpecialists:
             assert isinstance(objective, str)
             summaries = prompt["skill_summaries"]
             assert isinstance(summaries, list)
+            assert all(
+                set(item) == {"name", "description", "location"}
+                for item in cast(list[Mapping[str, object]], summaries)
+            )
             summary_names = tuple(
                 cast(str, item["name"])
                 for item in cast(list[Mapping[str, object]], summaries)
@@ -795,8 +797,8 @@ class FinancialFixture:
                     *CalculationMethod,
                 }
             ),
-            skill_catalog=SkillCatalog(
-                definitions=(
+            skill_catalog=static_skill_catalog(
+                (
                     SkillDefinition(
                         metadata=SkillMetadata(
                             name="financial-common",

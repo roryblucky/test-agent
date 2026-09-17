@@ -47,11 +47,12 @@ actors remain platform-defined.
 
 ## Catalog and selection
 
-Startup parses and validates each Tenant's Specialist and Skill definitions. It
-loads complete `.agent.md` and `SKILL.md` content into an in-memory Tenant
-catalog, but exposes only compact Specialist descriptors and Skill summaries to
-models. A malformed definition is skipped and logged without rejecting the
-Tenant's entire catalog.
+Startup parses and validates each Tenant's complete Specialist definitions and
+discovers each Skill's metadata summary and Tool dependencies. It retains
+complete `.agent.md` content but not complete `SKILL.md` instructions in the
+Tenant catalog, and exposes only compact Specialist descriptors and eligible
+Skill summaries to models. A malformed discovery entry is skipped and logged
+without rejecting the Tenant's entire catalog.
 
 The Coordinator receives every valid Specialist descriptor in the current
 Tenant and chooses a Specialist from its `id` and `description`. Business Intent
@@ -59,23 +60,27 @@ does not carry `allowed_specialist_ids` and does not directly filter the
 Specialist or Skill catalogs. Intent policy instead produces the current
 Research Scope, including permitted sources and Tools.
 
-Agent and `SKILL.md` changes become effective only after process restart. Every
-Coordinator decision, including after checkpoint resume, uses all valid
-Specialist descriptors in the current process's Tenant catalog. The Run retains
-its original Tool, source, query, freshness, and other data constraints. A
-legitimately dispatched Task whose Specialist Definition has since disappeared
-produces a failure outcome for that Task without preventing valid sibling Tasks
-from running; a forged Task, invalid identity, or damaged Batch manifest remains
-an invariant failure. An existing ID uses the definition loaded by the current
-process, and the accepted Specialist attempt or outcome records the content hash
-of the definition it actually used.
+Agent-definition and Skill-discovery-metadata changes become effective after
+process restart. Complete instructions for a Skill not yet activated are read
+from current storage on activation; after activation the shared Agent Skills
+Registry keeps its normal process-local Tier 2 cache. Every Coordinator decision,
+including after checkpoint resume, uses all valid Specialist descriptors in the
+current process's Tenant catalog. The Run retains its original Tool, source,
+query, freshness, and other data constraints. A legitimately dispatched Task
+whose Specialist Definition has since disappeared produces a failure outcome for
+that Task without preventing valid sibling Tasks from running; a forged Task,
+invalid identity, or damaged Batch manifest remains an invariant failure. An
+existing ID uses the definition loaded by the current process, and the accepted
+Specialist attempt or outcome records the content hash of the definition it
+actually used.
 
 ## Skill activation and references
 
 Skills follow the open Agent Skills progressive-disclosure model: discovery
-shows only metadata, and activation adds the cached full `SKILL.md` instructions
-to the current Specialist invocation. This is progressive disclosure to the
-model, not lazy storage access.
+shows only metadata, and activation asks the shared Agent Skills Registry to
+read the full `SKILL.md` instructions from storage before adding them to the
+current Specialist invocation. The Registry then reuses that activated Tier 2
+definition for the process lifetime unless it is explicitly invalidated.
 
 A Specialist invocation computes its eligible Skill set once from the loaded
 definitions and frozen effective Tools. It may progressively activate zero or

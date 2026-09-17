@@ -33,9 +33,11 @@ storage adapters produce the same in-memory Specialist Catalog and Skill Catalog
 A `.agent.md` document provides a Specialist's identity, description, approved
 model profile, named Skills, and instruction body. Its owning path supplies the
 Tenant ID. A standard `SKILL.md` document provides Skill discovery metadata,
-instructions, and Tool dependencies. Complete Agent and Skill definitions are
-validated and cached for the process lifetime, while Skill reference files remain
-live and are read only when an Activated Skill calls `load_reference`.
+instructions, and Tool dependencies. The runtime uses the existing Agent Skills
+physical three-tier loading: startup caches complete Agent definitions plus Skill
+discovery metadata and Tool dependencies; first activation rereads and caches the
+complete `SKILL.md` instructions; Skill reference files are never cached and are
+read live whenever an Activated Skill calls `load_reference`.
 
 The Coordinator Agent sees every valid Specialist Descriptor in the current
 Tenant's Specialist Catalog and selects by ID and description. Business Intent
@@ -159,9 +161,12 @@ Tenant-authored Specialist and Skill instructions.
   configuration and Model Registries exist and before request traffic is
   accepted. The startup composition installs Tenant-scoped catalogs where the
   Agent runtime can resolve them from the trusted request context.
-- Complete `.agent.md` and `SKILL.md` definitions are read, parsed, validated,
-  and cached at startup. Progressive disclosure refers only to what the model
-  sees; it is not lazy loading of Skill definitions from storage.
+- Complete `.agent.md` definitions are read, parsed, validated, and cached at
+  startup. Skills directly reuse the existing Agent Skills physical tiers:
+  startup discovery retains only `SKILL.md` metadata summaries and Tool
+  dependencies; activation uses the shared Skill Registry to reread complete
+  `SKILL.md` instructions from storage and then follows that Registry's
+  process-local activation-cache semantics.
 - Reference file contents are neither read nor cached at startup. The catalog
   retains only enough trusted source identity to locate the activated Skill's
   reference directory later.
@@ -173,9 +178,11 @@ Tenant-authored Specialist and Skill instructions.
   Specialist Definition that names a Skill absent from the
   successfully loaded Skill Catalog is invalid and excluded from the Specialist
   Catalog; the runtime does not silently rewrite the authored Skill list.
-- Catalog membership is immutable for the process lifetime. Agent or Skill edits
-  require restart. A storage failure cannot reuse another Tenant's catalog or
-  expand catalog membership.
+- Catalog membership is immutable for the process lifetime. Agent-definition or
+  Skill-discovery-metadata edits require restart. An unactivated Skill reads the
+  current `SKILL.md` at activation; an activated full definition remains in the
+  shared Skill Registry until restart or explicit invalidation. A storage failure
+  cannot reuse another Tenant's catalog or expand catalog membership.
 - Existing Agent Skills parsing and Local/GCS storage implementations are prior
   art and should be reused or deepened where their contracts match. The Agent
   Graph must not keep a separate persisted Skill schema or parser. The existing
@@ -370,11 +377,12 @@ Tenant-authored Specialist and Skill instructions.
   optional `allowed-tools`, and Tools excluded by Research Scope. Do not add
   `max_activated_skills` tests because no such setting exists.
 - The Local and GCS implementations justify one real Loader seam. Use a shared
-  Adapter contract fixture to prove that both return equivalent Agent and Skill
-  source documents for the same relative Tenant tree, isolate Tenant prefixes,
-  read complete Agent and Skill definitions at startup, leave references unread,
-  and return current reference contents on each call. Use an in-memory fake for
-  GCS; deterministic tests must not require network access.
+  Adapter contract fixture to prove that both return equivalent Agent definitions
+  and Skill discovery summaries for the same relative Tenant tree, isolate Tenant
+  prefixes, read complete `SKILL.md` only at activation, leave references unread
+  during startup and activation, and return current reference contents on each
+  call. Use an in-memory fake for GCS; deterministic tests must not require network
+  access.
 - Test the catalog through its public interface with mixed valid and invalid
   definitions. Verify invalid entries are absent, valid siblings remain, unknown
   model profiles and Tool names in either `required-tools` or `allowed-tools` are
@@ -413,9 +421,10 @@ Tenant-authored Specialist and Skill instructions.
   Definition; changing definition content must change the hash even when version
   is absent.
 - Test restart semantics with two independently built catalogs rather than a hot
-  reload mechanism. The first catalog continues using its cached Agent and Skill
-  definitions; a second startup sees edits. A retried Task in the second runtime
-  records the second pin and does not request historical content.
+  reload mechanism. The first catalog continues using its cached Agent definition
+  and activated Skill definition; a second startup rediscovers metadata and sees
+  edited instructions at activation. A retried Task in the second runtime records
+  the second pin and does not request historical content.
 - Run focused deterministic unit and integration suites during implementation,
   then the full suite. PostgreSQL-backed tests use the repository's standard
   PostgreSQL test runner and fixture-safety rules.
