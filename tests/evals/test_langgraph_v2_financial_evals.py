@@ -58,9 +58,8 @@ from app.langgraph_v2.agent_evidence import (
 from app.langgraph_v2.agent_graph import build_agent_graph
 from app.langgraph_v2.agent_scope import AgentIntentPolicy
 from app.langgraph_v2.agent_skills import (
+    SkillCatalog,
     SkillInvocation,
-    SkillRegistration,
-    SpecialistSkillRegistry,
 )
 from app.langgraph_v2.agent_termination import COORDINATION_LIMIT
 from app.langgraph_v2.calculations import (
@@ -91,6 +90,7 @@ from app.models.workflow import (
     QueryUnderstandingOutput,
     ResolvedQuery,
 )
+from app.skills.schema import SkillDefinition, SkillMetadata
 
 _AS_OF = date(2026, 9, 6)
 _TENANT_ID = "financial-evals-tenant"
@@ -402,19 +402,27 @@ class _Harness:
         return provider
 
     def catalog(self) -> SpecialistCatalog:
-        skills = SpecialistSkillRegistry(
-            registrations=(
-                SkillRegistration(
-                    name="financial-analysis",
-                    version="v1",
-                    description="Use fixed financial evidence only.",
+        skills = SkillCatalog(
+            definitions=(
+                SkillDefinition(
+                    metadata=SkillMetadata(
+                        name="financial-analysis",
+                        description="Use fixed financial evidence only.",
+                        skill_metadata={"version": "v1"},
+                        allowed_tools=[
+                            "market-reader",
+                            "fund-reader",
+                            "news-reader",
+                            "calculator",
+                        ],
+                    ),
                     instructions="Fixed financial analysis instructions.",
-                    allowed_tool_ids=frozenset(
-                        {"market-reader", "fund-reader", "news-reader", "calculator"}
+                    tenant_id=_TENANT_ID,
+                    source_path=(
+                        "tenants/eval-tenant/skills/financial-analysis/SKILL.md"
                     ),
                 ),
             ),
-            tenant_eligible_names=frozenset({"financial-analysis"}),
         )
         return SpecialistCatalog(
             registrations=tuple(
@@ -422,7 +430,7 @@ class _Harness:
                     id=role,
                     description=f"{role.title()} analysis",
                     actor_factory=self._factory(role),
-                    allowed_skill_names=frozenset({"financial-analysis"}),
+                    skill_names=("financial-analysis",),
                 )
                 for role in ("market", "fund", "news")
             ),
@@ -461,7 +469,7 @@ class _Harness:
             tenant_allowed_tool_ids=frozenset(
                 {"market-reader", "fund-reader", "news-reader", "calculator"}
             ),
-            skill_registry=skills,
+            skill_catalog=skills,
         )
 
     def _factory(self, role: str) -> Callable[..., SpecialistActor]:

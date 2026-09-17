@@ -61,10 +61,8 @@ from app.langgraph_v2.agent_graph import QueryUnderstandingActor, SynthesisActor
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy
 from app.langgraph_v2.agent_skills import (
+    SkillCatalog,
     SkillInvocation,
-    SkillReference,
-    SkillRegistration,
-    SpecialistSkillRegistry,
 )
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
@@ -87,6 +85,7 @@ from app.langgraph_v2.specialist_retry import (
     specialist_usage_limits,
 )
 from app.models.workflow import IntentResult, QueryUnderstandingOutput, ResolvedQuery
+from app.skills.schema import SkillDefinition, SkillMetadata
 from tests.integration.test_langgraph_v2_linear_core import (
     CheckpointerFactory,
     parse_sse,
@@ -744,13 +743,13 @@ class FinancialFixture:
                     id="market-analysis",
                     description="Market analysis",
                     actor_factory=self.specialists.market_analysis,
-                    allowed_skill_names=frozenset({"market-methodology"}),
+                    skill_names=("financial-common", "market-methodology"),
                 ),
                 SpecialistRegistration(
                     id="fund-research",
                     description="Fund research",
                     actor_factory=self.specialists.fund_research,
-                    allowed_skill_names=frozenset({"fund-disclosure"}),
+                    skill_names=("financial-common", "fund-disclosure"),
                 ),
             ),
             tool_registry=AgentToolRegistry(
@@ -796,51 +795,47 @@ class FinancialFixture:
                     *CalculationMethod,
                 }
             ),
-            skill_registry=SpecialistSkillRegistry(
-                registrations=(
-                    SkillRegistration(
-                        name="financial-common",
-                        version="2026.09",
-                        description="Use fixed financial fixture identifiers.",
+            skill_catalog=SkillCatalog(
+                definitions=(
+                    SkillDefinition(
+                        metadata=SkillMetadata(
+                            name="financial-common",
+                            description="Use fixed financial fixture identifiers.",
+                            skill_metadata={"version": "2026.09"},
+                            required_tools=["price_series"],
+                        ),
                         instructions="FULL-COMMON-SKILL-INSTRUCTIONS",
-                        required_tool_ids=frozenset({"price_series"}),
-                        references=(
-                            SkillReference(
-                                name="common-reference",
-                                content=self.content.skill_references.get(
-                                    "financial-common",
-                                    "FULL-COMMON-SKILL-REFERENCE",
-                                ),
-                            ),
+                        tenant_id="tenant-a",
+                        source_path=(
+                            "tenants/tenant-a/skills/financial-common/SKILL.md"
                         ),
                     ),
-                    SkillRegistration(
-                        name="market-methodology",
-                        version="2026.09",
-                        description="Interpret registered market calculations.",
+                    SkillDefinition(
+                        metadata=SkillMetadata(
+                            name="market-methodology",
+                            description="Interpret registered market calculations.",
+                            skill_metadata={"version": "2026.09"},
+                        ),
                         instructions="FULL-MARKET-SKILL-INSTRUCTIONS",
+                        tenant_id="tenant-a",
+                        source_path=(
+                            "tenants/tenant-a/skills/market-methodology/SKILL.md"
+                        ),
                     ),
-                    SkillRegistration(
-                        name="fund-disclosure",
-                        version="2026.09",
-                        description="Read fund holdings and disclosures.",
+                    SkillDefinition(
+                        metadata=SkillMetadata(
+                            name="fund-disclosure",
+                            description="Read fund holdings and disclosures.",
+                            skill_metadata={"version": "2026.09"},
+                            required_tools=["fund_holdings", "fund_reports"],
+                        ),
                         instructions="FULL-FUND-SKILL-INSTRUCTIONS",
-                        required_tool_ids=frozenset({"fund_holdings", "fund_reports"}),
-                        references=(
-                            SkillReference(
-                                name="fund-reference",
-                                content=self.content.skill_references.get(
-                                    "fund-disclosure",
-                                    "FULL-FUND-SKILL-REFERENCE",
-                                ),
-                            ),
+                        tenant_id="tenant-a",
+                        source_path=(
+                            "tenants/tenant-a/skills/fund-disclosure/SKILL.md"
                         ),
                     ),
                 ),
-                tenant_eligible_names=frozenset(
-                    {"financial-common", "market-methodology", "fund-disclosure"}
-                ),
-                shared_skill_names=frozenset({"financial-common"}),
             ),
         )
 

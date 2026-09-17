@@ -45,3 +45,40 @@ def test_specialist_definition_pin_is_recorded_without_definition_content(
         "task.id": "task-1",
         "specialist.definition.pin": "a" * 64,
     }
+
+
+def test_skill_pin_is_recorded_without_instruction_content_or_required_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    def get_tracer(_name: str) -> Tracer:
+        return provider.get_tracer("test")
+
+    monkeypatch.setattr(
+        telemetry_module.trace,
+        "get_tracer",
+        get_tracer,
+    )
+
+    telemetry_module.record_skill_pin(
+        tenant_id="tenant-a",
+        request_id="request-1",
+        task_id="task-1",
+        name="filing-analysis",
+        content_hash="b" * 64,
+        version=None,
+    )
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].name == "specialist.skill.accepted"
+    assert dict(spans[0].attributes or {}) == {
+        "tenant.id": "tenant-a",
+        "request.id": "request-1",
+        "task.id": "task-1",
+        "skill.name": "filing-analysis",
+        "skill.content_hash": "b" * 64,
+    }

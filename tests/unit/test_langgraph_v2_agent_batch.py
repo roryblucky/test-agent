@@ -60,10 +60,9 @@ from app.langgraph_v2.agent_graph import (
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
+    SkillCatalog,
     SkillInvocation,
     SkillPin,
-    SkillRegistration,
-    SpecialistSkillRegistry,
 )
 from app.langgraph_v2.calculations import (
     CalculationArtifactInvalid,
@@ -81,6 +80,26 @@ from app.langgraph_v2.specialist_retry import (
     SpecialistModelBoundary,
     specialist_usage_limits,
 )
+from app.skills.schema import SkillDefinition, SkillMetadata
+
+
+def _skill_definition(
+    name: str,
+    *,
+    instructions: str,
+    required_tools: tuple[str, ...] = (),
+) -> SkillDefinition:
+    return SkillDefinition(
+        metadata=SkillMetadata(
+            name=name,
+            description=f"{name} summary",
+            skill_metadata={"version": "1"},
+            required_tools=list(required_tools),
+        ),
+        instructions=instructions,
+        tenant_id="tenant-a",
+        source_path=f"tenants/tenant-a/skills/{name}/SKILL.md",
+    )
 
 
 class _Specialist:
@@ -1737,7 +1756,7 @@ def test_catalog_builds_a_no_tool_actor_when_scope_removes_all_tools() -> None:
     assert captured == [()]
 
 
-def test_catalog_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() -> None:
+def test_catalog_keeps_a_direct_no_tool_actor_when_skills_are_declared() -> None:
     direct_actor = _Specialist()
     catalog = SpecialistCatalog(
         registrations=(
@@ -1745,16 +1764,12 @@ def test_catalog_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() ->
                 id="market-data", description="market-data", actor=direct_actor
             ),
         ),
-        skill_registry=SpecialistSkillRegistry(
-            registrations=(
-                SkillRegistration(
-                    name="market-skill",
-                    version="1",
-                    description="Market summary",
-                    instructions="MARKET-FULL-INSTRUCTIONS",
+        skill_catalog=SkillCatalog(
+            definitions=(
+                _skill_definition(
+                    "market-skill", instructions="MARKET-FULL-INSTRUCTIONS"
                 ),
             ),
-            tenant_eligible_names=frozenset({"market-skill"}),
         ),
     )
 
@@ -1767,7 +1782,6 @@ def test_catalog_keeps_a_direct_no_tool_actor_when_scope_removes_all_skills() ->
                 "allowed_queries": frozenset(),
             }
         ),
-        scope_skill_names=frozenset(),
     )
 
     assert actor is direct_actor
@@ -1829,7 +1843,7 @@ def test_catalog_binds_skill_activation_without_expanding_frozen_business_tools(
                 id="market-data",
                 description="market-data",
                 actor_factory=factory,
-                allowed_skill_names=frozenset({"market-skill"}),
+                skill_names=("market-skill",),
             ),
         ),
         tool_registry=AgentToolRegistry(
@@ -1843,31 +1857,23 @@ def test_catalog_binds_skill_activation_without_expanding_frozen_business_tools(
             ),
         ),
         tenant_allowed_tool_ids=frozenset({"filing-tool"}),
-        skill_registry=SpecialistSkillRegistry(
-            registrations=(
-                SkillRegistration(
-                    name="shared-skill",
-                    version="1",
-                    description="Shared summary",
+        skill_catalog=SkillCatalog(
+            definitions=(
+                _skill_definition(
+                    "shared-skill",
                     instructions="SHARED-FULL-INSTRUCTIONS",
-                    required_tool_ids=frozenset({"filing-tool"}),
+                    required_tools=("filing-tool",),
                 ),
-                SkillRegistration(
-                    name="market-skill",
-                    version="1",
-                    description="Market summary",
-                    instructions="MARKET-FULL-INSTRUCTIONS",
+                _skill_definition(
+                    "market-skill", instructions="MARKET-FULL-INSTRUCTIONS"
                 ),
             ),
-            tenant_eligible_names=frozenset({"shared-skill", "market-skill"}),
-            shared_skill_names=frozenset({"shared-skill"}),
         ),
     )
 
     actor = catalog.bind_actor(
         catalog.registrations[0],
         context=_context(),
-        scope_skill_names=frozenset({"shared-skill", "market-skill"}),
     )
 
     assert isinstance(actor, _Specialist)
@@ -1876,13 +1882,12 @@ def test_catalog_binds_skill_activation_without_expanding_frozen_business_tools(
         "activate_skill",
     ]
     invocation = captured_invocation[0]
-    assert [summary.name for summary in invocation.summaries] == [
-        "shared-skill",
-        "market-skill",
-    ]
+    assert [summary.name for summary in invocation.summaries] == ["market-skill"]
     assert (
-        invocation.activate("shared-skill").instructions == "SHARED-FULL-INSTRUCTIONS"
+        invocation.activate("market-skill").instructions == "MARKET-FULL-INSTRUCTIONS"
     )
+    with pytest.raises(ValueError, match="Skill is not eligible"):
+        invocation.activate("shared-skill")
 
 
 def _tool_name(tool: Callable[..., object]) -> str:

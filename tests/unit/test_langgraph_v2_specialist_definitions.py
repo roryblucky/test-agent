@@ -41,6 +41,7 @@ from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import SkillInvocation
 from app.langgraph_v2.specialist_definitions import (
     LocalSpecialistDefinitionLoader,
+    SkillSourceLoad,
     SpecialistSourceDocument,
     SpecialistSourceLoad,
     build_specialist_catalog,
@@ -125,6 +126,20 @@ def _write_agent(
     directory = root / "tenants" / tenant_id / "agents"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / filename).write_text(content, encoding="utf-8")
+
+
+def _write_skill(
+    root: Path,
+    *,
+    tenant_id: str,
+    skill_name: str,
+    content: str,
+) -> Path:
+    directory = root / "tenants" / tenant_id / "skills" / skill_name
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "SKILL.md"
+    path.write_text(content, encoding="utf-8")
+    return path
 
 
 def _agent_document(
@@ -219,7 +234,7 @@ Instructions
     assert "tenant=tenant-a" in caplog.text
     assert "kind=specialist" in caplog.text
     assert "reason=unknown-model-profile" in caplog.text
-    assert "reason=skills-unavailable" in caplog.text
+    assert "reason=invalid-skill" in caplog.text
     assert "reason=invalid-metadata" in caplog.text
     assert "reason=invalid-instructions" in caplog.text
     assert "reason=read-failed" in caplog.text
@@ -292,6 +307,110 @@ async def test_markdown_specialist_uses_instruction_precedence_and_persists_pin(
 
 
 @pytest.mark.asyncio
+async def test_startup_loads_full_skills_without_references_and_validates_dependencies(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    valid_path = _write_skill(
+        tmp_path,
+        tenant_id="tenant-a",
+        skill_name="filing-analysis",
+        content="""---
+name: filing-analysis
+description: Analyze filings when assigned.
+metadata:
+  version: "1"
+required-tools: filing-reader
+allowed-tools: filing-reader news-reader
+---
+FULL-SKILL-INSTRUCTIONS-SENTINEL
+""",
+    )
+    references = valid_path.parent / "references"
+    references.mkdir()
+    (references / "guide.md").write_bytes(b"\xff")
+    _write_skill(
+        tmp_path,
+        tenant_id="tenant-a",
+        skill_name="unknown-tool",
+        content="""---
+name: unknown-tool
+description: Invalid tool dependency.
+allowed-tools: not-registered
+---
+INVALID-SKILL-INSTRUCTIONS-SENTINEL
+""",
+    )
+    _write_agent(
+        tmp_path,
+        tenant_id="tenant-a",
+        filename="valid.agent.md",
+        content=_agent_document(
+            specialist_id="valid",
+            skills="[filing-analysis]",
+        ),
+    )
+    _write_agent(
+        tmp_path,
+        tenant_id="tenant-a",
+        filename="invalid.agent.md",
+        content=_agent_document(
+            specialist_id="invalid",
+            skills="[unknown-tool]",
+        ),
+    )
+    _write_agent(
+        tmp_path,
+        tenant_id="tenant-a",
+        filename="missing.agent.md",
+        content=_agent_document(
+            specialist_id="missing",
+            skills="[does-not-exist]",
+        ),
+    )
+    tool_registry = AgentToolRegistry(
+        evidence_registrations=(
+            EvidenceToolRegistration(
+                id="filing-reader",
+                provider=lambda _source, _query: None,  # type: ignore[arg-type]
+                allowed_sources=frozenset(),
+            ),
+            EvidenceToolRegistration(
+                id="news-reader",
+                provider=lambda _source, _query: None,  # type: ignore[arg-type]
+                allowed_sources=frozenset(),
+            ),
+        )
+    )
+    caplog.set_level(logging.INFO)
+
+    catalog = await build_specialist_catalog(
+        LocalSpecialistDefinitionLoader(tmp_path),
+        tenant_id="tenant-a",
+        model_registry=cast(ModelRegistry, _ModelRegistry("specialist")),
+        tool_registry=tool_registry,
+        tenant_allowed_tool_ids=tool_registry.registered_ids,
+    )
+
+    assert [descriptor.id for descriptor in catalog.descriptors] == ["valid"]
+    registration = catalog.resolve("valid")
+    assert registration.skill_names == ("filing-analysis",)
+    assert catalog.skill_catalog is not None
+    invocation = catalog.skill_catalog.begin_invocation(
+        specialist_skill_names=registration.skill_names,
+        effective_tool_ids=frozenset({"filing-reader"}),
+    )
+    assert invocation.activate("filing-analysis").instructions == (
+        "FULL-SKILL-INSTRUCTIONS-SENTINEL"
+    )
+    assert "kind=skill loaded=1 skipped=1" in caplog.text
+    assert "reason=unknown-tool" in caplog.text
+    assert "reason=invalid-skill" in caplog.text
+    assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in caplog.text
+    assert "INVALID-SKILL-INSTRUCTIONS-SENTINEL" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_catalog_snapshot_stays_fixed_until_a_new_startup_load(
     tmp_path: Path,
 ) -> None:
@@ -354,6 +473,72 @@ async def test_catalog_snapshot_stays_fixed_until_a_new_startup_load(
 
 
 @pytest.mark.asyncio
+async def test_skill_snapshot_and_versionless_pin_change_only_after_new_startup(
+    tmp_path: Path,
+) -> None:
+    skill_path = _write_skill(
+        tmp_path,
+        tenant_id="tenant-a",
+        skill_name="market-analysis",
+        content="""---
+name: market-analysis
+description: Analyze a market.
+---
+FIRST-SKILL-INSTRUCTIONS
+""",
+    )
+    _write_agent(
+        tmp_path,
+        tenant_id="tenant-a",
+        filename="market-data.agent.md",
+        content=_agent_document(skills="[market-analysis]"),
+    )
+    loader = LocalSpecialistDefinitionLoader(tmp_path)
+    registry = cast(ModelRegistry, _ModelRegistry("specialist"))
+    first = await build_specialist_catalog(
+        loader,
+        tenant_id="tenant-a",
+        model_registry=registry,
+    )
+    first_registration = first.resolve("market-data")
+    assert first.skill_catalog is not None
+    first_invocation = first.skill_catalog.begin_invocation(
+        specialist_skill_names=first_registration.skill_names,
+        effective_tool_ids=frozenset(),
+    )
+    first_activation = first_invocation.activate("market-analysis")
+
+    skill_path.write_text(
+        """---
+name: market-analysis
+description: Analyze a market.
+---
+SECOND-SKILL-INSTRUCTIONS
+""",
+        encoding="utf-8",
+    )
+    repeated_activation = first_invocation.activate("market-analysis")
+    second = await build_specialist_catalog(
+        loader,
+        tenant_id="tenant-a",
+        model_registry=registry,
+    )
+    second_registration = second.resolve("market-data")
+    assert second.skill_catalog is not None
+    second_activation = second.skill_catalog.begin_invocation(
+        specialist_skill_names=second_registration.skill_names,
+        effective_tool_ids=frozenset(),
+    ).activate("market-analysis")
+
+    assert first_activation.pin.version is None
+    assert repeated_activation.instructions == "FIRST-SKILL-INSTRUCTIONS"
+    assert repeated_activation.pin == first_activation.pin
+    assert second_activation.instructions == "SECOND-SKILL-INSTRUCTIONS"
+    assert second_activation.pin.version is None
+    assert second_activation.pin.content_hash != first_activation.pin.content_hash
+
+
+@pytest.mark.asyncio
 async def test_definition_pin_is_canonical_and_excludes_storage_identity(
     tmp_path: Path,
 ) -> None:
@@ -403,11 +588,41 @@ def test_definition_pin_fields_are_backward_compatible_with_old_checkpoint_data(
     assert accepted.specialist_definition_pins == ()
 
 
+def test_skill_pin_checkpoint_accepts_new_optional_version_and_old_empty_field() -> (
+    None
+):
+    without_version = AcceptedBatch.model_validate(
+        {
+            "id": "batch-1",
+            "outcomes": [],
+            "skill_pins": [
+                {
+                    "task_id": "task-1",
+                    "pins": [
+                        {
+                            "name": "filing-analysis",
+                            "content_hash": "a" * 64,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    old_checkpoint = AcceptedBatch.model_validate({"id": "batch-1", "outcomes": []})
+
+    assert without_version.skill_pins[0].pins[0].version is None
+    assert old_checkpoint.skill_pins == ()
+
+
 @pytest.mark.asyncio
 async def test_catalog_rejects_a_loader_document_owned_by_another_tenant(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class ForeignTenantLoader:
+        async def load_skills(self, tenant_id: str) -> SkillSourceLoad:
+            assert tenant_id == "tenant-a"
+            return SkillSourceLoad()
+
         async def load_specialists(self, tenant_id: str) -> SpecialistSourceLoad:
             assert tenant_id == "tenant-a"
             return SpecialistSourceLoad(

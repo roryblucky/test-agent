@@ -2,151 +2,159 @@
 
 import pytest
 
-from app.langgraph_v2.agent_skills import (
-    SkillReference,
-    SkillRegistration,
-    SpecialistSkillRegistry,
-)
+from app.langgraph_v2.agent_skills import SkillCatalog
+from app.skills.schema import ReferenceDocument, SkillDefinition, SkillMetadata
 
 
 def _skill(
     name: str,
     *,
-    required_tool_ids: frozenset[str] = frozenset(),
-    allowed_tool_ids: frozenset[str] = frozenset(),
-) -> SkillRegistration:
-    return SkillRegistration(
-        name=name,
-        version="2026.09",
-        description=f"{name} summary",
-        instructions=f"{name} full-instructions-sentinel",
-        required_tool_ids=required_tool_ids,
-        allowed_tool_ids=allowed_tool_ids,
+    version: str | None = "2026.09",
+    required_tool_ids: tuple[str, ...] = (),
+    allowed_tool_ids: tuple[str, ...] = (),
+    instructions: str | None = None,
+) -> SkillDefinition:
+    metadata: dict[str, str] = {}
+    if version is not None:
+        metadata["version"] = version
+    return SkillDefinition(
+        metadata=SkillMetadata(
+            name=name,
+            description=f"{name} summary",
+            skill_metadata=metadata,
+            required_tools=list(required_tool_ids),
+            allowed_tools=list(allowed_tool_ids),
+        ),
+        instructions=instructions or f"{name} full-instructions-sentinel",
+        tenant_id="tenant-a",
+        source_path=f"tenants/tenant-a/skills/{name}/SKILL.md",
     )
 
 
-@pytest.mark.parametrize("registered_count", [20, 21])
-def test_effective_summaries_are_trusted_ordered_and_capped_at_twenty(
-    registered_count: int,
+@pytest.mark.parametrize("declared_count", [20, 21])
+def test_summaries_preserve_specialist_declaration_order_and_cap_at_twenty(
+    declared_count: int,
 ) -> None:
-    names = tuple(f"skill-{index:02d}" for index in range(registered_count))
-    registry = SpecialistSkillRegistry(
-        registrations=tuple(_skill(name) for name in names),
-        tenant_eligible_names=frozenset(names),
-        shared_skill_names=frozenset({"skill-00"}),
-    )
+    names = tuple(f"skill-{index:02d}" for index in range(declared_count))
+    catalog = SkillCatalog(definitions=tuple(_skill(name) for name in reversed(names)))
 
-    invocation = registry.begin_invocation(
-        specialist_skill_names=frozenset(names[1:]),
-        scope_skill_names=frozenset(names),
+    invocation = catalog.begin_invocation(
+        specialist_skill_names=names,
         effective_tool_ids=frozenset({"filing-reader"}),
     )
 
     assert [summary.name for summary in invocation.summaries] == list(names[:20])
-    assert all("full-instructions-sentinel" not in summary.description for summary in invocation.summaries)
-    if registered_count == 21:
+    assert all(
+        "full-instructions-sentinel" not in summary.description
+        for summary in invocation.summaries
+    )
+    if declared_count == 21:
         with pytest.raises(ValueError, match="Skill is not eligible"):
             invocation.activate("skill-20")
 
 
-def test_activation_rechecks_eligibility_pins_content_and_cannot_expand_tools() -> None:
-    registry = SpecialistSkillRegistry(
-        registrations=(
+def test_multiple_activations_are_idempotent_ordered_and_do_not_expand_tools() -> None:
+    catalog = SkillCatalog(
+        definitions=(
             _skill(
-                "shared-skill",
-                required_tool_ids=frozenset({"filing-reader"}),
-                allowed_tool_ids=frozenset({"filing-reader", "news-reader"}),
+                "filing-skill",
+                required_tool_ids=("filing-reader",),
+                allowed_tool_ids=("filing-reader", "news-reader"),
             ),
-            _skill("market-skill"),
-            _skill("other-specialist-skill"),
-            _skill("cached-only-skill"),
-        ),
-        tenant_eligible_names=frozenset(
-            {"shared-skill", "market-skill", "other-specialist-skill"}
-        ),
-        shared_skill_names=frozenset({"shared-skill"}),
+            _skill("market-skill", version=None),
+            _skill("undeclared-skill"),
+        )
     )
-    invocation = registry.begin_invocation(
-        specialist_skill_names=frozenset({"market-skill"}),
-        scope_skill_names=frozenset({"shared-skill", "market-skill"}),
+    invocation = catalog.begin_invocation(
+        specialist_skill_names=("market-skill", "filing-skill"),
         effective_tool_ids=frozenset({"filing-reader"}),
     )
 
-    activated = invocation.activate("shared-skill")
+    market = invocation.activate("market-skill")
+    filing = invocation.activate("filing-skill")
 
-    assert activated.instructions == "shared-skill full-instructions-sentinel"
-    assert activated.pin.name == "shared-skill"
-    assert activated.pin.version == "2026.09"
-    assert len(activated.pin.content_hash) == 64
-    assert invocation.pins == (activated.pin,)
+    assert market.instructions == "market-skill full-instructions-sentinel"
+    assert market.pin.version is None
+    assert filing.pin.version == "2026.09"
+    assert invocation.pins == (market.pin, filing.pin)
     assert invocation.effective_tool_ids == frozenset({"filing-reader"})
-    assert invocation.activate("shared-skill") == activated
-    assert invocation.pins == (activated.pin,)
-    with pytest.raises(ValueError, match="Specialist may activate only one Skill"):
-        invocation.activate("market-skill")
-
-    for name in ("other-specialist-skill", "cached-only-skill", "missing-skill"):
-        with pytest.raises(ValueError, match="Skill is not eligible"):
-            invocation.activate(name)
+    assert invocation.activate("market-skill") == market
+    assert invocation.pins == (market.pin, filing.pin)
+    with pytest.raises(ValueError, match="Skill is not eligible"):
+        invocation.activate("undeclared-skill")
+    with pytest.raises(ValueError, match="Skill is not eligible"):
+        invocation.activate("missing-skill")
 
 
-def test_activation_rejects_required_tool_outside_frozen_tool_set() -> None:
-    registry = SpecialistSkillRegistry(
-        registrations=(
-            _skill("requires-news", required_tool_ids=frozenset({"news-reader"})),
-        ),
-        tenant_eligible_names=frozenset({"requires-news"}),
-        shared_skill_names=frozenset({"requires-news"}),
+def test_required_tools_filter_summaries_but_allowed_tools_do_not() -> None:
+    catalog = SkillCatalog(
+        definitions=(
+            _skill("requires-news", required_tool_ids=("news-reader",)),
+            _skill("suggests-news", allowed_tool_ids=("news-reader",)),
+        )
     )
-    invocation = registry.begin_invocation(
-        specialist_skill_names=frozenset(),
-        scope_skill_names=frozenset({"requires-news"}),
+
+    invocation = catalog.begin_invocation(
+        specialist_skill_names=("requires-news", "suggests-news"),
         effective_tool_ids=frozenset({"filing-reader"}),
     )
 
-    with pytest.raises(ValueError, match="Skill required Tool is not eligible"):
+    assert [summary.name for summary in invocation.summaries] == ["suggests-news"]
+    with pytest.raises(ValueError, match="Skill is not eligible"):
         invocation.activate("requires-news")
 
 
-def test_activation_returns_references_and_pins_the_complete_skill_definition() -> None:
-    skill = SkillRegistration(
-        name="filing-analysis",
-        version="1",
-        description="Read an eligible filing.",
-        instructions="Use the filing guidance.",
-        required_tool_ids=frozenset({"filing-reader"}),
-        references=(
-            SkillReference(name="filing-guide", content="REFERENCE-SENTINEL"),
-        ),
+def test_pin_hashes_cached_definition_but_excludes_references_and_storage_identity() -> (
+    None
+):
+    original = _skill("filing-analysis", version=None)
+    same_content_elsewhere = original.model_copy(
+        update={
+            "tenant_id": "tenant-b",
+            "source_path": "gs://bucket/tenants/tenant-b/skills/renamed/SKILL.md",
+            "references": [
+                ReferenceDocument(
+                    filename="guide.md",
+                    content="REFERENCE-SENTINEL",
+                    source_path="ignored",
+                )
+            ],
+        }
     )
-    registry = SpecialistSkillRegistry(
-        registrations=(skill,),
-        tenant_eligible_names=frozenset({skill.name}),
-        shared_skill_names=frozenset({skill.name}),
+    changed = _skill(
+        "filing-analysis",
+        version=None,
+        instructions="changed instructions",
     )
 
-    activated = registry.begin_invocation(
-        specialist_skill_names=frozenset(),
-        scope_skill_names=frozenset({skill.name}),
-        effective_tool_ids=frozenset({"filing-reader"}),
-    ).activate(skill.name)
+    original_pin = (
+        SkillCatalog(definitions=(original,))
+        .begin_invocation(
+            specialist_skill_names=(original.metadata.name,),
+            effective_tool_ids=frozenset(),
+        )
+        .activate(original.metadata.name)
+        .pin
+    )
+    same_pin = (
+        SkillCatalog(definitions=(same_content_elsewhere,))
+        .begin_invocation(
+            specialist_skill_names=(same_content_elsewhere.metadata.name,),
+            effective_tool_ids=frozenset(),
+        )
+        .activate(same_content_elsewhere.metadata.name)
+        .pin
+    )
+    changed_pin = (
+        SkillCatalog(definitions=(changed,))
+        .begin_invocation(
+            specialist_skill_names=(changed.metadata.name,),
+            effective_tool_ids=frozenset(),
+        )
+        .activate(changed.metadata.name)
+        .pin
+    )
 
-    assert activated.references == skill.references
-    changed_reference = SkillRegistration(
-        name=skill.name,
-        version=skill.version,
-        description=skill.description,
-        instructions=skill.instructions,
-        required_tool_ids=skill.required_tool_ids,
-        references=(SkillReference(name="filing-guide", content="changed"),),
-    )
-    changed_tools = SkillRegistration(
-        name=skill.name,
-        version=skill.version,
-        description=skill.description,
-        instructions=skill.instructions,
-        required_tool_ids=frozenset({"news-reader"}),
-        references=skill.references,
-    )
-    assert skill.pin.content_hash != changed_reference.pin.content_hash
-    assert skill.pin.content_hash != changed_tools.pin.content_hash
+    assert original_pin.version is None
+    assert original_pin.content_hash == same_pin.content_hash
+    assert original_pin.content_hash != changed_pin.content_hash

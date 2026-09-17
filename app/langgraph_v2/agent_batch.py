@@ -31,9 +31,9 @@ from app.langgraph_v2.agent_evidence import (
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import (
+    SkillCatalog,
     SkillInvocation,
     SkillPin,
-    SpecialistSkillRegistry,
 )
 from app.langgraph_v2.calculations import (
     MAX_CALCULATIONS_PER_CONTRIBUTION,
@@ -518,7 +518,7 @@ class SpecialistRegistration:
     description: str
     actor: SpecialistActor | None = None
     actor_factory: SpecialistActorFactory | None = None
-    allowed_skill_names: frozenset[str] = frozenset()
+    skill_names: tuple[str, ...] = ()
     definition_pin: str = ""
 
     def __post_init__(self) -> None:
@@ -530,7 +530,7 @@ class SpecialistRegistration:
                         "adapter": "code",
                         "description": self.description,
                         "id": self.id,
-                        "skills": sorted(self.allowed_skill_names),
+                        "skills": list(self.skill_names),
                     },
                     sort_keys=True,
                     separators=(",", ":"),
@@ -665,7 +665,7 @@ class SpecialistCatalog:
     registrations: Sequence[SpecialistRegistration]
     tool_registry: AgentToolRegistry = AgentToolRegistry()
     tenant_allowed_tool_ids: frozenset[str] = frozenset()
-    skill_registry: SpecialistSkillRegistry | None = None
+    skill_catalog: SkillCatalog | None = None
 
     def __post_init__(self) -> None:
         ids = tuple(registration.id for registration in self.registrations)
@@ -716,7 +716,6 @@ class SpecialistCatalog:
         registration: SpecialistRegistration,
         *,
         context: EvidenceInvocationContext,
-        scope_skill_names: frozenset[str] = frozenset(),
         tool_telemetry: ToolTelemetry | None = None,
     ) -> SpecialistActor:
         """Create one actor with a frozen Scope-narrowed Tool surface."""
@@ -726,12 +725,11 @@ class SpecialistCatalog:
         assert actor_factory is not None
         effective_ids = self.effective_tool_ids(scope_tool_ids=context.allowed_tool_ids)
         skill_invocation = (
-            self.skill_registry.begin_invocation(
-                specialist_skill_names=registration.allowed_skill_names,
-                scope_skill_names=scope_skill_names,
+            self.skill_catalog.begin_invocation(
+                specialist_skill_names=registration.skill_names,
                 effective_tool_ids=effective_ids,
             )
-            if self.skill_registry is not None
+            if self.skill_catalog is not None
             else None
         )
         has_skill_activation = bool(
@@ -898,7 +896,6 @@ async def execute_specialist(
     specialist_catalog: SpecialistCatalog,
     catalog: RequestEvidenceCatalog | None = None,
     context: EvidenceInvocationContext,
-    scope_skill_names: frozenset[str] = frozenset(),
     context_results: tuple[PriorResultView, ...] = (),
     tool_telemetry: ToolTelemetry | None = None,
     diagnostics: SpecialistExecutionDiagnostics | None = None,
@@ -944,7 +941,6 @@ async def execute_specialist(
         actor = specialist_catalog.bind_actor(
             registration,
             context=attempt_context,
-            scope_skill_names=scope_skill_names,
             tool_telemetry=tool_telemetry,
         )
         try:

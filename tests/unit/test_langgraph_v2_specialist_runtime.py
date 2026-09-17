@@ -55,9 +55,7 @@ from app.langgraph_v2.agent_evidence import (
     bind_evidence_tool,
 )
 from app.langgraph_v2.agent_skills import (
-    SkillReference,
-    SkillRegistration,
-    SpecialistSkillRegistry,
+    SkillCatalog,
 )
 from app.langgraph_v2.specialist_retry import (
     RetryDisposition,
@@ -67,6 +65,7 @@ from app.langgraph_v2.specialist_retry import (
     classify_specialist_failure,
     specialist_usage_limits,
 )
+from app.skills.schema import SkillDefinition, SkillMetadata
 
 
 def _context() -> EvidenceInvocationContext:
@@ -114,7 +113,7 @@ def test_specialist_factory_enables_only_native_output_retries() -> None:
     }
     instructions = registry.kwargs["instructions"]
     assert isinstance(instructions, str)
-    assert "activate one eligible Skill" in instructions
+    assert "activate zero or more eligible Skills" in instructions
 
 
 def test_bound_specialist_factory_uses_exact_frozen_tools() -> None:
@@ -137,29 +136,38 @@ def test_bound_specialist_factory_uses_exact_frozen_tools() -> None:
 
 
 @pytest.mark.asyncio
-async def test_specialist_activates_a_summary_before_using_an_existing_tool() -> None:
-    skill_registry = SpecialistSkillRegistry(
-        registrations=(
-            SkillRegistration(
-                name="filing-analysis",
-                version="1",
-                description="Read a filing.",
-                instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
-                references=(
-                    SkillReference(
-                        name="filing-guide",
-                        content="FULL-SKILL-REFERENCE-SENTINEL",
-                    ),
+async def test_specialist_interleaves_multiple_skill_activations_with_business_tools() -> (
+    None
+):
+    skill_catalog = SkillCatalog(
+        definitions=tuple(
+            SkillDefinition(
+                metadata=SkillMetadata(
+                    name=name,
+                    description=description,
+                    skill_metadata={"version": "1"},
+                    required_tools=["read_evidence"],
                 ),
-                required_tool_ids=frozenset({"read_evidence"}),
-            ),
-        ),
-        tenant_eligible_names=frozenset({"filing-analysis"}),
-        shared_skill_names=frozenset({"filing-analysis"}),
+                instructions=instructions,
+                tenant_id="tenant-a",
+                source_path=f"tenants/tenant-a/skills/{name}/SKILL.md",
+            )
+            for name, description, instructions in (
+                (
+                    "filing-analysis",
+                    "Read a filing.",
+                    "FULL-FILING-INSTRUCTIONS-SENTINEL",
+                ),
+                (
+                    "market-analysis",
+                    "Interpret market evidence.",
+                    "FULL-MARKET-INSTRUCTIONS-SENTINEL",
+                ),
+            )
+        )
     )
-    invocation = skill_registry.begin_invocation(
-        specialist_skill_names=frozenset(),
-        scope_skill_names=frozenset({"filing-analysis"}),
+    invocation = skill_catalog.begin_invocation(
+        specialist_skill_names=("filing-analysis", "market-analysis"),
         effective_tool_ids=frozenset({"read_evidence"}),
     )
     calls = 0
@@ -176,7 +184,9 @@ async def test_specialist_activates_a_summary_before_using_an_existing_tool() ->
         assert business_tools == ["read_evidence"]
         if calls == 1:
             assert "filing-analysis" in repr(messages)
-            assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
+            assert "market-analysis" in repr(messages)
+            assert "FULL-FILING-INSTRUCTIONS-SENTINEL" not in repr(messages)
+            assert "FULL-MARKET-INSTRUCTIONS-SENTINEL" not in repr(messages)
             return ModelResponse(
                 parts=[
                     ToolCallPart(
@@ -186,11 +196,24 @@ async def test_specialist_activates_a_summary_before_using_an_existing_tool() ->
                 ]
             )
         if calls == 2:
-            assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
-            assert "FULL-SKILL-REFERENCE-SENTINEL" in repr(messages)
+            assert "FULL-FILING-INSTRUCTIONS-SENTINEL" in repr(messages)
+            assert "FULL-MARKET-INSTRUCTIONS-SENTINEL" not in repr(messages)
             return ModelResponse(
                 parts=[ToolCallPart(tool_name="read_evidence", args={})]
             )
+        if calls == 3:
+            assert "already-authorized-tool-result" in repr(messages)
+            assert "FULL-MARKET-INSTRUCTIONS-SENTINEL" not in repr(messages)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="activate_skill",
+                        args={"skill_name": "market-analysis"},
+                    )
+                ]
+            )
+        assert "FULL-FILING-INSTRUCTIONS-SENTINEL" in repr(messages)
+        assert "FULL-MARKET-INSTRUCTIONS-SENTINEL" in repr(messages)
         return ModelResponse(
             parts=[
                 ToolCallPart(
@@ -219,7 +242,11 @@ async def test_specialist_activates_a_summary_before_using_an_existing_tool() ->
         )
     )
 
-    assert calls == 3
+    assert calls == 4
+    assert [pin.name for pin in attempt.skill_pins] == [
+        "filing-analysis",
+        "market-analysis",
+    ]
     assert attempt.skill_pins == invocation.pins
 
 

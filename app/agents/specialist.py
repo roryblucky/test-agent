@@ -39,8 +39,8 @@ SPECIALIST_OUTPUT_RETRIES = 2
 
 SPECIALIST_INSTRUCTIONS = """\
 You are a Specialist Agent. Complete only the assigned objective.
-Return one structured finding. You may activate one eligible Skill named in the
-supplied summaries when it helps the objective. Skill activation never grants
+Return one structured finding. You may activate zero or more eligible Skills named
+in the supplied summaries when they help the objective. Skill activation never grants
 authority. You may call only the supplied Evidence Tools and must not include
 execution diagnostics.
 """

@@ -103,6 +103,30 @@ def record_specialist_definition_pin(
         )
 
 
+def record_skill_pin(
+    *,
+    tenant_id: str,
+    request_id: str,
+    task_id: str,
+    name: str,
+    content_hash: str,
+    version: str | None,
+) -> None:
+    """Attach one accepted Skill identity without its instructions to the trace."""
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_as_current_span("specialist.skill.accepted") as span:
+        attributes = {
+            "tenant.id": tenant_id,
+            "request.id": request_id,
+            "task.id": task_id,
+            "skill.name": name,
+            "skill.content_hash": content_hash,
+        }
+        if version is not None:
+            attributes["skill.version"] = version
+        span.set_attributes(attributes)
+
+
 def trace_span(name: str | None = None) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator to wrap a function execution in an OpenTelemetry span.
 

@@ -52,7 +52,9 @@ class _GCSClient(Protocol):
     def bucket(self, bucket_name: str) -> _GCSBucket: ...
 
 
-def _parse_skill_md(content: str, tenant_id: str, source_path: str) -> SkillDefinition:
+def parse_skill_definition(
+    content: str, tenant_id: str, source_path: str
+) -> SkillDefinition:
     """Parse a complete SKILL.md file (Tier 2 Activation object).
 
     Args:
@@ -211,7 +213,7 @@ class GCSSkillLoader:
         blob = bucket.blob(blob_name)
         content = blob.download_as_text()
 
-        skill = _parse_skill_md(content, summary.tenant_id, summary.source_path)
+        skill = parse_skill_definition(content, summary.tenant_id, summary.source_path)
         logger.info(
             f"[{summary.tenant_id}] Activated skill: {skill.metadata.name} "
             f"(tools: {skill.metadata.allowed_tools})"
@@ -365,7 +367,7 @@ class LocalSkillLoader:
         """Tier 2: Read and fully parse a SKILL.md from local path."""
         skill_file = Path(summary.source_path)
         content = skill_file.read_text(encoding="utf-8")
-        skill = _parse_skill_md(content, summary.tenant_id, str(skill_file))
+        skill = parse_skill_definition(content, summary.tenant_id, str(skill_file))
         logger.info(f"[{summary.tenant_id}] Activated skill: {skill.metadata.name}")
         return skill
 

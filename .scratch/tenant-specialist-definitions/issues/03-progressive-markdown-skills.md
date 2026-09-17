@@ -4,7 +4,7 @@
 
 **Blocked by:** 02 — 本地 Markdown Specialist 从启动加载到完成 Task。
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 依据：已批准的 Tenant-authored Specialist Definitions 规格及 ADR 0008。
 

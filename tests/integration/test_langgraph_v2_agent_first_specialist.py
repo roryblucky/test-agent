@@ -64,10 +64,8 @@ from app.langgraph_v2.agent_evidence import (
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy
 from app.langgraph_v2.agent_skills import (
+    SkillCatalog,
     SkillInvocation,
-    SkillReference,
-    SkillRegistration,
-    SpecialistSkillRegistry,
 )
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
@@ -96,6 +94,7 @@ from app.langgraph_v2.specialist_retry import (
     specialist_usage_limits,
 )
 from app.models.workflow import IntentResult, QueryUnderstandingOutput, ResolvedQuery
+from app.skills.schema import SkillDefinition, SkillMetadata
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
@@ -617,7 +616,6 @@ def _skill_specialist_factory(
             )
         if calls == 2:
             assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
-            assert "FULL-SKILL-REFERENCE-SENTINEL" in repr(messages)
             return ModelResponse(
                 parts=[
                     ToolCallPart(
@@ -707,9 +705,24 @@ class _MarkdownSpecialistModelRegistry:
 
     def create_agent(self, name: str, **kwargs: Any) -> object:
         assert name == "specialist"
+        calls = 0
 
         def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal calls
+            calls += 1
             self.model_messages.append(repr(messages))
+            if calls == 1:
+                assert "market-analysis" in repr(messages)
+                assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="activate_skill",
+                            args={"skill_name": "market-analysis"},
+                        )
+                    ]
+                )
+            assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
             return ModelResponse(
                 parts=[
                     ToolCallPart(
@@ -738,7 +751,7 @@ class _MarkdownTenantManager(_TenantManager):
         return cast(ModelRegistry, self.registry)
 
 
-def test_local_markdown_specialist_runs_through_http_and_persists_definition_pin(
+def test_local_markdown_specialist_and_skill_run_through_http_and_persist_pins(
     langgraph_v2_migrated_database_url: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -747,7 +760,7 @@ def test_local_markdown_specialist_runs_through_http_and_persists_definition_pin
 id: market-data
 description: Tenant-authored market analysis.
 model-profile: specialist
-skills: []
+skills: [market-analysis]
 ---
 TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL
 """
@@ -756,18 +769,36 @@ TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL
     )
     definition_path.parent.mkdir(parents=True)
     definition_path.write_text(definition, encoding="utf-8")
+    skill_path = (
+        tmp_path / "tenants" / "tenant-a" / "skills" / "market-analysis" / "SKILL.md"
+    )
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text(
+        """---
+name: market-analysis
+description: Apply the Tenant market methodology.
+---
+MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL
+""",
+        encoding="utf-8",
+    )
     registry = _MarkdownSpecialistModelRegistry()
     tenant_manager = _MarkdownTenantManager(registry)
     telemetry_records: list[dict[str, str]] = []
+    skill_telemetry_records: list[dict[str, str | None]] = []
 
     def record_specialist_definition_pin(**record: str) -> None:
         telemetry_records.append(record)
+
+    def record_skill_pin(**record: str | None) -> None:
+        skill_telemetry_records.append(record)
 
     monkeypatch.setattr(
         agent_graph,
         "record_specialist_definition_pin",
         record_specialist_definition_pin,
     )
+    monkeypatch.setattr(agent_graph, "record_skill_pin", record_skill_pin)
     catalogs = asyncio.run(
         load_local_specialist_catalogs(tenant_manager, root=tmp_path)
     )
@@ -819,6 +850,8 @@ TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL
         coordinator.inputs[0].specialist_descriptors == catalogs["tenant-a"].descriptors
     )
     assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" in registry.model_messages[0]
+    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in registry.model_messages[0]
+    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" in registry.model_messages[1]
     assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in response.text
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
@@ -836,7 +869,23 @@ TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL
             "pin": pin,
         }
     ]
+    skill_pins = accepted["skill_pins"]
+    skill_pin = skill_pins[0]["pins"][0]
+    assert skill_pin["name"] == "market-analysis"
+    assert skill_pin["version"] is None
+    assert len(skill_pin["content_hash"]) == 64
+    assert skill_telemetry_records == [
+        {
+            "tenant_id": "tenant-a",
+            "request_id": "markdown-specialist-request",
+            "task_id": accepted["outcomes"][0]["task_id"],
+            "name": "market-analysis",
+            "content_hash": skill_pin["content_hash"],
+            "version": None,
+        }
+    ]
     assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in repr(state)
+    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
 
 
 def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
@@ -2306,7 +2355,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
         intent="market_outlook",
         description="Assess market conditions.",
         allowed_tool_ids=frozenset({"filing_reader"}),
-        allowed_skill_names=frozenset({"filing-analysis"}),
+        allowed_skill_names=frozenset({"intent-must-not-filter-skills"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
     )
@@ -2316,7 +2365,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
                 id="market-data",
                 description="Market data",
                 actor_factory=_skill_specialist_factory,
-                allowed_skill_names=frozenset({"filing-analysis"}),
+                skill_names=("filing-analysis",),
             ),
         ),
         tool_registry=AgentToolRegistry(
@@ -2330,24 +2379,20 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
             ),
         ),
         tenant_allowed_tool_ids=frozenset({"filing_reader"}),
-        skill_registry=SpecialistSkillRegistry(
-            registrations=(
-                SkillRegistration(
-                    name="filing-analysis",
-                    version="2026.09",
-                    description="Read an eligible filing before analysis.",
-                    instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
-                    references=(
-                        SkillReference(
-                            name="filing-guide",
-                            content="FULL-SKILL-REFERENCE-SENTINEL",
-                        ),
+        skill_catalog=SkillCatalog(
+            definitions=(
+                SkillDefinition(
+                    metadata=SkillMetadata(
+                        name="filing-analysis",
+                        description="Read an eligible filing before analysis.",
+                        skill_metadata={"version": "2026.09"},
+                        required_tools=["filing_reader"],
                     ),
-                    required_tool_ids=frozenset({"filing_reader"}),
+                    instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
+                    tenant_id="tenant-a",
+                    source_path=("tenants/tenant-a/skills/filing-analysis/SKILL.md"),
                 ),
             ),
-            tenant_eligible_names=frozenset({"filing-analysis"}),
-            shared_skill_names=frozenset({"filing-analysis"}),
         ),
     )
 
@@ -2407,7 +2452,6 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
     assert pin["version"] == "2026.09"
     assert len(pin["content_hash"]) == 64
     assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
-    assert "FULL-SKILL-REFERENCE-SENTINEL" not in repr(state)
     assert all(
         "filing-analysis" not in input.model_dump_json() for input in coordinator.inputs
     )
