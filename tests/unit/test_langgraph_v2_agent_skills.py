@@ -72,6 +72,7 @@ def test_multiple_activations_are_idempotent_ordered_and_do_not_expand_tools() -
 
     market = invocation.activate("market-skill")
     filing = invocation.activate("filing-skill")
+    activation_tool = invocation.activation_tool()
 
     assert market.instructions == "market-skill full-instructions-sentinel"
     assert market.pin.version is None
@@ -79,6 +80,7 @@ def test_multiple_activations_are_idempotent_ordered_and_do_not_expand_tools() -
     assert invocation.pins == (market.pin, filing.pin)
     assert invocation.effective_tool_ids == frozenset({"filing-reader"})
     assert invocation.activate("market-skill") == market
+    assert activation_tool("market-skill") == ""
     assert invocation.pins == (market.pin, filing.pin)
     with pytest.raises(ValueError, match="Skill is not eligible"):
         invocation.activate("undeclared-skill")
@@ -102,6 +104,22 @@ def test_required_tools_filter_summaries_but_allowed_tools_do_not() -> None:
     assert [summary.name for summary in invocation.summaries] == ["suggests-news"]
     with pytest.raises(ValueError, match="Skill is not eligible"):
         invocation.activate("requires-news")
+
+
+def test_activation_tool_discloses_only_instructions_once() -> None:
+    invocation = SkillCatalog(definitions=(_skill("market-skill"),)).begin_invocation(
+        specialist_skill_names=("market-skill",),
+        effective_tool_ids=frozenset(),
+    )
+    activate_skill = invocation.activation_tool()
+
+    first_result = activate_skill("market-skill")
+    repeated_result = activate_skill("market-skill")
+
+    assert first_result == "market-skill full-instructions-sentinel"
+    assert "content_hash" not in first_result
+    assert repeated_result == ""
+    assert [pin.name for pin in invocation.pins] == ["market-skill"]
 
 
 def test_pin_hashes_cached_definition_but_excludes_references_and_storage_identity() -> (

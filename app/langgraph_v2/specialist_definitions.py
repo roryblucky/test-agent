@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -34,8 +35,8 @@ MAX_SPECIALIST_INSTRUCTION_CHARACTERS = 30_000
 
 
 @dataclass(frozen=True)
-class SpecialistSourceDocument:
-    """One complete `.agent.md` document owned by a trusted Tenant path."""
+class TenantSourceDocument:
+    """One complete definition document owned by a trusted Tenant path."""
 
     tenant_id: str
     source_identity: str
@@ -43,7 +44,7 @@ class SpecialistSourceDocument:
 
 
 @dataclass(frozen=True)
-class SpecialistSourceFailure:
+class TenantSourceFailure:
     """One bounded storage failure without document content."""
 
     tenant_id: str
@@ -52,47 +53,21 @@ class SpecialistSourceFailure:
 
 
 @dataclass(frozen=True)
-class SpecialistSourceLoad:
+class TenantSourceLoad:
     """Storage result consumed by the catalog implementation."""
 
-    documents: tuple[SpecialistSourceDocument, ...] = ()
-    failures: tuple[SpecialistSourceFailure, ...] = ()
+    documents: tuple[TenantSourceDocument, ...] = ()
+    failures: tuple[TenantSourceFailure, ...] = ()
 
 
-@dataclass(frozen=True)
-class SkillSourceDocument:
-    """One complete `SKILL.md` document owned by a trusted Tenant path."""
-
-    tenant_id: str
-    source_identity: str
-    content: str
-
-
-@dataclass(frozen=True)
-class SkillSourceFailure:
-    """One bounded Skill storage failure without document content."""
-
-    tenant_id: str
-    source_identity: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class SkillSourceLoad:
-    """Skill storage result consumed by the common startup catalog loader."""
-
-    documents: tuple[SkillSourceDocument, ...] = ()
-    failures: tuple[SkillSourceFailure, ...] = ()
-
-
-class SpecialistDefinitionLoader(Protocol):
+class TenantDefinitionLoader(Protocol):
     """Return Tenant-isolated source documents from one storage adapter."""
 
-    async def load_specialists(self, tenant_id: str) -> SpecialistSourceLoad:
+    async def load_specialists(self, tenant_id: str) -> TenantSourceLoad:
         """Load complete Specialist documents for exactly one known Tenant."""
         ...
 
-    async def load_skills(self, tenant_id: str) -> SkillSourceLoad:
+    async def load_skills(self, tenant_id: str) -> TenantSourceLoad:
         """Load complete Skill documents for exactly one known Tenant."""
         ...
 
@@ -111,146 +86,123 @@ class TenantModelRegistryProvider(Protocol):
 
 
 @dataclass(frozen=True)
-class LocalSpecialistDefinitionLoader:
+class _LocalDefinitionFile:
+    path: Path
+    source_identity: str
+    guarded_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class LocalTenantDefinitionLoader:
     """Read the shared Tenant definition tree from a local development root."""
 
     root: Path
 
-    async def load_specialists(self, tenant_id: str) -> SpecialistSourceLoad:
+    async def load_specialists(self, tenant_id: str) -> TenantSourceLoad:
         """Read complete `.agent.md` documents below one Tenant directory."""
-        if (
-            not tenant_id
-            or Path(tenant_id).parts != (tenant_id,)
-            or tenant_id in {".", ".."}
-        ):
-            return SpecialistSourceLoad(
-                failures=(
-                    SpecialistSourceFailure(
-                        tenant_id=tenant_id,
-                        source_identity="tenant-definition-root",
-                        reason="invalid-tenant-id",
-                    ),
-                )
-            )
-        tenant_directory = self.root / "tenants" / tenant_id
-        directory = tenant_directory / "agents"
-        if tenant_directory.is_symlink() or directory.is_symlink():
-            return SpecialistSourceLoad(
-                failures=(
-                    SpecialistSourceFailure(
-                        tenant_id=tenant_id,
-                        source_identity=f"tenants/{tenant_id}/agents",
-                        reason="symlink-not-allowed",
-                    ),
-                )
-            )
+        directory, failure = self._definition_directory(tenant_id, "agents")
+        if failure is not None:
+            return TenantSourceLoad(failures=(failure,))
         if not directory.exists():
-            return SpecialistSourceLoad()
-        documents: list[SpecialistSourceDocument] = []
-        failures: list[SpecialistSourceFailure] = []
-        for path in sorted(directory.glob("*.agent.md")):
-            source_identity = f"tenants/{tenant_id}/agents/{path.name}"
-            if path.is_symlink():
-                failures.append(
-                    SpecialistSourceFailure(
-                        tenant_id=tenant_id,
-                        source_identity=source_identity,
-                        reason="symlink-not-allowed",
-                    )
+            return TenantSourceLoad()
+        return self._read_documents(
+            tenant_id,
+            tuple(
+                _LocalDefinitionFile(
+                    path=path,
+                    source_identity=f"tenants/{tenant_id}/agents/{path.name}",
+                    guarded_paths=(path,),
                 )
-                continue
-            try:
-                content = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                failures.append(
-                    SpecialistSourceFailure(
-                        tenant_id=tenant_id,
-                        source_identity=source_identity,
-                        reason="read-failed",
-                    )
-                )
-                continue
-            documents.append(
-                SpecialistSourceDocument(
-                    tenant_id=tenant_id,
-                    source_identity=source_identity,
-                    content=content,
-                )
-            )
-        return SpecialistSourceLoad(
-            documents=tuple(documents),
-            failures=tuple(failures),
+                for path in sorted(directory.glob("*.agent.md"))
+            ),
         )
 
-    async def load_skills(self, tenant_id: str) -> SkillSourceLoad:
+    async def load_skills(self, tenant_id: str) -> TenantSourceLoad:
         """Read `SKILL.md` files without opening references or other resources."""
-        if (
-            not tenant_id
-            or Path(tenant_id).parts != (tenant_id,)
-            or tenant_id in {".", ".."}
-        ):
-            return SkillSourceLoad(
-                failures=(
-                    SkillSourceFailure(
-                        tenant_id=tenant_id,
-                        source_identity="tenant-definition-root",
-                        reason="invalid-tenant-id",
-                    ),
-                )
-            )
-        tenant_directory = self.root / "tenants" / tenant_id
-        directory = tenant_directory / "skills"
-        if tenant_directory.is_symlink() or directory.is_symlink():
-            return SkillSourceLoad(
-                failures=(
-                    SkillSourceFailure(
-                        tenant_id=tenant_id,
-                        source_identity=f"tenants/{tenant_id}/skills",
-                        reason="symlink-not-allowed",
-                    ),
-                )
-            )
+        directory, failure = self._definition_directory(tenant_id, "skills")
+        if failure is not None:
+            return TenantSourceLoad(failures=(failure,))
         if not directory.exists():
-            return SkillSourceLoad()
-        documents: list[SkillSourceDocument] = []
-        failures: list[SkillSourceFailure] = []
+            return TenantSourceLoad()
+        candidates: list[_LocalDefinitionFile] = []
         for skill_directory in sorted(directory.iterdir()):
             if not skill_directory.is_dir():
                 continue
-            source_identity = (
-                f"tenants/{tenant_id}/skills/{skill_directory.name}/SKILL.md"
-            )
             skill_path = skill_directory / "SKILL.md"
-            if skill_directory.is_symlink() or skill_path.is_symlink():
+            if not skill_path.is_file() and not skill_path.is_symlink():
+                continue
+            candidates.append(
+                _LocalDefinitionFile(
+                    path=skill_path,
+                    source_identity=(
+                        f"tenants/{tenant_id}/skills/{skill_directory.name}/SKILL.md"
+                    ),
+                    guarded_paths=(skill_directory, skill_path),
+                )
+            )
+        return self._read_documents(tenant_id, tuple(candidates))
+
+    def _definition_directory(
+        self,
+        tenant_id: str,
+        kind: str,
+    ) -> tuple[Path, TenantSourceFailure | None]:
+        tenant_directory = self.root / "tenants" / tenant_id
+        directory = tenant_directory / kind
+        if (
+            not tenant_id
+            or Path(tenant_id).parts != (tenant_id,)
+            or tenant_id in {".", ".."}
+        ):
+            return directory, TenantSourceFailure(
+                tenant_id=tenant_id,
+                source_identity="tenant-definition-root",
+                reason="invalid-tenant-id",
+            )
+        if tenant_directory.is_symlink() or directory.is_symlink():
+            return directory, TenantSourceFailure(
+                tenant_id=tenant_id,
+                source_identity=f"tenants/{tenant_id}/{kind}",
+                reason="symlink-not-allowed",
+            )
+        return directory, None
+
+    def _read_documents(
+        self,
+        tenant_id: str,
+        candidates: Sequence[_LocalDefinitionFile],
+    ) -> TenantSourceLoad:
+        documents: list[TenantSourceDocument] = []
+        failures: list[TenantSourceFailure] = []
+        for candidate in candidates:
+            if any(path.is_symlink() for path in candidate.guarded_paths):
                 failures.append(
-                    SkillSourceFailure(
+                    TenantSourceFailure(
                         tenant_id=tenant_id,
-                        source_identity=source_identity,
+                        source_identity=candidate.source_identity,
                         reason="symlink-not-allowed",
                     )
                 )
                 continue
-            if not skill_path.is_file():
-                continue
             try:
-                content = skill_path.read_text(encoding="utf-8")
+                content = candidate.path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 failures.append(
-                    SkillSourceFailure(
+                    TenantSourceFailure(
                         tenant_id=tenant_id,
-                        source_identity=source_identity,
+                        source_identity=candidate.source_identity,
                         reason="read-failed",
                     )
                 )
                 continue
             documents.append(
-                SkillSourceDocument(
+                TenantSourceDocument(
                     tenant_id=tenant_id,
-                    source_identity=source_identity,
+                    source_identity=candidate.source_identity,
                     content=content,
                 )
             )
-        return SkillSourceLoad(
+        return TenantSourceLoad(
             documents=tuple(documents),
             failures=tuple(failures),
         )
@@ -260,15 +212,21 @@ async def load_local_specialist_catalogs(
     tenant_manager: TenantModelRegistryProvider,
     *,
     root: Path,
+    tool_registry: AgentToolRegistry | None = None,
+    tenant_allowed_tool_ids: Mapping[str, frozenset[str]] | None = None,
 ) -> dict[str, SpecialistCatalog]:
     """Build one immutable local Specialist Catalog per configured Tenant."""
-    loader = LocalSpecialistDefinitionLoader(root)
+    loader = LocalTenantDefinitionLoader(root)
+    effective_tool_registry = tool_registry or AgentToolRegistry()
+    tenant_tool_policy = tenant_allowed_tool_ids or {}
     catalogs: dict[str, SpecialistCatalog] = {}
     for tenant_id in tenant_manager.tenant_ids:
         catalogs[tenant_id] = await build_specialist_catalog(
             loader,
             tenant_id=tenant_id,
             model_registry=tenant_manager.get_model_registry(tenant_id),
+            tool_registry=effective_tool_registry,
+            tenant_allowed_tool_ids=tenant_tool_policy.get(tenant_id, frozenset()),
         )
     return catalogs
 
@@ -305,7 +263,7 @@ class _ParsedSpecialistDefinition:
 
 
 async def build_specialist_catalog(
-    loader: SpecialistDefinitionLoader,
+    loader: TenantDefinitionLoader,
     *,
     tenant_id: str,
     model_registry: ModelRegistry,
@@ -423,7 +381,7 @@ async def build_specialist_catalog(
 
 
 def _parse_definition(
-    document: SpecialistSourceDocument,
+    document: TenantSourceDocument,
 ) -> _ParsedSpecialistDefinition:
     frontmatter, instructions = parse_frontmatter_and_body(
         document.content,

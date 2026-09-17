@@ -8,7 +8,9 @@ from typing import Any, cast
 
 import pytest
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.agents.specialist import SPECIALIST_INSTRUCTIONS, SPECIALIST_SECURITY_GUARDS
 from app.core.model_registry import ModelRegistry
@@ -40,12 +42,17 @@ from app.langgraph_v2.agent_evidence import (
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 from app.langgraph_v2.agent_skills import SkillInvocation
 from app.langgraph_v2.specialist_definitions import (
-    LocalSpecialistDefinitionLoader,
-    SkillSourceLoad,
-    SpecialistSourceDocument,
-    SpecialistSourceLoad,
+    LocalTenantDefinitionLoader,
+    TenantSourceDocument,
+    TenantSourceLoad,
     build_specialist_catalog,
     load_local_specialist_catalogs,
+)
+from app.langgraph_v2.specialist_retry import (
+    SpecialistFailureFacts,
+    SpecialistInvocationFailure,
+    SpecialistModelBoundary,
+    specialist_usage_limits,
 )
 
 
@@ -221,7 +228,7 @@ Instructions
     caplog.set_level(logging.INFO)
 
     catalog = await build_specialist_catalog(
-        LocalSpecialistDefinitionLoader(tmp_path),
+        LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-a",
         model_registry=cast(ModelRegistry, _ModelRegistry("specialist")),
     )
@@ -254,7 +261,7 @@ async def test_markdown_specialist_uses_instruction_precedence_and_persists_pin(
     )
     registry = _ExecutableModelRegistry()
     catalog = await build_specialist_catalog(
-        LocalSpecialistDefinitionLoader(tmp_path),
+        LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-a",
         model_registry=cast(ModelRegistry, registry),
     )
@@ -385,7 +392,7 @@ INVALID-SKILL-INSTRUCTIONS-SENTINEL
     caplog.set_level(logging.INFO)
 
     catalog = await build_specialist_catalog(
-        LocalSpecialistDefinitionLoader(tmp_path),
+        LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-a",
         model_registry=cast(ModelRegistry, _ModelRegistry("specialist")),
         tool_registry=tool_registry,
@@ -425,7 +432,7 @@ async def test_catalog_snapshot_stays_fixed_until_a_new_startup_load(
     )
     registry = _ExecutableModelRegistry()
     first = await build_specialist_catalog(
-        LocalSpecialistDefinitionLoader(tmp_path),
+        LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-a",
         model_registry=cast(ModelRegistry, registry),
     )
@@ -446,7 +453,7 @@ async def test_catalog_snapshot_stays_fixed_until_a_new_startup_load(
         ),
     )
     second = await build_specialist_catalog(
-        LocalSpecialistDefinitionLoader(tmp_path),
+        LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-a",
         model_registry=cast(ModelRegistry, registry),
     )
@@ -493,7 +500,7 @@ FIRST-SKILL-INSTRUCTIONS
         filename="market-data.agent.md",
         content=_agent_document(skills="[market-analysis]"),
     )
-    loader = LocalSpecialistDefinitionLoader(tmp_path)
+    loader = LocalTenantDefinitionLoader(tmp_path)
     registry = cast(ModelRegistry, _ModelRegistry("specialist"))
     first = await build_specialist_catalog(
         loader,
@@ -530,12 +537,95 @@ SECOND-SKILL-INSTRUCTIONS
         effective_tool_ids=frozenset(),
     ).activate("market-analysis")
 
+    attempt_count = 0
+
+    class _RetryingActor:
+        def __init__(self, invocation: SkillInvocation, attempt: int) -> None:
+            self.invocation = invocation
+            self.attempt = attempt
+
+        async def run(
+            self,
+            input: SpecialistTaskInput,
+            *,
+            usage: RunUsage | None = None,
+            usage_limits: UsageLimits | None = None,
+        ) -> SpecialistAttempt:
+            del input, usage, usage_limits
+            self.invocation.activate("market-analysis")
+            if self.attempt == 1:
+                raise SpecialistInvocationFailure(
+                    ModelHTTPError(429, "specialist"),
+                    facts=SpecialistFailureFacts(
+                        boundary=SpecialistModelBoundary.AZURE_OPENAI,
+                        at_model_request_boundary=True,
+                        terminal_output_tool_rejected=False,
+                        count_limit_exhausted=False,
+                        unreturned_model_requests=0,
+                        usage_limits=specialist_usage_limits(),
+                    ),
+                    messages=(),
+                )
+            return SpecialistAttempt(
+                finding=SpecialistFindingDraft(summary="accepted after restart"),
+                skill_pins=self.invocation.pins,
+            )
+
+    def retrying_factory(
+        tools: tuple[SpecialistTool, ...],
+        tool_capture: SpecialistToolCapture,
+        skill_invocation: SkillInvocation | None,
+    ) -> _RetryingActor:
+        nonlocal attempt_count
+        del tools, tool_capture
+        attempt_count += 1
+        assert skill_invocation is not None
+        return _RetryingActor(skill_invocation, attempt_count)
+
+    retry_catalog = SpecialistCatalog(
+        registrations=(
+            SpecialistRegistration(
+                id=second_registration.id,
+                description=second_registration.description,
+                actor_factory=retrying_factory,
+                skill_names=second_registration.skill_names,
+                definition_pin=second_registration.definition_pin,
+            ),
+        ),
+        skill_catalog=second.skill_catalog,
+    )
+    batch = accept_initial_dispatch(
+        DispatchBatch(
+            kind="dispatch",
+            tasks=(
+                TaskProposal(
+                    specialist_id="market-data",
+                    objective="Retry after the new startup.",
+                ),
+            ),
+        ),
+        request_id="request-retry",
+        specialist_catalog=retry_catalog,
+    )
+    contribution = await execute_specialist(
+        batch.tasks[0],
+        batch_id=batch.id,
+        specialist_catalog=retry_catalog,
+        context=EvidenceInvocationContext(
+            tenant_id="tenant-a",
+            request_id="request-retry",
+            task_id=batch.tasks[0].id,
+        ),
+    )
+
     assert first_activation.pin.version is None
     assert repeated_activation.instructions == "FIRST-SKILL-INSTRUCTIONS"
     assert repeated_activation.pin == first_activation.pin
     assert second_activation.instructions == "SECOND-SKILL-INSTRUCTIONS"
     assert second_activation.pin.version is None
     assert second_activation.pin.content_hash != first_activation.pin.content_hash
+    assert contribution.attempt == 2
+    assert contribution.skill_pins == (second_activation.pin,)
 
 
 @pytest.mark.asyncio
@@ -564,12 +654,12 @@ Use only the assigned Task context.
     registry = cast(ModelRegistry, _ModelRegistry("specialist"))
 
     first = await build_specialist_catalog(
-        LocalSpecialistDefinitionLoader(tmp_path),
+        LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-a",
         model_registry=registry,
     )
     second = await build_specialist_catalog(
-        LocalSpecialistDefinitionLoader(tmp_path),
+        LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-b",
         model_registry=registry,
     )
@@ -619,15 +709,15 @@ async def test_catalog_rejects_a_loader_document_owned_by_another_tenant(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class ForeignTenantLoader:
-        async def load_skills(self, tenant_id: str) -> SkillSourceLoad:
+        async def load_skills(self, tenant_id: str) -> TenantSourceLoad:
             assert tenant_id == "tenant-a"
-            return SkillSourceLoad()
+            return TenantSourceLoad()
 
-        async def load_specialists(self, tenant_id: str) -> SpecialistSourceLoad:
+        async def load_specialists(self, tenant_id: str) -> TenantSourceLoad:
             assert tenant_id == "tenant-a"
-            return SpecialistSourceLoad(
+            return TenantSourceLoad(
                 documents=(
-                    SpecialistSourceDocument(
+                    TenantSourceDocument(
                         tenant_id="tenant-b",
                         source_identity="tenants/tenant-b/agents/foreign.agent.md",
                         content=_agent_document(specialist_id="foreign"),
@@ -657,9 +747,7 @@ async def test_local_loader_rejects_a_tenant_id_that_can_escape_its_prefix(
         encoding="utf-8",
     )
 
-    loaded = await LocalSpecialistDefinitionLoader(tmp_path).load_specialists(
-        "../tenant-b"
-    )
+    loaded = await LocalTenantDefinitionLoader(tmp_path).load_specialists("../tenant-b")
 
     assert loaded.documents == ()
     assert len(loaded.failures) == 1
@@ -682,9 +770,7 @@ async def test_local_loader_rejects_a_cross_tenant_definition_symlink(
         tmp_path / "tenants" / "tenant-b" / "agents" / "foreign.agent.md"
     )
 
-    loaded = await LocalSpecialistDefinitionLoader(tmp_path).load_specialists(
-        "tenant-a"
-    )
+    loaded = await LocalTenantDefinitionLoader(tmp_path).load_specialists("tenant-a")
 
     assert loaded.documents == ()
     assert len(loaded.failures) == 1
@@ -702,7 +788,20 @@ async def test_startup_loads_only_known_tenants_with_their_own_model_registries(
         content=_agent_document(
             specialist_id="tenant-a-specialist",
             model_profile="tenant-a-model",
+            skills="[filing-analysis]",
         ),
+    )
+    _write_skill(
+        tmp_path,
+        tenant_id="tenant-a",
+        skill_name="filing-analysis",
+        content="""---
+name: filing-analysis
+description: Read a filing.
+required-tools: filing-reader
+---
+Use the filing reader.
+""",
     )
     _write_agent(
         tmp_path,
@@ -726,7 +825,27 @@ async def test_startup_loads_only_known_tenants_with_their_own_model_registries(
         }
     )
 
-    catalogs = await load_local_specialist_catalogs(manager, root=tmp_path)
+    async def provider(_source: str, _query: str) -> EvidenceEnvelope:
+        raise AssertionError("Startup must not call a business Tool")
+
+    tool_registry = AgentToolRegistry(
+        evidence_registrations=(
+            EvidenceToolRegistration(
+                id="filing-reader",
+                provider=provider,
+                allowed_sources=frozenset(),
+            ),
+        )
+    )
+    catalogs = await load_local_specialist_catalogs(
+        manager,
+        root=tmp_path,
+        tool_registry=tool_registry,
+        tenant_allowed_tool_ids={
+            "tenant-a": frozenset({"filing-reader"}),
+            "tenant-b": frozenset(),
+        },
+    )
 
     assert set(catalogs) == {"tenant-a", "tenant-b"}
     assert [item.id for item in catalogs["tenant-a"].descriptors] == [
@@ -735,6 +854,19 @@ async def test_startup_loads_only_known_tenants_with_their_own_model_registries(
     assert [item.id for item in catalogs["tenant-b"].descriptors] == [
         "tenant-b-specialist"
     ]
+    tenant_a_registration = catalogs["tenant-a"].resolve("tenant-a-specialist")
+    assert catalogs["tenant-a"].skill_catalog is not None
+    assert [
+        summary.name
+        for summary in catalogs["tenant-a"]
+        .skill_catalog.begin_invocation(
+            specialist_skill_names=tenant_a_registration.skill_names,
+            effective_tool_ids=catalogs["tenant-a"].effective_tool_ids(
+                scope_tool_ids=frozenset({"filing-reader"})
+            ),
+        )
+        .summaries
+    ] == ["filing-analysis"]
 
 
 @pytest.mark.asyncio
@@ -785,7 +917,7 @@ async def test_code_and_markdown_adapters_share_the_execution_contract(
     )
     markdown_registry = _ExecutableModelRegistry()
     markdown_catalog = await build_specialist_catalog(
-        LocalSpecialistDefinitionLoader(tmp_path),
+        LocalTenantDefinitionLoader(tmp_path),
         tenant_id="tenant-a",
         model_registry=cast(ModelRegistry, markdown_registry),
         tool_registry=tool_registry,

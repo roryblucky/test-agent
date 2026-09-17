@@ -43,6 +43,7 @@ from app.langgraph_v2.agent_batch import (
     SpecialistRegistration,
     SpecialistTaskInput,
     TaskProposal,
+    task_id_for,
 )
 from app.langgraph_v2.agent_completion import IncompleteResearch
 from app.langgraph_v2.agent_coordination import (
@@ -712,7 +713,31 @@ class _MarkdownSpecialistModelRegistry:
             calls += 1
             self.model_messages.append(repr(messages))
             if calls == 1:
+                assert "filing-analysis" in repr(messages)
                 assert "market-analysis" in repr(messages)
+                assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" not in repr(messages)
+                assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="activate_skill",
+                            args={"skill_name": "filing-analysis"},
+                        )
+                    ]
+                )
+            if calls == 2:
+                assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" in repr(messages)
+                assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="filing_reader",
+                            args={"source": "filing", "query": "Apple revenue"},
+                        )
+                    ]
+                )
+            if calls == 3:
+                assert "MARKDOWN-EVIDENCE-EXCERPT-SENTINEL" in repr(messages)
                 assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
                 return ModelResponse(
                     parts=[
@@ -722,6 +747,7 @@ class _MarkdownSpecialistModelRegistry:
                         )
                     ]
                 )
+            assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" in repr(messages)
             assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
             return ModelResponse(
                 parts=[
@@ -729,7 +755,7 @@ class _MarkdownSpecialistModelRegistry:
                         tool_name=info.output_tools[0].name,
                         args={
                             "summary": "Markdown specialist finding",
-                            "evidence_ids": [],
+                            "evidence_ids": ["markdown-evidence"],
                         },
                     )
                 ]
@@ -751,7 +777,7 @@ class _MarkdownTenantManager(_TenantManager):
         return cast(ModelRegistry, self.registry)
 
 
-def test_local_markdown_specialist_and_skill_run_through_http_and_persist_pins(
+def test_local_markdown_specialist_and_skills_run_through_http_and_persist_pins(
     langgraph_v2_migrated_database_url: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -760,7 +786,7 @@ def test_local_markdown_specialist_and_skill_run_through_http_and_persist_pins(
 id: market-data
 description: Tenant-authored market analysis.
 model-profile: specialist
-skills: [market-analysis]
+skills: [filing-analysis, market-analysis]
 ---
 TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL
 """
@@ -782,6 +808,20 @@ MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL
 """,
         encoding="utf-8",
     )
+    filing_skill_path = (
+        tmp_path / "tenants" / "tenant-a" / "skills" / "filing-analysis" / "SKILL.md"
+    )
+    filing_skill_path.parent.mkdir(parents=True)
+    filing_skill_path.write_text(
+        """---
+name: filing-analysis
+description: Read scoped filing evidence.
+required-tools: filing_reader
+---
+MARKDOWN-FILING-INSTRUCTIONS-SENTINEL
+""",
+        encoding="utf-8",
+    )
     registry = _MarkdownSpecialistModelRegistry()
     tenant_manager = _MarkdownTenantManager(registry)
     telemetry_records: list[dict[str, str]] = []
@@ -799,13 +839,51 @@ MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL
         record_specialist_definition_pin,
     )
     monkeypatch.setattr(agent_graph, "record_skill_pin", record_skill_pin)
+
+    async def filing_provider(source: str, query: str) -> EvidenceEnvelope:
+        assert (source, query) == ("filing", "Apple revenue")
+        return EvidenceEnvelope(
+            id="markdown-evidence",
+            tenant_id="tenant-a",
+            request_id="markdown-specialist-request",
+            task_id=task_id_for(
+                request_id="markdown-specialist-request",
+                round=1,
+                dispatch_order=0,
+            ),
+            source=source,
+            source_url="https://example.test/markdown-filing",
+            title="Markdown filing evidence",
+            body="MARKDOWN-EVIDENCE-SENTINEL",
+            excerpt="MARKDOWN-EVIDENCE-EXCERPT-SENTINEL",
+            as_of_date=date(2026, 9, 6),
+        )
+
+    tool_registry = AgentToolRegistry(
+        evidence_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=filing_provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple revenue"}),
+            ),
+        )
+    )
     catalogs = asyncio.run(
-        load_local_specialist_catalogs(tenant_manager, root=tmp_path)
+        load_local_specialist_catalogs(
+            tenant_manager,
+            root=tmp_path,
+            tool_registry=tool_registry,
+            tenant_allowed_tool_ids={"tenant-a": frozenset({"filing_reader"})},
+        )
     )
     coordinator = _Coordinator()
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
+        allowed_tool_ids=frozenset({"filing_reader"}),
+        allowed_sources=frozenset({"filing"}),
+        allowed_queries=frozenset({"Apple revenue"}),
     )
 
     def factory(
@@ -821,6 +899,7 @@ MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
             intent_policies={policy.intent: policy},
+            synthesis_actor=_Synthesis(),
         )
 
     conversation_id = "00000000-0000-0000-0000-000000000102"
@@ -850,8 +929,11 @@ MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL
         coordinator.inputs[0].specialist_descriptors == catalogs["tenant-a"].descriptors
     )
     assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" in registry.model_messages[0]
+    assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" not in registry.model_messages[0]
     assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in registry.model_messages[0]
-    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" in registry.model_messages[1]
+    assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" in registry.model_messages[1]
+    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in registry.model_messages[2]
+    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" in registry.model_messages[3]
     assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in response.text
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
@@ -870,22 +952,24 @@ MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL
         }
     ]
     skill_pins = accepted["skill_pins"]
-    skill_pin = skill_pins[0]["pins"][0]
-    assert skill_pin["name"] == "market-analysis"
-    assert skill_pin["version"] is None
-    assert len(skill_pin["content_hash"]) == 64
+    pins = skill_pins[0]["pins"]
+    assert [pin["name"] for pin in pins] == ["filing-analysis", "market-analysis"]
+    assert all(pin["version"] is None for pin in pins)
+    assert all(len(pin["content_hash"]) == 64 for pin in pins)
     assert skill_telemetry_records == [
         {
             "tenant_id": "tenant-a",
             "request_id": "markdown-specialist-request",
             "task_id": accepted["outcomes"][0]["task_id"],
-            "name": "market-analysis",
-            "content_hash": skill_pin["content_hash"],
+            "name": pin["name"],
+            "content_hash": pin["content_hash"],
             "version": None,
         }
+        for pin in pins
     ]
     assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in repr(state)
     assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
+    assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" not in repr(state)
 
 
 def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(

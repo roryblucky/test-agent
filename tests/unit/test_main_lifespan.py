@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -64,7 +63,9 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
     session_store = _AsyncCloseTracker()
     http_pool = _HttpPool()
     specialist_catalogs = {"tenant-a": object()}
-    specialist_load_calls: list[tuple[object, Path]] = []
+    specialist_load_calls: list[
+        tuple[object, Path, object, dict[str, frozenset[str]]]
+    ] = []
 
     class AssessmentAuditFactory:
         def __new__(cls, *, project_id: str) -> _AsyncCloseTracker:
@@ -75,13 +76,28 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
     async def postgres_lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         yield
 
-    def tenant_manager(_configs: object, _http_pool: object) -> SimpleNamespace:
-        return SimpleNamespace(tenant_ids=[])
+    class Manager:
+        tenant_ids = ["tenant-a"]
+
+        def get_agent_tool_ids(self, tenant_id: str) -> frozenset[str]:
+            assert tenant_id == "tenant-a"
+            return frozenset({"filing_reader"})
+
+    manager_instance = Manager()
+
+    def tenant_manager(_configs: object, _http_pool: object) -> Manager:
+        return manager_instance
 
     async def load_local_specialist_catalogs(
-        manager: object, *, root: Path
+        manager: object,
+        *,
+        root: Path,
+        tool_registry: object,
+        tenant_allowed_tool_ids: dict[str, frozenset[str]],
     ) -> dict[str, object]:
-        specialist_load_calls.append((manager, root))
+        specialist_load_calls.append(
+            (manager, root, tool_registry, tenant_allowed_tool_ids)
+        )
         return specialist_catalogs
 
     def audit_logger_factory(*, sinks: list[object]) -> _AsyncCloseTracker:
@@ -141,6 +157,8 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
     monkeypatch.setattr(router_module, "get_session_store", session_store_factory)
 
     lifespan_app = FastAPI()
+    expected_tool_registry = main_module.AgentToolRegistry()
+    lifespan_app.state.langgraph_v2_agent_tool_registry = expected_tool_registry
     if raise_from_body:
         with pytest.raises(RuntimeError, match="body failed"):
             async with main_module.lifespan(lifespan_app):
@@ -156,9 +174,12 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
                 == specialist_catalogs
             )
 
-    assert specialist_load_calls == [
-        (lifespan_app.state.tenant_manager, Path("/definitions"))
-    ]
+    assert len(specialist_load_calls) == 1
+    manager, root, tool_registry, tenant_tool_ids = specialist_load_calls[0]
+    assert manager is lifespan_app.state.tenant_manager
+    assert root == Path("/definitions")
+    assert tool_registry is expected_tool_registry
+    assert tenant_tool_ids == {"tenant-a": frozenset({"filing_reader"})}
     assert assessment_audit.closed
     assert audit_logger.closed
     assert rate_limiter.closed

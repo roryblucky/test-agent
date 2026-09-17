@@ -19,6 +19,7 @@ from app.config.loader import load_config
 from app.core.audit_middleware import AuditMiddleware
 from app.core.http_client_pool import HttpClientPool
 from app.core.rate_limit_middleware import TenantRateLimitMiddleware
+from app.langgraph_v2.agent_batch import AgentToolRegistry
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.postgres import postgres_lifespan
@@ -116,10 +117,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         specialist_root = Path(
             os.environ.get("SPECIALIST_DEFINITIONS_LOCAL_ROOT", "definitions")
         )
+        agent_tool_registry = getattr(
+            app.state,
+            "langgraph_v2_agent_tool_registry",
+            AgentToolRegistry(),
+        )
         app.state.langgraph_v2_specialist_catalogs = (
             await load_local_specialist_catalogs(
                 app.state.tenant_manager,
                 root=specialist_root,
+                tool_registry=agent_tool_registry,
+                tenant_allowed_tool_ids={
+                    tenant_id: app.state.tenant_manager.get_agent_tool_ids(tenant_id)
+                    for tenant_id in app.state.tenant_manager.tenant_ids
+                },
             )
         )
         app.state.http_pool = http_pool

@@ -101,12 +101,14 @@ class SkillInvocation:
             self._activated[skill_name] = activated
         return activated
 
-    def activation_tool(self) -> Callable[[str], ActivatedSkill]:
+    def activation_tool(self) -> Callable[[str], str]:
         """Expose activation to this invocation's PydanticAI actor only."""
 
-        def activate_skill(skill_name: str) -> ActivatedSkill:
+        def activate_skill(skill_name: str) -> str:
             """Activate an eligible Skill by name for the current task."""
-            return self.activate(skill_name)
+            already_activated = skill_name in self._activated
+            activated = self.activate(skill_name)
+            return "" if already_activated else activated.instructions
 
         return activate_skill
 
