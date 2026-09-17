@@ -14,13 +14,15 @@ from app.langgraph_v2.agent_batch import (
     MAX_DISPATCH_BATCH_TASKS,
     AcceptedBatch,
     AcceptedTask,
+    ActiveBatch,
     DispatchBatch,
     PriorResultView,
-    SpecialistCatalog,
+    SpecialistRegistry,
     TaskSucceeded,
     batch_id_for,
     normalize_task_objective,
     task_id_for,
+    validate_active_batch_manifest,
 )
 from app.langgraph_v2.agent_evidence import DataGapView
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
@@ -105,6 +107,19 @@ class CoordinatorActor(Protocol):
         ...
 
 
+class CoordinationTask(BaseModel):
+    """Checkpointed manifest entry for one accepted dispatch decision."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    objective: str
+    specialist_id: str
+    context_task_ids: tuple[str, ...] = Field(
+        max_length=MAX_TASK_CONTEXT_RESULTS, default=()
+    )
+
+
 class CoordinationRound(BaseModel):
     """Immutable accepted Coordinator decision and monotonic revision."""
 
@@ -114,7 +129,7 @@ class CoordinationRound(BaseModel):
     revision: int = Field(ge=1, le=MAX_COORDINATION_DECISIONS)
     kind: Literal["dispatch", "finish"]
     batch_id: str | None = None
-    tasks: tuple[AcceptedTask, ...] = Field(
+    tasks: tuple[CoordinationTask, ...] = Field(
         max_length=MAX_DISPATCH_BATCH_TASKS, default=()
     )
 
@@ -126,6 +141,14 @@ class CoordinationRound(BaseModel):
         if self.kind == "finish" and (self.batch_id is not None or self.tasks):
             raise ValueError("Finish Coordination Round is invalid")
         return self
+
+
+@dataclass(frozen=True)
+class AcceptedCoordinationDispatch:
+    """One accepted dispatch decision ready for the graph's single Send fanout."""
+
+    round: CoordinationRound
+    active_batch: ActiveBatch
 
 
 @dataclass(frozen=True)
@@ -266,7 +289,9 @@ def project_coordinator_input(
     )
     if accepted_task_count > MAX_ACCEPTED_TASKS:
         raise CoordinationInvariantError("Accepted Task limit is invalid")
-    dispatch_rounds = sum(round_.kind == "dispatch" for round_ in ordered_rounds)
+    dispatch_rounds = sum(
+        round_.kind == "dispatch" for round_ in ordered_rounds
+    )
     return CoordinatorInput(
         standalone_query=standalone_query,
         intent=intent,
@@ -354,8 +379,9 @@ def accept_coordination_dispatch(
     request_id: str,
     rounds: Sequence[CoordinationRound],
     accepted_batches: Mapping[str, AcceptedBatch],
-    specialist_catalog: SpecialistCatalog,
-) -> CoordinationRound:
+    registry: SpecialistRegistry,
+    scope_descriptors: Sequence[SpecialistDescriptor],
+) -> AcceptedCoordinationDispatch:
     """Validate one candidate Dispatch before it can create any graph Send."""
     ordered_rounds = validate_coordination_rounds(rounds, request_id=request_id)
     proposals = tuple(decision.tasks)
@@ -374,7 +400,7 @@ def accept_coordination_dispatch(
             and dispatch_rounds < MAX_DISPATCH_ROUNDS
         ),
         eligible_specialist_ids=frozenset(
-            descriptor.id for descriptor in specialist_catalog.descriptors
+            descriptor.id for descriptor in scope_descriptors
         ),
         prior_results=prior_results,
     )
@@ -383,7 +409,9 @@ def accept_coordination_dispatch(
     for dispatch_order, proposal in enumerate(proposals):
         try:
             objective = normalize_task_objective(proposal.objective)
-            specialist_catalog.resolve(proposal.specialist_id)
+            registry.resolve(
+                proposal.specialist_id, scope_descriptors=scope_descriptors
+            )
         except ValueError as error:
             raise CoordinationCandidateRejected(str(error)) from error
         active_tasks.append(
@@ -398,14 +426,33 @@ def accept_coordination_dispatch(
                 context_task_ids=proposal.context_task_ids,
             )
         )
+    active_batch = ActiveBatch(
+        id=batch_id_for(request_id=request_id, round=revision),
+        tasks=tuple(active_tasks),
+        round=revision,
+    )
+    validate_active_batch_manifest(
+        active_batch,
+        request_id=request_id,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
+    )
     round_ = CoordinationRound(
         id=_round_id(request_id=request_id, revision=revision),
         revision=revision,
         kind="dispatch",
-        batch_id=batch_id_for(request_id=request_id, round=revision),
-        tasks=tuple(active_tasks),
+        batch_id=active_batch.id,
+        tasks=tuple(
+            CoordinationTask(
+                id=task.id,
+                objective=task.objective,
+                specialist_id=task.specialist_id,
+                context_task_ids=task.context_task_ids,
+            )
+            for task in active_batch.tasks
+        ),
     )
-    return round_
+    return AcceptedCoordinationDispatch(round=round_, active_batch=active_batch)
 
 
 def accept_coordination_finish(
@@ -434,8 +481,9 @@ async def decide_coordination_round(
     request_id: str,
     rounds: Sequence[CoordinationRound],
     accepted_batches: Mapping[str, AcceptedBatch],
-    specialist_catalog: SpecialistCatalog,
-) -> CoordinationRound | CoordinationStopped:
+    registry: SpecialistRegistry,
+    scope_descriptors: Sequence[SpecialistDescriptor],
+) -> AcceptedCoordinationDispatch | CoordinationRound | CoordinationStopped:
     """Accept one actor-validated decision against authoritative current state."""
     candidate = await actor.decide(input)
     if isinstance(candidate, CoordinatorDecisionExhausted):
@@ -450,7 +498,8 @@ async def decide_coordination_round(
         request_id=request_id,
         rounds=rounds,
         accepted_batches=accepted_batches,
-        specialist_catalog=specialist_catalog,
+        registry=registry,
+        scope_descriptors=scope_descriptors,
     )
 
 
@@ -459,6 +508,37 @@ def _stopped_reason(rejection: str) -> StructuralStopReason:
     if rejection in {TASK_LIMIT, COORDINATION_LIMIT}:
         return cast(StructuralStopReason, rejection)
     return COORDINATION_INVALID
+
+
+def validate_active_batch_coordination_round(
+    batch: ActiveBatch,
+    *,
+    rounds: Sequence[CoordinationRound],
+) -> None:
+    """Ensure a recovered active manifest exactly matches its accepted Round."""
+    ordered_rounds = _ordered_rounds(rounds)
+    matching = [
+        round_
+        for round_ in ordered_rounds
+        if round_.kind == "dispatch" and round_.batch_id == batch.id
+    ]
+    if (
+        len(matching) != 1
+        or matching[0].revision != batch.round
+        or matching[0].revision != len(ordered_rounds)
+    ):
+        raise CoordinationInvariantError("Active Batch Coordination Round is invalid")
+    manifest_tasks = tuple(
+        CoordinationTask(
+            id=task.id,
+            objective=task.objective,
+            specialist_id=task.specialist_id,
+            context_task_ids=task.context_task_ids,
+        )
+        for task in batch.tasks
+    )
+    if matching[0].tasks != manifest_tasks:
+        raise CoordinationInvariantError("Active Batch Coordination Round is invalid")
 
 
 def materialize_specialist_context(

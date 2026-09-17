@@ -1,14 +1,13 @@
 """Public Agent Finish-first coverage."""
 
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
-from app.langgraph_v2.agent_batch import SpecialistCatalog, SpecialistRegistration
 from app.langgraph_v2.agent_coordination import CoordinatorInput, Finish
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
@@ -29,9 +28,7 @@ from tests.integration.test_langgraph_v2_linear_core import (
 
 
 class _UnderstandingActor:
-    def __init__(
-        self, *, intent: str = "market_outlook", standalone_query: str = "Apple outlook"
-    ) -> None:
+    def __init__(self, *, intent: str = "market_outlook", standalone_query: str = "Apple outlook") -> None:
         self.intent = intent
         self.standalone_query = standalone_query
         self.histories: list[list[ConversationExchange]] = []
@@ -41,9 +38,7 @@ class _UnderstandingActor:
     ) -> QueryUnderstandingOutput:
         self.histories.append(list(history))
         return QueryUnderstandingOutput(
-            resolved_query=ResolvedQuery(
-                original_query=query, standalone_query=self.standalone_query
-            ),
+            resolved_query=ResolvedQuery(original_query=query, standalone_query=self.standalone_query),
             intent=IntentResult(intent=self.intent, confidence=0.9),
         )
 
@@ -79,22 +74,13 @@ def _factory(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-    )
-    specialist_catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data",
-                description="Market data",
-                actor=cast(Any, object()),
-            ),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
         ),
     )
 
     def factory(
-        *,
-        app: FastAPI,
-        request_context: TrustedRequestContext,
-        checkpointer: BaseCheckpointSaver[Any],
+        *, app: FastAPI, request_context: TrustedRequestContext, checkpointer: BaseCheckpointSaver[Any]
     ) -> GraphRuntimeAdapter:
         return build_agent_runtime(
             app,
@@ -102,7 +88,6 @@ def _factory(
             checkpointer=checkpointer,
             query_understanding_actor=understanding,
             coordinator_actor=coordinator,
-            specialist_catalog=specialist_catalog,
             intent_policies={policy.intent: policy},
         )
 
@@ -132,9 +117,7 @@ def test_agent_first_finish_publishes_one_insufficient_evidence_answer(
             lambda: read_conversation_messages(
                 app.state.langgraph_v2_checkpointer,
                 thread_checkpoint_config(
-                    thread_id=thread_id_for(
-                        "tenant-a", "subject-a", "agent", conversation_id
-                    )
+                    thread_id=thread_id_for("tenant-a", "subject-a", "agent", conversation_id)
                 ),
                 state_adapter=AgentCheckpointStateAdapter(),
             )
@@ -147,9 +130,7 @@ def test_agent_first_finish_publishes_one_insufficient_evidence_answer(
     answer = done[0]["data"]["answer"]
     assert answer == "Incomplete research: no eligible Evidence was available."
     assert answer.count("no eligible Evidence") == 1
-    assert (
-        "".join(event["data"] for event in events if event["type"] == "token") == answer
-    )
+    assert "".join(event["data"] for event in events if event["type"] == "token") == answer
     assert [event["type"] for event in events].index("token") < [
         event["type"] for event in events
     ].index("done")

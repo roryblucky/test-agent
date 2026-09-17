@@ -6,7 +6,6 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import date
 from decimal import Decimal
-from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
@@ -28,22 +27,19 @@ from app.agents.specialist import (
     PydanticAISpecialistActor,
 )
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
-from app.core.model_registry import ModelRegistry
 from app.langgraph_v2 import agent_graph
 from app.langgraph_v2.agent_batch import (
-    AgentToolRegistry,
     CalculationToolRegistration,
     DispatchBatch,
     EvidenceToolRegistration,
     SpecialistActor,
     SpecialistActorFactory,
     SpecialistAttempt,
-    SpecialistCatalog,
     SpecialistFindingDraft,
     SpecialistRegistration,
+    SpecialistRegistry,
     SpecialistTaskInput,
     TaskProposal,
-    task_id_for,
 )
 from app.langgraph_v2.agent_completion import IncompleteResearch
 from app.langgraph_v2.agent_coordination import (
@@ -63,8 +59,13 @@ from app.langgraph_v2.agent_evidence import (
     ToolUnavailableReason,
 )
 from app.langgraph_v2.agent_runtime import build_agent_runtime
-from app.langgraph_v2.agent_scope import AgentIntentPolicy
-from app.langgraph_v2.agent_skills import SkillInvocation
+from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
+from app.langgraph_v2.agent_skills import (
+    SkillInvocation,
+    SkillReference,
+    SkillRegistration,
+    SpecialistSkillRegistry,
+)
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.calculations import (
@@ -84,7 +85,6 @@ from app.langgraph_v2.checkpointing import (
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.postgres import CheckpointerFactory
-from app.langgraph_v2.specialist_definitions import load_local_specialist_catalogs
 from app.langgraph_v2.specialist_retry import (
     SpecialistFailureFacts,
     SpecialistInvocationFailure,
@@ -92,14 +92,12 @@ from app.langgraph_v2.specialist_retry import (
     specialist_usage_limits,
 )
 from app.models.workflow import IntentResult, QueryUnderstandingOutput, ResolvedQuery
-from app.skills.schema import SkillDefinition, SkillMetadata
 from tests.integration.test_langgraph_v2_linear_core import (
     parse_sse,
     persistent_linear_app,
     stream_request,
     v2_stream_endpoint,
 )
-from tests.skill_fakes import static_skill_catalog
 
 
 class _UnderstandingActor:
@@ -362,6 +360,9 @@ class _ConcurrentBatchSpecialist:
 _CONCURRENT_BATCH_POLICY = AgentIntentPolicy(
     intent="market_outlook",
     description="Assess market conditions.",
+    specialist_descriptors=(
+        SpecialistDescriptor(id="market-data", description="Market data"),
+    ),
 )
 _TENANT_HEADERS = {"X-Application-Id": "tenant-a", "X-Subject-Id": "subject-a"}
 
@@ -373,12 +374,9 @@ def _concurrent_batch_app(
     specialist: SpecialistActor,
     checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
 ) -> FastAPI:
-    catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data", description="Market data", actor=specialist
-            ),
-        ),
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
     def factory(
@@ -393,7 +391,7 @@ def _concurrent_batch_app(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={_CONCURRENT_BATCH_POLICY.intent: _CONCURRENT_BATCH_POLICY},
         )
 
@@ -599,9 +597,7 @@ def _skill_specialist_factory(
         nonlocal calls
         calls += 1
         business_tools = [
-            tool.name
-            for tool in info.function_tools
-            if tool.name not in {"activate_skill", "load_reference"}
+            tool.name for tool in info.function_tools if tool.name != "activate_skill"
         ]
         assert business_tools == ["filing_reader"]
         if calls == 1:
@@ -617,6 +613,7 @@ def _skill_specialist_factory(
             )
         if calls == 2:
             assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
+            assert "FULL-SKILL-REFERENCE-SENTINEL" in repr(messages)
             return ModelResponse(
                 parts=[
                     ToolCallPart(
@@ -673,14 +670,12 @@ class _Synthesis:
         del prepared
         return FinancialResearchReport(markdown_report="Apple revenue grew. [[E:1]]")
 
-
 class _EmptySynthesis:
     async def synthesize(self, prepared: object) -> FinancialResearchReport:
         del prepared
         return FinancialResearchReport(
             markdown_report="No matching filing records were found. [[E:1]]"
         )
-
 
 class _TenantManager:
     def get_tenant_config(self, tenant_id: str) -> TenantConfig:
@@ -695,244 +690,6 @@ class _TenantManager:
         )
 
 
-class _MarkdownSpecialistModelRegistry:
-    def __init__(self) -> None:
-        self.model_messages: list[str] = []
-
-    def get_model(self, name: str) -> object:
-        if name != "specialist":
-            raise KeyError(name)
-        return object()
-
-    def create_agent(self, name: str, **kwargs: Any) -> object:
-        assert name == "specialist"
-        calls = 0
-
-        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal calls
-            calls += 1
-            self.model_messages.append(repr(messages))
-            if calls == 1:
-                assert "filing-analysis" in repr(messages)
-                assert "market-analysis" in repr(messages)
-                assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" not in repr(messages)
-                assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart(
-                            tool_name="activate_skill",
-                            args={"skill_name": "filing-analysis"},
-                        )
-                    ]
-                )
-            if calls == 2:
-                assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" in repr(messages)
-                assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart(
-                            tool_name="filing_reader",
-                            args={"source": "filing", "query": "Apple revenue"},
-                        )
-                    ]
-                )
-            if calls == 3:
-                assert "MARKDOWN-EVIDENCE-EXCERPT-SENTINEL" in repr(messages)
-                assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(messages)
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart(
-                            tool_name="activate_skill",
-                            args={"skill_name": "market-analysis"},
-                        )
-                    ]
-                )
-            assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" in repr(messages)
-            assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" in repr(messages)
-            return ModelResponse(
-                parts=[
-                    ToolCallPart(
-                        tool_name=info.output_tools[0].name,
-                        args={
-                            "summary": "Markdown specialist finding",
-                            "evidence_ids": ["markdown-evidence"],
-                        },
-                    )
-                ]
-            )
-
-        return Agent(FunctionModel(model), **kwargs)
-
-
-class _MarkdownTenantManager(_TenantManager):
-    def __init__(self, registry: _MarkdownSpecialistModelRegistry) -> None:
-        self.registry = registry
-
-    @property
-    def tenant_ids(self) -> list[str]:
-        return ["tenant-a"]
-
-    def get_model_registry(self, tenant_id: str) -> ModelRegistry:
-        assert tenant_id == "tenant-a"
-        return cast(ModelRegistry, self.registry)
-
-
-def test_local_markdown_specialist_and_skills_run_through_http(
-    langgraph_v2_migrated_database_url: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    definition = """---
-id: market-data
-description: Tenant-authored market analysis.
-model-profile: specialist
-skills: [filing-analysis, market-analysis]
----
-TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL
-"""
-    definition_path = (
-        tmp_path / "tenants" / "tenant-a" / "agents" / "market-data.agent.md"
-    )
-    definition_path.parent.mkdir(parents=True)
-    definition_path.write_text(definition, encoding="utf-8")
-    skill_path = (
-        tmp_path / "tenants" / "tenant-a" / "skills" / "market-analysis" / "SKILL.md"
-    )
-    skill_path.parent.mkdir(parents=True)
-    skill_path.write_text(
-        """---
-name: market-analysis
-description: Apply the Tenant market methodology.
----
-MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL
-""",
-        encoding="utf-8",
-    )
-    filing_skill_path = (
-        tmp_path / "tenants" / "tenant-a" / "skills" / "filing-analysis" / "SKILL.md"
-    )
-    filing_skill_path.parent.mkdir(parents=True)
-    filing_skill_path.write_text(
-        """---
-name: filing-analysis
-description: Read scoped filing evidence.
-allowed-tools: filing_reader
----
-MARKDOWN-FILING-INSTRUCTIONS-SENTINEL
-""",
-        encoding="utf-8",
-    )
-    registry = _MarkdownSpecialistModelRegistry()
-    tenant_manager = _MarkdownTenantManager(registry)
-
-    async def filing_provider(source: str, query: str) -> EvidenceEnvelope:
-        assert (source, query) == ("filing", "Apple revenue")
-        return EvidenceEnvelope(
-            id="markdown-evidence",
-            tenant_id="tenant-a",
-            request_id="markdown-specialist-request",
-            task_id=task_id_for(
-                request_id="markdown-specialist-request",
-                round=1,
-                dispatch_order=0,
-            ),
-            source=source,
-            source_url="https://example.test/markdown-filing",
-            title="Markdown filing evidence",
-            body="MARKDOWN-EVIDENCE-SENTINEL",
-            excerpt="MARKDOWN-EVIDENCE-EXCERPT-SENTINEL",
-            as_of_date=date(2026, 9, 6),
-        )
-
-    tool_registry = AgentToolRegistry(
-        evidence_registrations=(
-            EvidenceToolRegistration(
-                id="filing_reader",
-                provider=filing_provider,
-                allowed_sources=frozenset({"filing"}),
-                allowed_queries=frozenset({"Apple revenue"}),
-            ),
-        )
-    )
-    catalogs = asyncio.run(
-        load_local_specialist_catalogs(
-            tenant_manager,
-            root=tmp_path,
-            tool_registry=tool_registry,
-            tenant_allowed_tool_ids={"tenant-a": frozenset({"filing_reader"})},
-        )
-    )
-    coordinator = _Coordinator()
-    policy = AgentIntentPolicy(
-        intent="market_outlook",
-        description="Assess market conditions.",
-        allowed_tool_ids=frozenset({"filing_reader"}),
-        allowed_sources=frozenset({"filing"}),
-        allowed_queries=frozenset({"Apple revenue"}),
-    )
-
-    def factory(
-        *,
-        app: FastAPI,
-        request_context: TrustedRequestContext,
-        checkpointer: BaseCheckpointSaver[Any],
-    ) -> GraphRuntimeAdapter:
-        return build_agent_runtime(
-            app,
-            request_context=request_context,
-            checkpointer=checkpointer,
-            query_understanding_actor=_UnderstandingActor(),
-            coordinator_actor=coordinator,
-            intent_policies={policy.intent: policy},
-            synthesis_actor=_Synthesis(),
-        )
-
-    conversation_id = "00000000-0000-0000-0000-000000000102"
-    app = persistent_linear_app(
-        langgraph_v2_migrated_database_url,
-        agent_runtime_factory=factory,
-    )
-    app.state.tenant_manager = tenant_manager
-    app.state.langgraph_v2_specialist_catalogs = catalogs
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/v2/query/stream",
-            json={
-                "query": "What about it?",
-                "sessionId": conversation_id,
-                "clientRequestId": "markdown-specialist-request",
-            },
-            headers=_TENANT_HEADERS,
-        )
-        checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
-
-    events = parse_sse(response.text)
-    assert response.status_code == 200
-    assert len([event for event in events if event["type"] == "done"]) == 1
-    assert (
-        coordinator.inputs[0].specialist_descriptors == catalogs["tenant-a"].descriptors
-    )
-    assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" in registry.model_messages[0]
-    assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" not in registry.model_messages[0]
-    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in registry.model_messages[0]
-    assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" in registry.model_messages[1]
-    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in registry.model_messages[2]
-    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" in registry.model_messages[3]
-    assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in response.text
-    assert checkpoint is not None
-    state = checkpoint.checkpoint["channel_values"]
-    accepted = next(iter(state["accepted_batches"].values()))
-    assert accepted["outcomes"][0]["result"]["summary"] == (
-        "Markdown specialist finding"
-    )
-    assert "specialist_definition_pins" not in accepted
-    assert "skill_pins" not in accepted
-    assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in repr(state)
-    assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
-    assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" not in repr(state)
-
-
 def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
@@ -941,13 +698,13 @@ def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-    )
-    catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data", description="Market data", actor=specialist
-            ),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
         ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
     def factory(
@@ -962,7 +719,7 @@ def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -999,6 +756,7 @@ def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
         "dispatch",
         "finish",
     ]
+    assert state["active_batch"] is None
     assert len(state["accepted_batches"]) == 2
 
 
@@ -1010,13 +768,13 @@ def test_maximum_legal_rolling_path_completes_within_recursion_limit(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-    )
-    catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data", description="Market data", actor=specialist
-            ),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
         ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
     def factory(
@@ -1031,7 +789,7 @@ def test_maximum_legal_rolling_path_completes_within_recursion_limit(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -1080,13 +838,13 @@ def test_next_request_in_one_conversation_resets_rolling_coordination_state(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-    )
-    catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data", description="Market data", actor=specialist
-            ),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
         ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
     def factory(
@@ -1101,7 +859,7 @@ def test_next_request_in_one_conversation_resets_rolling_coordination_state(
             checkpointer=checkpointer,
             query_understanding_actor=_ConversationUnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -1143,52 +901,24 @@ def test_next_request_in_one_conversation_resets_rolling_coordination_state(
     assert [len(input.prior_results) for input in coordinator.inputs] == [0, 1, 0, 1]
 
 
-def test_http_scope_excludes_platform_tool_before_specialist_construction(
+def test_first_no_tool_specialist_is_accepted_before_conservative_done(
     langgraph_v2_migrated_database_url: str,
 ) -> None:
     coordinator = _Coordinator()
     specialist = _Specialist()
-    bound_tool_names: list[tuple[str, ...]] = []
-    provider_calls: list[tuple[str, str]] = []
-
-    async def out_of_scope_provider(source: str, query: str) -> EvidenceEnvelope:
-        provider_calls.append((source, query))
-        raise AssertionError("Research Scope must reject this Tool before execution")
-
-    def specialist_factory(
-        tools: tuple[Callable[..., object], ...],
-        tool_capture: SpecialistToolCapture,
-        skill_invocation: SkillInvocation | None,
-    ) -> SpecialistActor:
-        del tool_capture, skill_invocation
-        bound_tool_names.append(tuple(tool.__name__ for tool in tools))
-        return specialist
-
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
+        allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
     )
-    catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data",
-                description="Market data",
-                actor_factory=specialist_factory,
-            ),
-        ),
-        tool_registry=AgentToolRegistry(
-            evidence_registrations=(
-                EvidenceToolRegistration(
-                    id="filing_reader",
-                    provider=out_of_scope_provider,
-                    allowed_sources=frozenset({"filing"}),
-                    allowed_queries=frozenset({"Apple revenue"}),
-                ),
-            ),
-        ),
-        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
     def factory(
@@ -1203,7 +933,7 @@ def test_http_scope_excludes_platform_tool_before_specialist_construction(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -1235,13 +965,12 @@ def test_http_scope_excludes_platform_tool_before_specialist_construction(
     assert response.status_code == 200
     assert len(done) == 1
     assert done[0]["data"]["metadata"]["termination_reason"] == "insufficient_evidence"
-    assert bound_tool_names == [()]
-    assert provider_calls == []
     assert len(coordinator.inputs) == 2
     assert specialist.inputs[0].objective == "Assess Apple market outlook."
     assert specialist.inputs[0].task_id.startswith("task_")
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
+    assert state["active_batch"] is None
     assert state["staged_contributions"] == {}
     assert len(state["accepted_batches"]) == 1
 
@@ -1254,13 +983,13 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-    )
-    catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data", description="Market data", actor=specialist
-            ),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
         ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
     def factory(
@@ -1275,7 +1004,7 @@ def test_retry_exhaustion_promotes_one_failed_task_and_completes_incomplete(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -1339,17 +1068,17 @@ def test_prior_outcome_changes_the_follow_up_execution_shape(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
     )
 
     def run_scenario(*, fail_premise: bool, conversation_id: str) -> dict[str, object]:
         coordinator = _OutcomeDrivenCoordinator()
         specialist = _OutcomeDrivenSpecialist(fail_premise=fail_premise)
-        catalog = SpecialistCatalog(
-            registrations=(
-                SpecialistRegistration(
-                    id="market-data", description="Market data", actor=specialist
-                ),
-            ),
+        registry = SpecialistRegistry(
+            registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+            tenant_eligible_ids=frozenset({"market-data"}),
         )
 
         def factory(
@@ -1364,7 +1093,7 @@ def test_prior_outcome_changes_the_follow_up_execution_shape(
                 checkpointer=checkpointer,
                 query_understanding_actor=_UnderstandingActor(),
                 coordinator_actor=coordinator,
-                specialist_catalog=catalog,
+                specialist_registry=registry,
                 intent_policies={policy.intent: policy},
             )
 
@@ -1417,13 +1146,13 @@ def test_rejected_candidates_leave_no_checkpoint_coordination_round(
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-    )
-    catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data", description="Market data", actor=specialist
-            ),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
         ),
+    )
+    registry = SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data", actor=specialist),),
+        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
     def factory(
@@ -1438,7 +1167,7 @@ def test_rejected_candidates_leave_no_checkpoint_coordination_round(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
         )
 
@@ -1497,6 +1226,7 @@ def test_concurrent_mixed_batch_is_atomically_accepted_in_manifest_order(
         assert specialist.max_active == 8
         assert checkpoint is not None
         state = checkpoint.checkpoint["channel_values"]
+        assert state["active_batch"] is None
         assert state["staged_contributions"] == {}
         accepted = next(iter(state["accepted_batches"].values()))
         assert [outcome["kind"] for outcome in accepted["outcomes"]] == [
@@ -1649,22 +1379,24 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
             intent="market_outlook",
             description="Assess market conditions.",
             allowed_tool_ids=frozenset({"calculator"}),
+            specialist_descriptors=(
+                SpecialistDescriptor(id="market-data", description="Market data"),
+            ),
             as_of_date=date(2026, 9, 6),
         )
-        catalog = SpecialistCatalog(
+        registry = SpecialistRegistry(
             registrations=(
                 SpecialistRegistration(
                     id="market-data",
-                    description="Market data",
                     actor_factory=factory,
+                    allowed_tool_ids=frozenset({"calculator"}),
                 ),
             ),
-            tool_registry=AgentToolRegistry(
-                calculation_registrations=(
-                    CalculationToolRegistration(id="calculator", executor=executor),
-                ),
+            tenant_eligible_ids=frozenset({"market-data"}),
+            calculation_tool_registrations=(
+                CalculationToolRegistration(id="calculator", executor=executor),
             ),
-            tenant_allowed_tool_ids=frozenset({"calculator"}),
+            tenant_eligible_tool_ids=frozenset({"calculator"}),
         )
 
         def app_factory(
@@ -1679,7 +1411,7 @@ def test_calculation_aliases_are_independent_of_specialist_completion_order(
                 checkpointer=checkpointer,
                 query_understanding_actor=_UnderstandingActor(),
                 coordinator_actor=coordinator,
-                specialist_catalog=catalog,
+                specialist_registry=registry,
                 intent_policies={policy.intent: policy},
                 synthesis_actor=synthesis,
             )
@@ -1802,6 +1534,7 @@ def test_batch_barrier_checkpoint_failure_never_half_accepts_a_mixed_batch(
     }
     assert {
         "accepted_batches",
+        "active_batch",
         "staged_contributions",
     } <= barrier_channels
 
@@ -1924,26 +1657,28 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
         allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
     )
-    catalog = SpecialistCatalog(
+    registry = SpecialistRegistry(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
-                description="Market data",
                 actor_factory=_evidence_specialist_factory,
+                allowed_tool_ids=frozenset({"filing_reader"}),
             ),
         ),
-        tool_registry=AgentToolRegistry(
-            evidence_registrations=(
-                EvidenceToolRegistration(
-                    id="filing_reader",
-                    provider=_evidence_provider,
-                    allowed_sources=frozenset({"filing"}),
-                    allowed_queries=frozenset({"Apple revenue"}),
-                ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=_evidence_provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple revenue"}),
             ),
         ),
-        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
     )
 
     def factory(
@@ -1958,7 +1693,7 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=_Synthesis(),
         )
@@ -2006,18 +1741,15 @@ def test_evidence_backed_specialist_publishes_citation_without_checkpoint_body(
     assert response.status_code == 200
     assert done[0]["data"]["answer"] == "Apple revenue grew. [[E:1]]"
     assert done[0]["data"]["citations"][0]["evidence_id"] == "evidence-1"
-    assert (
-        "".join(event["data"] for event in events if event["type"] == "token")
-        == done[0]["data"]["answer"]
-    )
+    assert "".join(event["data"] for event in events if event["type"] == "token") == done[
+        0
+    ]["data"]["answer"]
     assert [event["data"] for event in events if event["type"] == "citations"] == [
         done[0]["data"]["citations"]
     ]
     event_types = [event["type"] for event in events]
-    assert (
-        event_types.index("token")
-        < event_types.index("citations")
-        < event_types.index("done")
+    assert event_types.index("token") < event_types.index("citations") < event_types.index(
+        "done"
     )
     assert any(
         event["type"] == "step_start" and event.get("step") == "specialist"
@@ -2079,9 +1811,7 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
         return published
 
     class _BarrierSynthesis:
-        async def synthesize(
-            self, prepared: PreparedSynthesis
-        ) -> FinancialResearchReport:
+        async def synthesize(self, prepared: PreparedSynthesis) -> FinancialResearchReport:
             del prepared
             if phase == "synthesis":
                 entered.set()
@@ -2099,26 +1829,28 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
         allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
     )
-    catalog = SpecialistCatalog(
+    registry = SpecialistRegistry(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
-                description="Market data",
                 actor_factory=_evidence_specialist_factory,
+                allowed_tool_ids=frozenset({"filing_reader"}),
             ),
         ),
-        tool_registry=AgentToolRegistry(
-            evidence_registrations=(
-                EvidenceToolRegistration(
-                    id="filing_reader",
-                    provider=_evidence_provider,
-                    allowed_sources=frozenset({"filing"}),
-                    allowed_queries=frozenset({"Apple revenue"}),
-                ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=_evidence_provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple revenue"}),
             ),
         ),
-        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
     )
 
     def factory(
@@ -2133,7 +1865,7 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=_BarrierSynthesis(),
         )
@@ -2150,9 +1882,7 @@ async def test_cancellation_before_finalization_never_publishes_research_state(
         agent_runtime_factory=factory,
     )
     app.state.tenant_manager = _TenantManager()
-    request_context = TrustedRequestContext(
-        tenant_id="tenant-a", subject_id="subject-a"
-    )
+    request_context = TrustedRequestContext(tenant_id="tenant-a", subject_id="subject-a")
 
     async with app.router.lifespan_context(app):
         response = await v2_stream_endpoint(app)(
@@ -2292,32 +2022,34 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
         allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
     )
-    catalog = SpecialistCatalog(
+    registry = SpecialistRegistry(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
-                description="Market data",
                 actor_factory=specialist_factory,
+                allowed_tool_ids=frozenset({"filing_reader"}),
             ),
         ),
-        tool_registry=AgentToolRegistry(
-            evidence_registrations=(
-                EvidenceToolRegistration(
-                    id="filing_reader",
-                    provider=provider,
-                    allowed_sources=frozenset({"filing"}),
-                    allowed_queries=frozenset({"Apple revenue"}),
-                    expected_unavailability=(
-                        ExpectedToolUnavailability(
-                            exception_type=SourceUnreachable,
-                            reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-                        ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple revenue"}),
+                expected_unavailability=(
+                    ExpectedToolUnavailability(
+                        exception_type=SourceUnreachable,
+                        reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
                     ),
                 ),
             ),
         ),
-        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
     )
     synthesis = PartialSynthesis()
 
@@ -2333,7 +2065,7 @@ def test_unavailable_tool_fallback_persists_a_gap_and_marks_completion_incomplet
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=synthesis,
         )
@@ -2396,43 +2128,50 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
         intent="market_outlook",
         description="Assess market conditions.",
         allowed_tool_ids=frozenset({"filing_reader"}),
+        allowed_skill_names=frozenset({"filing-analysis"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
     )
-    catalog = SpecialistCatalog(
+    registry = SpecialistRegistry(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
-                description="Market data",
                 actor_factory=_skill_specialist_factory,
-                skill_names=("filing-analysis",),
+                allowed_tool_ids=frozenset({"filing_reader"}),
+                allowed_skill_names=frozenset({"filing-analysis"}),
             ),
         ),
-        tool_registry=AgentToolRegistry(
-            evidence_registrations=(
-                EvidenceToolRegistration(
-                    id="filing_reader",
-                    provider=_evidence_provider,
-                    allowed_sources=frozenset({"filing"}),
-                    allowed_queries=frozenset({"Apple revenue"}),
-                ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=_evidence_provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple revenue"}),
             ),
         ),
-        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
-        skill_catalog=static_skill_catalog(
-            (
-                SkillDefinition(
-                    metadata=SkillMetadata(
-                        name="filing-analysis",
-                        description="Read an eligible filing before analysis.",
-                        skill_metadata={"version": "2026.09"},
-                        allowed_tools=["filing_reader"],
-                    ),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
+        skill_registry=SpecialistSkillRegistry(
+            registrations=(
+                SkillRegistration(
+                    name="filing-analysis",
+                    version="2026.09",
+                    description="Read an eligible filing before analysis.",
                     instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
-                    tenant_id="tenant-a",
-                    source_path=("tenants/tenant-a/skills/filing-analysis/SKILL.md"),
+                    references=(
+                        SkillReference(
+                            name="filing-guide",
+                            content="FULL-SKILL-REFERENCE-SENTINEL",
+                        ),
+                    ),
+                    required_tool_ids=frozenset({"filing_reader"}),
                 ),
             ),
+            tenant_eligible_names=frozenset({"filing-analysis"}),
+            shared_skill_names=frozenset({"filing-analysis"}),
         ),
     )
 
@@ -2448,7 +2187,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=_Synthesis(),
         )
@@ -2486,7 +2225,13 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
     assert done[0]["data"]["citations"][0]["evidence_id"] == "evidence-1"
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
+    skill_pins = next(iter(state["accepted_batches"].values()))["skill_pins"]
+    pin = skill_pins[0]["pins"][0]
+    assert pin["name"] == "filing-analysis"
+    assert pin["version"] == "2026.09"
+    assert len(pin["content_hash"]) == 64
     assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
+    assert "FULL-SKILL-REFERENCE-SENTINEL" not in repr(state)
     assert all(
         "filing-analysis" not in input.model_dump_json() for input in coordinator.inputs
     )
@@ -2501,30 +2246,32 @@ def test_authoritative_empty_result_still_publishes_evidence_backed_report(
         allowed_tool_ids=frozenset({"filing_reader"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple litigation"}),
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
     )
-    catalog = SpecialistCatalog(
+    registry = SpecialistRegistry(
         registrations=(
             SpecialistRegistration(
                 id="market-data",
-                description="Market data",
                 actor_factory=_specialist_factory(
                     query="Apple litigation",
                     summary="The authoritative search returned no matching records.",
                     evidence_id="evidence-empty-1",
                 ),
+                allowed_tool_ids=frozenset({"filing_reader"}),
             ),
         ),
-        tool_registry=AgentToolRegistry(
-            evidence_registrations=(
-                EvidenceToolRegistration(
-                    id="filing_reader",
-                    provider=_empty_evidence_provider,
-                    allowed_sources=frozenset({"filing"}),
-                    allowed_queries=frozenset({"Apple litigation"}),
-                ),
+        tenant_eligible_ids=frozenset({"market-data"}),
+        tool_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=_empty_evidence_provider,
+                allowed_sources=frozenset({"filing"}),
+                allowed_queries=frozenset({"Apple litigation"}),
             ),
         ),
-        tenant_allowed_tool_ids=frozenset({"filing_reader"}),
+        tenant_eligible_tool_ids=frozenset({"filing_reader"}),
     )
 
     def factory(
@@ -2539,7 +2286,7 @@ def test_authoritative_empty_result_still_publishes_evidence_backed_report(
             checkpointer=checkpointer,
             query_understanding_actor=_UnderstandingActor(),
             coordinator_actor=_Coordinator(),
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=_EmptySynthesis(),
         )

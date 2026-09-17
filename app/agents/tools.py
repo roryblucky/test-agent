@@ -39,7 +39,6 @@ from app.models.workflow import (
     ToolResultRecord,
 )
 from app.services.flow_context import FlowContext
-from app.skills.reference_tool import SkillReferenceResult, load_skill_references
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +311,7 @@ async def activate_skill_tool(ctx: RunContext[AgentDeps], skill_name: str) -> st
 
 async def load_skill_references_tool(
     ctx: RunContext[AgentDeps], skill_name: str
-) -> SkillReferenceResult:
+) -> str:
     """Load detailed reference documents for a previously activated skill.
 
     Call this when you need additional technical context beyond the skill's
@@ -328,36 +327,43 @@ async def load_skill_references_tool(
         skill_name: The name of a previously activated skill.
 
     Returns:
-        The same structured reference result used by Specialist agents.
+        All reference documents concatenated as formatted text.
     """
     registry = ctx.deps.skill_registry
     tenant_id = ctx.deps.tenant_id
-    should_emit = registry is not None and skill_name in ctx.deps.activated_skill_names
 
-    if should_emit and ctx.deps.emitter:
+    if registry is None:
+        return "Skill system not configured."
+
+    skill = registry.get_activated_skill(tenant_id, skill_name)
+    if skill is None:
+        return (
+            f"Skill '{skill_name}' has not been activated yet. "
+            f"Call activate_skill_tool('{skill_name}') first."
+        )
+
+    if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_start(f"skill:references:{skill_name}")
 
-    result = await load_skill_references(
-        registry=registry,
-        tenant_id=tenant_id,
-        activated_skill_names=ctx.deps.activated_skill_names,
-        skill_name=skill_name,
-    )
+    # Tier 3: load reference document contents
+    refs = await registry.load_references(skill)
 
-    if should_emit and ctx.deps.emitter and result.status == "loaded":
+    if ctx.deps.emitter:
         await ctx.deps.emitter.emit_step_completed(
             f"skill:references:{skill_name}",
-            {"reference_count": len(result.references)},
+            {"reference_count": len(refs)},
         )
 
-    if result.status == "loaded":
-        logger.info(
-            "[%s] Agent loaded %d reference(s) for skill '%s'",
-            tenant_id,
-            len(result.references),
-            skill_name,
-        )
-    return result
+    if not refs:
+        return f"No reference documents available for skill '{skill_name}'."
+
+    parts = [f"# Reference Documents for '{skill_name}'\n"]
+    parts.extend(f"## {ref.filename}\n\n{ref.content}\n" for ref in refs)
+
+    logger.info(
+        f"[{tenant_id}] Agent loaded {len(refs)} reference(s) for skill '{skill_name}'"
+    )
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------

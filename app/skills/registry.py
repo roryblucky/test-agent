@@ -4,7 +4,7 @@ Three-tier progressive loading:
 
     Tier 1 — Discovery (startup)
         ``registry.discover(tenant_id)``
-        Loads compact discovery metadata for all skills (~30-50 prompt tokens/skill).
+        Loads only name + description for all skills (~30-50 tokens/skill).
         Used to build the agent's capability index in system prompt.
 
     Tier 2 — Activation (on demand or pre-warm)
@@ -23,11 +23,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from app.skills.loader import (
-    SkillDiscoveryFailure,
-    SkillReferenceLoadError,
-    SkillReferenceLoadFailureReason,
-)
 from app.skills.schema import ReferenceDocument, SkillDefinition, SkillSummary
 
 if TYPE_CHECKING:
@@ -58,9 +53,10 @@ class TenantSkillRegistry:
         self._loader = loader
         # Tier 1 cache: tenant_id → list of summaries
         self._summaries: dict[str, list[SkillSummary]] = {}
-        self._discovery_failures: dict[str, tuple[SkillDiscoveryFailure, ...]] = {}
         # Tier 2 cache: (tenant_id, skill_name) → full SkillDefinition
         self._activated: dict[tuple[str, str], SkillDefinition] = {}
+        # Resource listing cache: (tenant_id, skill_name) → list of filenames
+        self._resource_files: dict[tuple[str, str], list[str]] = {}
 
     # ------------------------------------------------------------------
     # Tier 1 — Discovery
@@ -69,35 +65,19 @@ class TenantSkillRegistry:
     async def discover(self, tenant_id: str) -> None:
         """Load (or reload) Tier 1 summaries for a tenant.
 
-        Only compact discovery metadata is retained. Safe to call at startup for
-        all tenants, even with many skills.
+        Only name + description are fetched. Safe to call at startup
+        for all tenants, even with many skills.
         """
-        result = await self._loader.discover_skills(tenant_id)
-        summaries = list(result.summaries)
-        failures = result.failures
+        summaries = await self._loader.discover_skills(tenant_id)
         self._summaries[tenant_id] = summaries
-        self._discovery_failures[tenant_id] = failures
-        for failure in failures:
-            logger.warning(
-                "Skill discovery skipped tenant=%s source=%s reason=%s",
-                tenant_id,
-                failure.source_path,
-                failure.reason,
-            )
         logger.info(
-            f"[{tenant_id}] Discovery complete: {len(summaries)} skill(s), "
-            f"{len(failures)} skipped → {[s.name for s in summaries]}"
+            f"[{tenant_id}] Discovery complete: {len(summaries)} skill(s) → "
+            f"{[s.name for s in summaries]}"
         )
 
     def get_summaries(self, tenant_id: str) -> list[SkillSummary]:
         """Return all Tier 1 summaries for a tenant (from cache)."""
         return self._summaries.get(tenant_id, [])
-
-    def get_discovery_failures(
-        self, tenant_id: str
-    ) -> tuple[SkillDiscoveryFailure, ...]:
-        """Return bounded failures captured by the latest Tier 1 discovery."""
-        return self._discovery_failures.get(tenant_id, ())
 
     def get_summary(self, tenant_id: str, skill_name: str) -> SkillSummary | None:
         """Return a single Tier 1 summary by name."""
@@ -136,25 +116,32 @@ class TenantSkillRegistry:
         lines.append("</available_skills>")
         return "\n".join(lines)
 
-    async def get_resource_files(self, tenant_id: str, skill_name: str) -> list[str]:
+    async def get_resource_files(
+        self, tenant_id: str, skill_name: str
+    ) -> list[str]:
         """List available reference filenames for a skill (Tier 2.5).
 
         Called during activation to populate <skill_resources> in the response.
-        Files are NOT downloaded — just names listed. The listing is read fresh
-        on every call so it matches the contents available to Tier 3.
+        Results are cached. Files are NOT downloaded — just names listed.
 
         Returns:
             Sorted list of filenames in references/ (e.g. ['schema.md']).
         """
+        cache_key = (tenant_id, skill_name)
+        if cache_key in self._resource_files:
+            return self._resource_files[cache_key]
+
         summary = self.get_summary(tenant_id, skill_name)
         if summary is None:
             return []
 
         try:
-            return await self._loader.list_resource_files(summary)
+            filenames = await self._loader.list_resource_files(summary)
+            self._resource_files[cache_key] = filenames
+            return filenames
         except Exception:
-            logger.error(
-                "[%s] Failed to list resource files for '%s'", tenant_id, skill_name
+            logger.exception(
+                f"[{tenant_id}] Failed to list resource files for '{skill_name}'"
             )
             return []
 
@@ -162,7 +149,9 @@ class TenantSkillRegistry:
     # Tier 2 — Activation
     # ------------------------------------------------------------------
 
-    async def activate(self, tenant_id: str, skill_name: str) -> SkillDefinition | None:
+    async def activate(
+        self, tenant_id: str, skill_name: str
+    ) -> SkillDefinition | None:
         """Load full SKILL.md for a named skill (Tier 2 Activation).
 
         Checks the activation cache first. Downloads from GCS only on
@@ -204,7 +193,9 @@ class TenantSkillRegistry:
             )
             return skill
         except Exception:
-            logger.error("[%s] Failed to activate skill: '%s'", tenant_id, skill_name)
+            logger.exception(
+                f"[{tenant_id}] Failed to activate skill: '{skill_name}'"
+            )
             return None
 
     def get_activated_skill(
@@ -217,11 +208,13 @@ class TenantSkillRegistry:
     # Tier 3 — References
     # ------------------------------------------------------------------
 
-    async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
+    async def load_references(
+        self, skill: SkillDefinition
+    ) -> list[ReferenceDocument]:
         """Load reference documents for a skill (Tier 3 on demand).
 
-        Downloads all files from the skill's ``references/`` directory. Content
-        is read fresh on every call and is not attached to the activated Skill.
+        Downloads all files from the skill's ``references/`` directory.
+        Attaches them to the skill object in-place for reuse.
 
         Args:
             skill: The activated SkillDefinition to load references for.
@@ -229,28 +222,21 @@ class TenantSkillRegistry:
         Returns:
             List of ReferenceDocument objects.
         """
-        return await self._loader.load_references(skill)
+        if skill.references:
+            # Already loaded (idempotent)
+            return skill.references
 
-    async def load_activated_references(
-        self, tenant_id: str, skill_name: str
-    ) -> list[ReferenceDocument]:
-        """Resolve one cached Tier 2 identity before a live Tier 3 read."""
-        skill = self.get_activated_skill(tenant_id, skill_name)
-        if (
-            skill is None
-            or skill.tenant_id != tenant_id
-            or skill.metadata.name != skill_name
-        ):
-            raise SkillReferenceLoadError(
-                SkillReferenceLoadFailureReason.ACTIVATED_SKILL_MISSING
-            )
-        return await self.load_references(skill)
+        refs = await self._loader.load_references(skill)
+        skill.references = refs  # Attach in-place for caching
+        return refs
 
     # ------------------------------------------------------------------
     # Convenience helpers
     # ------------------------------------------------------------------
 
-    def get_tool_names_for_skills(self, skills: list[SkillDefinition]) -> set[str]:
+    def get_tool_names_for_skills(
+        self, skills: list[SkillDefinition]
+    ) -> set[str]:
         """Collect all unique allowed tool names from activated skills.
 
         Uses ``allowed-tools`` from the official agentskills.io spec.
@@ -272,13 +258,14 @@ class TenantSkillRegistry:
     def invalidate(self, tenant_id: str) -> None:
         """Invalidate all cached data for a tenant (for hot-reload).
 
-        Clears Tier 1 summaries and the Tier 2 activation cache.
+        Clears Tier 1 summaries, Tier 2 activation cache, and resource listing cache.
         """
         self._summaries.pop(tenant_id, None)
-        self._discovery_failures.pop(tenant_id, None)
-        for key in [key for key in self._activated if key[0] == tenant_id]:
-            del self._activated[key]
+        for cache in (self._activated, self._resource_files):
+            for k in [k for k in cache if k[0] == tenant_id]:
+                del cache[k]
         logger.info(f"[{tenant_id}] Skill cache invalidated")
+
 
     @property
     def loaded_tenants(self) -> list[str]:

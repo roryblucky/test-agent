@@ -5,14 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncGenerator, Callable
-from contextlib import (
-    AbstractAsyncContextManager,
-    AsyncExitStack,
-    asynccontextmanager,
-)
-from functools import partial
-from pathlib import Path
+from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -24,11 +18,10 @@ from app.config.loader import load_config
 from app.core.audit_middleware import AuditMiddleware
 from app.core.http_client_pool import HttpClientPool
 from app.core.rate_limit_middleware import TenantRateLimitMiddleware
-from app.langgraph_v2.agent_batch import AgentToolRegistry
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.postgres import postgres_lifespan
-from app.langgraph_v2.specialist_definitions import load_local_specialist_catalogs
+from app.langgraph_v2.specialist_retry import require_pinned_pydantic_ai_version
 from app.services.tenant_manager import TenantManager
 
 logger = logging.getLogger(__name__)
@@ -96,12 +89,9 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
 
 @asynccontextmanager
-async def _lifespan(
-    app: FastAPI,
-    *,
-    agent_tool_registry: AgentToolRegistry,
-) -> AsyncGenerator[None]:
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Application lifespan — initialise and tear down shared resources."""
+    require_pinned_pydantic_ai_version()
     # Startup
     from app.api.router import get_session_store
     from app.config.config_reloader import ConfigReloader
@@ -121,23 +111,6 @@ async def _lifespan(
         cleanup.push_async_callback(http_pool.close_all)
         configs = load_config("config.json")
         app.state.tenant_manager = TenantManager(configs, http_pool)
-        specialist_root = Path(
-            os.environ.get("SPECIALIST_DEFINITIONS_LOCAL_ROOT", "definitions")
-        )
-        app.state.langgraph_v2_specialist_catalogs = (
-            await load_local_specialist_catalogs(
-                app.state.tenant_manager,
-                root=specialist_root,
-                tool_registry=agent_tool_registry,
-                tenant_allowed_tool_ids={
-                    tenant_id: (
-                        app.state.tenant_manager.get_agent_tool_ids(tenant_id)
-                        & agent_tool_registry.registered_ids
-                    )
-                    for tenant_id in app.state.tenant_manager.tenant_ids
-                },
-            )
-        )
         app.state.http_pool = http_pool
 
         # Rate limiter (Redis in production, InMemory for dev)
@@ -174,19 +147,6 @@ async def _lifespan(
         await cleanup.enter_async_context(postgres_lifespan(app))
         yield
     logger.info("KMS shutdown complete")
-
-
-def create_lifespan(
-    agent_tool_registry: AgentToolRegistry,
-) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
-    """Bind the executable platform Tool Registry at application composition."""
-    return partial(_lifespan, agent_tool_registry=agent_tool_registry)
-
-
-# This deployment has no production Agent Graph Tool adapters yet. Keep the
-# registry empty rather than treating legacy FlowEngine callables as executable
-# Evidence or Calculation registrations.
-lifespan = create_lifespan(AgentToolRegistry())
 
 
 # ---------------------------------------------------------------------------

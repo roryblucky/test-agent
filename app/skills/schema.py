@@ -159,8 +159,8 @@ class SkillMetadata(BaseModel):
 class SkillSummary(BaseModel):
     """Tier 1 Discovery object — minimal metadata for skill routing.
 
-    Only compact discovery metadata is retained at startup. Tool dependency
-    fields are internal eligibility metadata and are excluded from prompts.
+    Only ``name`` and ``description`` are loaded at startup.
+    This keeps the agent's context window lean when many skills exist.
 
     ~30-50 tokens per skill, suitable for inclusion in system prompt
     as a capability index.
@@ -170,8 +170,6 @@ class SkillSummary(BaseModel):
     description: str
     source_path: str  # GCS URI or local path (for lazy full loading)
     tenant_id: str
-    required_tools: list[str] = Field(default_factory=list, exclude=True)
-    allowed_tools: list[str] = Field(default_factory=list, exclude=True)
 
 
 class ReferenceDocument(BaseModel):
@@ -199,7 +197,7 @@ class SkillDefinition(BaseModel):
     tenant_id: str
     source_path: str  # gs://bucket/path or local path
 
-    # Compatibility field for direct callers; the registry does not populate or cache it.
+    # Tier 3: populated lazily by the registry on demand
     references: list[ReferenceDocument] = Field(default_factory=list[ReferenceDocument])
 
     def to_summary(self) -> SkillSummary:
@@ -209,6 +207,4 @@ class SkillDefinition(BaseModel):
             description=self.metadata.description,
             source_path=self.source_path,
             tenant_id=self.tenant_id,
-            required_tools=self.metadata.required_tools,
-            allowed_tools=self.metadata.allowed_tools,
         )

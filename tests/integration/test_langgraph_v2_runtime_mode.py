@@ -295,7 +295,7 @@ def test_agent_recursion_error_reaches_the_request_stream_without_terminal_state
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
     assert state.get("final_response") is None
-    assert "completion_status" not in state
+    assert state.get("completion_status") is None
 
 
 def test_query_requires_trusted_tenant_runtime_configuration(

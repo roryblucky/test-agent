@@ -1,25 +1,91 @@
-"""Invocation-local progressive access to shared Agent Skills."""
+"""Trusted progressive Skill selection for one Specialist invocation."""
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+import hashlib
+import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
 
-from app.skills.reference_tool import (
-    SkillReferenceRegistry,
-    SkillReferenceResult,
-    load_skill_references,
-)
-from app.skills.schema import SkillDefinition, SkillSummary
+from pydantic import BaseModel, ConfigDict, Field
+
+_MAX_SKILL_SUMMARIES = 20
 
 
-class SkillRuntimeRegistry(SkillReferenceRegistry, Protocol):
-    """Tier 2 and Tier 3 portion of the shared Agent Skills registry contract."""
+class SkillSummary(BaseModel):
+    """Prompt-visible discovery metadata without full instructions."""
 
-    async def activate(self, tenant_id: str, skill_name: str) -> SkillDefinition | None:
-        """Load or return the activated Tier 2 definition."""
-        ...
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+
+
+class SkillPin(BaseModel):
+    """Stable identity recorded after one accepted Skill activation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SkillReference(BaseModel):
+    """One full invocation-local Skill reference document."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
+class ActivatedSkill(BaseModel):
+    """Invocation-local full instructions plus their immutable pin."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    pin: SkillPin
+    instructions: str = Field(min_length=1)
+    references: tuple[SkillReference, ...] = ()
+
+
+@dataclass(frozen=True)
+class SkillRegistration:
+    """One trusted Skill definition kept behind the registry seam."""
+
+    name: str
+    version: str
+    description: str
+    instructions: str
+    required_tool_ids: frozenset[str] = frozenset()
+    allowed_tool_ids: frozenset[str] = frozenset()
+    references: tuple[SkillReference, ...] = ()
+
+    @property
+    def pin(self) -> SkillPin:
+        """Return the immutable identity of this exact instruction content."""
+        canonical = json.dumps(
+            {
+                "name": self.name,
+                "version": self.version,
+                "description": self.description,
+                "instructions": self.instructions,
+                "required_tool_ids": sorted(self.required_tool_ids),
+                "allowed_tool_ids": sorted(self.allowed_tool_ids),
+                "references": [
+                    reference.model_dump(mode="json") for reference in self.references
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return SkillPin(
+            name=self.name,
+            version=self.version,
+            content_hash=hashlib.sha256(canonical.encode()).hexdigest(),
+        )
 
 
 @dataclass
@@ -27,104 +93,86 @@ class SkillInvocation:
     """One Specialist's fixed eligible Skill view and activation state."""
 
     summaries: tuple[SkillSummary, ...]
-    _registry: SkillRuntimeRegistry
-    _tenant_id: str
-    _activated: dict[str, str] = field(default_factory=lambda: dict[str, str]())
+    _eligible: dict[str, SkillRegistration]
+    _effective_tool_ids: frozenset[str]
+    _activated: dict[str, ActivatedSkill] = field(
+        default_factory=lambda: dict[str, ActivatedSkill]()
+    )
 
-    async def activate(self, skill_name: str) -> str:
-        """Load and disclose one eligible Skill without rebinding any Tool."""
-        if skill_name not in {summary.name for summary in self.summaries}:
+    @property
+    def pins(self) -> tuple[SkillPin, ...]:
+        """Return activation pins in first-activation order without instructions."""
+        return tuple(item.pin for item in self._activated.values())
+
+    @property
+    def effective_tool_ids(self) -> frozenset[str]:
+        """Expose the unchanged frozen business Tool set for contract tests."""
+        return self._effective_tool_ids
+
+    def activate(self, skill_name: str) -> ActivatedSkill:
+        """Load one eligible Skill without granting or rebinding a Tool."""
+        skill = self._eligible.get(skill_name)
+        if skill is None:
             raise ValueError("Skill is not eligible")
+        if self._activated and skill_name not in self._activated:
+            raise ValueError("Specialist may activate only one Skill")
+        if not skill.required_tool_ids <= self._effective_tool_ids:
+            raise ValueError("Skill required Tool is not eligible")
         activated = self._activated.get(skill_name)
         if activated is None:
-            definition = await self._registry.activate(self._tenant_id, skill_name)
-            if (
-                definition is None
-                or definition.tenant_id != self._tenant_id
-                or definition.metadata.name != skill_name
-            ):
-                raise ValueError("Skill is not eligible")
-            activated = definition.instructions
+            activated = ActivatedSkill(
+                pin=skill.pin,
+                instructions=skill.instructions,
+                references=skill.references,
+            )
             self._activated[skill_name] = activated
         return activated
 
-    def activation_tool(self) -> Callable[[str], Awaitable[str]]:
+    def activation_tool(self) -> Callable[[str], ActivatedSkill]:
         """Expose activation to this invocation's PydanticAI actor only."""
 
-        async def activate_skill(skill_name: str) -> str:
-            """Activate an eligible Skill by name for the current task."""
-            already_activated = skill_name in self._activated
-            activated = await self.activate(skill_name)
-            return "" if already_activated else activated
+        def activate_skill(skill_name: str) -> ActivatedSkill:
+            """Activate one eligible Skill by name for the current task."""
+            return self.activate(skill_name)
 
         return activate_skill
 
-    def reference_tool(
-        self,
-    ) -> Callable[[str], Awaitable[SkillReferenceResult]]:
-        """Expose live Tier 3 reference loading to this invocation only."""
-
-        async def load_reference(skill_name: str) -> SkillReferenceResult:
-            """Load all current references for a Skill activated in this task."""
-            return await load_skill_references(
-                registry=self._registry,
-                tenant_id=self._tenant_id,
-                activated_skill_names=self._activated,
-                skill_name=skill_name,
-            )
-
-        return load_reference
-
 
 @dataclass(frozen=True)
-class SkillCatalog:
-    """Adapt discovered Agent Skills into fixed invocation-local views."""
+class SpecialistSkillRegistry:
+    """Create bounded invocation-local Skill views from trusted registration."""
 
-    registry: SkillRuntimeRegistry
-    tenant_id: str
-    summaries: Sequence[SkillSummary]
+    registrations: Sequence[SkillRegistration]
+    tenant_eligible_names: frozenset[str]
+    shared_skill_names: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
-        summaries = tuple(summary.model_copy(deep=True) for summary in self.summaries)
-        object.__setattr__(self, "summaries", summaries)
-        names = tuple(summary.name for summary in summaries)
+        names = tuple(skill.name for skill in self.registrations)
         if len(set(names)) != len(names):
-            raise ValueError("Skill summary names must be unique")
-        if any(summary.tenant_id != self.tenant_id for summary in summaries):
-            raise ValueError("Skill summary Tenant does not match")
-
-    @property
-    def names(self) -> frozenset[str]:
-        """Return every valid Skill name in this Tenant catalog."""
-        return frozenset(summary.name for summary in self.summaries)
-
-    def allowed_tool_ids_for(
-        self, specialist_skill_names: Sequence[str]
-    ) -> frozenset[str]:
-        """Return the Tool ceiling declared by this Specialist's valid Skills."""
-        selected = set(specialist_skill_names)
-        return frozenset(
-            tool_id
-            for summary in self.summaries
-            if summary.name in selected
-            for tool_id in summary.allowed_tools
-        )
+            raise ValueError("Skill registration names must be unique")
 
     def begin_invocation(
         self,
         *,
-        specialist_skill_names: Sequence[str],
+        specialist_skill_names: frozenset[str],
+        scope_skill_names: frozenset[str],
+        effective_tool_ids: frozenset[str],
     ) -> SkillInvocation:
-        """Freeze eligible Skills in Specialist declaration order."""
-        summaries_by_name = {summary.name: summary for summary in self.summaries}
-        eligible_summaries: list[SkillSummary] = []
-        for name in specialist_skill_names:
-            summary = summaries_by_name.get(name)
-            if summary is None:
-                continue
-            eligible_summaries.append(summary)
+        """Freeze one Specialist's eligible discovery view in registration order."""
+        selectable_names = self.shared_skill_names | specialist_skill_names
+        eligible_names = (
+            selectable_names & self.tenant_eligible_names & scope_skill_names
+        )
+        eligible_registrations = tuple(
+            skill for skill in self.registrations if skill.name in eligible_names
+        )[:_MAX_SKILL_SUMMARIES]
+        eligible = {skill.name: skill for skill in eligible_registrations}
+        summaries = tuple(
+            SkillSummary(name=skill.name, description=skill.description)
+            for skill in eligible_registrations
+        )
         return SkillInvocation(
-            summaries=tuple(eligible_summaries),
-            _registry=self.registry,
-            _tenant_id=self.tenant_id,
+            summaries=summaries,
+            _eligible=eligible,
+            _effective_tool_ids=effective_tool_ids,
         )

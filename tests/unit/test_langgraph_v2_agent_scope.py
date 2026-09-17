@@ -2,27 +2,21 @@
 
 from app.langgraph_v2.agent_scope import (
     AgentIntentPolicy,
+    SpecialistDescriptor,
     resolve_research_scope,
 )
 from app.models.workflow import IntentResult
 
 
-def test_two_intents_share_catalog_specialists_but_keep_distinct_data_scope() -> None:
-    market_policy = AgentIntentPolicy(
+def test_scope_uses_only_trusted_policy_not_model_metadata() -> None:
+    policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
-        allowed_tool_ids=frozenset({"market-search"}),
-        allowed_sources=frozenset({"filing"}),
-        allowed_queries=frozenset({"Apple revenue"}),
-        max_evidence_age_days=7,
-    )
-    legal_policy = AgentIntentPolicy(
-        intent="legal_risk",
-        description="Assess legal risk.",
-        allowed_tool_ids=frozenset({"legal-search"}),
-        allowed_sources=frozenset({"court-record"}),
-        allowed_queries=frozenset({"Apple litigation"}),
-        max_evidence_age_days=30,
+        specialist_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+            SpecialistDescriptor(id="news", description="News"),
+        ),
+        allowed_skill_names=frozenset({"filing-analysis"}),
     )
     intent = IntentResult(
         intent="market_outlook",
@@ -35,31 +29,19 @@ def test_two_intents_share_catalog_specialists_but_keep_distinct_data_scope() ->
         },
     )
 
-    policies = {
-        market_policy.intent: market_policy,
-        legal_policy.intent: legal_policy,
-    }
-    market_scope = resolve_research_scope(intent, policies)
-    legal_scope = resolve_research_scope(
-        IntentResult(intent="legal_risk", confidence=0.9),
-        policies,
-    )
+    scope = resolve_research_scope(intent, {policy.intent: policy})
 
-    assert market_scope.allowed_tool_ids == frozenset({"market-search"})
-    assert legal_scope.allowed_tool_ids == frozenset({"legal-search"})
-    assert market_scope.allowed_sources == frozenset({"filing"})
-    assert legal_scope.allowed_sources == frozenset({"court-record"})
-    assert market_scope.allowed_queries == frozenset({"Apple revenue"})
-    assert legal_scope.allowed_queries == frozenset({"Apple litigation"})
-    assert market_scope.max_evidence_age_days == 7
-    assert legal_scope.max_evidence_age_days == 30
-    assert not hasattr(market_scope, "tools")
+    assert scope.intent == "market_outlook"
+    assert scope.specialist_descriptors == policy.specialist_descriptors
+    assert scope.allowed_skill_names == frozenset({"filing-analysis"})
+    assert not hasattr(scope, "tools")
 
 
 def test_scope_rejects_unknown_intent() -> None:
     policy = AgentIntentPolicy(
         intent="market_outlook",
         description="Assess market conditions.",
+        specialist_descriptors=(),
     )
 
     try:

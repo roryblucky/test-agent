@@ -1,15 +1,15 @@
 """Rolling Coordination Round acceptance and projection coverage."""
 
 from collections.abc import Callable
-from typing import Any, cast
 
 import pytest
 
 from app.langgraph_v2.agent_batch import (
     AcceptedBatch,
+    ActiveBatch,
     DispatchBatch,
-    SpecialistCatalog,
     SpecialistRegistration,
+    SpecialistRegistry,
     SpecialistResult,
     TaskFailed,
     TaskProposal,
@@ -29,21 +29,17 @@ from app.langgraph_v2.agent_coordination import (
     decide_coordination_round,
     materialize_specialist_context,
     project_coordinator_input,
+    validate_active_batch_coordination_round,
     validate_coordination_rounds,
     validate_coordinator_decision,
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
 
 
-def _catalog() -> SpecialistCatalog:
-    return SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data",
-                description="market-data",
-                actor=cast(Any, object()),
-            ),
-        ),
+def _registry() -> SpecialistRegistry:
+    return SpecialistRegistry(
+        registrations=(SpecialistRegistration(id="market-data"),),
+        tenant_eligible_ids=frozenset({"market-data"}),
     )
 
 
@@ -71,6 +67,7 @@ def _accepted_rounds(
     ),
 ) -> tuple[tuple[CoordinationRound, ...], dict[str, AcceptedBatch]]:
     """Build accepted dispatch rounds through the public acceptance boundary."""
+    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
     rounds: tuple[CoordinationRound, ...] = ()
     accepted_batches: dict[str, AcceptedBatch] = {}
     for round_index in range(count):
@@ -88,12 +85,12 @@ def _accepted_rounds(
             request_id="request-1",
             rounds=rounds,
             accepted_batches=accepted_batches,
-            specialist_catalog=_catalog(),
+            registry=_registry(),
+            scope_descriptors=scope,
         )
-        assert accepted.batch_id is not None
-        rounds += (accepted,)
-        accepted_batches[accepted.batch_id] = AcceptedBatch(
-            id=accepted.batch_id,
+        rounds += (accepted.round,)
+        accepted_batches[accepted.active_batch.id] = AcceptedBatch(
+            id=accepted.active_batch.id,
             outcomes=tuple(
                 TaskSucceeded(
                     task_id=task.id,
@@ -101,7 +98,7 @@ def _accepted_rounds(
                         summary=summary_for(round_index, task_index)
                     ),
                 )
-                for task_index, task in enumerate(accepted.tasks)
+                for task_index, task in enumerate(accepted.active_batch.tasks)
             ),
         )
     return rounds, accepted_batches
@@ -122,11 +119,13 @@ def test_follow_up_dispatch_projects_and_materializes_only_prior_successes() -> 
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        specialist_catalog=_catalog(),
+        registry=_registry(),
+        scope_descriptors=scope,
     )
-    assert first.batch_id is not None
     accepted_batches = {
-        first.batch_id: _accepted_batch(first.batch_id, first.tasks[0].id)
+        first.active_batch.id: _accepted_batch(
+            first.active_batch.id, first.active_batch.tasks[0].id
+        )
     }
     second = accept_coordination_dispatch(
         DispatchBatch(
@@ -135,33 +134,34 @@ def test_follow_up_dispatch_projects_and_materializes_only_prior_successes() -> 
                 TaskProposal(
                     specialist_id="market-data",
                     objective="Assess implications for the next step.",
-                    context_task_ids=(first.tasks[0].id,),
+                    context_task_ids=(first.active_batch.tasks[0].id,),
                 ),
             ),
         ),
         request_id="request-1",
-        rounds=(first,),
+        rounds=(first.round,),
         accepted_batches=accepted_batches,
-        specialist_catalog=_catalog(),
+        registry=_registry(),
+        scope_descriptors=scope,
     )
 
     coordinator_input = project_coordinator_input(
         standalone_query="Market outlook",
         intent="market_outlook",
         specialist_descriptors=scope,
-        rounds=(first,),
+        rounds=(first.round,),
         accepted_batches=accepted_batches,
     )
     context = materialize_specialist_context(
-        second.tasks[0],
-        current_round=second.revision,
-        rounds=(first,),
+        second.active_batch.tasks[0],
+        current_round=second.round.revision,
+        rounds=(first.round,),
         accepted_batches=accepted_batches,
     )
 
-    assert first.revision == 1
-    assert second.revision == 2
-    assert coordinator_input.prior_results[0].task_id == first.tasks[0].id
+    assert first.round.revision == 1
+    assert second.round.revision == 2
+    assert coordinator_input.prior_results[0].task_id == first.active_batch.tasks[0].id
     assert (
         coordinator_input.prior_results[0].summary == "The first-round market finding."
     )
@@ -185,24 +185,24 @@ def test_failed_prior_task_is_projected_without_diagnostics() -> None:
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        specialist_catalog=_catalog(),
+        registry=_registry(),
+        scope_descriptors=scope,
     )
-    assert first.batch_id is not None
     failed = AcceptedBatch(
-        id=first.batch_id,
-        outcomes=(TaskFailed(task_id=first.tasks[0].id),),
+        id=first.active_batch.id,
+        outcomes=(TaskFailed(task_id=first.active_batch.tasks[0].id),),
     )
 
     input = project_coordinator_input(
         standalone_query="Market outlook",
         intent="market_outlook",
         specialist_descriptors=scope,
-        rounds=(first,),
-        accepted_batches={first.batch_id: failed},
+        rounds=(first.round,),
+        accepted_batches={first.active_batch.id: failed},
     )
 
     assert input.prior_results == ()
-    assert input.failed_tasks[0].task_id == first.tasks[0].id
+    assert input.failed_tasks[0].task_id == first.active_batch.tasks[0].id
     assert input.failed_tasks[0].objective == "Assess market conditions."
     assert input.remaining_task_slots == 31
     assert input.dispatch_allowed is True
@@ -264,7 +264,10 @@ async def test_actor_output_exhaustion_stops_without_an_accepted_round() -> None
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        specialist_catalog=_catalog(),
+        registry=_registry(),
+        scope_descriptors=(
+            SpecialistDescriptor(id="market-data", description="Market data"),
+        ),
     )
 
     assert result == CoordinationStopped("coordination_invalid")
@@ -274,6 +277,7 @@ async def test_actor_output_exhaustion_stops_without_an_accepted_round() -> None
 def test_coordination_acceptance_persists_canonical_objectives_and_round_manifest() -> (
     None
 ):
+    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
     accepted = accept_coordination_dispatch(
         DispatchBatch(
             kind="dispatch",
@@ -287,16 +291,31 @@ def test_coordination_acceptance_persists_canonical_objectives_and_round_manifes
         request_id="request-1",
         rounds=(),
         accepted_batches={},
-        specialist_catalog=_catalog(),
+        registry=_registry(),
+        scope_descriptors=scope,
     )
 
-    assert accepted.tasks[0].objective == "Café analysis"
-    assert validate_coordination_rounds((accepted,), request_id="request-1") == (
-        accepted,
+    assert accepted.active_batch.tasks[0].objective == "Café analysis"
+    assert accepted.round.tasks[0].objective == "Café analysis"
+    validate_active_batch_coordination_round(
+        accepted.active_batch,
+        rounds=(accepted.round,),
     )
-    tampered = accepted.model_copy(update={"batch_id": "batch_tampered"})
-    with pytest.raises(CoordinationInvariantError, match="batch is invalid"):
-        validate_coordination_rounds((tampered,), request_id="request-1")
+
+    tampered = ActiveBatch(
+        id=accepted.active_batch.id,
+        round=accepted.active_batch.round,
+        tasks=(
+            accepted.active_batch.tasks[0].model_copy(
+                update={"objective": "Different objective."}
+            ),
+        ),
+    )
+    with pytest.raises(CoordinationInvariantError, match="Active Batch Coordination"):
+        validate_active_batch_coordination_round(
+            tampered,
+            rounds=(accepted.round,),
+        )
 
 
 def test_fourth_dispatch_projects_finish_only_policy() -> None:
@@ -346,7 +365,10 @@ def test_task_limit_takes_precedence_when_all_32_tasks_are_accepted() -> None:
             request_id="request-1",
             rounds=rounds,
             accepted_batches=accepted_batches,
-            specialist_catalog=_catalog(),
+            registry=_registry(),
+            scope_descriptors=(
+                SpecialistDescriptor(id="market-data", description="Market data"),
+            ),
         )
 
 
@@ -375,6 +397,7 @@ def test_checkpoint_round_validation_rejects_a_fifth_dispatch_round() -> None:
 
 
 def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() -> None:
+    scope = (SpecialistDescriptor(id="market-data", description="Market data"),)
     first, accepted_batches = _accepted_rounds(tasks_per_round=8, count=1)
     first_round = first[0]
     first_batch = accepted_batches[first_round.batch_id or ""]
@@ -393,16 +416,17 @@ def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() ->
         request_id="request-1",
         rounds=first,
         accepted_batches=accepted_batches,
-        specialist_catalog=_catalog(),
+        registry=_registry(),
+        scope_descriptors=scope,
     )
 
-    assert accepted.tasks[0].context_task_ids == context_ids
+    assert accepted.active_batch.tasks[0].context_task_ids == context_ids
     assert (
         tuple(
             result.task_id
             for result in materialize_specialist_context(
-                accepted.tasks[0],
-                current_round=accepted.revision,
+                accepted.active_batch.tasks[0],
+                current_round=accepted.round.revision,
                 rounds=first,
                 accepted_batches=accepted_batches,
             )
@@ -425,5 +449,6 @@ def test_context_reference_count_accepts_eight_and_rejects_nine_before_send() ->
             request_id="request-1",
             rounds=first,
             accepted_batches=accepted_batches,
-            specialist_catalog=_catalog(),
+            registry=_registry(),
+            scope_descriptors=scope,
         )

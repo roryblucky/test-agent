@@ -23,24 +23,23 @@ from pydantic_evals.evaluators import Evaluator, EvaluatorContext
 
 from app.langgraph_v2.agent_batch import (
     AcceptedBatch,
-    AgentToolRegistry,
     CalculationToolRegistration,
     DispatchBatch,
     EvidenceToolRegistration,
     SpecialistActor,
     SpecialistAttempt,
-    SpecialistCatalog,
     SpecialistFindingDraft,
     SpecialistRegistration,
+    SpecialistRegistry,
     SpecialistTaskInput,
     TaskProposal,
+    accept_initial_dispatch,
 )
 from app.langgraph_v2.agent_coordination import (
     CoordinationRound,
     CoordinatorDecisionExhausted,
     CoordinatorInput,
     Finish,
-    accept_coordination_dispatch,
 )
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
@@ -56,8 +55,16 @@ from app.langgraph_v2.agent_evidence import (
     publish_report,
 )
 from app.langgraph_v2.agent_graph import build_agent_graph
-from app.langgraph_v2.agent_scope import AgentIntentPolicy
-from app.langgraph_v2.agent_skills import SkillInvocation
+from app.langgraph_v2.agent_scope import (
+    AgentIntentPolicy,
+    SpecialistDescriptor,
+    resolve_research_scope,
+)
+from app.langgraph_v2.agent_skills import (
+    SkillInvocation,
+    SkillRegistration,
+    SpecialistSkillRegistry,
+)
 from app.langgraph_v2.agent_termination import COORDINATION_LIMIT
 from app.langgraph_v2.calculations import (
     CalculationArtifactInvalid,
@@ -87,8 +94,6 @@ from app.models.workflow import (
     QueryUnderstandingOutput,
     ResolvedQuery,
 )
-from app.skills.schema import SkillDefinition, SkillMetadata
-from tests.skill_fakes import static_skill_catalog
 
 _AS_OF = date(2026, 9, 6)
 _TENANT_ID = "financial-evals-tenant"
@@ -312,7 +317,6 @@ class _Synthesis:
             )
         )
 
-
 @dataclass
 class _Harness:
     scenario: str
@@ -320,7 +324,6 @@ class _Harness:
     provider_calls: list[str] = field(default_factory=lambda: list[str]())
     tool_calls: list[str] = field(default_factory=lambda: list[str]())
     task_calls: list[str] = field(default_factory=lambda: list[str]())
-    skill_activations: list[str] = field(default_factory=lambda: list[str]())
     task_tool_calls: Counter[str] = field(default_factory=Counter[str])
     active_task_ids: dict[str, str] = field(default_factory=lambda: dict[str, str]())
     evidence_counts: Counter[str] = field(default_factory=Counter[str])
@@ -330,13 +333,23 @@ class _Harness:
         self.coordinator = _Coordinator(self.scenario)
 
     @property
+    def descriptors(self) -> tuple[SpecialistDescriptor, ...]:
+        return (
+            SpecialistDescriptor(id="market", description="Market analysis"),
+            SpecialistDescriptor(id="fund", description="Fund research"),
+            SpecialistDescriptor(id="news", description="Company news"),
+        )
+
+    @property
     def policy(self) -> AgentIntentPolicy:
         return AgentIntentPolicy(
             intent=_INTENT,
             description="Fixed financial evaluation scope.",
+            specialist_descriptors=self.descriptors,
             allowed_tool_ids=frozenset(
                 {"market-reader", "fund-reader", "news-reader", "calculator"}
             ),
+            allowed_skill_names=frozenset({"financial-analysis"}),
             allowed_sources=frozenset({"market", "fund", "news"}),
             allowed_queries=frozenset(
                 {
@@ -399,75 +412,68 @@ class _Harness:
 
         return provider
 
-    def catalog(self) -> SpecialistCatalog:
-        skills = static_skill_catalog(
-            (
-                SkillDefinition(
-                    metadata=SkillMetadata(
-                        name="financial-analysis",
-                        description="Use fixed financial evidence only.",
-                        skill_metadata={"version": "v1"},
-                        allowed_tools=[
-                            "market-reader",
-                            "fund-reader",
-                            "news-reader",
-                            "calculator",
-                        ],
-                    ),
+    def registry(self) -> SpecialistRegistry:
+        skills = SpecialistSkillRegistry(
+            registrations=(
+                SkillRegistration(
+                    name="financial-analysis",
+                    version="v1",
+                    description="Use fixed financial evidence only.",
                     instructions="Fixed financial analysis instructions.",
-                    tenant_id=_TENANT_ID,
-                    source_path=(
-                        "tenants/eval-tenant/skills/financial-analysis/SKILL.md"
+                    allowed_tool_ids=frozenset(
+                        {"market-reader", "fund-reader", "news-reader", "calculator"}
                     ),
                 ),
             ),
+            tenant_eligible_names=frozenset({"financial-analysis"}),
         )
-        return SpecialistCatalog(
+        return SpecialistRegistry(
             registrations=tuple(
                 SpecialistRegistration(
                     id=role,
-                    description=f"{role.title()} analysis",
                     actor_factory=self._factory(role),
-                    skill_names=("financial-analysis",),
+                    allowed_tool_ids=frozenset(tool_ids),
+                    allowed_skill_names=frozenset({"financial-analysis"}),
                 )
-                for role in ("market", "fund", "news")
+                for role, tool_ids in (
+                    ("market", ("market-reader", "calculator")),
+                    ("fund", ("fund-reader",)),
+                    ("news", ("news-reader",)),
+                )
             ),
-            tool_registry=AgentToolRegistry(
-                evidence_registrations=tuple(
-                    EvidenceToolRegistration(
-                        id=tool_id,
-                        provider=self._provider(tool_id, source),
-                        allowed_sources=frozenset({source}),
-                        allowed_queries=frozenset({query}),
-                        expected_unavailability=(
-                            ExpectedToolUnavailability(
-                                exception_type=_FixtureUnavailable,
-                                reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
-                            ),
-                        )
-                        if tool_id == "fund-reader"
-                        else (),
-                    )
-                    for tool_id, source, query in (
-                        (
-                            "market-reader",
-                            "market",
-                            "FUND-ALPHA versus BENCHMARK-OMEGA",
+            tenant_eligible_ids=frozenset({"market", "fund", "news"}),
+            tool_registrations=tuple(
+                EvidenceToolRegistration(
+                    id=tool_id,
+                    provider=self._provider(tool_id, source),
+                    allowed_sources=frozenset({source}),
+                    allowed_queries=frozenset({query}),
+                    expected_unavailability=(
+                        ExpectedToolUnavailability(
+                            exception_type=_FixtureUnavailable,
+                            reason=ToolUnavailableReason.SOURCE_UNREACHABLE,
                         ),
-                        ("fund-reader", "fund", "FUND-ALPHA holdings"),
-                        ("news-reader", "news", "FUND-ALPHA company news"),
                     )
-                ),
-                calculation_registrations=(
-                    CalculationToolRegistration(
-                        id="calculator", executor=self.calculator
+                    if tool_id == "fund-reader"
+                    else (),
+                )
+                for tool_id, source, query in (
+                    (
+                        "market-reader",
+                        "market",
+                        "FUND-ALPHA versus BENCHMARK-OMEGA",
                     ),
-                ),
+                    ("fund-reader", "fund", "FUND-ALPHA holdings"),
+                    ("news-reader", "news", "FUND-ALPHA company news"),
+                )
             ),
-            tenant_allowed_tool_ids=frozenset(
+            calculation_tool_registrations=(
+                CalculationToolRegistration(id="calculator", executor=self.calculator),
+            ),
+            tenant_eligible_tool_ids=frozenset(
                 {"market-reader", "fund-reader", "news-reader", "calculator"}
             ),
-            skill_catalog=skills,
+            skill_registry=skills,
         )
 
     def _factory(self, role: str) -> Callable[..., SpecialistActor]:
@@ -516,8 +522,7 @@ class _Specialist:
                 messages=(),
             )
         assert self.skills is not None
-        await self.skills.activate("financial-analysis")
-        self.harness.skill_activations.append("financial-analysis")
+        self.skills.activate("financial-analysis")
         tool_calls_before = len(self.harness.tool_calls)
         tool_id, source, query = {
             "market": (
@@ -549,6 +554,7 @@ class _Specialist:
             evidence=tuple(self.capture.evidence),
             unavailability=tuple(self.capture.unavailability),
             calculations=tuple(self.capture.calculations),
+            skill_pins=self.skills.pins,
         )
 
     async def _call(self, tool_id: str, *args: object) -> None:
@@ -589,7 +595,7 @@ async def _graph_observation(harness: _Harness) -> FinancialObservation:
         InMemorySaver(),
         query_understanding_actor=_Understanding(harness.scenario),
         coordinator_actor=harness.coordinator,
-        specialist_catalog=harness.catalog(),
+        specialist_registry=harness.registry(),
         intent_policies={_INTENT: harness.policy},
         moderation_provider=MockModerationProvider(),
         tenant_id=_TENANT_ID,
@@ -658,7 +664,16 @@ async def _graph_observation(harness: _Harness) -> FinancialObservation:
             accepted_outcomes=tuple(
                 tuple(outcome.kind for outcome in batch.outcomes) for batch in batches
             ),
-            selected_skills=tuple(sorted(set(harness.skill_activations))),
+            selected_skills=tuple(
+                sorted(
+                    {
+                        pin.name
+                        for batch in batches
+                        for task_pins in batch.skill_pins
+                        for pin in task_pins.pins
+                    }
+                )
+            ),
             selected_tools=tuple(sorted(set(harness.tool_calls))),
             provider_calls=len(harness.provider_calls),
             model_requests=sum(batch.usage.model_requests for batch in batches),
@@ -702,22 +717,26 @@ async def _graph_observation(harness: _Harness) -> FinancialObservation:
 
 def _gate_observation(case: FinancialCase) -> FinancialObservation:
     if case.scenario == "scope_permission_gate":
-        market_only_catalog = SpecialistCatalog(
-            registrations=(
-                SpecialistRegistration(
-                    id="market",
-                    description="Market analysis",
-                    actor=cast(SpecialistActor, object()),
-                ),
-            ),
+        scope = resolve_research_scope(
+            IntentResult(intent=_INTENT, confidence=1.0),
+            {
+                _INTENT: AgentIntentPolicy(
+                    intent=_INTENT,
+                    description="Market-only fixed scope.",
+                    specialist_descriptors=(
+                        SpecialistDescriptor(
+                            id="market", description="Market analysis"
+                        ),
+                    ),
+                )
+            },
         )
         with pytest.raises(ValueError, match="Specialist is not eligible"):
-            accept_coordination_dispatch(
+            accept_initial_dispatch(
                 _dispatch(("fund", _FUND_OBJECTIVE)),
                 request_id=_REQUEST_ID,
-                rounds=(),
-                accepted_batches={},
-                specialist_catalog=market_only_catalog,
+                registry=_Harness("golden").registry(),
+                scope_descriptors=scope.specialist_descriptors,
             )
         return FinancialObservation(gates=GateObservation(scope_rejected=True))
     catalog = RequestEvidenceCatalog()

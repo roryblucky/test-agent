@@ -105,15 +105,6 @@ class TenantManager:
         self._resolve_tenant(app_id)
         return self._registries[app_id]
 
-    def get_agent_tool_ids(self, app_id: str) -> frozenset[str]:
-        """Return the Tenant-wide upper bound for Agent Graph Tool IDs."""
-        config = self._resolve_tenant(app_id).agent_research_config
-        if config is None:
-            return frozenset()
-        return frozenset(
-            tool_id for intent in config.intents for tool_id in intent.allowed_tool_ids
-        )
-
     def get_providers(self, app_id: str) -> TenantProviders:
         """Return the tenant-scoped non-LLM providers for adapter construction."""
         self._resolve_tenant(app_id)

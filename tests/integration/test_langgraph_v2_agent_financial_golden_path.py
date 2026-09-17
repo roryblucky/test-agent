@@ -35,14 +35,13 @@ from app.agents.synthesis import (
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
 from app.core.model_registry import ModelRegistry
 from app.langgraph_v2.agent_batch import (
-    AgentToolRegistry,
     CalculationToolRegistration,
     DispatchBatch,
     EvidenceToolRegistration,
     SpecialistActor,
-    SpecialistCatalog,
     SpecialistFindingDraft,
     SpecialistRegistration,
+    SpecialistRegistry,
     SpecialistTaskInput,
     TaskProposal,
     task_id_for,
@@ -59,8 +58,13 @@ from app.langgraph_v2.agent_evidence import (
 )
 from app.langgraph_v2.agent_graph import QueryUnderstandingActor, SynthesisActor
 from app.langgraph_v2.agent_runtime import build_agent_runtime
-from app.langgraph_v2.agent_scope import AgentIntentPolicy
-from app.langgraph_v2.agent_skills import SkillInvocation
+from app.langgraph_v2.agent_scope import AgentIntentPolicy, SpecialistDescriptor
+from app.langgraph_v2.agent_skills import (
+    SkillInvocation,
+    SkillReference,
+    SkillRegistration,
+    SpecialistSkillRegistry,
+)
 from app.langgraph_v2.api import GraphRuntimeAdapter
 from app.langgraph_v2.authorization import TrustedRequestContext
 from app.langgraph_v2.calculations import (
@@ -82,13 +86,11 @@ from app.langgraph_v2.specialist_retry import (
     specialist_usage_limits,
 )
 from app.models.workflow import IntentResult, QueryUnderstandingOutput, ResolvedQuery
-from app.skills.schema import SkillDefinition, SkillMetadata
 from tests.integration.test_langgraph_v2_linear_core import (
     CheckpointerFactory,
     parse_sse,
     persistent_linear_app,
 )
-from tests.skill_fakes import static_skill_catalog
 
 _AS_OF_DATE = date(2026, 9, 6)
 _FUND_ID = "FUND-ALPHA"
@@ -435,10 +437,6 @@ class _FinancialSpecialists:
             assert isinstance(objective, str)
             summaries = prompt["skill_summaries"]
             assert isinstance(summaries, list)
-            assert all(
-                set(item) == {"name", "description", "location"}
-                for item in cast(list[Mapping[str, object]], summaries)
-            )
             summary_names = tuple(
                 cast(str, item["name"])
                 for item in cast(list[Mapping[str, object]], summaries)
@@ -452,7 +450,7 @@ class _FinancialSpecialists:
             business_tools = {
                 tool.name
                 for tool in info.function_tools
-                if tool.name not in {"activate_skill", "load_reference"}
+                if tool.name != "activate_skill"
             }
             expected_tools = (
                 {
@@ -718,7 +716,7 @@ class FinancialFixture:
         self.tools.request_id = request_id
         self.tools.fund_task_dispatch_order = fund_task_dispatch_order
 
-    def catalog(self) -> SpecialistCatalog:
+    def registry(self) -> SpecialistRegistry:
         price_body = "fixed closes: 100, 110, 99"
         calculator = CalculationExecutor(
             (
@@ -739,56 +737,62 @@ class FinancialFixture:
                 ),
             )
         )
-        return SpecialistCatalog(
+        return SpecialistRegistry(
             registrations=(
                 SpecialistRegistration(
                     id="market-analysis",
-                    description="Market analysis",
                     actor_factory=self.specialists.market_analysis,
-                    skill_names=("financial-common", "market-methodology"),
+                    allowed_tool_ids=frozenset(
+                        {
+                            "price_series",
+                            CalculationMethod.PERIOD_RETURN,
+                            CalculationMethod.ANNUALIZED_VOLATILITY,
+                            CalculationMethod.MAXIMUM_DRAWDOWN,
+                        }
+                    ),
+                    allowed_skill_names=frozenset({"market-methodology"}),
                 ),
                 SpecialistRegistration(
                     id="fund-research",
-                    description="Fund research",
                     actor_factory=self.specialists.fund_research,
-                    skill_names=("financial-common", "fund-disclosure"),
+                    allowed_tool_ids=frozenset(
+                        {"fund_holdings", "fund_reports", "company_news"}
+                    ),
+                    allowed_skill_names=frozenset({"fund-disclosure"}),
                 ),
             ),
-            tool_registry=AgentToolRegistry(
-                evidence_registrations=(
-                    EvidenceToolRegistration(
-                        id="price_series",
-                        provider=self.tools.price_series,
-                        allowed_sources=frozenset({"market"}),
-                        allowed_queries=frozenset(
-                            {f"{_FUND_ID} versus {_BENCHMARK_ID}"}
-                        ),
-                    ),
-                    EvidenceToolRegistration(
-                        id="fund_holdings",
-                        provider=self.tools.fund_holdings,
-                        allowed_sources=frozenset({"fund"}),
-                        allowed_queries=frozenset({f"{_FUND_ID} holdings"}),
-                    ),
-                    EvidenceToolRegistration(
-                        id="fund_reports",
-                        provider=self.tools.fund_reports,
-                        allowed_sources=frozenset({"fund"}),
-                        allowed_queries=frozenset({f"{_FUND_ID} report"}),
-                    ),
-                    EvidenceToolRegistration(
-                        id="company_news",
-                        provider=self.tools.company_news,
-                        allowed_sources=frozenset({"news"}),
-                        allowed_queries=frozenset({f"{_FUND_ID} company news"}),
-                    ),
+            tenant_eligible_ids=frozenset({"market-analysis", "fund-research"}),
+            tool_registrations=(
+                EvidenceToolRegistration(
+                    id="price_series",
+                    provider=self.tools.price_series,
+                    allowed_sources=frozenset({"market"}),
+                    allowed_queries=frozenset({f"{_FUND_ID} versus {_BENCHMARK_ID}"}),
                 ),
-                calculation_registrations=tuple(
-                    CalculationToolRegistration(id=method, executor=calculator)
-                    for method in CalculationMethod
+                EvidenceToolRegistration(
+                    id="fund_holdings",
+                    provider=self.tools.fund_holdings,
+                    allowed_sources=frozenset({"fund"}),
+                    allowed_queries=frozenset({f"{_FUND_ID} holdings"}),
+                ),
+                EvidenceToolRegistration(
+                    id="fund_reports",
+                    provider=self.tools.fund_reports,
+                    allowed_sources=frozenset({"fund"}),
+                    allowed_queries=frozenset({f"{_FUND_ID} report"}),
+                ),
+                EvidenceToolRegistration(
+                    id="company_news",
+                    provider=self.tools.company_news,
+                    allowed_sources=frozenset({"news"}),
+                    allowed_queries=frozenset({f"{_FUND_ID} company news"}),
                 ),
             ),
-            tenant_allowed_tool_ids=frozenset(
+            calculation_tool_registrations=tuple(
+                CalculationToolRegistration(id=method, executor=calculator)
+                for method in CalculationMethod
+            ),
+            tenant_eligible_tool_ids=frozenset(
                 {
                     "price_series",
                     "fund_holdings",
@@ -797,47 +801,51 @@ class FinancialFixture:
                     *CalculationMethod,
                 }
             ),
-            skill_catalog=static_skill_catalog(
-                (
-                    SkillDefinition(
-                        metadata=SkillMetadata(
-                            name="financial-common",
-                            description="Use fixed financial fixture identifiers.",
-                            skill_metadata={"version": "2026.09"},
-                            allowed_tools=["price_series"],
-                        ),
+            skill_registry=SpecialistSkillRegistry(
+                registrations=(
+                    SkillRegistration(
+                        name="financial-common",
+                        version="2026.09",
+                        description="Use fixed financial fixture identifiers.",
                         instructions="FULL-COMMON-SKILL-INSTRUCTIONS",
-                        tenant_id="tenant-a",
-                        source_path=(
-                            "tenants/tenant-a/skills/financial-common/SKILL.md"
+                        required_tool_ids=frozenset({"price_series"}),
+                        references=(
+                            SkillReference(
+                                name="common-reference",
+                                content=self.content.skill_references.get(
+                                    "financial-common",
+                                    "FULL-COMMON-SKILL-REFERENCE",
+                                ),
+                            ),
                         ),
                     ),
-                    SkillDefinition(
-                        metadata=SkillMetadata(
-                            name="market-methodology",
-                            description="Interpret registered market calculations.",
-                            skill_metadata={"version": "2026.09"},
-                        ),
+                    SkillRegistration(
+                        name="market-methodology",
+                        version="2026.09",
+                        description="Interpret registered market calculations.",
                         instructions="FULL-MARKET-SKILL-INSTRUCTIONS",
-                        tenant_id="tenant-a",
-                        source_path=(
-                            "tenants/tenant-a/skills/market-methodology/SKILL.md"
-                        ),
                     ),
-                    SkillDefinition(
-                        metadata=SkillMetadata(
-                            name="fund-disclosure",
-                            description="Read fund holdings and disclosures.",
-                            skill_metadata={"version": "2026.09"},
-                            allowed_tools=["fund_holdings", "fund_reports"],
-                        ),
+                    SkillRegistration(
+                        name="fund-disclosure",
+                        version="2026.09",
+                        description="Read fund holdings and disclosures.",
                         instructions="FULL-FUND-SKILL-INSTRUCTIONS",
-                        tenant_id="tenant-a",
-                        source_path=(
-                            "tenants/tenant-a/skills/fund-disclosure/SKILL.md"
+                        required_tool_ids=frozenset({"fund_holdings", "fund_reports"}),
+                        references=(
+                            SkillReference(
+                                name="fund-reference",
+                                content=self.content.skill_references.get(
+                                    "fund-disclosure",
+                                    "FULL-FUND-SKILL-REFERENCE",
+                                ),
+                            ),
                         ),
                     ),
                 ),
+                tenant_eligible_names=frozenset(
+                    {"financial-common", "market-methodology", "fund-disclosure"}
+                ),
+                shared_skill_names=frozenset({"financial-common"}),
             ),
         )
 
@@ -845,6 +853,12 @@ class FinancialFixture:
         return AgentIntentPolicy(
             intent="financial_golden_path",
             description="Fixed financial fan-out/fan-in fixture.",
+            specialist_descriptors=(
+                SpecialistDescriptor(
+                    id="market-analysis", description="Market analysis"
+                ),
+                SpecialistDescriptor(id="fund-research", description="Fund research"),
+            ),
             allowed_tool_ids=frozenset(
                 {
                     "price_series",
@@ -853,6 +867,9 @@ class FinancialFixture:
                     "company_news",
                     *CalculationMethod,
                 }
+            ),
+            allowed_skill_names=frozenset(
+                {"financial-common", "market-methodology", "fund-disclosure"}
             ),
             allowed_sources=frozenset({"market", "fund", "news"}),
             allowed_queries=frozenset(
@@ -877,7 +894,7 @@ def financial_app(
     checkpointer_factory: CheckpointerFactory = AsyncPostgresSaver,
 ) -> FastAPI:
     """Assemble the golden fixture with optional request-shape scripting."""
-    catalog = fixture.catalog()
+    registry = fixture.registry()
     policy = fixture.policy()
 
     def factory(
@@ -893,7 +910,7 @@ def financial_app(
             query_understanding_actor=query_understanding_actor
             or fixture.understanding,
             coordinator_actor=coordinator_actor or fixture.coordinator,
-            specialist_catalog=catalog,
+            specialist_registry=registry,
             intent_policies={policy.intent: policy},
             synthesis_actor=synthesis_actor or fixture.synthesis.actor(),
         )

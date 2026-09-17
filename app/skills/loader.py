@@ -21,16 +21,13 @@ from __future__ import annotations
 
 import importlib
 import logging
-import stat
+import re
 from collections.abc import Callable
-from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
-from pydantic import ValidationError
+import yaml
 
-from app.markdown import is_safe_path_segment, parse_frontmatter_and_body
 from app.skills.schema import (
     ReferenceDocument,
     SkillDefinition,
@@ -41,72 +38,62 @@ from app.skills.schema import (
 logger = logging.getLogger(__name__)
 
 
-class GCSBlobProtocol(Protocol):
-    """Minimal GCS blob surface used by the Skill loader."""
-
+class _GCSBlob(Protocol):
     name: str
 
-    def download_as_text(self) -> str:
-        """Download the blob as text."""
-        ...
+    def download_as_text(self) -> str: ...
 
 
-class GCSBucketProtocol(Protocol):
-    """Minimal GCS bucket surface used by the Skill loader."""
+class _GCSBucket(Protocol):
+    def list_blobs(self, *, prefix: str) -> list[_GCSBlob]: ...
 
-    def list_blobs(self, *, prefix: str) -> list[GCSBlobProtocol]:
-        """List blobs below one trusted prefix."""
-        ...
-
-    def blob(self, blob_name: str) -> GCSBlobProtocol:
-        """Return one named blob handle."""
-        ...
+    def blob(self, blob_name: str) -> _GCSBlob: ...
 
 
-class GCSClientProtocol(Protocol):
-    """Minimal injectable GCS client surface used by the Skill loader."""
-
-    def bucket(self, bucket_name: str) -> GCSBucketProtocol:
-        """Return one bucket handle."""
-        ...
+class _GCSClient(Protocol):
+    def bucket(self, bucket_name: str) -> _GCSBucket: ...
 
 
-@dataclass(frozen=True)
-class SkillDiscoveryFailure:
-    """One bounded Tier 1 failure without Skill content or exception text."""
-
-    tenant_id: str
-    source_path: str
-    reason: str
+# ---------------------------------------------------------------------------
+# Internal parser
+# ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class SkillDiscoveryResult:
-    """One atomic Tier 1 result returned by a Skill storage adapter."""
+def _parse_frontmatter_and_body(
+    content: str, source_path: str
+) -> tuple[dict[str, Any], str]:
+    """Split YAML frontmatter and Markdown body from a SKILL.md file.
 
-    summaries: tuple[SkillSummary, ...] = ()
-    failures: tuple[SkillDiscoveryFailure, ...] = ()
+    Args:
+        content: Raw file content.
+        source_path: Path string for error messages.
+
+    Returns:
+        Tuple of (frontmatter_dict, instructions_body).
+
+    Raises:
+        ValueError: If the frontmatter delimiters are missing.
+    """
+    match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)", content, re.DOTALL)
+    if not match:
+        raise ValueError(
+            f"Invalid SKILL.md at {source_path}: "
+            "expected YAML frontmatter between --- delimiters"
+        )
+    loaded: object = yaml.safe_load(match.group(1))
+    if loaded is None:
+        frontmatter: dict[str, Any] = {}
+    elif isinstance(loaded, dict):
+        frontmatter = cast(dict[str, Any], loaded)
+    else:
+        raise ValueError(
+            f"Invalid SKILL.md at {source_path}: frontmatter must be a mapping"
+        )
+    instructions = match.group(2).strip()
+    return frontmatter, instructions
 
 
-class SkillReferenceLoadFailureReason(StrEnum):
-    """Bounded storage failure categories for Tier 3 loading."""
-
-    LIST_FAILED = "reference-list-failed"
-    READ_FAILED = "reference-read-failed"
-    ACTIVATED_SKILL_MISSING = "activated-skill-missing"
-
-
-class SkillReferenceLoadError(RuntimeError):
-    """Report a Tier 3 storage failure without leaking provider details."""
-
-    def __init__(self, reason: SkillReferenceLoadFailureReason) -> None:
-        self.reason = reason
-        super().__init__(reason.value)
-
-
-def parse_skill_definition(
-    content: str, tenant_id: str, source_path: str
-) -> SkillDefinition:
+def _parse_skill_md(content: str, tenant_id: str, source_path: str) -> SkillDefinition:
     """Parse a complete SKILL.md file (Tier 2 Activation object).
 
     Args:
@@ -117,11 +104,7 @@ def parse_skill_definition(
     Returns:
         SkillDefinition with metadata + instructions (no references yet).
     """
-    frontmatter, instructions = parse_frontmatter_and_body(
-        content,
-        source_identity=source_path,
-        document_name="SKILL.md",
-    )
+    frontmatter, instructions = _parse_frontmatter_and_body(content, source_path)
     return SkillDefinition(
         metadata=SkillMetadata(**frontmatter),
         instructions=instructions,
@@ -133,10 +116,9 @@ def parse_skill_definition(
 def _parse_skill_summary(
     content: str, tenant_id: str, source_path: str
 ) -> SkillSummary:
-    """Retain only frontmatter metadata for Tier 1 Discovery (lightweight).
+    """Parse only the frontmatter for Tier 1 Discovery (lightweight).
 
-    Prompt-visible data remains name + description; Tool metadata is retained
-    only for deterministic eligibility validation.
+    Only reads name + description — ~30-50 tokens per skill.
 
     Args:
         content: Raw SKILL.md content.
@@ -144,22 +126,14 @@ def _parse_skill_summary(
         source_path: GCS URI or local path.
 
     Returns:
-        SkillSummary with prompt-visible name/description plus internal Tool
-        dependency metadata.
+        SkillSummary with name + description only.
     """
-    frontmatter, _ = parse_frontmatter_and_body(
-        content,
-        source_identity=source_path,
-        document_name="SKILL.md",
-    )
-    metadata = SkillMetadata(**frontmatter)
+    frontmatter, _ = _parse_frontmatter_and_body(content, source_path)
     return SkillSummary(
-        name=metadata.name,
-        description=metadata.description,
+        name=frontmatter.get("name", ""),
+        description=frontmatter.get("description", ""),
         source_path=source_path,
         tenant_id=tenant_id,
-        required_tools=metadata.required_tools,
-        allowed_tools=metadata.allowed_tools,
     )
 
 
@@ -171,8 +145,8 @@ def _parse_skill_summary(
 class SkillLoaderProtocol(Protocol):
     """Protocol for skill loaders (GCS, local, test doubles)."""
 
-    async def discover_skills(self, tenant_id: str) -> SkillDiscoveryResult:
-        """Tier 1: Load compact summaries and bounded failures atomically."""
+    async def discover_skills(self, tenant_id: str) -> list[SkillSummary]:
+        """Tier 1: Load only name + description for all skills."""
         ...
 
     async def activate_skill(self, summary: SkillSummary) -> SkillDefinition:
@@ -193,21 +167,6 @@ class SkillLoaderProtocol(Protocol):
         ...
 
 
-def _direct_reference_blobs(
-    blobs: list[GCSBlobProtocol], refs_prefix: str
-) -> list[tuple[str, GCSBlobProtocol]]:
-    """Project direct reference files from one GCS directory prefix."""
-    direct_files: list[tuple[str, GCSBlobProtocol]] = []
-    for blob in blobs:
-        if not blob.name.startswith(refs_prefix):
-            continue
-        filename = blob.name.removeprefix(refs_prefix)
-        if not filename or "/" in filename:
-            continue
-        direct_files.append((filename, blob))
-    return sorted(direct_files, key=lambda item: item[0])
-
-
 # ---------------------------------------------------------------------------
 # GCS implementation
 # ---------------------------------------------------------------------------
@@ -224,39 +183,27 @@ class GCSSkillLoader:
     Usage::
 
         loader = GCSSkillLoader("my-config-bucket")
-        discovery = await loader.discover_skills("acme")       # Tier 1
-        skill = await loader.activate_skill(discovery.summaries[0])  # Tier 2
+        summaries = await loader.discover_skills("acme")       # Tier 1
+        skill = await loader.activate_skill(summaries[0])     # Tier 2
         refs = await loader.load_references(skill)            # Tier 3
     """
 
-    def __init__(
-        self, bucket_name: str, client: GCSClientProtocol | None = None
-    ) -> None:
+    def __init__(self, bucket_name: str) -> None:
         self.bucket_name = bucket_name
-        self._client = client
+        self._client: _GCSClient | None = None
 
-    def _get_client(self) -> GCSClientProtocol:
+    def _get_client(self) -> _GCSClient:
         if self._client is None:
             storage_module = importlib.import_module("google.cloud.storage")
             client_type = cast(Callable[[], object], storage_module.Client)
-            self._client = cast(GCSClientProtocol, client_type())
+            self._client = cast(_GCSClient, client_type())
         return self._client
 
-    def _get_bucket(self) -> GCSBucketProtocol:
+    def _get_bucket(self) -> _GCSBucket:
         return self._get_client().bucket(self.bucket_name)
 
-    async def discover_skills(self, tenant_id: str) -> SkillDiscoveryResult:
+    async def discover_skills(self, tenant_id: str) -> list[SkillSummary]:
         """Tier 1: Scan GCS for SKILL.md files, parse frontmatter only."""
-        failures: list[SkillDiscoveryFailure] = []
-        if not is_safe_path_segment(tenant_id):
-            failures.append(
-                SkillDiscoveryFailure(
-                    tenant_id=tenant_id,
-                    source_path="skill-definition-root",
-                    reason="invalid-tenant-id",
-                )
-            )
-            return SkillDiscoveryResult(failures=tuple(failures))
         bucket = self._get_bucket()
         prefix = f"tenants/{tenant_id}/skills/"
         summaries: list[SkillSummary] = []
@@ -268,53 +215,28 @@ class GCSSkillLoader:
                     source_path = f"gs://{self.bucket_name}/{blob.name}"
                     try:
                         content = blob.download_as_text()
-                    except Exception:
-                        failures.append(
-                            SkillDiscoveryFailure(
-                                tenant_id=tenant_id,
-                                source_path=source_path,
-                                reason="unreadable-definition",
-                            )
-                        )
-                        continue
-                    try:
                         summary = _parse_skill_summary(content, tenant_id, source_path)
                         summaries.append(summary)
                         logger.debug(f"[{tenant_id}] Discovered skill: {summary.name}")
-                    except (ValueError, ValidationError):
-                        failures.append(
-                            SkillDiscoveryFailure(
-                                tenant_id=tenant_id,
-                                source_path=source_path,
-                                reason="invalid-definition",
-                            )
+                    except Exception:
+                        logger.exception(
+                            f"[{tenant_id}] Failed to parse skill summary at "
+                            f"{source_path}"
                         )
         except Exception:
-            failures.append(
-                SkillDiscoveryFailure(
-                    tenant_id=tenant_id,
-                    source_path=f"gs://{self.bucket_name}/{prefix}",
-                    reason="list-failed",
-                )
+            logger.exception(
+                f"[{tenant_id}] Failed to list skills from "
+                f"gs://{self.bucket_name}/{prefix}"
             )
 
         logger.info(
-            f"[{tenant_id}] Discovered {len(summaries)} skill(s), "
-            f"skipped {len(failures)}: "
+            f"[{tenant_id}] Discovered {len(summaries)} skill(s): "
             f"{[s.name for s in summaries]}"
         )
-        return SkillDiscoveryResult(
-            summaries=tuple(summaries),
-            failures=tuple(failures),
-        )
+        return summaries
 
     async def activate_skill(self, summary: SkillSummary) -> SkillDefinition:
         """Tier 2: Download and fully parse a specific SKILL.md."""
-        if not is_safe_path_segment(summary.tenant_id):
-            raise ValueError("Invalid Tenant ID")
-        expected_prefix = f"gs://{self.bucket_name}/tenants/{summary.tenant_id}/skills/"
-        if not summary.source_path.startswith(expected_prefix):
-            raise ValueError("Skill source is outside its Tenant prefix")
         # Derive the blob path from the source_path URI
         # source_path = gs://{bucket}/{blob_name}
         blob_name = summary.source_path.removeprefix(f"gs://{self.bucket_name}/")
@@ -322,7 +244,7 @@ class GCSSkillLoader:
         blob = bucket.blob(blob_name)
         content = blob.download_as_text()
 
-        skill = parse_skill_definition(content, summary.tenant_id, summary.source_path)
+        skill = _parse_skill_md(content, summary.tenant_id, summary.source_path)
         logger.info(
             f"[{summary.tenant_id}] Activated skill: {skill.metadata.name} "
             f"(tools: {skill.metadata.allowed_tools})"
@@ -334,11 +256,6 @@ class GCSSkillLoader:
 
         GCS path: ``tenants/{tenant_id}/skills/{name}/references/*``
         """
-        if not is_safe_path_segment(skill.tenant_id):
-            raise ValueError("Invalid Tenant ID")
-        expected_prefix = f"gs://{self.bucket_name}/tenants/{skill.tenant_id}/skills/"
-        if not skill.source_path.startswith(expected_prefix):
-            raise ValueError("Skill source is outside its Tenant prefix")
         # Derive the skill directory prefix from the SKILL.md path
         # source_path = gs://{bucket}/tenants/{tid}/skills/{name}/SKILL.md
         skill_dir = summary_source_to_prefix(skill.source_path, self.bucket_name)
@@ -349,36 +266,30 @@ class GCSSkillLoader:
 
         try:
             blobs = list(bucket.list_blobs(prefix=refs_prefix))
+            for blob in blobs:
+                if blob.name == refs_prefix:
+                    continue  # Skip the directory placeholder blob
+                try:
+                    content = blob.download_as_text()
+                    filename = blob.name.split("/")[-1]
+                    source_path = f"gs://{self.bucket_name}/{blob.name}"
+                    documents.append(
+                        ReferenceDocument(
+                            filename=filename,
+                            content=content,
+                            source_path=source_path,
+                        )
+                    )
+                    logger.debug(f"[{skill.tenant_id}] Loaded reference: {filename}")
+                except Exception:
+                    logger.exception(
+                        f"[{skill.tenant_id}] Failed to load reference: {blob.name}"
+                    )
         except Exception:
-            logger.error(
-                "[%s] Failed to list references for skill '%s'",
-                skill.tenant_id,
-                skill.metadata.name,
+            logger.exception(
+                f"[{skill.tenant_id}] Failed to list references at "
+                f"gs://{self.bucket_name}/{refs_prefix}"
             )
-            raise SkillReferenceLoadError(
-                SkillReferenceLoadFailureReason.LIST_FAILED
-            ) from None
-        for filename, blob in _direct_reference_blobs(blobs, refs_prefix):
-            try:
-                content = blob.download_as_text()
-            except Exception:
-                logger.error(
-                    "[%s] Failed to read a reference for skill '%s'",
-                    skill.tenant_id,
-                    skill.metadata.name,
-                )
-                raise SkillReferenceLoadError(
-                    SkillReferenceLoadFailureReason.READ_FAILED
-                ) from None
-            source_path = f"gs://{self.bucket_name}/{blob.name}"
-            documents.append(
-                ReferenceDocument(
-                    filename=filename,
-                    content=content,
-                    source_path=source_path,
-                )
-            )
-            logger.debug(f"[{skill.tenant_id}] Loaded reference: {filename}")
 
         logger.info(
             f"[{skill.tenant_id}] Loaded {len(documents)} reference(s) "
@@ -395,18 +306,21 @@ class GCSSkillLoader:
         skill_dir = summary_source_to_prefix(summary.source_path, self.bucket_name)
         refs_prefix = f"{skill_dir}references/"
         bucket = self._get_bucket()
+        filenames: list[str] = []
+
         try:
             blobs = list(bucket.list_blobs(prefix=refs_prefix))
+            for blob in blobs:
+                if blob.name == refs_prefix:
+                    continue
+                filenames.append(blob.name.split("/")[-1])
         except Exception:
             logger.debug(
                 f"[{summary.tenant_id}] No references found at "
                 f"gs://{self.bucket_name}/{refs_prefix}"
             )
-            return []
 
-        return [
-            filename for filename, _ in _direct_reference_blobs(blobs, refs_prefix)
-        ]
+        return sorted(filenames)
 
 
 def summary_source_to_prefix(source_path: str, bucket_name: str) -> str:
@@ -425,10 +339,6 @@ def summary_source_to_prefix(source_path: str, bucket_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Local filesystem implementation (dev / testing)
 # ---------------------------------------------------------------------------
-
-
-class _SkillSourceSymlinkError(ValueError):
-    """The local Skill identity became a symlink after discovery."""
 
 
 class LocalSkillLoader:
@@ -453,183 +363,71 @@ class LocalSkillLoader:
     def _tenant_skills_dir(self, tenant_id: str) -> Path:
         return self.base_dir / "tenants" / tenant_id / "skills"
 
-    def _trusted_skill_file(self, tenant_id: str, source_path: str) -> Path:
-        if not is_safe_path_segment(tenant_id):
-            raise ValueError("Invalid Tenant ID")
-        tenant_root = self.base_dir / "tenants" / tenant_id
-        skills_root = tenant_root / "skills"
-        skill_file = Path(source_path)
-        absolute_root = skills_root.absolute()
-        absolute_file = skill_file.absolute()
-        try:
-            relative = absolute_file.relative_to(absolute_root)
-        except ValueError as error:
-            raise ValueError("Skill source is outside its Tenant directory") from error
-        if len(relative.parts) != 2 or relative.parts[-1] != "SKILL.md":
-            raise ValueError("Skill source is not a direct Skill definition")
-        guarded_paths = (tenant_root, skills_root, skill_file.parent, skill_file)
-        if any(path.is_symlink() for path in guarded_paths):
-            raise _SkillSourceSymlinkError("Skill source symlinks are not allowed")
-        return skill_file
-
-    async def discover_skills(self, tenant_id: str) -> SkillDiscoveryResult:
+    async def discover_skills(self, tenant_id: str) -> list[SkillSummary]:
         """Tier 1: Scan local directory, parse frontmatter only."""
-        failures: list[SkillDiscoveryFailure] = []
-        if not is_safe_path_segment(tenant_id):
-            failures.append(
-                SkillDiscoveryFailure(
-                    tenant_id=tenant_id,
-                    source_path="skill-definition-root",
-                    reason="invalid-tenant-id",
-                )
-            )
-            return SkillDiscoveryResult(failures=tuple(failures))
         tenant_dir = self._tenant_skills_dir(tenant_id)
         summaries: list[SkillSummary] = []
 
-        if tenant_dir.parent.is_symlink() or tenant_dir.is_symlink():
-            failures.append(
-                SkillDiscoveryFailure(
-                    tenant_id=tenant_id,
-                    source_path=f"tenants/{tenant_id}/skills",
-                    reason="symlink-not-allowed",
-                )
-            )
-            return SkillDiscoveryResult(failures=tuple(failures))
         if not tenant_dir.exists():
             logger.warning(f"[{tenant_id}] Skill directory not found: {tenant_dir}")
-            return SkillDiscoveryResult()
+            return summaries
 
         for skill_dir in sorted(tenant_dir.iterdir()):
-            if skill_dir.is_symlink():
-                failures.append(
-                    SkillDiscoveryFailure(
-                        tenant_id=tenant_id,
-                        source_path=str(skill_dir),
-                        reason="symlink-not-allowed",
-                    )
-                )
-                continue
             if not skill_dir.is_dir():
                 continue
             skill_file = skill_dir / "SKILL.md"
-            if skill_file.is_symlink():
-                failures.append(
-                    SkillDiscoveryFailure(
-                        tenant_id=tenant_id,
-                        source_path=str(skill_file),
-                        reason="symlink-not-allowed",
-                    )
-                )
-                continue
-            if not skill_file.is_file():
+            if not skill_file.exists():
                 continue
             try:
                 content = skill_file.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                failures.append(
-                    SkillDiscoveryFailure(
-                        tenant_id=tenant_id,
-                        source_path=str(skill_file),
-                        reason="unreadable-definition",
-                    )
-                )
-                continue
-            try:
                 summary = _parse_skill_summary(content, tenant_id, str(skill_file))
                 summaries.append(summary)
                 logger.debug(f"[{tenant_id}] Discovered skill: {summary.name}")
-            except (ValueError, ValidationError):
-                failures.append(
-                    SkillDiscoveryFailure(
-                        tenant_id=tenant_id,
-                        source_path=str(skill_file),
-                        reason="invalid-definition",
-                    )
+            except Exception:
+                logger.exception(
+                    f"[{tenant_id}] Failed to parse skill summary at {skill_file}"
                 )
 
         logger.info(
-            f"[{tenant_id}] Discovered {len(summaries)} local skill(s), "
-            f"skipped {len(failures)}: "
+            f"[{tenant_id}] Discovered {len(summaries)} local skill(s): "
             f"{[s.name for s in summaries]}"
         )
-        return SkillDiscoveryResult(
-            summaries=tuple(summaries),
-            failures=tuple(failures),
-        )
+        return summaries
 
     async def activate_skill(self, summary: SkillSummary) -> SkillDefinition:
         """Tier 2: Read and fully parse a SKILL.md from local path."""
-        skill_file = self._trusted_skill_file(summary.tenant_id, summary.source_path)
+        skill_file = Path(summary.source_path)
         content = skill_file.read_text(encoding="utf-8")
-        skill = parse_skill_definition(content, summary.tenant_id, str(skill_file))
+        skill = _parse_skill_md(content, summary.tenant_id, str(skill_file))
         logger.info(f"[{summary.tenant_id}] Activated skill: {skill.metadata.name}")
         return skill
 
     async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
         """Tier 3: Load all files from references/ subdirectory."""
-        try:
-            skill_file = self._trusted_skill_file(skill.tenant_id, skill.source_path)
-        except _SkillSourceSymlinkError:
-            raise SkillReferenceLoadError(
-                SkillReferenceLoadFailureReason.LIST_FAILED
-            ) from None
+        skill_file = Path(skill.source_path)
         refs_dir = skill_file.parent / "references"
         documents: list[ReferenceDocument] = []
 
-        if refs_dir.is_symlink():
-            raise SkillReferenceLoadError(
-                SkillReferenceLoadFailureReason.LIST_FAILED
-            )
-        try:
-            ref_files = sorted(refs_dir.iterdir())
-        except FileNotFoundError:
+        if not refs_dir.exists():
             return documents
-        except OSError:
-            logger.error(
-                "[%s] Failed to list references for skill '%s'",
-                skill.tenant_id,
-                skill.metadata.name,
-            )
-            raise SkillReferenceLoadError(
-                SkillReferenceLoadFailureReason.LIST_FAILED
-            ) from None
 
-        for ref_file in ref_files:
-            if ref_file.is_symlink():
-                continue
-            try:
-                is_file = stat.S_ISREG(ref_file.stat().st_mode)
-            except OSError:
-                logger.error(
-                    "[%s] Failed to inspect a reference for skill '%s'",
-                    skill.tenant_id,
-                    skill.metadata.name,
-                )
-                raise SkillReferenceLoadError(
-                    SkillReferenceLoadFailureReason.READ_FAILED
-                ) from None
-            if not is_file:
+        for ref_file in sorted(refs_dir.iterdir()):
+            if not ref_file.is_file():
                 continue
             try:
                 content = ref_file.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                logger.error(
-                    "[%s] Failed to read a reference for skill '%s'",
-                    skill.tenant_id,
-                    skill.metadata.name,
+                documents.append(
+                    ReferenceDocument(
+                        filename=ref_file.name,
+                        content=content,
+                        source_path=str(ref_file),
+                    )
                 )
-                raise SkillReferenceLoadError(
-                    SkillReferenceLoadFailureReason.READ_FAILED
-                ) from None
-            documents.append(
-                ReferenceDocument(
-                    filename=ref_file.name,
-                    content=content,
-                    source_path=str(ref_file),
+                logger.debug(f"[{skill.tenant_id}] Loaded reference: {ref_file.name}")
+            except Exception:
+                logger.exception(
+                    f"[{skill.tenant_id}] Failed to load reference: {ref_file}"
                 )
-            )
-            logger.debug(f"[{skill.tenant_id}] Loaded reference: {ref_file.name}")
 
         logger.info(
             f"[{skill.tenant_id}] Loaded {len(documents)} reference(s) "
@@ -643,16 +441,10 @@ class LocalSkillLoader:
         Scans ``references/`` subdirectory only. No scripts/ per K8s policy.
         Returns bare filenames sorted alphabetically.
         """
-        skill_file = self._trusted_skill_file(summary.tenant_id, summary.source_path)
+        skill_file = Path(summary.source_path)
         refs_dir = skill_file.parent / "references"
 
-        if refs_dir.is_symlink():
-            raise ValueError("Skill reference symlinks are not allowed")
         if not refs_dir.exists():
             return []
 
-        return sorted(
-            file.name
-            for file in refs_dir.iterdir()
-            if not file.is_symlink() and file.is_file()
-        )
+        return sorted(f.name for f in refs_dir.iterdir() if f.is_file())
