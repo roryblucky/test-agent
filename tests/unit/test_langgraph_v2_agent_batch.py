@@ -1881,6 +1881,7 @@ async def test_catalog_binds_skill_activation_without_expanding_frozen_business_
     assert [_tool_name(tool) for tool in captured_tools] == [
         "filing-tool",
         "activate_skill",
+        "load_reference",
     ]
     invocation = captured_invocation[0]
     assert [summary.name for summary in invocation.summaries] == ["market-skill"]

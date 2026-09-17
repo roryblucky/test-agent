@@ -599,7 +599,9 @@ def _skill_specialist_factory(
         nonlocal calls
         calls += 1
         business_tools = [
-            tool.name for tool in info.function_tools if tool.name != "activate_skill"
+            tool.name
+            for tool in info.function_tools
+            if tool.name not in {"activate_skill", "load_reference"}
         ]
         assert business_tools == ["filing_reader"]
         if calls == 1:

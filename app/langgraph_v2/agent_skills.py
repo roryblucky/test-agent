@@ -6,20 +6,27 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.skills.schema import SkillDefinition, SkillSummary
+from app.skills.loader import SkillReferenceLoadError
+from app.skills.schema import ReferenceDocument, SkillDefinition, SkillSummary
 
 _MAX_SKILL_SUMMARIES = 20
 
 
-class SkillActivationRegistry(Protocol):
-    """Tier 2 portion of the shared Agent Skills registry contract."""
+class SkillRuntimeRegistry(Protocol):
+    """Tier 2 and Tier 3 portion of the shared Agent Skills registry contract."""
 
     async def activate(self, tenant_id: str, skill_name: str) -> SkillDefinition | None:
         """Load or return the activated Tier 2 definition."""
+        ...
+
+    async def load_activated_references(
+        self, tenant_id: str, skill_name: str
+    ) -> list[ReferenceDocument]:
+        """Resolve the cached Tier 2 identity and read current Tier 3 documents."""
         ...
 
 
@@ -40,6 +47,38 @@ class ActivatedSkill(BaseModel):
 
     pin: SkillPin
     instructions: str = Field(min_length=1)
+
+
+class SkillReferenceContent(BaseModel):
+    """One model-visible reference without its trusted storage identity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    filename: str = Field(min_length=1)
+    content: str
+
+
+class SkillReferencesLoaded(BaseModel):
+    """Complete current reference set returned by Tier 3 loading."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["loaded"] = "loaded"
+    skill_name: str = Field(min_length=1)
+    references: tuple[SkillReferenceContent, ...]
+
+
+class SkillReferencesFailed(BaseModel):
+    """Bounded model-visible failure for a Tier 3 request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["failed"] = "failed"
+    skill_name: str = Field(min_length=1)
+    reason: Literal["not-activated", "load-failed"]
+
+
+type SkillReferenceResult = SkillReferencesLoaded | SkillReferencesFailed
 
 
 def _skill_pin(definition: SkillDefinition) -> SkillPin:
@@ -73,7 +112,7 @@ class SkillInvocation:
     summaries: tuple[SkillSummary, ...]
     _eligible: dict[str, SkillSummary]
     _effective_tool_ids: frozenset[str]
-    _registry: SkillActivationRegistry
+    _registry: SkillRuntimeRegistry
     _tenant_id: str
     _activated: dict[str, ActivatedSkill] = field(
         default_factory=lambda: dict[str, ActivatedSkill]()
@@ -97,7 +136,11 @@ class SkillInvocation:
         activated = self._activated.get(skill_name)
         if activated is None:
             definition = await self._registry.activate(self._tenant_id, skill_name)
-            if definition is None or definition.metadata.name != skill_name:
+            if (
+                definition is None
+                or definition.tenant_id != self._tenant_id
+                or definition.metadata.name != skill_name
+            ):
                 raise ValueError("Skill is not eligible")
             activated = ActivatedSkill(
                 pin=_skill_pin(definition),
@@ -117,12 +160,47 @@ class SkillInvocation:
 
         return activate_skill
 
+    def reference_tool(
+        self,
+    ) -> Callable[[str], Awaitable[SkillReferenceResult]]:
+        """Expose live Tier 3 reference loading to this invocation only."""
+
+        async def load_reference(skill_name: str) -> SkillReferenceResult:
+            """Load all current references for a Skill activated in this task."""
+            if skill_name not in self._activated:
+                return SkillReferencesFailed(
+                    skill_name=skill_name,
+                    reason="not-activated",
+                )
+            try:
+                references = await self._registry.load_activated_references(
+                    self._tenant_id,
+                    skill_name,
+                )
+            except SkillReferenceLoadError:
+                return SkillReferencesFailed(
+                    skill_name=skill_name,
+                    reason="load-failed",
+                )
+            return SkillReferencesLoaded(
+                skill_name=skill_name,
+                references=tuple(
+                    SkillReferenceContent(
+                        filename=reference.filename,
+                        content=reference.content,
+                    )
+                    for reference in references
+                ),
+            )
+
+        return load_reference
+
 
 @dataclass(frozen=True)
 class SkillCatalog:
     """Adapt discovered Agent Skills into fixed invocation-local views."""
 
-    registry: SkillActivationRegistry
+    registry: SkillRuntimeRegistry
     tenant_id: str
     summaries: Sequence[SkillSummary]
 

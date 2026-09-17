@@ -23,7 +23,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from app.skills.loader import SkillDiscoveryFailure
+from app.skills.loader import (
+    SkillDiscoveryFailure,
+    SkillReferenceLoadError,
+    SkillReferenceLoadFailureReason,
+)
 from app.skills.schema import ReferenceDocument, SkillDefinition, SkillSummary
 
 if TYPE_CHECKING:
@@ -226,6 +230,21 @@ class TenantSkillRegistry:
             List of ReferenceDocument objects.
         """
         return await self._loader.load_references(skill)
+
+    async def load_activated_references(
+        self, tenant_id: str, skill_name: str
+    ) -> list[ReferenceDocument]:
+        """Resolve one cached Tier 2 identity before a live Tier 3 read."""
+        skill = self.get_activated_skill(tenant_id, skill_name)
+        if (
+            skill is None
+            or skill.tenant_id != tenant_id
+            or skill.metadata.name != skill_name
+        ):
+            raise SkillReferenceLoadError(
+                SkillReferenceLoadFailureReason.ACTIVATED_SKILL_MISSING
+            )
+        return await self.load_references(skill)
 
     # ------------------------------------------------------------------
     # Convenience helpers

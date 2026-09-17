@@ -3,6 +3,7 @@
 import asyncio
 import json
 from datetime import date
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -54,6 +55,7 @@ from app.langgraph_v2.agent_evidence import (
     ToolUnavailableReason,
     bind_evidence_tool,
 )
+from app.langgraph_v2.agent_skills import SkillCatalog
 from app.langgraph_v2.specialist_retry import (
     RetryDisposition,
     SpecialistInvocationFailure,
@@ -62,6 +64,8 @@ from app.langgraph_v2.specialist_retry import (
     classify_specialist_failure,
     specialist_usage_limits,
 )
+from app.skills.loader import LocalSkillLoader
+from app.skills.registry import TenantSkillRegistry
 from app.skills.schema import SkillDefinition, SkillMetadata
 from tests.skill_fakes import static_skill_catalog
 
@@ -112,6 +116,7 @@ def test_specialist_factory_enables_only_native_output_retries() -> None:
     instructions = registry.kwargs["instructions"]
     assert isinstance(instructions, str)
     assert "activate zero or more eligible Skills" in instructions
+    assert "load_reference" in instructions
 
 
 def test_bound_specialist_factory_uses_exact_frozen_tools() -> None:
@@ -177,7 +182,9 @@ async def test_specialist_interleaves_multiple_skill_activations_with_business_t
         nonlocal calls
         calls += 1
         business_tools = [
-            tool.name for tool in info.function_tools if tool.name != "activate_skill"
+            tool.name
+            for tool in info.function_tools
+            if tool.name not in {"activate_skill", "load_reference"}
         ]
         assert business_tools == ["read_evidence"]
         if calls == 1:
@@ -245,6 +252,123 @@ async def test_specialist_interleaves_multiple_skill_activations_with_business_t
         "filing-analysis",
         "market-analysis",
     ]
+    assert attempt.skill_pins == invocation.pins
+
+
+@pytest.mark.asyncio
+async def test_specialist_loads_current_local_references_before_business_execution(
+    tmp_path: Path,
+) -> None:
+    skill_directory = (
+        tmp_path / "tenants" / "tenant-a" / "skills" / "market-analysis"
+    )
+    references = skill_directory / "references"
+    references.mkdir(parents=True)
+    (skill_directory / "SKILL.md").write_text(
+        """---
+name: market-analysis
+description: Analyze market evidence.
+---
+FULL-MARKET-INSTRUCTIONS
+""",
+        encoding="utf-8",
+    )
+    guide = references / "guide.md"
+    guide.write_text("FIRST-REFERENCE", encoding="utf-8")
+    registry = TenantSkillRegistry(LocalSkillLoader(tmp_path))
+    await registry.discover("tenant-a")
+    invocation = SkillCatalog(
+        registry=registry,
+        tenant_id="tenant-a",
+        summaries=registry.get_summaries("tenant-a"),
+    ).begin_invocation(
+        specialist_skill_names=("market-analysis",),
+        effective_tool_ids=frozenset({"read_evidence"}),
+    )
+    calls = 0
+
+    async def read_evidence() -> dict[str, str]:
+        return {"excerpt": "authorized-business-result"}
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        assert [tool.name for tool in info.function_tools] == [
+            "read_evidence",
+            "activate_skill",
+            "load_reference",
+        ]
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="activate_skill",
+                        args={"skill_name": "market-analysis"},
+                    )
+                ]
+            )
+        if calls == 2:
+            assert "FULL-MARKET-INSTRUCTIONS" in repr(messages)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="load_reference",
+                        args={"skill_name": "market-analysis"},
+                    )
+                ]
+            )
+        if calls == 3:
+            assert "FIRST-REFERENCE" in repr(messages)
+            guide.write_text("SECOND-REFERENCE", encoding="utf-8")
+            (references / "new.md").write_text("NEW-REFERENCE", encoding="utf-8")
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="load_reference",
+                        args={"skill_name": "market-analysis"},
+                    )
+                ]
+            )
+        if calls == 4:
+            assert "SECOND-REFERENCE" in repr(messages)
+            assert "NEW-REFERENCE" in repr(messages)
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name="read_evidence", args={})]
+            )
+        assert "authorized-business-result" in repr(messages)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args={"summary": "Current-reference finding", "evidence_ids": []},
+                )
+            ]
+        )
+
+    actor = PydanticAISpecialistActor(
+        Agent(
+            FunctionModel(model),
+            output_type=SpecialistFindingDraft,
+            tools=(
+                read_evidence,
+                invocation.activation_tool(),
+                invocation.reference_tool(),
+            ),
+            tool_retries=0,
+            output_retries=0,
+            end_strategy="early",
+        ),
+        skill_invocation=invocation,
+    )
+
+    attempt = await actor.run(
+        SpecialistTaskInput(task_id="task-1", objective="Assess the market.")
+    )
+
+    assert calls == 5
+    assert attempt.finding.summary == "Current-reference finding"
+    assert invocation.effective_tool_ids == frozenset({"read_evidence"})
+    assert len(attempt.skill_pins) == 1
     assert attempt.skill_pins == invocation.pins
 
 

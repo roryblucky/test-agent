@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import importlib
 import logging
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -84,6 +86,22 @@ class SkillDiscoveryResult:
 
     summaries: tuple[SkillSummary, ...] = ()
     failures: tuple[SkillDiscoveryFailure, ...] = ()
+
+
+class SkillReferenceLoadFailureReason(StrEnum):
+    """Bounded storage failure categories for Tier 3 loading."""
+
+    LIST_FAILED = "reference-list-failed"
+    READ_FAILED = "reference-read-failed"
+    ACTIVATED_SKILL_MISSING = "activated-skill-missing"
+
+
+class SkillReferenceLoadError(RuntimeError):
+    """Report a Tier 3 storage failure without leaking provider details."""
+
+    def __init__(self, reason: SkillReferenceLoadFailureReason) -> None:
+        self.reason = reason
+        super().__init__(reason.value)
 
 
 def parse_skill_definition(
@@ -173,6 +191,21 @@ class SkillLoaderProtocol(Protocol):
         No scripts/ support per K8s enterprise policy.
         """
         ...
+
+
+def _direct_reference_blobs(
+    blobs: list[GCSBlobProtocol], refs_prefix: str
+) -> list[tuple[str, GCSBlobProtocol]]:
+    """Project direct reference files from one GCS directory prefix."""
+    direct_files: list[tuple[str, GCSBlobProtocol]] = []
+    for blob in blobs:
+        if not blob.name.startswith(refs_prefix):
+            continue
+        filename = blob.name.removeprefix(refs_prefix)
+        if not filename or "/" in filename:
+            continue
+        direct_files.append((filename, blob))
+    return sorted(direct_files, key=lambda item: item[0])
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +334,11 @@ class GCSSkillLoader:
 
         GCS path: ``tenants/{tenant_id}/skills/{name}/references/*``
         """
+        if not is_safe_path_segment(skill.tenant_id):
+            raise ValueError("Invalid Tenant ID")
+        expected_prefix = f"gs://{self.bucket_name}/tenants/{skill.tenant_id}/skills/"
+        if not skill.source_path.startswith(expected_prefix):
+            raise ValueError("Skill source is outside its Tenant prefix")
         # Derive the skill directory prefix from the SKILL.md path
         # source_path = gs://{bucket}/tenants/{tid}/skills/{name}/SKILL.md
         skill_dir = summary_source_to_prefix(skill.source_path, self.bucket_name)
@@ -311,30 +349,36 @@ class GCSSkillLoader:
 
         try:
             blobs = list(bucket.list_blobs(prefix=refs_prefix))
-            for blob in blobs:
-                if blob.name == refs_prefix:
-                    continue  # Skip the directory placeholder blob
-                try:
-                    content = blob.download_as_text()
-                    filename = blob.name.split("/")[-1]
-                    source_path = f"gs://{self.bucket_name}/{blob.name}"
-                    documents.append(
-                        ReferenceDocument(
-                            filename=filename,
-                            content=content,
-                            source_path=source_path,
-                        )
-                    )
-                    logger.debug(f"[{skill.tenant_id}] Loaded reference: {filename}")
-                except Exception:
-                    logger.exception(
-                        f"[{skill.tenant_id}] Failed to load reference: {blob.name}"
-                    )
         except Exception:
-            logger.exception(
-                f"[{skill.tenant_id}] Failed to list references at "
-                f"gs://{self.bucket_name}/{refs_prefix}"
+            logger.error(
+                "[%s] Failed to list references for skill '%s'",
+                skill.tenant_id,
+                skill.metadata.name,
             )
+            raise SkillReferenceLoadError(
+                SkillReferenceLoadFailureReason.LIST_FAILED
+            ) from None
+        for filename, blob in _direct_reference_blobs(blobs, refs_prefix):
+            try:
+                content = blob.download_as_text()
+            except Exception:
+                logger.error(
+                    "[%s] Failed to read a reference for skill '%s'",
+                    skill.tenant_id,
+                    skill.metadata.name,
+                )
+                raise SkillReferenceLoadError(
+                    SkillReferenceLoadFailureReason.READ_FAILED
+                ) from None
+            source_path = f"gs://{self.bucket_name}/{blob.name}"
+            documents.append(
+                ReferenceDocument(
+                    filename=filename,
+                    content=content,
+                    source_path=source_path,
+                )
+            )
+            logger.debug(f"[{skill.tenant_id}] Loaded reference: {filename}")
 
         logger.info(
             f"[{skill.tenant_id}] Loaded {len(documents)} reference(s) "
@@ -351,21 +395,18 @@ class GCSSkillLoader:
         skill_dir = summary_source_to_prefix(summary.source_path, self.bucket_name)
         refs_prefix = f"{skill_dir}references/"
         bucket = self._get_bucket()
-        filenames: list[str] = []
-
         try:
             blobs = list(bucket.list_blobs(prefix=refs_prefix))
-            for blob in blobs:
-                if blob.name == refs_prefix:
-                    continue
-                filenames.append(blob.name.split("/")[-1])
         except Exception:
             logger.debug(
                 f"[{summary.tenant_id}] No references found at "
                 f"gs://{self.bucket_name}/{refs_prefix}"
             )
+            return []
 
-        return sorted(filenames)
+        return [
+            filename for filename, _ in _direct_reference_blobs(blobs, refs_prefix)
+        ]
 
 
 def summary_source_to_prefix(source_path: str, bucket_name: str) -> str:
@@ -384,6 +425,10 @@ def summary_source_to_prefix(source_path: str, bucket_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Local filesystem implementation (dev / testing)
 # ---------------------------------------------------------------------------
+
+
+class _SkillSourceSymlinkError(ValueError):
+    """The local Skill identity became a symlink after discovery."""
 
 
 class LocalSkillLoader:
@@ -424,7 +469,7 @@ class LocalSkillLoader:
             raise ValueError("Skill source is not a direct Skill definition")
         guarded_paths = (tenant_root, skills_root, skill_file.parent, skill_file)
         if any(path.is_symlink() for path in guarded_paths):
-            raise ValueError("Skill source symlinks are not allowed")
+            raise _SkillSourceSymlinkError("Skill source symlinks are not allowed")
         return skill_file
 
     async def discover_skills(self, tenant_id: str) -> SkillDiscoveryResult:
@@ -523,32 +568,68 @@ class LocalSkillLoader:
 
     async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
         """Tier 3: Load all files from references/ subdirectory."""
-        skill_file = self._trusted_skill_file(skill.tenant_id, skill.source_path)
+        try:
+            skill_file = self._trusted_skill_file(skill.tenant_id, skill.source_path)
+        except _SkillSourceSymlinkError:
+            raise SkillReferenceLoadError(
+                SkillReferenceLoadFailureReason.LIST_FAILED
+            ) from None
         refs_dir = skill_file.parent / "references"
         documents: list[ReferenceDocument] = []
 
         if refs_dir.is_symlink():
-            raise ValueError("Skill reference symlinks are not allowed")
-        if not refs_dir.exists():
+            raise SkillReferenceLoadError(
+                SkillReferenceLoadFailureReason.LIST_FAILED
+            )
+        try:
+            ref_files = sorted(refs_dir.iterdir())
+        except FileNotFoundError:
             return documents
+        except OSError:
+            logger.error(
+                "[%s] Failed to list references for skill '%s'",
+                skill.tenant_id,
+                skill.metadata.name,
+            )
+            raise SkillReferenceLoadError(
+                SkillReferenceLoadFailureReason.LIST_FAILED
+            ) from None
 
-        for ref_file in sorted(refs_dir.iterdir()):
-            if ref_file.is_symlink() or not ref_file.is_file():
+        for ref_file in ref_files:
+            if ref_file.is_symlink():
+                continue
+            try:
+                is_file = stat.S_ISREG(ref_file.stat().st_mode)
+            except OSError:
+                logger.error(
+                    "[%s] Failed to inspect a reference for skill '%s'",
+                    skill.tenant_id,
+                    skill.metadata.name,
+                )
+                raise SkillReferenceLoadError(
+                    SkillReferenceLoadFailureReason.READ_FAILED
+                ) from None
+            if not is_file:
                 continue
             try:
                 content = ref_file.read_text(encoding="utf-8")
-                documents.append(
-                    ReferenceDocument(
-                        filename=ref_file.name,
-                        content=content,
-                        source_path=str(ref_file),
-                    )
+            except (OSError, UnicodeError):
+                logger.error(
+                    "[%s] Failed to read a reference for skill '%s'",
+                    skill.tenant_id,
+                    skill.metadata.name,
                 )
-                logger.debug(f"[{skill.tenant_id}] Loaded reference: {ref_file.name}")
-            except Exception:
-                logger.exception(
-                    f"[{skill.tenant_id}] Failed to load reference: {ref_file}"
+                raise SkillReferenceLoadError(
+                    SkillReferenceLoadFailureReason.READ_FAILED
+                ) from None
+            documents.append(
+                ReferenceDocument(
+                    filename=ref_file.name,
+                    content=content,
+                    source_path=str(ref_file),
                 )
+            )
+            logger.debug(f"[{skill.tenant_id}] Loaded reference: {ref_file.name}")
 
         logger.info(
             f"[{skill.tenant_id}] Loaded {len(documents)} reference(s) "

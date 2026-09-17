@@ -452,7 +452,7 @@ class _FinancialSpecialists:
             business_tools = {
                 tool.name
                 for tool in info.function_tools
-                if tool.name != "activate_skill"
+                if tool.name not in {"activate_skill", "load_reference"}
             }
             expected_tools = (
                 {

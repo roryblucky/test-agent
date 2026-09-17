@@ -744,6 +744,7 @@ class SpecialistCatalog:
         if has_skill_activation:
             assert skill_invocation is not None
             tools.append(skill_invocation.activation_tool())
+            tools.append(skill_invocation.reference_tool())
         return actor_factory(
             tuple(tools),
             bound_tools.capture,

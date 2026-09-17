@@ -235,27 +235,50 @@ MARKET-INSTRUCTIONS
     references.mkdir()
     guide = references / "guide.md"
     guide.write_text("FIRST-REFERENCE", encoding="utf-8")
+    _write_agent(
+        tmp_path,
+        tenant_id="tenant-a",
+        filename="market-data.agent.md",
+        content=_agent_document(skills="[market-analysis]"),
+    )
     registry = TenantSkillRegistry(LocalSkillLoader(tmp_path))
-    await registry.discover("tenant-a")
-    skill = await registry.activate("tenant-a", "market-analysis")
-    assert skill is not None
+    catalog = await build_specialist_catalog(
+        LocalTenantDefinitionLoader(tmp_path),
+        tenant_id="tenant-a",
+        model_registry=cast(ModelRegistry, _ModelRegistry("specialist")),
+        skill_registry=registry,
+    )
+    registration = catalog.resolve("market-data")
+    definition_pin = registration.definition_pin
+    assert catalog.skill_catalog is not None
+    invocation = catalog.skill_catalog.begin_invocation(
+        specialist_skill_names=registration.skill_names,
+        effective_tool_ids=frozenset(),
+    )
+    activated = await invocation.activate("market-analysis")
+    skill_pin = activated.pin
 
     first_files = await registry.get_resource_files("tenant-a", "market-analysis")
-    first_references = await registry.load_references(skill)
+    first_references = await invocation.reference_tool()("market-analysis")
     guide.write_text("SECOND-REFERENCE", encoding="utf-8")
     (references / "new.md").write_text("NEW-REFERENCE", encoding="utf-8")
     second_files = await registry.get_resource_files("tenant-a", "market-analysis")
-    second_references = await registry.load_references(skill)
+    second_references = await invocation.reference_tool()("market-analysis")
 
     assert first_files == ["guide.md"]
-    assert [(item.filename, item.content) for item in first_references] == [
+    assert first_references.status == "loaded"
+    assert [(item.filename, item.content) for item in first_references.references] == [
         ("guide.md", "FIRST-REFERENCE")
     ]
     assert second_files == ["guide.md", "new.md"]
-    assert [(item.filename, item.content) for item in second_references] == [
+    assert second_references.status == "loaded"
+    assert [(item.filename, item.content) for item in second_references.references] == [
         ("guide.md", "SECOND-REFERENCE"),
         ("new.md", "NEW-REFERENCE"),
     ]
+    assert catalog.resolve("market-data").definition_pin == definition_pin
+    assert (await invocation.activate("market-analysis")).pin == skill_pin
+    assert invocation.effective_tool_ids == frozenset()
 
 
 @pytest.mark.asyncio

@@ -3,15 +3,25 @@
 from collections.abc import Sequence
 
 from app.langgraph_v2.agent_skills import SkillCatalog
-from app.skills.schema import SkillDefinition
+from app.skills.schema import ReferenceDocument, SkillDefinition
 
 
 class StaticSkillRegistry:
     """Return fixed Tier 2 definitions through the runtime registry seam."""
 
     def __init__(self, definitions: Sequence[SkillDefinition]) -> None:
+        self._references = {
+            definition.metadata.name: tuple(
+                reference.model_copy(deep=True)
+                for reference in definition.references
+            )
+            for definition in definitions
+        }
         self._definitions = {
-            definition.metadata.name: definition.model_copy(deep=True)
+            definition.metadata.name: definition.model_copy(
+                deep=True,
+                update={"references": []},
+            )
             for definition in definitions
         }
 
@@ -20,6 +30,17 @@ class StaticSkillRegistry:
         if definition is None or definition.tenant_id != tenant_id:
             return None
         return definition.model_copy(deep=True)
+
+    async def load_activated_references(
+        self, tenant_id: str, skill_name: str
+    ) -> list[ReferenceDocument]:
+        definition = self._definitions.get(skill_name)
+        if definition is None or definition.tenant_id != tenant_id:
+            return []
+        return [
+            reference.model_copy(deep=True)
+            for reference in self._references[skill_name]
+        ]
 
 
 def static_skill_catalog(

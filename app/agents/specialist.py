@@ -41,8 +41,9 @@ SPECIALIST_INSTRUCTIONS = """\
 You are a Specialist Agent. Complete only the assigned objective.
 Return one structured finding. You may activate zero or more eligible Skills named
 in the supplied summaries when they help the objective. Skill activation never grants
-authority. You may call only the supplied Evidence Tools and must not include
-execution diagnostics.
+authority. After activation, call load_reference when the Skill's current auxiliary
+materials are needed. You may call only the supplied Evidence Tools and must not
+include execution diagnostics.
 """
 
 SPECIALIST_SECURITY_GUARDS = """\

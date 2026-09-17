@@ -5,7 +5,11 @@ from collections.abc import Sequence
 import pytest
 
 from app.langgraph_v2.agent_skills import SkillCatalog
-from app.skills.loader import SkillDiscoveryResult
+from app.skills.loader import (
+    SkillDiscoveryResult,
+    SkillReferenceLoadError,
+    SkillReferenceLoadFailureReason,
+)
 from app.skills.registry import TenantSkillRegistry
 from app.skills.schema import (
     ReferenceDocument,
@@ -43,6 +47,7 @@ def _skill(
 class _SkillLoader:
     def __init__(self, definitions: Sequence[SkillDefinition]) -> None:
         self.definitions = {item.metadata.name: item for item in definitions}
+        self.references: dict[str, list[ReferenceDocument]] = {}
 
     async def discover_skills(self, tenant_id: str) -> SkillDiscoveryResult:
         return SkillDiscoveryResult(
@@ -57,11 +62,17 @@ class _SkillLoader:
         return self.definitions[summary.name].model_copy(deep=True)
 
     async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
-        return list(skill.references)
+        return list(self.references.get(skill.metadata.name, ()))
 
     async def list_resource_files(self, summary: SkillSummary) -> list[str]:
         del summary
         return []
+
+
+class _FailingReferenceLoader(_SkillLoader):
+    async def load_references(self, skill: SkillDefinition) -> list[ReferenceDocument]:
+        del skill
+        raise SkillReferenceLoadError(SkillReferenceLoadFailureReason.READ_FAILED)
 
 
 async def _catalog(
@@ -187,6 +198,28 @@ async def test_activation_does_not_recompute_frozen_eligibility_from_live_metada
 
 
 @pytest.mark.asyncio
+async def test_activation_rejects_a_definition_from_another_tenant() -> None:
+    definition = _skill("market-skill")
+    loader = _SkillLoader((definition,))
+    registry = TenantSkillRegistry(loader)
+    await registry.discover("tenant-a")
+    invocation = SkillCatalog(
+        registry=registry,
+        tenant_id="tenant-a",
+        summaries=registry.get_summaries("tenant-a"),
+    ).begin_invocation(
+        specialist_skill_names=("market-skill",),
+        effective_tool_ids=frozenset(),
+    )
+    loader.definitions["market-skill"] = definition.model_copy(
+        update={"tenant_id": "tenant-b"}
+    )
+
+    with pytest.raises(ValueError, match="Skill is not eligible"):
+        await invocation.activate("market-skill")
+
+
+@pytest.mark.asyncio
 async def test_activation_tool_discloses_only_instructions_once() -> None:
     invocation = (await _catalog((_skill("market-skill"),))).begin_invocation(
         specialist_skill_names=("market-skill",),
@@ -201,6 +234,92 @@ async def test_activation_tool_discloses_only_instructions_once() -> None:
     assert "content_hash" not in first_result
     assert repeated_result == ""
     assert [pin.name for pin in invocation.pins] == ["market-skill"]
+
+
+@pytest.mark.asyncio
+async def test_reference_tool_reads_only_a_skill_activated_in_this_invocation() -> None:
+    definition = _skill("market-skill")
+    loader = _SkillLoader((definition,))
+    loader.references["market-skill"] = [
+        ReferenceDocument(
+            filename="guide.md",
+            content="CURRENT-REFERENCE",
+            source_path="trusted-reference-path",
+        )
+    ]
+    registry = TenantSkillRegistry(loader)
+    await registry.discover("tenant-a")
+    catalog = SkillCatalog(
+        registry=registry,
+        tenant_id="tenant-a",
+        summaries=registry.get_summaries("tenant-a"),
+    )
+    activated_invocation = catalog.begin_invocation(
+        specialist_skill_names=("market-skill",),
+        effective_tool_ids=frozenset(),
+    )
+    other_invocation = catalog.begin_invocation(
+        specialist_skill_names=("market-skill",),
+        effective_tool_ids=frozenset(),
+    )
+    await activated_invocation.activate("market-skill")
+
+    loaded = await activated_invocation.reference_tool()("market-skill")
+    unavailable = await other_invocation.reference_tool()("market-skill")
+
+    assert loaded.model_dump(mode="json") == {
+        "status": "loaded",
+        "skill_name": "market-skill",
+        "references": [
+            {"filename": "guide.md", "content": "CURRENT-REFERENCE"}
+        ],
+    }
+    assert unavailable.model_dump(mode="json") == {
+        "status": "failed",
+        "skill_name": "market-skill",
+        "reason": "not-activated",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reference_tool_returns_a_bounded_storage_failure() -> None:
+    definition = _skill("market-skill")
+    registry = TenantSkillRegistry(_FailingReferenceLoader((definition,)))
+    await registry.discover("tenant-a")
+    invocation = SkillCatalog(
+        registry=registry,
+        tenant_id="tenant-a",
+        summaries=registry.get_summaries("tenant-a"),
+    ).begin_invocation(
+        specialist_skill_names=("market-skill",),
+        effective_tool_ids=frozenset(),
+    )
+    await invocation.activate("market-skill")
+
+    result = await invocation.reference_tool()("market-skill")
+
+    assert result.model_dump(mode="json") == {
+        "status": "failed",
+        "skill_name": "market-skill",
+        "reason": "load-failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reference_tool_returns_a_successful_empty_reference_set() -> None:
+    invocation = (await _catalog((_skill("market-skill"),))).begin_invocation(
+        specialist_skill_names=("market-skill",),
+        effective_tool_ids=frozenset(),
+    )
+    await invocation.activate("market-skill")
+
+    result = await invocation.reference_tool()("market-skill")
+
+    assert result.model_dump(mode="json") == {
+        "status": "loaded",
+        "skill_name": "market-skill",
+        "references": [],
+    }
 
 
 @pytest.mark.asyncio
