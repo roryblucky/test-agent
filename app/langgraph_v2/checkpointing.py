@@ -143,10 +143,7 @@ class AgentCheckpointStateAdapter:
         {
             "answer",
             "standalone_query",
-            "completion_status",
-            "termination_reason",
             "coordination_stop_reason",
-            "coordination_request_id",
         }
     )
     _nullable_json_object_channels = frozenset(
@@ -155,7 +152,6 @@ class AgentCheckpointStateAdapter:
             "intent",
             "research_scope",
             "incomplete_research",
-            "active_batch",
             "dispatched_task",
             "final_response",
         }
@@ -185,10 +181,6 @@ class AgentCheckpointStateAdapter:
             channel_values["halted"], bool
         ):
             raise TypeError("checkpoint halted is invalid")
-        if "coordination_finished" in channel_values and not isinstance(
-            channel_values["coordination_finished"], bool
-        ):
-            raise TypeError("checkpoint coordination_finished is invalid")
         stop_reason = channel_values.get("coordination_stop_reason")
         if stop_reason is not None and stop_reason not in COORDINATION_STOP_REASONS:
             raise TypeError("checkpoint coordination_stop_reason is invalid")
@@ -238,7 +230,7 @@ class AgentCheckpointStateAdapter:
                 raise TypeError("checkpoint coordination_rounds is invalid")
             parsed_rounds.append(parsed)
         if parsed_rounds:
-            request_id = channel_values.get("coordination_request_id")
+            request_id = channel_values.get("request_id")
             if not isinstance(request_id, str):
                 raise TypeError("checkpoint request_id is invalid")
             try:

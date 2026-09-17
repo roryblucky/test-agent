@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -228,7 +226,6 @@ class _SpecialistMetadata(BaseModel):
 class _ParsedSpecialistDefinition:
     metadata: _SpecialistMetadata
     instructions: str
-    definition_pin: str
 
 
 async def build_specialist_catalog(
@@ -260,7 +257,7 @@ async def build_specialist_catalog(
         try:
             if summary.name in seen_skill_names:
                 raise ValueError("duplicate-name")
-            declared_tool_ids = set(summary.required_tools) | set(summary.allowed_tools)
+            declared_tool_ids = set(summary.allowed_tools)
             if not declared_tool_ids <= effective_tool_registry.registered_ids:
                 raise ValueError("unknown-tool")
         except ValueError as error:
@@ -339,7 +336,6 @@ async def build_specialist_catalog(
                     instructions=definition.instructions,
                 ),
                 skill_names=definition.metadata.skills,
-                definition_pin=definition.definition_pin,
             )
         )
     logger.info(
@@ -367,22 +363,9 @@ def _parse_definition(
     metadata = _SpecialistMetadata.model_validate(frontmatter)
     if not instructions or len(instructions) > MAX_SPECIALIST_INSTRUCTION_CHARACTERS:
         raise ValueError("invalid-instructions")
-    canonical = json.dumps(
-        {
-            "description": metadata.description,
-            "id": metadata.id,
-            "instructions": instructions,
-            "model-profile": metadata.model_profile,
-            "skills": list(metadata.skills),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
     return _ParsedSpecialistDefinition(
         metadata=metadata,
         instructions=instructions,
-        definition_pin=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
     )
 
 

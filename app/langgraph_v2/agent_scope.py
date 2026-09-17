@@ -27,7 +27,6 @@ class AgentIntentPolicy(BaseModel):
     intent: str = Field(min_length=1)
     description: str = Field(min_length=1)
     allowed_tool_ids: frozenset[str] = frozenset()
-    allowed_skill_names: frozenset[str] = frozenset()
     allowed_sources: frozenset[str] = frozenset()
     allowed_queries: frozenset[str] = frozenset()
     as_of_date: date = Field(default_factory=date.today)
@@ -40,9 +39,7 @@ class ResearchScope(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     intent: str
-    specialist_descriptors: tuple[SpecialistDescriptor, ...]
     allowed_tool_ids: frozenset[str]
-    allowed_skill_names: frozenset[str]
     allowed_sources: frozenset[str]
     allowed_queries: frozenset[str]
     as_of_date: date
@@ -52,18 +49,14 @@ class ResearchScope(BaseModel):
 def resolve_research_scope(
     intent: IntentResult,
     policies: Mapping[str, AgentIntentPolicy],
-    *,
-    specialist_descriptors: tuple[SpecialistDescriptor, ...],
 ) -> ResearchScope:
-    """Combine a trusted Intent policy with the current Tenant Catalog."""
+    """Resolve one trusted Intent policy into an immutable research scope."""
     policy = policies.get(intent.intent)
     if policy is None:
         raise ValueError("Agent Intent is not configured")
     return ResearchScope(
         intent=policy.intent,
-        specialist_descriptors=specialist_descriptors,
         allowed_tool_ids=policy.allowed_tool_ids,
-        allowed_skill_names=policy.allowed_skill_names,
         allowed_sources=policy.allowed_sources,
         allowed_queries=policy.allowed_queries,
         as_of_date=policy.as_of_date,

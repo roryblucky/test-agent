@@ -2,6 +2,7 @@
 
 import hashlib
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import cast
@@ -15,8 +16,8 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.langgraph_v2.agent_batch import (
+    AcceptedBatch,
     AcceptedTask,
-    ActiveBatch,
     AgentToolRegistry,
     BatchContribution,
     CalculationToolRegistration,
@@ -35,15 +36,15 @@ from app.langgraph_v2.agent_batch import (
     SpecialistUsage,
     TaskFailed,
     TaskProposal,
-    TaskSkillPins,
     TaskSucceeded,
-    accept_initial_dispatch,
     execute_specialist,
     normalize_task_objective,
-    promote_batch,
-    validate_active_batch_manifest,
     validate_promoted_calculation_contribution,
 )
+from app.langgraph_v2.agent_batch import (
+    promote_batch as _promote_batch,
+)
+from app.langgraph_v2.agent_coordination import accept_coordination_dispatch
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
@@ -55,14 +56,9 @@ from app.langgraph_v2.agent_evidence import (
 from app.langgraph_v2.agent_graph import (
     _accepted_task_dump,  # pyright: ignore[reportPrivateUsage]
     _accepted_task_load,  # pyright: ignore[reportPrivateUsage]
-    _active_batch_dump,  # pyright: ignore[reportPrivateUsage]
-    _active_batch_load,  # pyright: ignore[reportPrivateUsage]
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
-from app.langgraph_v2.agent_skills import (
-    SkillInvocation,
-    SkillPin,
-)
+from app.langgraph_v2.agent_skills import SkillInvocation
 from app.langgraph_v2.calculations import (
     CalculationArtifactInvalid,
     CalculationExecutionContext,
@@ -73,7 +69,6 @@ from app.langgraph_v2.calculations import (
     TrustedPriceSeries,
 )
 from app.langgraph_v2.specialist_retry import (
-    SpecialistExecutionDiagnostics,
     SpecialistFailureFacts,
     SpecialistInvocationFailure,
     SpecialistModelBoundary,
@@ -88,6 +83,7 @@ def _skill_definition(
     *,
     instructions: str,
     required_tools: tuple[str, ...] = (),
+    allowed_tools: tuple[str, ...] = (),
 ) -> SkillDefinition:
     return SkillDefinition(
         metadata=SkillMetadata(
@@ -95,6 +91,7 @@ def _skill_definition(
             description=f"{name} summary",
             skill_metadata={"version": "1"},
             required_tools=list(required_tools),
+            allowed_tools=list(allowed_tools),
         ),
         instructions=instructions,
         tenant_id="tenant-a",
@@ -102,16 +99,56 @@ def _skill_definition(
     )
 
 
+@dataclass(frozen=True)
+class _BatchFixture:
+    id: str
+    round: int
+    tasks: tuple[AcceptedTask, ...]
+
+    @property
+    def task_ids(self) -> tuple[str, ...]:
+        return tuple(task.id for task in self.tasks)
+
+
+def accept_initial_dispatch(
+    decision: DispatchBatch,
+    *,
+    request_id: str,
+    specialist_catalog: SpecialistCatalog,
+) -> _BatchFixture:
+    accepted = accept_coordination_dispatch(
+        decision,
+        request_id=request_id,
+        rounds=(),
+        accepted_batches={},
+        specialist_catalog=specialist_catalog,
+    )
+    assert accepted.batch_id is not None
+    return _BatchFixture(accepted.batch_id, accepted.revision, accepted.tasks)
+
+
+def promote_batch(
+    batch: _BatchFixture,
+    contributions: dict[str, BatchContribution],
+    *,
+    calculation_validator: Callable[[BatchContribution], None] | None = None,
+) -> AcceptedBatch:
+    return _promote_batch(
+        batch.id,
+        batch.tasks,
+        contributions,
+        calculation_validator=calculation_validator,
+    )
+
+
 class _Specialist:
     def __init__(
         self,
         finding: SpecialistFindingDraft | None = None,
-        skill_pins: tuple[SkillPin, ...] = (),
         unavailability: tuple[ToolUnavailabilityRecord, ...] = (),
         evidence: tuple[EvidenceEnvelope, ...] = (),
     ) -> None:
         self.finding = finding or SpecialistFindingDraft(summary="No-tool finding")
-        self.skill_pins = skill_pins
         self.unavailability = unavailability
         self.evidence = evidence
 
@@ -126,7 +163,6 @@ class _Specialist:
         del usage, usage_limits
         return SpecialistAttempt(
             finding=self.finding,
-            skill_pins=self.skill_pins,
             unavailability=self.unavailability,
             evidence=self.evidence,
         )
@@ -434,7 +470,7 @@ def test_initial_dispatch_rejects_ninth_task_even_if_model_validation_was_bypass
         ),
     )
 
-    with pytest.raises(ValueError, match="Dispatch Batch exceeds 8 Tasks"):
+    with pytest.raises(ValueError, match="Task count is invalid"):
         accept_initial_dispatch(
             decision,
             request_id="request-1",
@@ -448,42 +484,14 @@ def test_initial_dispatch_rejects_ninth_task_even_if_model_validation_was_bypass
         )
 
 
-def test_active_batch_rejects_duplicate_task_identities() -> None:
-    task = AcceptedTask(
-        id="task-1",
-        objective="Assess market outlook.",
-        specialist_id="market-data",
-    )
-
-    with pytest.raises(ValueError, match="Active Batch Task identities conflict"):
-        ActiveBatch(id="batch-1", tasks=(task, task))
-
-
-def test_active_batch_rejects_recovered_manifest_larger_than_eight_tasks() -> None:
-    tasks = tuple(
-        AcceptedTask(
-            id=f"task-{index}",
-            objective=f"Assess market dimension {index}.",
-            specialist_id="market-data",
-        )
-        for index in range(9)
-    )
-
-    with pytest.raises(ValidationError, match="at most 8 items"):
-        ActiveBatch(id="batch-1", tasks=tasks)
-
-
-def test_active_batch_checkpoint_json_round_trips_with_tuple_containers() -> None:
+def test_dispatched_task_checkpoint_round_trips() -> None:
     task = AcceptedTask(
         id="task-1",
         objective="Assess market outlook.",
         specialist_id="market-data",
         context_task_ids=("prior-1",),
     )
-    batch = ActiveBatch(id="batch-1", tasks=(task,), round=1)
-
     task_payload = _accepted_task_dump(task)
-    batch_payload = _active_batch_dump(batch)
 
     assert task_payload == {
         "id": "task-1",
@@ -491,111 +499,7 @@ def test_active_batch_checkpoint_json_round_trips_with_tuple_containers() -> Non
         "specialist_id": "market-data",
         "context_task_ids": ["prior-1"],
     }
-    assert batch_payload == {
-        "id": "batch-1",
-        "tasks": [task_payload],
-        "round": 1,
-    }
     assert _accepted_task_load(task_payload) == task
-    assert _active_batch_load(batch_payload) == batch
-
-
-@pytest.mark.parametrize(
-    "update",
-    [
-        {"round": "1"},
-        {"round": True},
-        {"unexpected": "field"},
-        {"tasks": [{"id": "task-1"}]},
-        {
-            "tasks": [
-                {
-                    "id": "task-1",
-                    "objective": "Assess market outlook.",
-                    "specialist_id": "market-data",
-                    "context_task_ids": [1],
-                }
-            ]
-        },
-    ],
-)
-def test_active_batch_checkpoint_contamination_fails_closed(
-    update: dict[str, object],
-) -> None:
-    payload: dict[str, object] = {
-        "id": "batch-1",
-        "tasks": [
-            {
-                "id": "task-1",
-                "objective": "Assess market outlook.",
-                "specialist_id": "market-data",
-                "context_task_ids": [],
-            }
-        ],
-        "round": 1,
-    }
-    payload.update(update)
-
-    with pytest.raises(TypeError, match="Agent active batch is invalid"):
-        _active_batch_load(payload)
-
-
-def test_recovered_active_batch_is_validated_before_specialist_fanout() -> None:
-    valid = accept_initial_dispatch(
-        _dispatch(),
-        request_id="request-1",
-        specialist_catalog=_catalog(),
-    )
-    task = valid.tasks[0]
-    invalid_batches = (
-        (
-            ActiveBatch(
-                id=valid.id,
-                tasks=(
-                    AcceptedTask(
-                        id="task-invalid",
-                        objective=task.objective,
-                        specialist_id=task.specialist_id,
-                    ),
-                ),
-            ),
-            "Active Batch Task identity is invalid",
-        ),
-        (
-            ActiveBatch(
-                id=valid.id,
-                tasks=(
-                    AcceptedTask(
-                        id=task.id,
-                        objective=" ",
-                        specialist_id=task.specialist_id,
-                    ),
-                ),
-            ),
-            "Active Batch Task objective is invalid",
-        ),
-        (
-            ActiveBatch(
-                id=valid.id,
-                tasks=(
-                    AcceptedTask(
-                        id=task.id,
-                        objective=task.objective,
-                        specialist_id="other",
-                    ),
-                ),
-            ),
-            "Specialist is not eligible",
-        ),
-    )
-
-    for batch, error in invalid_batches:
-        with pytest.raises(ValueError, match=error):
-            validate_active_batch_manifest(
-                batch,
-                request_id="request-1",
-                specialist_catalog=_catalog(),
-            )
 
 
 def test_initial_dispatch_rejects_specialist_absent_from_tenant_catalog() -> None:
@@ -619,7 +523,7 @@ def test_initial_dispatch_uses_current_catalog_not_stale_scope_descriptors() -> 
 
 def test_initial_dispatch_rejects_context_and_model_authority_fields() -> None:
     with pytest.raises(
-        ValueError, match="initial Dispatch cannot select prior Task context"
+        ValueError, match="Task context is not an accepted prior success"
     ):
         accept_initial_dispatch(
             _dispatch(context_task_ids=("earlier",)),
@@ -939,14 +843,11 @@ async def test_execute_specialist_retries_fresh_actors_and_keeps_only_last_attem
         request_id="request-1",
         specialist_catalog=specialist_catalog,
     )
-    diagnostics = SpecialistExecutionDiagnostics()
-
     contribution = await execute_specialist(
         batch.tasks[0],
         batch_id=batch.id,
         specialist_catalog=specialist_catalog,
         context=_context(task_id=batch.tasks[0].id),
-        diagnostics=diagnostics,
     )
 
     assert build_count == 2
@@ -957,7 +858,6 @@ async def test_execute_specialist_retries_fresh_actors_and_keeps_only_last_attem
     )
     assert contribution.usage.model_requests == 8
     assert contribution.usage.completed_tool_calls == 4
-    assert diagnostics.failed_attempts[0].messages == ("abandoned-message",)
 
 
 @pytest.mark.asyncio
@@ -1465,42 +1365,6 @@ async def test_execute_specialist_reports_priced_model_usage(
 
 
 @pytest.mark.asyncio
-async def test_execute_specialist_persists_only_activated_skill_pins() -> None:
-    batch = accept_initial_dispatch(
-        _dispatch(),
-        request_id="request-1",
-        specialist_catalog=_catalog(),
-    )
-    pin = SkillPin(
-        name="filing-analysis",
-        version="1",
-        content_hash="a" * 64,
-    )
-    catalog = SpecialistCatalog(
-        registrations=(
-            SpecialistRegistration(
-                id="market-data",
-                description="market-data",
-                actor=_Specialist(skill_pins=(pin,)),
-            ),
-        ),
-    )
-
-    contribution = await execute_specialist(
-        batch.tasks[0],
-        batch_id=batch.id,
-        specialist_catalog=catalog,
-        context=_context(task_id=batch.tasks[0].id),
-    )
-    accepted = promote_batch(batch, {contribution.task_id: contribution})
-
-    assert contribution.skill_pins == (pin,)
-    assert accepted.skill_pins == (
-        TaskSkillPins(task_id=batch.tasks[0].id, pins=(pin,)),
-    )
-
-
-@pytest.mark.asyncio
 async def test_execute_specialist_derives_one_data_gap_from_one_accepted_record() -> (
     None
 ):
@@ -1767,7 +1631,9 @@ def test_catalog_keeps_a_direct_no_tool_actor_when_skills_are_declared() -> None
         skill_catalog=static_skill_catalog(
             (
                 _skill_definition(
-                    "market-skill", instructions="MARKET-FULL-INSTRUCTIONS"
+                    "market-skill",
+                    instructions="MARKET-FULL-INSTRUCTIONS",
+                    allowed_tools=("filing-tool",),
                 ),
             ),
         ),
@@ -1866,7 +1732,9 @@ async def test_catalog_binds_skill_activation_without_expanding_frozen_business_
                     required_tools=("filing-tool",),
                 ),
                 _skill_definition(
-                    "market-skill", instructions="MARKET-FULL-INSTRUCTIONS"
+                    "market-skill",
+                    instructions="MARKET-FULL-INSTRUCTIONS",
+                    allowed_tools=("filing-tool",),
                 ),
             ),
         ),
@@ -1885,9 +1753,7 @@ async def test_catalog_binds_skill_activation_without_expanding_frozen_business_
     ]
     invocation = captured_invocation[0]
     assert [summary.name for summary in invocation.summaries] == ["market-skill"]
-    assert (
-        await invocation.activate("market-skill")
-    ).instructions == "MARKET-FULL-INSTRUCTIONS"
+    assert await invocation.activate("market-skill") == "MARKET-FULL-INSTRUCTIONS"
     with pytest.raises(ValueError, match="Skill is not eligible"):
         await invocation.activate("shared-skill")
 

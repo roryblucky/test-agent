@@ -804,7 +804,7 @@ class FinancialFixture:
                             name="financial-common",
                             description="Use fixed financial fixture identifiers.",
                             skill_metadata={"version": "2026.09"},
-                            required_tools=["price_series"],
+                            allowed_tools=["price_series"],
                         ),
                         instructions="FULL-COMMON-SKILL-INSTRUCTIONS",
                         tenant_id="tenant-a",
@@ -829,7 +829,7 @@ class FinancialFixture:
                             name="fund-disclosure",
                             description="Read fund holdings and disclosures.",
                             skill_metadata={"version": "2026.09"},
-                            required_tools=["fund_holdings", "fund_reports"],
+                            allowed_tools=["fund_holdings", "fund_reports"],
                         ),
                         instructions="FULL-FUND-SKILL-INSTRUCTIONS",
                         tenant_id="tenant-a",
@@ -853,9 +853,6 @@ class FinancialFixture:
                     "company_news",
                     *CalculationMethod,
                 }
-            ),
-            allowed_skill_names=frozenset(
-                {"financial-common", "market-methodology", "fund-disclosure"}
             ),
             allowed_sources=frozenset({"market", "fund", "news"}),
             allowed_queries=frozenset(

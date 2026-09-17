@@ -398,41 +398,16 @@ class AgentConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class AgentResearchSpecialistConfig(BaseModel):
-    """Trusted prompt-visible Specialist descriptor for Agent Research."""
-
-    id: str
-    description: str
-
-
 class AgentResearchIntentConfig(BaseModel):
     """Trusted Agent Research policy for one selectable Business Intent."""
 
     intent: str
     description: str
-    specialist_descriptors: Annotated[
-        list[AgentResearchSpecialistConfig],
-        Field(
-            validation_alias=AliasChoices(
-                "specialist_descriptors", "specialistDescriptors"
-            ),
-            serialization_alias="specialistDescriptors",
-        ),
-    ] = Field(default_factory=list[AgentResearchSpecialistConfig])
     allowed_tool_ids: Annotated[
         list[str],
         Field(
             validation_alias=AliasChoices("allowed_tool_ids", "allowedToolIds"),
             serialization_alias="allowedToolIds",
-        ),
-    ] = Field(default_factory=list[str])
-    allowed_skill_names: Annotated[
-        list[str],
-        Field(
-            validation_alias=AliasChoices(
-                "allowed_skill_names", "allowedSkillNames"
-            ),
-            serialization_alias="allowedSkillNames",
         ),
     ] = Field(default_factory=list[str])
     allowed_sources: Annotated[

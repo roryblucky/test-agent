@@ -208,6 +208,7 @@ class _CapturingSynthesis:
         assert prepared.calculations == ()
         return FinancialResearchReport(markdown_report=_RUN_TWO_ANSWER)
 
+
 @dataclass
 class _ConsecutiveRunsFixture:
     app: FastAPI
@@ -364,19 +365,14 @@ def test_consecutive_agent_runs_reset_state_and_change_execution_shape(
     assert reset["coordination_rounds"] == {}
     assert reset["dispatched_task"] is None
     assert reset["halted"] is False
-    assert reset["coordination_finished"] is False
     assert reset["citations"] == []
     for channel in (
         "standalone_query",
         "intent",
         "research_scope",
-        "active_batch",
-        "coordination_request_id",
         "coordination_stop_reason",
         "clarification",
         "answer",
-        "completion_status",
-        "termination_reason",
         "incomplete_research",
         "final_response",
     ):
@@ -460,7 +456,6 @@ def test_consecutive_agent_runs_reset_state_and_change_execution_shape(
     second_state = second_checkpoint.checkpoint["channel_values"]
     assert second_state["request_id"] == _RUN_TWO_ID
     assert second_state["staged_contributions"] == {}
-    assert second_state["active_batch"] is None
     assert second_state["dispatched_task"] is None
     assert len(second_state["accepted_batches"]) == 1
     second_batch = next(iter(second_state["accepted_batches"].values()))

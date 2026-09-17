@@ -29,7 +29,6 @@ from app.langgraph_v2.specialist_retry import (
     SpecialistInvocationFailure,
     SpecialistModelBoundary,
     SpecialistModelRequestTimeout,
-    require_pinned_pydantic_ai_version,
     specialist_usage_limits,
 )
 
@@ -70,7 +69,6 @@ class PydanticAISpecialistActor:
         usage_limits: UsageLimits | None = None,
     ) -> SpecialistAttempt:
         """Return one structured finding from the assigned Task only."""
-        require_pinned_pydantic_ai_version()
         run_usage = usage if usage is not None else RunUsage()
         run_usage_limits = (
             usage_limits if usage_limits is not None else specialist_usage_limits()
@@ -186,9 +184,6 @@ class PydanticAISpecialistActor:
             evidence=evidence,
             unavailability=unavailability,
             calculations=calculations,
-            skill_pins=(
-                self.skill_invocation.pins if self.skill_invocation is not None else ()
-            ),
             messages=tuple(result.new_messages()),
         )
 
@@ -201,7 +196,6 @@ def create_specialist_agent(
     tenant_instructions: str | None = None,
 ) -> Agent[None, SpecialistFindingDraft]:
     """Create one first-round Specialist with its already-frozen Tool set."""
-    require_pinned_pydantic_ai_version()
     instructions = f"{SPECIALIST_INSTRUCTIONS}\n{SPECIALIST_SECURITY_GUARDS}"
     if tenant_instructions is not None:
         instructions = f"{instructions}\n{tenant_instructions}"

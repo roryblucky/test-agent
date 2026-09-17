@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.usage import RunUsage, UsageLimits
 
@@ -30,11 +29,7 @@ from app.langgraph_v2.agent_evidence import (
     bind_evidence_tool,
 )
 from app.langgraph_v2.agent_scope import SpecialistDescriptor
-from app.langgraph_v2.agent_skills import (
-    SkillCatalog,
-    SkillInvocation,
-    SkillPin,
-)
+from app.langgraph_v2.agent_skills import SkillCatalog, SkillInvocation
 from app.langgraph_v2.calculations import (
     MAX_CALCULATIONS_PER_CONTRIBUTION,
     CalculationArtifact,
@@ -49,7 +44,6 @@ from app.langgraph_v2.calculations import (
 from app.langgraph_v2.specialist_retry import (
     SPECIALIST_MAX_ATTEMPTS,
     RetryDisposition,
-    SpecialistExecutionDiagnostics,
     SpecialistInvocationFailure,
     classify_specialist_failure,
     specialist_usage_limits,
@@ -174,7 +168,6 @@ class SpecialistAttempt(BaseModel):
     evidence: tuple[EvidenceEnvelope, ...] = ()
     unavailability: tuple[ToolUnavailabilityRecord, ...] = ()
     calculations: tuple[CalculationArtifact, ...] = ()
-    skill_pins: tuple[SkillPin, ...] = ()
     messages: tuple[ModelMessage, ...] = ()
 
 
@@ -235,11 +228,13 @@ def _validate_attempt_calculations(
     *,
     context: EvidenceInvocationContext,
     specialist_catalog: SpecialistCatalog,
+    registration: SpecialistRegistration,
     support: tuple[EvidenceEnvelope, ...],
 ) -> tuple[CalculationArtifact, ...]:
     """Accept only current registered Calculator Artifacts after final output gates."""
     effective_ids = specialist_catalog.effective_tool_ids(
-        scope_tool_ids=context.allowed_tool_ids
+        scope_tool_ids=context.allowed_tool_ids,
+        registration=registration,
     )
     registered = {
         tool.id: tool
@@ -364,38 +359,9 @@ class BatchContribution(BaseModel):
     attempt: int = Field(ge=1, le=SPECIALIST_MAX_ATTEMPTS)
     outcome: TaskOutcome
     usage: SpecialistUsage = Field(default_factory=SpecialistUsage)
-    specialist_definition_pin: str | None = Field(
-        default=None,
-        min_length=64,
-        max_length=64,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    skill_pins: tuple[SkillPin, ...] = ()
     calculations: tuple[CalculationArtifact, ...] = Field(
         max_length=MAX_CALCULATIONS_PER_CONTRIBUTION,
         default=(),
-    )
-
-
-class TaskSkillPins(BaseModel):
-    """Immutable Skill pins associated with one accepted Task."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    task_id: str
-    pins: tuple[SkillPin, ...]
-
-
-class TaskSpecialistDefinitionPin(BaseModel):
-    """Definition Pin used by one accepted Specialist Task execution."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    task_id: str
-    pin: str = Field(
-        min_length=64,
-        max_length=64,
-        pattern=r"^[0-9a-f]{64}$",
     )
 
 
@@ -407,8 +373,6 @@ class AcceptedBatch(BaseModel):
     id: str
     outcomes: tuple[TaskOutcome, ...]
     usage: SpecialistUsage = Field(default_factory=SpecialistUsage)
-    specialist_definition_pins: tuple[TaskSpecialistDefinitionPin, ...] = ()
-    skill_pins: tuple[TaskSkillPins, ...] = ()
     calculations: tuple[CalculationArtifact, ...] = ()
 
 
@@ -427,36 +391,6 @@ class AcceptedTask(BaseModel):
     def _accept_json_context_task_ids(cls, value: object) -> object:
         """Accept JSON arrays without loosening strict scalar validation."""
         return tuple(cast(list[object], value)) if isinstance(value, list) else value
-
-
-class ActiveBatch(BaseModel):
-    """Immutable first-round manifest awaiting whole-batch acceptance."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    id: str = Field(min_length=1)
-    tasks: tuple[AcceptedTask, ...] = Field(
-        min_length=1, max_length=MAX_DISPATCH_BATCH_TASKS
-    )
-    round: int = Field(default=1, ge=1)
-
-    @field_validator("tasks", mode="before")
-    @classmethod
-    def _accept_json_tasks(cls, value: object) -> object:
-        """Accept a checkpoint JSON array while retaining strict nested fields."""
-        return tuple(cast(list[object], value)) if isinstance(value, list) else value
-
-    @model_validator(mode="after")
-    def _validate_task_identities(self) -> ActiveBatch:
-        """Reject malformed manifests before they can be dispatched or promoted."""
-        if len(set(self.task_ids)) != len(self.tasks):
-            raise ValueError("Active Batch Task identities conflict")
-        return self
-
-    @property
-    def task_ids(self) -> tuple[str, ...]:
-        """Expose stable manifest order to the barrier."""
-        return tuple(task.id for task in self.tasks)
 
 
 class SpecialistActor(Protocol):
@@ -519,27 +453,6 @@ class SpecialistRegistration:
     actor: SpecialistActor | None = None
     actor_factory: SpecialistActorFactory | None = None
     skill_names: tuple[str, ...] = ()
-    definition_pin: str = ""
-
-    def __post_init__(self) -> None:
-        definition_pin = (
-            self.definition_pin
-            or hashlib.sha256(
-                json.dumps(
-                    {
-                        "adapter": "code",
-                        "description": self.description,
-                        "id": self.id,
-                        "skills": list(self.skill_names),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-        )
-        if re.fullmatch(r"[0-9a-f]{64}", definition_pin) is None:
-            raise ValueError("Specialist Definition Pin is invalid")
-        object.__setattr__(self, "definition_pin", definition_pin)
 
 
 @dataclass(frozen=True)
@@ -704,11 +617,17 @@ class SpecialistCatalog:
         self,
         *,
         scope_tool_ids: frozenset[str],
+        registration: SpecialistRegistration | None = None,
     ) -> frozenset[str]:
-        """Return the frozen business Tool authority for one Scope."""
-        return self.tool_registry.effective_tool_ids(
+        """Return the Tool intersection for one Scope and Specialist."""
+        effective_ids = self.tool_registry.effective_tool_ids(
             tenant_tool_ids=self.tenant_allowed_tool_ids,
             scope_tool_ids=scope_tool_ids,
+        )
+        if registration is None or self.skill_catalog is None:
+            return effective_ids
+        return effective_ids & self.skill_catalog.allowed_tool_ids_for(
+            registration.skill_names
         )
 
     def bind_actor(
@@ -723,11 +642,13 @@ class SpecialistCatalog:
             return registration.actor
         actor_factory = registration.actor_factory
         assert actor_factory is not None
-        effective_ids = self.effective_tool_ids(scope_tool_ids=context.allowed_tool_ids)
+        effective_ids = self.effective_tool_ids(
+            scope_tool_ids=context.allowed_tool_ids,
+            registration=registration,
+        )
         skill_invocation = (
             self.skill_catalog.begin_invocation(
                 specialist_skill_names=registration.skill_names,
-                effective_tool_ids=effective_ids,
             )
             if self.skill_catalog is not None
             else None
@@ -736,7 +657,7 @@ class SpecialistCatalog:
             skill_invocation is not None and skill_invocation.summaries
         )
         bound_tools = self.tool_registry.bind(
-            context=context,
+            context=context.model_copy(update={"allowed_tool_ids": effective_ids}),
             tenant_tool_ids=self.tenant_allowed_tool_ids,
             tool_telemetry=tool_telemetry,
         )
@@ -762,44 +683,6 @@ class SpecialistTaskInput:
     validation_feedback: str | None = None
 
 
-def accept_initial_dispatch(
-    decision: DispatchBatch,
-    *,
-    request_id: str,
-    specialist_catalog: SpecialistCatalog,
-) -> ActiveBatch:
-    """Validate a first Dispatch before assigning graph-owned Task identities."""
-    proposals = tuple(decision.tasks)
-    if not 1 <= len(proposals) <= MAX_DISPATCH_BATCH_TASKS:
-        raise ValueError(f"Dispatch Batch exceeds {MAX_DISPATCH_BATCH_TASKS} Tasks")
-    for proposal in proposals:
-        normalize_task_objective(proposal.objective)
-        if proposal.context_task_ids:
-            raise ValueError("initial Dispatch cannot select prior Task context")
-        specialist_catalog.resolve(proposal.specialist_id)
-    batch_id = batch_id_for(request_id=request_id, round=1)
-    active_batch = ActiveBatch(
-        id=batch_id,
-        tasks=tuple(
-            AcceptedTask(
-                id=task_id_for(
-                    request_id=request_id, round=1, dispatch_order=dispatch_order
-                ),
-                objective=normalize_task_objective(proposal.objective),
-                specialist_id=proposal.specialist_id,
-            )
-            for dispatch_order, proposal in enumerate(proposals)
-        ),
-        round=1,
-    )
-    validate_active_batch_manifest(
-        active_batch,
-        request_id=request_id,
-        specialist_catalog=specialist_catalog,
-    )
-    return active_batch
-
-
 def batch_id_for(*, request_id: str, round: int) -> str:
     """Return a stable Graph-owned Batch identity for one Coordination Round."""
     return _stable_id("batch", {"request_id": request_id, "round": round})
@@ -815,37 +698,6 @@ def task_id_for(*, request_id: str, round: int, dispatch_order: int) -> str:
             "dispatch_order": dispatch_order,
         },
     )
-
-
-def validate_active_batch_manifest(
-    batch: ActiveBatch,
-    *,
-    request_id: str,
-    specialist_catalog: SpecialistCatalog,
-) -> None:
-    """Revalidate a checkpointed batch before it can fan out Specialist work."""
-    expected_batch_id = batch_id_for(request_id=request_id, round=batch.round)
-    if batch.id != expected_batch_id:
-        raise ValueError("Active Batch identity is invalid")
-    for dispatch_order, task in enumerate(batch.tasks):
-        expected_task_id = task_id_for(
-            request_id=request_id,
-            round=batch.round,
-            dispatch_order=dispatch_order,
-        )
-        if task.id != expected_task_id:
-            raise ValueError("Active Batch Task identity is invalid")
-        try:
-            canonical_objective = normalize_task_objective(task.objective)
-        except ValueError as error:
-            raise ValueError("Active Batch Task objective is invalid") from error
-        if task.objective != canonical_objective:
-            raise ValueError("Active Batch Task objective is invalid")
-        if len(task.context_task_ids) > 8 or len(set(task.context_task_ids)) != len(
-            task.context_task_ids
-        ):
-            raise ValueError("Active Batch Task context is invalid")
-        specialist_catalog.resolve(task.specialist_id)
 
 
 def validate_promoted_calculation_contribution(
@@ -865,7 +717,7 @@ def validate_promoted_calculation_contribution(
         raise CalculationArtifactInvalid(
             "Failed Task contribution cannot contain Calculation Artifacts"
         )
-    specialist_catalog.resolve(task.specialist_id)
+    registration = specialist_catalog.resolve(task.specialist_id)
     context = EvidenceInvocationContext(
         tenant_id=tenant_id,
         request_id=request_id,
@@ -886,6 +738,7 @@ def validate_promoted_calculation_contribution(
         contribution.calculations,
         context=context,
         specialist_catalog=specialist_catalog,
+        registration=registration,
         support=support,
     )
 
@@ -899,7 +752,6 @@ async def execute_specialist(
     context: EvidenceInvocationContext,
     context_results: tuple[PriorResultView, ...] = (),
     tool_telemetry: ToolTelemetry | None = None,
-    diagnostics: SpecialistExecutionDiagnostics | None = None,
 ) -> BatchContribution:
     """Run up to three fresh bounded attempts and stage one terminal Outcome."""
     registration = specialist_catalog.resolve(task.specialist_id)
@@ -917,7 +769,6 @@ async def execute_specialist(
             task_id=task.id,
             attempt=attempt_number,
             outcome=TaskFailed(task_id=task.id),
-            specialist_definition_pin=registration.definition_pin,
             usage=SpecialistUsage.from_run_usage(
                 cumulative_usage,
                 tool_attempts=cumulative_tool_attempts,
@@ -925,16 +776,6 @@ async def execute_specialist(
                 cost_is_complete=cumulative_cost_is_complete,
             ),
         )
-
-    def record_validation_failure(
-        attempt_number: int,
-        attempt: SpecialistAttempt,
-    ) -> None:
-        if diagnostics is not None:
-            diagnostics.record_failed_attempt(
-                attempt=attempt_number,
-                messages=tuple(attempt.messages),
-            )
 
     validation_feedback: str | None = None
     for attempt_number in range(1, SPECIALIST_MAX_ATTEMPTS + 1):
@@ -966,11 +807,6 @@ async def execute_specialist(
                 and attempt_cost_is_complete
                 and failure.facts.unreturned_model_requests == 0
             )
-            if diagnostics is not None:
-                diagnostics.record_failed_attempt(
-                    attempt=attempt_number,
-                    messages=failure.messages,
-                )
             disposition = classify_specialist_failure(
                 failure.error, facts=failure.facts
             )
@@ -1000,7 +836,8 @@ async def execute_specialist(
             attempt.unavailability,
             context=attempt_context,
             effective_tool_ids=specialist_catalog.effective_tool_ids(
-                scope_tool_ids=context.allowed_tool_ids
+                scope_tool_ids=context.allowed_tool_ids,
+                registration=registration,
             ),
         )
         result = SpecialistResult(
@@ -1021,7 +858,6 @@ async def execute_specialist(
                     context=attempt_context,
                 )
             except EvidenceReferenceInvalid:
-                record_validation_failure(attempt_number, attempt)
                 if attempt_number == SPECIALIST_MAX_ATTEMPTS:
                     return failed_contribution(attempt_number)
                 validation_feedback = (
@@ -1033,10 +869,10 @@ async def execute_specialist(
                     attempt.calculations,
                     context=attempt_context,
                     specialist_catalog=specialist_catalog,
+                    registration=registration,
                     support=support,
                 )
             except CalculationDomainRejected:
-                record_validation_failure(attempt_number, attempt)
                 if attempt_number == SPECIALIST_MAX_ATTEMPTS:
                     return failed_contribution(attempt_number)
                 validation_feedback = (
@@ -1054,14 +890,12 @@ async def execute_specialist(
             task_id=task.id,
             attempt=attempt_number,
             outcome=TaskSucceeded(task_id=task.id, result=result),
-            specialist_definition_pin=registration.definition_pin,
             usage=SpecialistUsage.from_run_usage(
                 cumulative_usage,
                 tool_attempts=cumulative_tool_attempts,
                 cost_usd=cumulative_cost_usd,
                 cost_is_complete=cumulative_cost_is_complete,
             ),
-            skill_pins=attempt.skill_pins,
             calculations=calculations,
         )
     raise AssertionError("Specialist attempts did not reach a terminal outcome")
@@ -1095,24 +929,26 @@ def _message_cost_usd(messages: Sequence[object]) -> tuple[float, bool]:
 
 
 def promote_batch(
-    batch: ActiveBatch,
+    batch_id: str,
+    tasks: Sequence[AcceptedTask],
     contributions: Mapping[str, BatchContribution],
     *,
     calculation_validator: Callable[[BatchContribution], None] | None = None,
 ) -> AcceptedBatch:
     """Validate exact manifest membership before atomically promoting a batch."""
-    if set(contributions) != set(batch.task_ids):
+    task_ids = tuple(task.id for task in tasks)
+    if set(contributions) != set(task_ids):
         raise ValueError("Batch contribution manifest is invalid")
     if any(
         task_id != contribution.task_id
         for task_id, contribution in contributions.items()
     ):
         raise ValueError("Batch contribution manifest is invalid")
-    ordered = tuple(contributions[task_id] for task_id in batch.task_ids)
+    ordered = tuple(contributions[task_id] for task_id in task_ids)
     if any(
-        contribution.batch_id != batch.id
+        contribution.batch_id != batch_id
         or contribution.task_id != contribution.outcome.task_id
-        or contribution.task_id not in batch.task_ids
+        or contribution.task_id not in task_ids
         or not 1 <= contribution.attempt <= SPECIALIST_MAX_ATTEMPTS
         for contribution in ordered
     ):
@@ -1154,21 +990,8 @@ def promote_batch(
     for contribution in ordered:
         usage = usage.add(contribution.usage)
     return AcceptedBatch(
-        id=batch.id,
+        id=batch_id,
         outcomes=tuple(item.outcome for item in ordered),
         usage=usage,
-        specialist_definition_pins=tuple(
-            TaskSpecialistDefinitionPin(
-                task_id=item.task_id,
-                pin=item.specialist_definition_pin,
-            )
-            for item in ordered
-            if item.specialist_definition_pin is not None
-        ),
-        skill_pins=tuple(
-            TaskSkillPins(task_id=item.task_id, pins=item.skill_pins)
-            for item in ordered
-            if item.skill_pins
-        ),
         calculations=calculations,
     )

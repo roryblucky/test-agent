@@ -13,9 +13,9 @@
 - [ ] 应用接收流量前完成已知 Tenant 的完整 Agent/Skill definition 加载；references 不预读；遵守逐条 skip/log 和 loaded/skipped counts 规则。
 - [ ] prefix 定位严格隔离 Tenant；存储失败不会借用其他 Tenant 内容或扩大 catalog membership；日志不泄漏完整 instructions 或 references。
 - [ ] Local 和 GCS 通过同一 Adapter 合同，覆盖等价 source documents、校验结果、启动快照、实时 references、确定性顺序、空目录、列举或读取失败时无部分成功结果。
-- [ ] 通过真实 startup composition 和现有 HTTP/SSE Agent 路径验证 GCS 定义驱动的 Specialist selection、Skill 交错激活、scope-limited Tool execution、结果发布及 pins。模型和 GCS 使用确定性替身，测试不要求真实网络或生产 credentials。
+- [ ] 通过真实 startup composition 和现有 HTTP/SSE Agent 路径验证 GCS 定义驱动的 Specialist selection、Skill 交错激活、scope-limited Tool execution 和结果发布。模型和 GCS 使用确定性替身，测试不要求真实网络或生产 credentials。
 - [ ] 生产 composition 以 Markdown-defined Specialists 为目标，迁移用 code Adapter 继续可用；不重构 legacy FlowEngine。
-- [ ] 提供最小 authoring 与环境配置说明，明确 definitions 重启生效、references 每次实时读取、required-tools/allowed-tools 语义和无 version Skill 的使用。
+- [ ] 提供最小 authoring 与环境配置说明，明确 definitions 重启生效、references 每次实时读取，以及 Graph `allowed-tools` 的限制语义。
 - [ ] 聚焦 Adapter/集成测试和受影响回归测试通过，并完成规格要求的最终确定性测试检查；无需等待 06 才能独立验证本票行为。
 
 ## Comments

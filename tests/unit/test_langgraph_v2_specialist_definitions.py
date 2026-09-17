@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +17,7 @@ from app.agents.specialist import SPECIALIST_INSTRUCTIONS, SPECIALIST_SECURITY_G
 from app.core.model_registry import ModelRegistry
 from app.langgraph_v2.agent_batch import (
     AcceptedBatch,
+    AcceptedTask,
     AgentToolRegistry,
     BatchContribution,
     DispatchBatch,
@@ -28,12 +30,13 @@ from app.langgraph_v2.agent_batch import (
     SpecialistTaskInput,
     SpecialistTool,
     TaskProposal,
-    TaskSpecialistDefinitionPin,
     TaskSucceeded,
-    accept_initial_dispatch,
     execute_specialist,
-    promote_batch,
 )
+from app.langgraph_v2.agent_batch import (
+    promote_batch as _promote_batch,
+)
+from app.langgraph_v2.agent_coordination import accept_coordination_dispatch
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
     EvidenceInvocationContext,
@@ -66,6 +69,36 @@ class _ModelRegistry:
         if name not in self.approved_profiles:
             raise KeyError(name)
         return object()
+
+
+@dataclass(frozen=True)
+class _BatchFixture:
+    id: str
+    tasks: tuple[AcceptedTask, ...]
+
+
+def accept_initial_dispatch(
+    decision: DispatchBatch,
+    *,
+    request_id: str,
+    specialist_catalog: SpecialistCatalog,
+) -> _BatchFixture:
+    accepted = accept_coordination_dispatch(
+        decision,
+        request_id=request_id,
+        rounds=(),
+        accepted_batches={},
+        specialist_catalog=specialist_catalog,
+    )
+    assert accepted.batch_id is not None
+    return _BatchFixture(accepted.batch_id, accepted.tasks)
+
+
+def promote_batch(
+    batch: _BatchFixture,
+    contributions: dict[str, BatchContribution],
+) -> AcceptedBatch:
+    return _promote_batch(batch.id, batch.tasks, contributions)
 
 
 class _ExecutableModelRegistry(_ModelRegistry):
@@ -211,11 +244,10 @@ ACTIVATION-TIME-INSTRUCTIONS
     assert catalog.skill_catalog is not None
     invocation = catalog.skill_catalog.begin_invocation(
         specialist_skill_names=("market-analysis",),
-        effective_tool_ids=frozenset(),
     )
     activated = await invocation.activate("market-analysis")
 
-    assert activated.instructions == "ACTIVATION-TIME-INSTRUCTIONS"
+    assert activated == "ACTIVATION-TIME-INSTRUCTIONS"
 
 
 @pytest.mark.asyncio
@@ -249,14 +281,11 @@ MARKET-INSTRUCTIONS
         skill_registry=registry,
     )
     registration = catalog.resolve("market-data")
-    definition_pin = registration.definition_pin
     assert catalog.skill_catalog is not None
     invocation = catalog.skill_catalog.begin_invocation(
         specialist_skill_names=registration.skill_names,
-        effective_tool_ids=frozenset(),
     )
     activated = await invocation.activate("market-analysis")
-    skill_pin = activated.pin
 
     first_files = await registry.get_resource_files("tenant-a", "market-analysis")
     first_references = await invocation.reference_tool()("market-analysis")
@@ -276,9 +305,7 @@ MARKET-INSTRUCTIONS
         ("guide.md", "SECOND-REFERENCE"),
         ("new.md", "NEW-REFERENCE"),
     ]
-    assert catalog.resolve("market-data").definition_pin == definition_pin
-    assert (await invocation.activate("market-analysis")).pin == skill_pin
-    assert invocation.effective_tool_ids == frozenset()
+    assert await invocation.activate("market-analysis") == activated
 
 
 @pytest.mark.asyncio
@@ -394,7 +421,7 @@ Instructions
 
 
 @pytest.mark.asyncio
-async def test_markdown_specialist_uses_instruction_precedence_and_persists_pin(
+async def test_markdown_specialist_uses_instruction_precedence(
     tmp_path: Path,
 ) -> None:
     _write_agent(
@@ -431,17 +458,6 @@ async def test_markdown_specialist_uses_instruction_precedence_and_persists_pin(
             tenant_id="tenant-a",
             request_id="request-1",
             task_id=batch.tasks[0].id,
-        ),
-    )
-    accepted = promote_batch(batch, {contribution.task_id: contribution})
-
-    registration = catalog.resolve("market-data")
-    assert len(registration.definition_pin) == 64
-    assert contribution.specialist_definition_pin == registration.definition_pin
-    assert accepted.specialist_definition_pins == (
-        TaskSpecialistDefinitionPin(
-            task_id=batch.tasks[0].id,
-            pin=registration.definition_pin,
         ),
     )
     instructions = registry.instructions[0]
@@ -551,10 +567,10 @@ INVALID-SKILL-INSTRUCTIONS-SENTINEL
     assert catalog.skill_catalog is not None
     invocation = catalog.skill_catalog.begin_invocation(
         specialist_skill_names=registration.skill_names,
-        effective_tool_ids=frozenset({"filing-reader"}),
     )
-    assert (await invocation.activate("filing-analysis")).instructions == (
-        "FULL-SKILL-INSTRUCTIONS-SENTINEL"
+    assert (
+        await invocation.activate("filing-analysis")
+        == "FULL-SKILL-INSTRUCTIONS-SENTINEL"
     )
     assert "kind=skill loaded=1 skipped=1" in caplog.text
     assert "reason=unknown-tool" in caplog.text
@@ -619,14 +635,13 @@ async def test_catalog_snapshot_stays_fixed_until_a_new_startup_load(
     assert second.descriptors == (
         SpecialistDescriptor(id="market-data", description="Second description."),
     )
-    assert first_registration.definition_pin != second_registration.definition_pin
     assert "FIRST-INSTRUCTIONS" in registry.instructions[0]
     assert "SECOND-INSTRUCTIONS" not in registry.instructions[0]
     assert "SECOND-INSTRUCTIONS" in registry.instructions[1]
 
 
 @pytest.mark.asyncio
-async def test_activated_skill_cache_and_versionless_pin_reset_on_new_startup(
+async def test_activated_skill_cache_resets_on_new_startup(
     tmp_path: Path,
 ) -> None:
     skill_path = _write_skill(
@@ -659,7 +674,6 @@ FIRST-SKILL-INSTRUCTIONS
     assert first.skill_catalog is not None
     first_invocation = first.skill_catalog.begin_invocation(
         specialist_skill_names=first_registration.skill_names,
-        effective_tool_ids=frozenset(),
     )
     first_activation = await first_invocation.activate("market-analysis")
 
@@ -684,7 +698,6 @@ SECOND-SKILL-INSTRUCTIONS
     assert second.skill_catalog is not None
     second_activation = await second.skill_catalog.begin_invocation(
         specialist_skill_names=second_registration.skill_names,
-        effective_tool_ids=frozenset(),
     ).activate("market-analysis")
 
     attempt_count = 0
@@ -718,7 +731,6 @@ SECOND-SKILL-INSTRUCTIONS
                 )
             return SpecialistAttempt(
                 finding=SpecialistFindingDraft(summary="accepted after restart"),
-                skill_pins=self.invocation.pins,
             )
 
     def retrying_factory(
@@ -739,7 +751,6 @@ SECOND-SKILL-INSTRUCTIONS
                 description=second_registration.description,
                 actor_factory=retrying_factory,
                 skill_names=second_registration.skill_names,
-                definition_pin=second_registration.definition_pin,
             ),
         ),
         skill_catalog=second.skill_catalog,
@@ -768,90 +779,10 @@ SECOND-SKILL-INSTRUCTIONS
         ),
     )
 
-    assert first_activation.pin.version is None
-    assert repeated_activation.instructions == "FIRST-SKILL-INSTRUCTIONS"
-    assert repeated_activation.pin == first_activation.pin
-    assert second_activation.instructions == "SECOND-SKILL-INSTRUCTIONS"
-    assert second_activation.pin.version is None
-    assert second_activation.pin.content_hash != first_activation.pin.content_hash
+    assert repeated_activation == "FIRST-SKILL-INSTRUCTIONS"
+    assert repeated_activation == first_activation
+    assert second_activation == "SECOND-SKILL-INSTRUCTIONS"
     assert contribution.attempt == 2
-    assert contribution.skill_pins == (second_activation.pin,)
-
-
-@pytest.mark.asyncio
-async def test_definition_pin_is_canonical_and_excludes_storage_identity(
-    tmp_path: Path,
-) -> None:
-    _write_agent(
-        tmp_path,
-        tenant_id="tenant-a",
-        filename="first-name.agent.md",
-        content=_agent_document(),
-    )
-    _write_agent(
-        tmp_path,
-        tenant_id="tenant-b",
-        filename="different-name.agent.md",
-        content="""---
-skills: []
-model-profile: specialist
-description: Analyze market data.
-id: market-data
----
-Use only the assigned Task context.
-""",
-    )
-    registry = cast(ModelRegistry, _ModelRegistry("specialist"))
-
-    first = await build_specialist_catalog(
-        LocalTenantDefinitionLoader(tmp_path),
-        tenant_id="tenant-a",
-        model_registry=registry,
-    )
-    second = await build_specialist_catalog(
-        LocalTenantDefinitionLoader(tmp_path),
-        tenant_id="tenant-b",
-        model_registry=registry,
-    )
-
-    assert (
-        first.resolve("market-data").definition_pin
-        == second.resolve("market-data").definition_pin
-    )
-
-
-def test_definition_pin_fields_are_backward_compatible_with_old_checkpoint_data() -> (
-    None
-):
-    accepted = AcceptedBatch.model_validate({"id": "batch-1", "outcomes": []})
-
-    assert accepted.specialist_definition_pins == ()
-
-
-def test_skill_pin_checkpoint_accepts_new_optional_version_and_old_empty_field() -> (
-    None
-):
-    without_version = AcceptedBatch.model_validate(
-        {
-            "id": "batch-1",
-            "outcomes": [],
-            "skill_pins": [
-                {
-                    "task_id": "task-1",
-                    "pins": [
-                        {
-                            "name": "filing-analysis",
-                            "content_hash": "a" * 64,
-                        }
-                    ],
-                }
-            ],
-        }
-    )
-    old_checkpoint = AcceptedBatch.model_validate({"id": "batch-1", "outcomes": []})
-
-    assert without_version.skill_pins[0].pins[0].version is None
-    assert old_checkpoint.skill_pins == ()
 
 
 @pytest.mark.asyncio
@@ -1039,9 +970,6 @@ Use the filing reader.
         for summary in catalogs["tenant-a"]
         .skill_catalog.begin_invocation(
             specialist_skill_names=tenant_a_registration.skill_names,
-            effective_tool_ids=catalogs["tenant-a"].effective_tool_ids(
-                scope_tool_ids=frozenset({"filing-reader"})
-            ),
         )
         .summaries
     ] == ["filing-analysis"]
@@ -1142,6 +1070,3 @@ async def test_code_and_markdown_adapters_share_the_execution_contract(
         "filing-reader",
     )
     assert contributions[0].outcome == contributions[1].outcome
-    assert all(
-        len(item.specialist_definition_pin or "") == 64 for item in contributions
-    )

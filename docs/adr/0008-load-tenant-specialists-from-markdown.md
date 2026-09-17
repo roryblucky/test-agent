@@ -3,16 +3,15 @@
 Status: accepted
 
 Tenant administrators need to add or revise Specialist Agents without changing
-Python registration code. We will load Tenant-owned Specialist Definitions from
-Markdown, use Agent Skills for reusable instructions, and adapt both Markdown-
-defined and existing code-defined Specialists to the same runtime contracts. The
-design deliberately borrows portable conventions from VS Code agent files and
-the open Agent Skills format without promising exact VS Code compatibility.
+Python registration code. We load Tenant-owned Specialist Definitions from
+Markdown, reuse the repository's Agent Skills loader and registry, and adapt
+Markdown-defined Specialists to the existing Graph execution contracts. The
+authoring format borrows useful conventions from VS Code agent files and the
+open Agent Skills format without claiming exact VS Code compatibility.
 
 ## Definition and storage layout
 
-Each Tenant uses its `kmsAppId` as its Tenant ID and owns one relative definition
-tree:
+Each Tenant uses its `kmsAppId` as its Tenant ID and owns one relative tree:
 
 ```text
 tenants/{kmsAppId}/
@@ -25,148 +24,116 @@ tenants/{kmsAppId}/
 ```
 
 Development reads this tree from a local root. Production reads the same
-relative structure from a configured GCS prefix. Storage-specific code remains
-behind loaders so the Specialist runtime consumes one common catalog model.
+relative structure from a configured GCS prefix. Storage-specific behavior
+stays behind loaders and both environments build the same runtime catalog.
 
-A `.agent.md` file has YAML frontmatter containing only:
+A `.agent.md` file has YAML frontmatter containing only `id`, `description`,
+`model-profile`, and `skills`. Its Markdown body is the Specialist's
+instructions. The owning path supplies Tenant identity. The runtime supplies
+the common `SpecialistTaskInput -> SpecialistResult` contract, platform
+instructions, security guards, and Tool bindings. A definition cannot declare
+its own Tenant, Intent allowlist, Tool allowlist, role, or output schema.
 
-- `id`
-- `description`
-- `model-profile`
-- `skills`
-
-Its Markdown body is the Specialist's instructions. It does not declare a role,
-Tenant ID, Intent allowlist, Tool allowlist, or output schema. The owning path
-supplies the Tenant identity, and the runtime supplies common input and output
-contracts. `model-profile` must resolve to a platform-approved model profile.
-Specialist instruction bodies are limited to 30,000 characters, and one
-Specialist exposes at most 20 eligible Skill summaries.
-
-The first phase applies only to Specialist Agents. Coordinator and Synthesis
-actors remain platform-defined.
+`model-profile` must resolve to a platform-approved profile. Specialist
+instructions are limited to 30,000 characters. An invocation exposes all
+eligible Skill summaries in declaration order. This phase applies only to
+Specialists; Coordinator and Synthesis remain platform-defined.
 
 ## Catalog and selection
 
-Startup parses and validates each Tenant's complete Specialist definitions and
-discovers each Skill's metadata summary and Tool dependencies. It retains
-complete `.agent.md` content but not complete `SKILL.md` instructions in the
-Tenant catalog, and exposes only compact Specialist descriptors and eligible
-Skill summaries to models. A malformed discovery entry is skipped and logged
-without rejecting the Tenant's entire catalog.
+Startup validates each Tenant's Specialist definitions and discovers Skill
+metadata. Invalid entries are skipped and logged without rejecting valid
+siblings. Agent and Skill definition changes take effect on restart. Reference
+files are the exception: they are read live on each `load_reference` call.
 
-The Coordinator receives every valid Specialist descriptor in the current
-Tenant and chooses a Specialist from its `id` and `description`. Business Intent
-does not carry `allowed_specialist_ids` and does not directly filter the
-Specialist or Skill catalogs. Intent policy instead produces the current
-Research Scope, including permitted sources and Tools.
+The Coordinator sees every valid `id` and `description` in the current Tenant
+catalog. Intent does not contain an Agent or Skill allowlist. Intent policy
+continues to define the data scope: Tools, sources, queries, freshness, and
+other business constraints.
 
-Agent-definition and Skill-discovery-metadata changes become effective after
-process restart. Complete instructions for a Skill not yet activated are read
-from current storage on activation; after activation the shared Agent Skills
-Registry keeps its normal process-local Tier 2 cache. Every Coordinator decision,
-including after checkpoint resume, uses all valid Specialist descriptors in the
-current process's Tenant catalog. The Run retains its original Tool, source,
-query, freshness, and other data constraints. A legitimately dispatched Task
-whose Specialist Definition has since disappeared produces a failure outcome for
-that Task without preventing valid sibling Tasks from running; a forged Task,
-invalid identity, or damaged Batch manifest remains an invariant failure. An
-existing ID uses the definition loaded by the current process, and the accepted
-Specialist attempt or outcome records the content hash of the definition it
-actually used.
+The model proposes a Task and deterministic code accepts it as an
+`AcceptedTask`. The accepted Task is stored once in its `CoordinationRound`.
+An unaccepted final dispatch round is the pending batch; no separate active
+batch checkpoint exists. The batch barrier still validates and atomically
+promotes the exact set of Task outcomes; these two trust boundaries remain.
 
 ## Skill activation and references
 
-Skills follow the open Agent Skills progressive-disclosure model: discovery
-shows only metadata, and activation asks the shared Agent Skills Registry to
-read the full `SKILL.md` instructions from storage before adding them to the
-current Specialist invocation. The Registry then reuses that activated Tier 2
-definition for the process lifetime unless it is explicitly invalidated.
+Skills retain the repository's physical three-tier behavior:
 
-A Specialist invocation computes its eligible Skill set once from the loaded
-definitions and frozen effective Tools. It may progressively activate zero or
-more members of that fixed set before or after business Tool calls. There is no
-separate `max_activated_skills` setting, each activation remains effective for
-the rest of the invocation, and there is no `required-skills` dependency
-mechanism. A Skill Pin contains the Skill name, its content hash, and the optional
-`metadata.version` value when the author supplied one. The content hash identifies
-the actual cached definition when no version is declared; version is not a
-required authoring field.
+1. startup discovery exposes metadata summaries;
+2. `activate_skill` loads full `SKILL.md` instructions on demand through the
+   shared `TenantSkillRegistry`, whose Tier 2 definition cache is process-local;
+3. `load_reference` reads the current direct files under `references/` every
+   time and does not cache their contents.
 
-Activated Skills are peers. The runtime does not assign precedence, detect
-semantic conflicts, reorder instructions, degrade behavior, or provide a code-
-level fallback for conflicting Skills. Such conflicts are Tenant-authored
-content defects handled through publishing review and evaluations.
+A Specialist's eligible Skills are exactly its declared names that exist in
+the current Tenant Skill Catalog, in declaration order. An
+invocation may activate zero or more of them, including between business Tool
+calls. Repeated activation is idempotent. There is no `required-skills` or
+`max_activated_skills` setting. Skill conflicts are Tenant content-quality
+problems handled by publishing review and evals, not runtime precedence logic.
 
-Reference contents are not loaded or cached at startup. When the model needs
-them, `load_reference` reads and returns all files in that Skill's `references/`
-directory. Each call sees the latest stored contents without requiring restart;
-the runtime does not pin or preserve a historical reference version. An absent or
-empty directory returns an empty result. A listing or file-read failure returns an
-explicit Tool failure and no partial contents, so incomplete data is never
-reported as a complete reference set.
+An absent or empty references directory returns a successful empty result. A
+listing or read failure returns a bounded failure and no partial contents.
+Neither full instructions nor references are persisted in graph state.
 
 ## Tool authority and instruction precedence
 
-Tools are registered in the platform's global Tool Registry. A Specialist does
-not own a separate Tool allowlist. Its effective Tools are the intersection of
-Tenant Tool policy and the current Research Scope:
+Tools are registered globally by the platform. For a Markdown Specialist, the
+business Tools bound to an invocation are:
 
 ```text
-Effective Tools = Tenant Tool Policy ∩ Research Scope
+Registered Tools
+∩ Tenant Tool Policy
+∩ Research Scope
+∩ union(allowed-tools of the Specialist's declared valid Skills)
 ```
 
-`required-tools` declares the hard Tool dependencies used to decide whether a
-Skill is eligible for an invocation. `allowed-tools` is portable usage guidance
-for Tools the Skill may discuss when they are otherwise available; it neither
-grants Tools nor makes them prerequisites. Every Tool name in either field must
-resolve in the global Tool Registry or the Skill is invalid and skipped at
-startup. If a `required-tools` Tool exists but the current Research Scope does
-not permit it, that Skill is omitted from the Specialist's eligible summaries.
-Executable capability must come from the Tool Registry; the runtime does not
-execute bundled Skill scripts.
+`allowed-tools` is a restrictive ceiling, not a grant. Every listed name must
+exist in the global registry or the Skill is skipped at startup. A Tool omitted
+from the declared Skills is not bound even if broader platform policy permits
+it. Graph Specialist eligibility does not consume `required-tools`; that legacy
+field remains available to the FlowEngine Skill implementation and is not a
+second Graph policy.
 
-Platform instructions and fixed security guards have authority over Specialist
-and Skill instructions. Specialist instructions are appended to the platform
-instructions, and activated Skill instructions are subsequently introduced into
-the invocation. Neither can widen Tenant authority, Research Scope, Tool
-bindings, or graph routing. We do not add a semantic instruction-conflict
-detector; the platform instruction boundary remains authoritative.
+Executable capability always comes from the Tool Registry; bundled Skill
+scripts are not executed. Platform Specialist instructions and fixed security
+guards precede Tenant Specialist instructions. Activated Skill instructions
+arrive later through the activation result. Instructions cannot widen Tenant
+identity, Research Scope, Tool bindings, validation, or graph routing.
 
-## Runtime contract and migration
+## Runtime state and observability
 
-Both implementation styles use the existing common
-`SpecialistTaskInput -> SpecialistResult` contract. During migration, code-
-defined and Markdown-defined adapters remain available and must pass the same
-contract tests. The production target is Markdown-defined Specialists only;
-the code-defined adapter exists to compare behavior and de-risk the transition,
-not as a permanent second authoring model.
+The runtime does not compute or persist Specialist Definition Pins or Skill
+Pins. They did not enforce authority or provide exact replay because definitions
+are loaded from the current process catalog and references are live. Existing
+Task outcomes, bounded usage accounting, startup logs, and normal traces provide
+the required operational observability without hashing authoring content into
+checkpoint state.
 
-## Considered alternatives
+Graph state stores accepted facts, not derived mirrors. Coordination completion
+is derived from a terminal `CoordinationRound` or a bounded stop reason. Public
+`completion_status` and `termination_reason` remain in response metadata but are
+derived during finalization from `incomplete_research`; they are not separate
+checkpoint channels.
 
-- Keeping Specialists registered only in Python was rejected because Tenant
-  administrators would still require a code change and deployment to author one.
-- Exact VS Code agent-file compatibility was rejected because this runtime has
-  different Tenant, Tool, Intent, and execution contracts.
-- Filtering Specialists through Intent `allowed_specialist_ids` was rejected;
-  the Coordinator should select from all valid Tenant Specialist descriptors,
-  while Intent policy controls data and Tool scope.
-- Preserving or intersecting a historical Specialist ID snapshot on resume was
-  rejected because every Coordinator decision should use the current Tenant
-  catalog; the original Run's Tool, source, query, and freshness constraints
-  continue to prevent data-authority expansion.
-- Hot-reloading Agent and Skill instructions was rejected in favor of a stable
-  process-lifetime definition snapshot. References intentionally remain live.
-- Atomic all-or-nothing Tenant catalog loading was rejected in favor of skipping
-  and logging individual invalid definitions.
-- A Specialist-specific Tool allowlist was rejected because Tenant policy and
-  Research Scope already own Tool authority, while Skills only express
-  dependencies and usage guidance.
+The reviewed PydanticAI version is already fixed by `pyproject.toml` and the
+lockfile. The runtime does not duplicate dependency resolution with a startup
+or per-attempt version check.
 
-## Consequences
+## Migration and consequences
 
-Tenant isolation follows the `kmsAppId`-scoped path, catalog, and Tool context.
-Description quality becomes important because Coordinator and Skill selection
-are model-driven, so publishing review and evaluations are required operational
-controls. Definitions are stable for a process lifetime, but live references
-and latest-definition retries mean historical execution is observable by hashes
-rather than exactly replayable from persisted definition contents.
+Code-defined and Markdown-defined adapters temporarily share the existing
+Specialist input/output contract for comparison. Markdown definitions are the
+production target; Graph code does not gain a general plugin framework.
+
+Tenant isolation follows the `kmsAppId`-scoped storage path, catalog, trusted
+request context, and Tool binding. Descriptions and Skill content require
+Tenant publishing review and evals. Definitions are stable for a process
+lifetime, while references intentionally remain live.
+
+Rejected alternatives include Intent Agent allowlists, historical definition
+snapshots, hot reload of Agent or Skill instructions, atomic all-or-nothing
+Tenant catalog loading, runtime Skill-conflict resolution, bundled code
+execution, and a second Graph-specific Agent Skills implementation.

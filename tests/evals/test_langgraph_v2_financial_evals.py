@@ -34,13 +34,13 @@ from app.langgraph_v2.agent_batch import (
     SpecialistRegistration,
     SpecialistTaskInput,
     TaskProposal,
-    accept_initial_dispatch,
 )
 from app.langgraph_v2.agent_coordination import (
     CoordinationRound,
     CoordinatorDecisionExhausted,
     CoordinatorInput,
     Finish,
+    accept_coordination_dispatch,
 )
 from app.langgraph_v2.agent_evidence import (
     EvidenceEnvelope,
@@ -320,6 +320,7 @@ class _Harness:
     provider_calls: list[str] = field(default_factory=lambda: list[str]())
     tool_calls: list[str] = field(default_factory=lambda: list[str]())
     task_calls: list[str] = field(default_factory=lambda: list[str]())
+    skill_activations: list[str] = field(default_factory=lambda: list[str]())
     task_tool_calls: Counter[str] = field(default_factory=Counter[str])
     active_task_ids: dict[str, str] = field(default_factory=lambda: dict[str, str]())
     evidence_counts: Counter[str] = field(default_factory=Counter[str])
@@ -336,7 +337,6 @@ class _Harness:
             allowed_tool_ids=frozenset(
                 {"market-reader", "fund-reader", "news-reader", "calculator"}
             ),
-            allowed_skill_names=frozenset({"financial-analysis"}),
             allowed_sources=frozenset({"market", "fund", "news"}),
             allowed_queries=frozenset(
                 {
@@ -517,6 +517,7 @@ class _Specialist:
             )
         assert self.skills is not None
         await self.skills.activate("financial-analysis")
+        self.harness.skill_activations.append("financial-analysis")
         tool_calls_before = len(self.harness.tool_calls)
         tool_id, source, query = {
             "market": (
@@ -548,7 +549,6 @@ class _Specialist:
             evidence=tuple(self.capture.evidence),
             unavailability=tuple(self.capture.unavailability),
             calculations=tuple(self.capture.calculations),
-            skill_pins=self.skills.pins,
         )
 
     async def _call(self, tool_id: str, *args: object) -> None:
@@ -658,16 +658,7 @@ async def _graph_observation(harness: _Harness) -> FinancialObservation:
             accepted_outcomes=tuple(
                 tuple(outcome.kind for outcome in batch.outcomes) for batch in batches
             ),
-            selected_skills=tuple(
-                sorted(
-                    {
-                        pin.name
-                        for batch in batches
-                        for task_pins in batch.skill_pins
-                        for pin in task_pins.pins
-                    }
-                )
-            ),
+            selected_skills=tuple(sorted(set(harness.skill_activations))),
             selected_tools=tuple(sorted(set(harness.tool_calls))),
             provider_calls=len(harness.provider_calls),
             model_requests=sum(batch.usage.model_requests for batch in batches),
@@ -721,9 +712,11 @@ def _gate_observation(case: FinancialCase) -> FinancialObservation:
             ),
         )
         with pytest.raises(ValueError, match="Specialist is not eligible"):
-            accept_initial_dispatch(
+            accept_coordination_dispatch(
                 _dispatch(("fund", _FUND_OBJECTIVE)),
                 request_id=_REQUEST_ID,
+                rounds=(),
+                accepted_batches={},
                 specialist_catalog=market_only_catalog,
             )
         return FinancialObservation(gates=GateObservation(scope_rejected=True))

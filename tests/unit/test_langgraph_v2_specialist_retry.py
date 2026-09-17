@@ -16,13 +16,11 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.usage import RunUsage, UsageLimits
 
 from app.langgraph_v2.specialist_retry import (
-    PinnedPydanticAIVersionError,
     RetryDisposition,
     SpecialistFailureFacts,
     SpecialistModelBoundary,
     SpecialistModelRequestTimeout,
     classify_specialist_failure,
-    require_pinned_pydantic_ai_version,
     specialist_usage_limits,
 )
 
@@ -142,7 +140,10 @@ def test_raw_google_transport_errors_are_fatal_outside_the_google_model_boundary
     error_type: type[httpx.TransportError],
     boundary: SpecialistModelBoundary,
 ) -> None:
-    error = error_type("business transport failure", request=httpx.Request("GET", "https://example.test"))
+    error = error_type(
+        "business transport failure",
+        request=httpx.Request("GET", "https://example.test"),
+    )
 
     assert classify_specialist_failure(error, facts=_facts(boundary=boundary)) is None
     assert (
@@ -207,13 +208,6 @@ def test_closed_v1_classifier_has_no_superclass_or_message_fallback(
     expected: RetryDisposition | None,
 ) -> None:
     assert classify_specialist_failure(error, facts=facts) is expected
-
-
-def test_pinned_pydantic_ai_version_is_required() -> None:
-    require_pinned_pydantic_ai_version()
-
-    with pytest.raises(PinnedPydanticAIVersionError):
-        require_pinned_pydantic_ai_version(version="1.93.1")
 
 
 def test_specialist_count_limits_allow_exact_bound_and_reject_one_more() -> None:

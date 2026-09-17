@@ -171,7 +171,6 @@ async def test_specialist_interleaves_multiple_skill_activations_with_business_t
     )
     invocation = skill_catalog.begin_invocation(
         specialist_skill_names=("filing-analysis", "market-analysis"),
-        effective_tool_ids=frozenset({"read_evidence"}),
     )
     calls = 0
 
@@ -248,20 +247,14 @@ async def test_specialist_interleaves_multiple_skill_activations_with_business_t
     )
 
     assert calls == 4
-    assert [pin.name for pin in attempt.skill_pins] == [
-        "filing-analysis",
-        "market-analysis",
-    ]
-    assert attempt.skill_pins == invocation.pins
+    assert attempt.finding.summary == "Filing analysis"
 
 
 @pytest.mark.asyncio
 async def test_specialist_loads_current_local_references_before_business_execution(
     tmp_path: Path,
 ) -> None:
-    skill_directory = (
-        tmp_path / "tenants" / "tenant-a" / "skills" / "market-analysis"
-    )
+    skill_directory = tmp_path / "tenants" / "tenant-a" / "skills" / "market-analysis"
     references = skill_directory / "references"
     references.mkdir(parents=True)
     (skill_directory / "SKILL.md").write_text(
@@ -283,7 +276,6 @@ FULL-MARKET-INSTRUCTIONS
         summaries=registry.get_summaries("tenant-a"),
     ).begin_invocation(
         specialist_skill_names=("market-analysis",),
-        effective_tool_ids=frozenset({"read_evidence"}),
     )
     calls = 0
 
@@ -367,9 +359,6 @@ FULL-MARKET-INSTRUCTIONS
 
     assert calls == 5
     assert attempt.finding.summary == "Current-reference finding"
-    assert invocation.effective_tool_ids == frozenset({"read_evidence"})
-    assert len(attempt.skill_pins) == 1
-    assert attempt.skill_pins == invocation.pins
 
 
 @pytest.mark.asyncio

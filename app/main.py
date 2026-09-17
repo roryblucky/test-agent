@@ -29,7 +29,6 @@ from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.postgres import postgres_lifespan
 from app.langgraph_v2.specialist_definitions import load_local_specialist_catalogs
-from app.langgraph_v2.specialist_retry import require_pinned_pydantic_ai_version
 from app.services.tenant_manager import TenantManager
 
 logger = logging.getLogger(__name__)
@@ -103,7 +102,6 @@ async def _lifespan(
     agent_tool_registry: AgentToolRegistry,
 ) -> AsyncGenerator[None]:
     """Application lifespan — initialise and tear down shared resources."""
-    require_pinned_pydantic_ai_version()
     # Startup
     from app.api.router import get_session_store
     from app.config.config_reloader import ConfigReloader

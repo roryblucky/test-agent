@@ -31,7 +31,6 @@ from app.agents.coordinator import (
 from app.config.models import (
     AgentResearchConfig,
     AgentResearchIntentConfig,
-    AgentResearchSpecialistConfig,
     FlowConfig,
     LLMConfig,
     TenantConfig,
@@ -42,7 +41,6 @@ from app.langgraph_v2.agent_batch import (
     SpecialistRegistration,
 )
 from app.langgraph_v2.agent_coordination import (
-    AcceptedCoordinationDispatch,
     CoordinationRound,
     CoordinatorDecision,
     CoordinatorDecisionExhausted,
@@ -309,7 +307,8 @@ async def test_coordinator_uses_builtin_retry_with_actionable_policy_feedback(
         ),
     )
 
-    assert isinstance(decision, AcceptedCoordinationDispatch)
+    assert isinstance(decision, CoordinationRound)
+    assert decision.kind == "dispatch"
     assert calls == 2
     assert len(retry_parts) == 1
     assert retry_parts[0].content == ("Task context is not an accepted prior success")
@@ -401,12 +400,6 @@ def test_runtime_resolves_intent_policy_and_catalog_from_separate_tenant_sources
                         AgentResearchIntentConfig(
                             intent="market_outlook",
                             description="Assess market conditions.",
-                            allowed_skill_names=["filing-analysis"],
-                            specialist_descriptors=[
-                                AgentResearchSpecialistConfig(
-                                    id="market-data", description="Market data"
-                                )
-                            ],
                         )
                     ]
                 ),
@@ -449,9 +442,4 @@ def test_runtime_resolves_intent_policy_and_catalog_from_separate_tenant_sources
     )
     with pytest.raises(ValueError, match="Specialist is not eligible"):
         runtime.specialist_catalog.resolve("foreign")
-    assert not hasattr(
-        runtime.intent_policies["market_outlook"], "specialist_descriptors"
-    )
-    assert runtime.intent_policies["market_outlook"].allowed_skill_names == frozenset(
-        {"filing-analysis"}
-    )
+    assert not hasattr(runtime.intent_policies["market_outlook"], "allowed_skill_names")

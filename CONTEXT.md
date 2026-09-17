@@ -190,12 +190,6 @@ description, instructions, approved model profile, and eligible Skills. It
 cannot grant Tools or widen Research Scope.
 _Avoid_: Specialist Descriptor, Skill, Tool policy
 
-**Specialist Definition Pin**:
-The content hash of the Specialist Definition actually used for one Specialist
-attempt. It identifies observed execution configuration but does not embed the
-definition or guarantee that historical content remains available for replay.
-_Avoid_: Specialist Definition, catalog version
-
 **Specialist Catalog**:
 The Tenant-scoped collection of successfully loaded Specialist Definitions that
 the Coordinator may consider for every Business Intent in that Tenant. Invalid
@@ -242,23 +236,15 @@ A package of instructions and reference material that an Agent may activate on
 demand. It guides use of already-authorized capabilities and cannot grant a Tool.
 _Avoid_: Tool, prompt template, plugin
 
-**Skill Pin**:
-The recorded identity of the Skill Definition used for one activation: its name,
-optional declared version, and content hash. The hash identifies the actual
-cached definition; live reference contents are excluded.
-_Avoid_: Skill version, reference snapshot
-
 **Skill Catalog**:
 The Tenant-scoped collection of successfully loaded Skills. Multiple Specialist
 Definitions may reference the same Skill; invalid Skills, including Skills that
-name an unregistered Tool in `required-tools` or `allowed-tools`, are not members
-of the catalog.
+name an unregistered Tool in `allowed-tools`, are not members of the catalog.
 _Avoid_: Intent Catalog, Specialist Catalog, per-Agent Skill copy
 
 **Eligible Skill**:
 A Skill in the Tenant's Skill Catalog that one Specialist Definition names for
-discovery and whose `required-tools` dependencies the current Research Scope
-permits. The eligible set is fixed when the Specialist invocation starts; it
+discovery. The eligible set is fixed when the Specialist invocation starts; it
 does not mean full instructions have been loaded and does not grant Tools.
 _Avoid_: Available Skill, activated Skill
 

@@ -11,7 +11,7 @@
 - [x] code-defined registration 提供 Specialist ID、description 和构建 actor 所需的可信定义信息；Coordinator descriptors 来自当前 Tenant Catalog，不再来自 Intent-specific descriptor 配置。
 - [x] 两个 Business Intents 获得同一 Tenant 的完整有效 Specialist Descriptors，同时保留各自 Tool、source、query 和 freshness 约束；Intent Result 和 Intent Catalog item 结构不变。
 - [x] 不同 Tenant 的 catalog 和执行上下文隔离；Coordinator 选择未知或跨 Tenant Specialist ID 时被确定性拒绝。
-- [x] Agent Graph 所用 Evidence 和 Calculation Tools 通过共同的平台 registry/binding seam 解析。有效 Tools 为全局已注册 Tools、Tenant Tool policy 和 Research Scope 的交集，不再依赖 Specialist Tool allowlist。
+- [x] Agent Graph 所用 Evidence 和 Calculation Tools 通过共同的平台 registry/binding seam 解析。基础 Tools 为全局已注册 Tools、Tenant Tool policy 和 Research Scope 的交集；Markdown Skill `allowed-tools` 在 03 中进一步缩小该集合。
 - [x] 构建 actor 前冻结有效 Tool bindings；现有 Evidence、Calculation、expected unavailability 和 Data Gap 的代码校验继续有效。
 - [x] 保留现有 SpecialistTaskInput、SpecialistAttempt、SpecialistResult 和 Task Outcome 合同，建立可供两种 Adapter 复用的 code Adapter 合同测试基线。
 - [x] 通过现有 HTTP/SSE Agent 集成入口演示 code-defined Specialist 被选择、调用允许的 Tool 并完成 Task；拒绝 scope 外的 Tool。
@@ -20,7 +20,7 @@
 
 ## Answer
 
-已实现 Tenant-scoped `SpecialistCatalog`、共同 `AgentToolRegistry` 与 code Adapter 合同。Coordinator 始终读取当前 Tenant Catalog；执行时只接受 Catalog 成员，并在构建 actor 前冻结全局注册、Tenant policy 与 Research Scope 的 Tool 交集。`SpecialistRegistration` 必须且只能提供 `actor` 或 `actor_factory`；直接测试 actor 不接收 Tool/Skill bindings，factory actor 使用冻结后的 bindings。
+已实现 Tenant-scoped `SpecialistCatalog`、共同 `AgentToolRegistry` 与 code Adapter 合同。Coordinator 始终读取当前 Tenant Catalog；执行时只接受 Catalog 成员，并在构建 actor 前冻结 Tool bindings。`SpecialistRegistration` 必须且只能提供 `actor` 或 `actor_factory`；直接测试 actor 不接收 Tool/Skill bindings，factory actor 使用冻结后的 bindings。
 
 ## Comments
 

@@ -777,7 +777,7 @@ class _MarkdownTenantManager(_TenantManager):
         return cast(ModelRegistry, self.registry)
 
 
-def test_local_markdown_specialist_and_skills_run_through_http_and_persist_pins(
+def test_local_markdown_specialist_and_skills_run_through_http(
     langgraph_v2_migrated_database_url: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -816,7 +816,7 @@ MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL
         """---
 name: filing-analysis
 description: Read scoped filing evidence.
-required-tools: filing_reader
+allowed-tools: filing_reader
 ---
 MARKDOWN-FILING-INSTRUCTIONS-SENTINEL
 """,
@@ -824,21 +824,6 @@ MARKDOWN-FILING-INSTRUCTIONS-SENTINEL
     )
     registry = _MarkdownSpecialistModelRegistry()
     tenant_manager = _MarkdownTenantManager(registry)
-    telemetry_records: list[dict[str, str]] = []
-    skill_telemetry_records: list[dict[str, str | None]] = []
-
-    def record_specialist_definition_pin(**record: str) -> None:
-        telemetry_records.append(record)
-
-    def record_skill_pin(**record: str | None) -> None:
-        skill_telemetry_records.append(record)
-
-    monkeypatch.setattr(
-        agent_graph,
-        "record_specialist_definition_pin",
-        record_specialist_definition_pin,
-    )
-    monkeypatch.setattr(agent_graph, "record_skill_pin", record_skill_pin)
 
     async def filing_provider(source: str, query: str) -> EvidenceEnvelope:
         assert (source, query) == ("filing", "Apple revenue")
@@ -941,32 +926,8 @@ MARKDOWN-FILING-INSTRUCTIONS-SENTINEL
     assert accepted["outcomes"][0]["result"]["summary"] == (
         "Markdown specialist finding"
     )
-    pin = accepted["specialist_definition_pins"][0]["pin"]
-    assert pin == catalogs["tenant-a"].resolve("market-data").definition_pin
-    assert telemetry_records == [
-        {
-            "tenant_id": "tenant-a",
-            "request_id": "markdown-specialist-request",
-            "task_id": accepted["outcomes"][0]["task_id"],
-            "pin": pin,
-        }
-    ]
-    skill_pins = accepted["skill_pins"]
-    pins = skill_pins[0]["pins"]
-    assert [pin["name"] for pin in pins] == ["filing-analysis", "market-analysis"]
-    assert all(pin["version"] is None for pin in pins)
-    assert all(len(pin["content_hash"]) == 64 for pin in pins)
-    assert skill_telemetry_records == [
-        {
-            "tenant_id": "tenant-a",
-            "request_id": "markdown-specialist-request",
-            "task_id": accepted["outcomes"][0]["task_id"],
-            "name": pin["name"],
-            "content_hash": pin["content_hash"],
-            "version": None,
-        }
-        for pin in pins
-    ]
+    assert "specialist_definition_pins" not in accepted
+    assert "skill_pins" not in accepted
     assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in repr(state)
     assert "MARKDOWN-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
     assert "MARKDOWN-FILING-INSTRUCTIONS-SENTINEL" not in repr(state)
@@ -1038,7 +999,6 @@ def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(
         "dispatch",
         "finish",
     ]
-    assert state["active_batch"] is None
     assert len(state["accepted_batches"]) == 2
 
 
@@ -1282,7 +1242,6 @@ def test_http_scope_excludes_platform_tool_before_specialist_construction(
     assert specialist.inputs[0].task_id.startswith("task_")
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
-    assert state["active_batch"] is None
     assert state["staged_contributions"] == {}
     assert len(state["accepted_batches"]) == 1
 
@@ -1538,7 +1497,6 @@ def test_concurrent_mixed_batch_is_atomically_accepted_in_manifest_order(
         assert specialist.max_active == 8
         assert checkpoint is not None
         state = checkpoint.checkpoint["channel_values"]
-        assert state["active_batch"] is None
         assert state["staged_contributions"] == {}
         accepted = next(iter(state["accepted_batches"].values()))
         assert [outcome["kind"] for outcome in accepted["outcomes"]] == [
@@ -1844,7 +1802,6 @@ def test_batch_barrier_checkpoint_failure_never_half_accepts_a_mixed_batch(
     }
     assert {
         "accepted_batches",
-        "active_batch",
         "staged_contributions",
     } <= barrier_channels
 
@@ -2439,7 +2396,6 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
         intent="market_outlook",
         description="Assess market conditions.",
         allowed_tool_ids=frozenset({"filing_reader"}),
-        allowed_skill_names=frozenset({"intent-must-not-filter-skills"}),
         allowed_sources=frozenset({"filing"}),
         allowed_queries=frozenset({"Apple revenue"}),
     )
@@ -2470,7 +2426,7 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
                         name="filing-analysis",
                         description="Read an eligible filing before analysis.",
                         skill_metadata={"version": "2026.09"},
-                        required_tools=["filing_reader"],
+                        allowed_tools=["filing_reader"],
                     ),
                     instructions="FULL-SKILL-INSTRUCTIONS-SENTINEL",
                     tenant_id="tenant-a",
@@ -2530,11 +2486,6 @@ def test_specialist_activates_a_scope_bound_skill_before_publishing_evidence(
     assert done[0]["data"]["citations"][0]["evidence_id"] == "evidence-1"
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
-    skill_pins = next(iter(state["accepted_batches"].values()))["skill_pins"]
-    pin = skill_pins[0]["pins"][0]
-    assert pin["name"] == "filing-analysis"
-    assert pin["version"] == "2026.09"
-    assert len(pin["content_hash"]) == 64
     assert "FULL-SKILL-INSTRUCTIONS-SENTINEL" not in repr(state)
     assert all(
         "filing-analysis" not in input.model_dump_json() for input in coordinator.inputs

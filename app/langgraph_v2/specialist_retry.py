@@ -7,7 +7,6 @@ from enum import StrEnum
 
 import httpx
 import openai
-import pydantic_ai
 from pydantic_ai.exceptions import (
     ContentFilterError,
     IncompleteToolCall,
@@ -18,24 +17,9 @@ from pydantic_ai.exceptions import (
 )
 from pydantic_ai.usage import UsageLimits
 
-PINNED_PYDANTIC_AI_VERSION = "1.93.0"
 SPECIALIST_MAX_ATTEMPTS = 3
 SPECIALIST_MODEL_REQUEST_LIMIT = 12
 SPECIALIST_TOOL_CALL_LIMIT = 8
-
-
-class PinnedPydanticAIVersionError(RuntimeError):
-    """Reject a runtime whose SDK semantics differ from the reviewed mapping."""
-
-
-def require_pinned_pydantic_ai_version(*, version: str | None = None) -> None:
-    """Require the PydanticAI baseline that this closed table was reviewed for."""
-    resolved = pydantic_ai.__version__ if version is None else version
-    if resolved != PINNED_PYDANTIC_AI_VERSION:
-        raise PinnedPydanticAIVersionError(
-            "Specialist retry mapping requires "
-            f"pydantic-ai=={PINNED_PYDANTIC_AI_VERSION}, got {resolved}"
-        )
 
 
 class SpecialistModelBoundary(StrEnum):
@@ -85,32 +69,6 @@ class SpecialistInvocationFailure(Exception):
         super().__init__(str(error))
 
 
-@dataclass(frozen=True)
-class SpecialistFailedAttemptDiagnostic:
-    """Request-local failed-attempt message capture, never a Task Outcome field."""
-
-    attempt: int
-    messages: tuple[object, ...]
-
-
-@dataclass
-class SpecialistExecutionDiagnostics:
-    """Ephemeral execution diagnostics owned by the invocation caller."""
-
-    failed_attempts: list[SpecialistFailedAttemptDiagnostic]
-
-    def __init__(self) -> None:
-        self.failed_attempts = []
-
-    def record_failed_attempt(
-        self, *, attempt: int, messages: tuple[object, ...]
-    ) -> None:
-        """Retain one failed SDK invocation outside accepted graph state."""
-        self.failed_attempts.append(
-            SpecialistFailedAttemptDiagnostic(attempt=attempt, messages=messages)
-        )
-
-
 def specialist_usage_limits() -> UsageLimits:
     """Return the Task-cumulative count limits with every token limit disabled."""
     return UsageLimits(
@@ -139,9 +97,7 @@ def classify_specialist_failure(
     if isinstance(error, ContentFilterError):
         return None
     if isinstance(error, SpecialistModelRequestTimeout):
-        return (
-            RetryDisposition.RETRY if facts.at_model_request_boundary else None
-        )
+        return RetryDisposition.RETRY if facts.at_model_request_boundary else None
     if isinstance(error, ModelHTTPError):
         if (
             facts.boundary is not SpecialistModelBoundary.UNKNOWN

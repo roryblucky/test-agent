@@ -92,15 +92,16 @@ def test_agent_checkpoint_adapter_round_trips_only_valid_coordination_rounds() -
     round_ = accept_coordination_finish(request_id="request-1", rounds=())
     adapter = AgentCheckpointStateAdapter()
 
-    assert adapter.validate_checkpoint_state(
-        {
-            "coordination_rounds": {round_.id: round_.model_dump(mode="json")},
-            "request_id": "request-1",
-            "coordination_request_id": "request-1",
-            "coordination_finished": True,
-            "coordination_stop_reason": None,
-        }
-    ) == []
+    assert (
+        adapter.validate_checkpoint_state(
+            {
+                "coordination_rounds": {round_.id: round_.model_dump(mode="json")},
+                "request_id": "request-1",
+                "coordination_stop_reason": None,
+            }
+        )
+        == []
+    )
 
     with pytest.raises(TypeError, match="checkpoint coordination_rounds is invalid"):
         adapter.validate_checkpoint_state(
@@ -123,7 +124,9 @@ def test_agent_checkpoint_adapter_round_trips_only_valid_coordination_rounds() -
             }
         )
 
-    with pytest.raises(TypeError, match="checkpoint coordination_stop_reason is invalid"):
+    with pytest.raises(
+        TypeError, match="checkpoint coordination_stop_reason is invalid"
+    ):
         adapter.validate_checkpoint_state({"coordination_stop_reason": "raw-error"})
 
 
@@ -227,4 +230,6 @@ async def test_linear_graph_reuses_strict_json_native_checkpoint_state() -> None
     assert checkpoint is not None
     values = checkpoint.checkpoint["channel_values"]
     assert isinstance(values["final_response"], dict)
-    assert all(isinstance(message, HumanMessage) for message in values["conversation_messages"])
+    assert all(
+        isinstance(message, HumanMessage) for message in values["conversation_messages"]
+    )
