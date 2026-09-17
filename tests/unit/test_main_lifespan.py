@@ -14,6 +14,11 @@ import app.core.rate_limiter as rate_limiter_module
 import app.core.telemetry as telemetry_module
 import app.langgraph_v2.output_assessments as output_assessments_module
 import app.main as main_module
+from app.langgraph_v2.agent_batch import (
+    AgentToolRegistry,
+    EvidenceToolRegistration,
+)
+from app.langgraph_v2.agent_evidence import EvidenceEnvelope
 
 
 class _AsyncCloseTracker:
@@ -81,7 +86,7 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
 
         def get_agent_tool_ids(self, tenant_id: str) -> frozenset[str]:
             assert tenant_id == "tenant-a"
-            return frozenset({"filing_reader"})
+            return frozenset({"filing_reader", "unregistered"})
 
     manager_instance = Manager()
 
@@ -157,18 +162,29 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
     monkeypatch.setattr(router_module, "get_session_store", session_store_factory)
 
     lifespan_app = FastAPI()
-    expected_tool_registry = main_module.AgentToolRegistry()
-    lifespan_app.state.langgraph_v2_agent_tool_registry = expected_tool_registry
+    async def filing_provider(_source: str, _query: str) -> EvidenceEnvelope:
+        raise AssertionError("startup must not execute business Tools")
+
+    expected_tool_registry = AgentToolRegistry(
+        evidence_registrations=(
+            EvidenceToolRegistration(
+                id="filing_reader",
+                provider=filing_provider,
+                allowed_sources=frozenset(),
+            ),
+        )
+    )
+    configured_lifespan = main_module.create_lifespan(expected_tool_registry)
     if raise_from_body:
         with pytest.raises(RuntimeError, match="body failed"):
-            async with main_module.lifespan(lifespan_app):
+            async with configured_lifespan(lifespan_app):
                 assert (
                     lifespan_app.state.langgraph_v2_specialist_catalogs
                     == specialist_catalogs
                 )
                 raise RuntimeError("body failed")
     else:
-        async with main_module.lifespan(lifespan_app):
+        async with configured_lifespan(lifespan_app):
             assert (
                 lifespan_app.state.langgraph_v2_specialist_catalogs
                 == specialist_catalogs

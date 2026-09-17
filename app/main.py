@@ -5,8 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import AsyncGenerator
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import AsyncGenerator, Callable
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+)
+from functools import partial
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
@@ -92,7 +97,11 @@ class TimeoutMiddleware(BaseHTTPMiddleware):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+async def _lifespan(
+    app: FastAPI,
+    *,
+    agent_tool_registry: AgentToolRegistry,
+) -> AsyncGenerator[None]:
     """Application lifespan — initialise and tear down shared resources."""
     require_pinned_pydantic_ai_version()
     # Startup
@@ -117,18 +126,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         specialist_root = Path(
             os.environ.get("SPECIALIST_DEFINITIONS_LOCAL_ROOT", "definitions")
         )
-        agent_tool_registry = getattr(
-            app.state,
-            "langgraph_v2_agent_tool_registry",
-            AgentToolRegistry(),
-        )
         app.state.langgraph_v2_specialist_catalogs = (
             await load_local_specialist_catalogs(
                 app.state.tenant_manager,
                 root=specialist_root,
                 tool_registry=agent_tool_registry,
                 tenant_allowed_tool_ids={
-                    tenant_id: app.state.tenant_manager.get_agent_tool_ids(tenant_id)
+                    tenant_id: (
+                        app.state.tenant_manager.get_agent_tool_ids(tenant_id)
+                        & agent_tool_registry.registered_ids
+                    )
                     for tenant_id in app.state.tenant_manager.tenant_ids
                 },
             )
@@ -169,6 +176,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await cleanup.enter_async_context(postgres_lifespan(app))
         yield
     logger.info("KMS shutdown complete")
+
+
+def create_lifespan(
+    agent_tool_registry: AgentToolRegistry,
+) -> Callable[[FastAPI], AbstractAsyncContextManager[None]]:
+    """Bind the executable platform Tool Registry at application composition."""
+    return partial(_lifespan, agent_tool_registry=agent_tool_registry)
+
+
+# This deployment has no production Agent Graph Tool adapters yet. Keep the
+# registry empty rather than treating legacy FlowEngine callables as executable
+# Evidence or Calculation registrations.
+lifespan = create_lifespan(AgentToolRegistry())
 
 
 # ---------------------------------------------------------------------------

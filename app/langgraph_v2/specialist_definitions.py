@@ -1,4 +1,4 @@
-"""Startup loading for Tenant-authored Specialist Definitions."""
+"""Startup loading for Tenant-authored Specialist and Skill definitions."""
 
 from __future__ import annotations
 
@@ -212,12 +212,11 @@ async def load_local_specialist_catalogs(
     tenant_manager: TenantModelRegistryProvider,
     *,
     root: Path,
-    tool_registry: AgentToolRegistry | None = None,
+    tool_registry: AgentToolRegistry,
     tenant_allowed_tool_ids: Mapping[str, frozenset[str]] | None = None,
 ) -> dict[str, SpecialistCatalog]:
     """Build one immutable local Specialist Catalog per configured Tenant."""
     loader = LocalTenantDefinitionLoader(root)
-    effective_tool_registry = tool_registry or AgentToolRegistry()
     tenant_tool_policy = tenant_allowed_tool_ids or {}
     catalogs: dict[str, SpecialistCatalog] = {}
     for tenant_id in tenant_manager.tenant_ids:
@@ -225,7 +224,7 @@ async def load_local_specialist_catalogs(
             loader,
             tenant_id=tenant_id,
             model_registry=tenant_manager.get_model_registry(tenant_id),
-            tool_registry=effective_tool_registry,
+            tool_registry=tool_registry,
             tenant_allowed_tool_ids=tenant_tool_policy.get(tenant_id, frozenset()),
         )
     return catalogs
@@ -310,7 +309,7 @@ async def build_specialist_catalog(
         skill_definitions.append(definition)
     skill_catalog = RuntimeSkillCatalog(definitions=tuple(skill_definitions))
     logger.info(
-        "Specialist definitions loaded tenant=%s kind=skill loaded=%d skipped=%d",
+        "Skill definitions loaded tenant=%s kind=skill loaded=%d skipped=%d",
         tenant_id,
         len(skill_definitions),
         skipped_skills,
@@ -458,7 +457,7 @@ def _log_skip(tenant_id: str, source_identity: str, reason: str) -> None:
 
 def _log_skill_skip(tenant_id: str, source_identity: str, reason: str) -> None:
     logger.warning(
-        "Specialist definition skipped tenant=%s source=%s kind=skill reason=%s",
+        "Skill definition skipped tenant=%s source=%s kind=skill reason=%s",
         tenant_id,
         source_identity,
         reason,
