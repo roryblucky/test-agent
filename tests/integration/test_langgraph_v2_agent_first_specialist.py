@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
@@ -27,6 +28,7 @@ from app.agents.specialist import (
     PydanticAISpecialistActor,
 )
 from app.config.models import FlowConfig, LangGraphRuntimeMode, LLMConfig, TenantConfig
+from app.core.model_registry import ModelRegistry
 from app.langgraph_v2 import agent_graph
 from app.langgraph_v2.agent_batch import (
     AgentToolRegistry,
@@ -86,6 +88,7 @@ from app.langgraph_v2.checkpointing import (
 from app.langgraph_v2.contracts import V2QueryRequest
 from app.langgraph_v2.conversation_context import ConversationExchange
 from app.langgraph_v2.postgres import CheckpointerFactory
+from app.langgraph_v2.specialist_definitions import load_local_specialist_catalogs
 from app.langgraph_v2.specialist_retry import (
     SpecialistFailureFacts,
     SpecialistInvocationFailure,
@@ -691,6 +694,146 @@ class _TenantManager:
             llm_config=LLMConfig(models={}),
             flow_config=FlowConfig(),
         )
+
+
+class _MarkdownSpecialistModelRegistry:
+    def __init__(self) -> None:
+        self.model_messages: list[str] = []
+
+    def get_model(self, name: str) -> object:
+        if name != "specialist":
+            raise KeyError(name)
+        return object()
+
+    def create_agent(self, name: str, **kwargs: Any) -> object:
+        assert name == "specialist"
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            self.model_messages.append(repr(messages))
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=info.output_tools[0].name,
+                        args={
+                            "summary": "Markdown specialist finding",
+                            "evidence_ids": [],
+                        },
+                    )
+                ]
+            )
+
+        return Agent(FunctionModel(model), **kwargs)
+
+
+class _MarkdownTenantManager(_TenantManager):
+    def __init__(self, registry: _MarkdownSpecialistModelRegistry) -> None:
+        self.registry = registry
+
+    @property
+    def tenant_ids(self) -> list[str]:
+        return ["tenant-a"]
+
+    def get_model_registry(self, tenant_id: str) -> ModelRegistry:
+        assert tenant_id == "tenant-a"
+        return cast(ModelRegistry, self.registry)
+
+
+def test_local_markdown_specialist_runs_through_http_and_persists_definition_pin(
+    langgraph_v2_migrated_database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = """---
+id: market-data
+description: Tenant-authored market analysis.
+model-profile: specialist
+skills: []
+---
+TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL
+"""
+    definition_path = (
+        tmp_path / "tenants" / "tenant-a" / "agents" / "market-data.agent.md"
+    )
+    definition_path.parent.mkdir(parents=True)
+    definition_path.write_text(definition, encoding="utf-8")
+    registry = _MarkdownSpecialistModelRegistry()
+    tenant_manager = _MarkdownTenantManager(registry)
+    telemetry_records: list[dict[str, str]] = []
+
+    def record_specialist_definition_pin(**record: str) -> None:
+        telemetry_records.append(record)
+
+    monkeypatch.setattr(
+        agent_graph,
+        "record_specialist_definition_pin",
+        record_specialist_definition_pin,
+    )
+    catalogs = asyncio.run(
+        load_local_specialist_catalogs(tenant_manager, root=tmp_path)
+    )
+    coordinator = _Coordinator()
+    policy = AgentIntentPolicy(
+        intent="market_outlook",
+        description="Assess market conditions.",
+    )
+
+    def factory(
+        *,
+        app: FastAPI,
+        request_context: TrustedRequestContext,
+        checkpointer: BaseCheckpointSaver[Any],
+    ) -> GraphRuntimeAdapter:
+        return build_agent_runtime(
+            app,
+            request_context=request_context,
+            checkpointer=checkpointer,
+            query_understanding_actor=_UnderstandingActor(),
+            coordinator_actor=coordinator,
+            intent_policies={policy.intent: policy},
+        )
+
+    conversation_id = "00000000-0000-0000-0000-000000000102"
+    app = persistent_linear_app(
+        langgraph_v2_migrated_database_url,
+        agent_runtime_factory=factory,
+    )
+    app.state.tenant_manager = tenant_manager
+    app.state.langgraph_v2_specialist_catalogs = catalogs
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/query/stream",
+            json={
+                "query": "What about it?",
+                "sessionId": conversation_id,
+                "clientRequestId": "markdown-specialist-request",
+            },
+            headers=_TENANT_HEADERS,
+        )
+        checkpoint = _concurrent_batch_checkpoint(app, client, conversation_id)
+
+    events = parse_sse(response.text)
+    assert response.status_code == 200
+    assert len([event for event in events if event["type"] == "done"]) == 1
+    assert (
+        coordinator.inputs[0].specialist_descriptors == catalogs["tenant-a"].descriptors
+    )
+    assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" in registry.model_messages[0]
+    assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in response.text
+    assert checkpoint is not None
+    state = checkpoint.checkpoint["channel_values"]
+    accepted = next(iter(state["accepted_batches"].values()))
+    pin = accepted["specialist_definition_pins"][0]["pin"]
+    assert pin == catalogs["tenant-a"].resolve("market-data").definition_pin
+    assert telemetry_records == [
+        {
+            "tenant_id": "tenant-a",
+            "request_id": "markdown-specialist-request",
+            "task_id": accepted["outcomes"][0]["task_id"],
+            "pin": pin,
+        }
+    ]
+    assert "TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL" not in repr(state)
 
 
 def test_rolling_rounds_change_dispatch_shape_from_accepted_prior_results(

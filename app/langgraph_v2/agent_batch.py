@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -363,6 +364,12 @@ class BatchContribution(BaseModel):
     attempt: int = Field(ge=1, le=SPECIALIST_MAX_ATTEMPTS)
     outcome: TaskOutcome
     usage: SpecialistUsage = Field(default_factory=SpecialistUsage)
+    specialist_definition_pin: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     skill_pins: tuple[SkillPin, ...] = ()
     calculations: tuple[CalculationArtifact, ...] = Field(
         max_length=MAX_CALCULATIONS_PER_CONTRIBUTION,
@@ -379,6 +386,19 @@ class TaskSkillPins(BaseModel):
     pins: tuple[SkillPin, ...]
 
 
+class TaskSpecialistDefinitionPin(BaseModel):
+    """Definition Pin used by one accepted Specialist Task execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str
+    pin: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
 class AcceptedBatch(BaseModel):
     """One immutable batch promoted only by the barrier."""
 
@@ -387,6 +407,7 @@ class AcceptedBatch(BaseModel):
     id: str
     outcomes: tuple[TaskOutcome, ...]
     usage: SpecialistUsage = Field(default_factory=SpecialistUsage)
+    specialist_definition_pins: tuple[TaskSpecialistDefinitionPin, ...] = ()
     skill_pins: tuple[TaskSkillPins, ...] = ()
     calculations: tuple[CalculationArtifact, ...] = ()
 
@@ -498,6 +519,27 @@ class SpecialistRegistration:
     actor: SpecialistActor | None = None
     actor_factory: SpecialistActorFactory | None = None
     allowed_skill_names: frozenset[str] = frozenset()
+    definition_pin: str = ""
+
+    def __post_init__(self) -> None:
+        definition_pin = (
+            self.definition_pin
+            or hashlib.sha256(
+                json.dumps(
+                    {
+                        "adapter": "code",
+                        "description": self.description,
+                        "id": self.id,
+                        "skills": sorted(self.allowed_skill_names),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", definition_pin) is None:
+            raise ValueError("Specialist Definition Pin is invalid")
+        object.__setattr__(self, "definition_pin", definition_pin)
 
 
 @dataclass(frozen=True)
@@ -877,6 +919,7 @@ async def execute_specialist(
             task_id=task.id,
             attempt=attempt_number,
             outcome=TaskFailed(task_id=task.id),
+            specialist_definition_pin=registration.definition_pin,
             usage=SpecialistUsage.from_run_usage(
                 cumulative_usage,
                 tool_attempts=cumulative_tool_attempts,
@@ -1014,6 +1057,7 @@ async def execute_specialist(
             task_id=task.id,
             attempt=attempt_number,
             outcome=TaskSucceeded(task_id=task.id, result=result),
+            specialist_definition_pin=registration.definition_pin,
             usage=SpecialistUsage.from_run_usage(
                 cumulative_usage,
                 tool_attempts=cumulative_tool_attempts,
@@ -1116,6 +1160,14 @@ def promote_batch(
         id=batch.id,
         outcomes=tuple(item.outcome for item in ordered),
         usage=usage,
+        specialist_definition_pins=tuple(
+            TaskSpecialistDefinitionPin(
+                task_id=item.task_id,
+                pin=item.specialist_definition_pin,
+            )
+            for item in ordered
+            if item.specialist_definition_pin is not None
+        ),
         skill_pins=tuple(
             TaskSkillPins(task_id=item.task_id, pins=item.skill_pins)
             for item in ordered

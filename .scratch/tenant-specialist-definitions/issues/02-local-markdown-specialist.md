@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — 统一 code-defined Specialist Catalog 与 Tool 权限。
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 依据：已批准的 Tenant-authored Specialist Definitions 规格及 ADR 0008。
 

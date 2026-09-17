@@ -83,6 +83,25 @@ class TelemetryService:
         # Could add FastAPIInstrumentor here
 
 
+def record_specialist_definition_pin(
+    *,
+    tenant_id: str,
+    request_id: str,
+    task_id: str,
+    pin: str,
+) -> None:
+    """Attach one accepted Specialist definition identity to the active trace."""
+    trace.get_current_span().add_event(
+        "specialist.task.accepted",
+        attributes={
+            "tenant.id": tenant_id,
+            "request.id": request_id,
+            "task.id": task_id,
+            "specialist.definition.pin": pin,
+        },
+    )
+
+
 def trace_span(name: str | None = None) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Decorator to wrap a function execution in an OpenTelemetry span.
 

@@ -7,6 +7,7 @@ import logging
 import os
 from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -21,6 +22,7 @@ from app.core.rate_limit_middleware import TenantRateLimitMiddleware
 from app.langgraph_v2.agent_runtime import build_agent_runtime
 from app.langgraph_v2.api import register_v2_routes
 from app.langgraph_v2.postgres import postgres_lifespan
+from app.langgraph_v2.specialist_definitions import load_local_specialist_catalogs
 from app.langgraph_v2.specialist_retry import require_pinned_pydantic_ai_version
 from app.services.tenant_manager import TenantManager
 
@@ -111,6 +113,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         cleanup.push_async_callback(http_pool.close_all)
         configs = load_config("config.json")
         app.state.tenant_manager = TenantManager(configs, http_pool)
+        specialist_root = Path(
+            os.environ.get("SPECIALIST_DEFINITIONS_LOCAL_ROOT", "definitions")
+        )
+        app.state.langgraph_v2_specialist_catalogs = (
+            await load_local_specialist_catalogs(
+                app.state.tenant_manager,
+                root=specialist_root,
+            )
+        )
         app.state.http_pool = http_pool
 
         # Rate limiter (Redis in production, InMemory for dev)

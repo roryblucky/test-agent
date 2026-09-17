@@ -19,6 +19,7 @@ from langgraph.graph.message import (  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.types import Overwrite, Send
 from pydantic import ValidationError
 
+from app.core.telemetry import record_specialist_definition_pin
 from app.langgraph_v2.agent_batch import (
     AcceptedBatch,
     AcceptedTask,
@@ -478,6 +479,13 @@ def build_agent_graph(
                 )
             ),
         )
+        for definition_pin in accepted.specialist_definition_pins:
+            record_specialist_definition_pin(
+                tenant_id=tenant_id,
+                request_id=state["request_id"],
+                task_id=definition_pin.task_id,
+                pin=definition_pin.pin,
+            )
         return {
             "accepted_batches": {accepted.id: accepted.model_dump(mode="json")},
             "staged_contributions": cast(Any, Overwrite({})),

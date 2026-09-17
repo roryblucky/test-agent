@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -40,7 +41,9 @@ async def test_lifespan_checks_the_pinned_pydantic_ai_version_before_setup(
         calls += 1
         raise RuntimeError("PydanticAI version is not pinned")
 
-    monkeypatch.setattr(main_module, "require_pinned_pydantic_ai_version", require_version)
+    monkeypatch.setattr(
+        main_module, "require_pinned_pydantic_ai_version", require_version
+    )
 
     with pytest.raises(RuntimeError, match="not pinned"):
         async with main_module.lifespan(FastAPI()):
@@ -60,6 +63,8 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
     rate_limiter = _AsyncCloseTracker()
     session_store = _AsyncCloseTracker()
     http_pool = _HttpPool()
+    specialist_catalogs = {"tenant-a": object()}
+    specialist_load_calls: list[tuple[object, Path]] = []
 
     class AssessmentAuditFactory:
         def __new__(cls, *, project_id: str) -> _AsyncCloseTracker:
@@ -72,6 +77,12 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
 
     def tenant_manager(_configs: object, _http_pool: object) -> SimpleNamespace:
         return SimpleNamespace(tenant_ids=[])
+
+    async def load_local_specialist_catalogs(
+        manager: object, *, root: Path
+    ) -> dict[str, object]:
+        specialist_load_calls.append((manager, root))
+        return specialist_catalogs
 
     def audit_logger_factory(*, sinks: list[object]) -> _AsyncCloseTracker:
         assert len(sinks) == 2
@@ -103,9 +114,16 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
         return session_store
 
     monkeypatch.setenv("GCP_PROJECT_ID", "project-a")
+    monkeypatch.setenv("SPECIALIST_DEFINITIONS_LOCAL_ROOT", "/definitions")
     monkeypatch.setattr(main_module, "HttpClientPool", http_pool_factory)
     monkeypatch.setattr(main_module, "load_config", load_config)
     monkeypatch.setattr(main_module, "TenantManager", tenant_manager)
+    monkeypatch.setattr(
+        main_module,
+        "load_local_specialist_catalogs",
+        load_local_specialist_catalogs,
+        raising=False,
+    )
     monkeypatch.setattr(main_module, "postgres_lifespan", postgres_lifespan)
     monkeypatch.setattr(config_reloader_module, "ConfigReloader", config_reloader)
     monkeypatch.setattr(telemetry_module, "TelemetryService", telemetry_service)
@@ -122,14 +140,25 @@ async def test_lifespan_always_closes_bigquery_assessment_audit(
     )
     monkeypatch.setattr(router_module, "get_session_store", session_store_factory)
 
+    lifespan_app = FastAPI()
     if raise_from_body:
         with pytest.raises(RuntimeError, match="body failed"):
-            async with main_module.lifespan(FastAPI()):
+            async with main_module.lifespan(lifespan_app):
+                assert (
+                    lifespan_app.state.langgraph_v2_specialist_catalogs
+                    == specialist_catalogs
+                )
                 raise RuntimeError("body failed")
     else:
-        async with main_module.lifespan(FastAPI()):
-            pass
+        async with main_module.lifespan(lifespan_app):
+            assert (
+                lifespan_app.state.langgraph_v2_specialist_catalogs
+                == specialist_catalogs
+            )
 
+    assert specialist_load_calls == [
+        (lifespan_app.state.tenant_manager, Path("/definitions"))
+    ]
     assert assessment_audit.closed
     assert audit_logger.closed
     assert rate_limiter.closed

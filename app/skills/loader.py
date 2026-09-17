@@ -21,13 +21,11 @@ from __future__ import annotations
 
 import importlib
 import logging
-import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
 
-import yaml
-
+from app.markdown import parse_frontmatter_and_body
 from app.skills.schema import (
     ReferenceDocument,
     SkillDefinition,
@@ -54,45 +52,6 @@ class _GCSClient(Protocol):
     def bucket(self, bucket_name: str) -> _GCSBucket: ...
 
 
-# ---------------------------------------------------------------------------
-# Internal parser
-# ---------------------------------------------------------------------------
-
-
-def _parse_frontmatter_and_body(
-    content: str, source_path: str
-) -> tuple[dict[str, Any], str]:
-    """Split YAML frontmatter and Markdown body from a SKILL.md file.
-
-    Args:
-        content: Raw file content.
-        source_path: Path string for error messages.
-
-    Returns:
-        Tuple of (frontmatter_dict, instructions_body).
-
-    Raises:
-        ValueError: If the frontmatter delimiters are missing.
-    """
-    match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)", content, re.DOTALL)
-    if not match:
-        raise ValueError(
-            f"Invalid SKILL.md at {source_path}: "
-            "expected YAML frontmatter between --- delimiters"
-        )
-    loaded: object = yaml.safe_load(match.group(1))
-    if loaded is None:
-        frontmatter: dict[str, Any] = {}
-    elif isinstance(loaded, dict):
-        frontmatter = cast(dict[str, Any], loaded)
-    else:
-        raise ValueError(
-            f"Invalid SKILL.md at {source_path}: frontmatter must be a mapping"
-        )
-    instructions = match.group(2).strip()
-    return frontmatter, instructions
-
-
 def _parse_skill_md(content: str, tenant_id: str, source_path: str) -> SkillDefinition:
     """Parse a complete SKILL.md file (Tier 2 Activation object).
 
@@ -104,7 +63,11 @@ def _parse_skill_md(content: str, tenant_id: str, source_path: str) -> SkillDefi
     Returns:
         SkillDefinition with metadata + instructions (no references yet).
     """
-    frontmatter, instructions = _parse_frontmatter_and_body(content, source_path)
+    frontmatter, instructions = parse_frontmatter_and_body(
+        content,
+        source_identity=source_path,
+        document_name="SKILL.md",
+    )
     return SkillDefinition(
         metadata=SkillMetadata(**frontmatter),
         instructions=instructions,
@@ -128,7 +91,11 @@ def _parse_skill_summary(
     Returns:
         SkillSummary with name + description only.
     """
-    frontmatter, _ = _parse_frontmatter_and_body(content, source_path)
+    frontmatter, _ = parse_frontmatter_and_body(
+        content,
+        source_identity=source_path,
+        document_name="SKILL.md",
+    )
     return SkillSummary(
         name=frontmatter.get("name", ""),
         description=frontmatter.get("description", ""),
