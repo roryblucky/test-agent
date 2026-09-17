@@ -91,15 +91,16 @@ def record_specialist_definition_pin(
     pin: str,
 ) -> None:
     """Attach one accepted Specialist definition identity to the active trace."""
-    trace.get_current_span().add_event(
-        "specialist.task.accepted",
-        attributes={
-            "tenant.id": tenant_id,
-            "request.id": request_id,
-            "task.id": task_id,
-            "specialist.definition.pin": pin,
-        },
-    )
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_as_current_span("specialist.task.accepted") as span:
+        span.set_attributes(
+            {
+                "tenant.id": tenant_id,
+                "request.id": request_id,
+                "task.id": task_id,
+                "specialist.definition.pin": pin,
+            }
+        )
 
 
 def trace_span(name: str | None = None) -> Callable[[Callable[P, R]], Callable[P, R]]:

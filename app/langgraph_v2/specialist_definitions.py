@@ -99,13 +99,33 @@ class LocalSpecialistDefinitionLoader:
                     ),
                 )
             )
-        directory = self.root / "tenants" / tenant_id / "agents"
+        tenant_directory = self.root / "tenants" / tenant_id
+        directory = tenant_directory / "agents"
+        if tenant_directory.is_symlink() or directory.is_symlink():
+            return SpecialistSourceLoad(
+                failures=(
+                    SpecialistSourceFailure(
+                        tenant_id=tenant_id,
+                        source_identity=f"tenants/{tenant_id}/agents",
+                        reason="symlink-not-allowed",
+                    ),
+                )
+            )
         if not directory.exists():
             return SpecialistSourceLoad()
         documents: list[SpecialistSourceDocument] = []
         failures: list[SpecialistSourceFailure] = []
         for path in sorted(directory.glob("*.agent.md")):
             source_identity = f"tenants/{tenant_id}/agents/{path.name}"
+            if path.is_symlink():
+                failures.append(
+                    SpecialistSourceFailure(
+                        tenant_id=tenant_id,
+                        source_identity=source_identity,
+                        reason="symlink-not-allowed",
+                    )
+                )
+                continue
             try:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):

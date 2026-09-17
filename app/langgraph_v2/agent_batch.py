@@ -512,7 +512,7 @@ class CalculationToolRegistration:
 
 @dataclass(frozen=True)
 class SpecialistRegistration:
-    """Typed code registration for one Specialist actor."""
+    """Runtime registration for one Specialist Definition and actor."""
 
     id: str
     description: str

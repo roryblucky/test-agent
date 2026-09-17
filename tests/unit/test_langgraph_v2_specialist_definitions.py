@@ -100,10 +100,8 @@ class _ContractActor:
     def __init__(
         self,
         *,
-        tools: tuple[SpecialistTool, ...],
         inputs: list[SpecialistTaskInput],
     ) -> None:
-        self.tools = tools
         self.inputs = inputs
 
     async def run(
@@ -454,6 +452,31 @@ async def test_local_loader_rejects_a_tenant_id_that_can_escape_its_prefix(
 
 
 @pytest.mark.asyncio
+async def test_local_loader_rejects_a_cross_tenant_definition_symlink(
+    tmp_path: Path,
+) -> None:
+    _write_agent(
+        tmp_path,
+        tenant_id="tenant-b",
+        filename="foreign.agent.md",
+        content=_agent_document(specialist_id="foreign"),
+    )
+    tenant_a_directory = tmp_path / "tenants" / "tenant-a" / "agents"
+    tenant_a_directory.mkdir(parents=True)
+    (tenant_a_directory / "foreign.agent.md").symlink_to(
+        tmp_path / "tenants" / "tenant-b" / "agents" / "foreign.agent.md"
+    )
+
+    loaded = await LocalSpecialistDefinitionLoader(tmp_path).load_specialists(
+        "tenant-a"
+    )
+
+    assert loaded.documents == ()
+    assert len(loaded.failures) == 1
+    assert loaded.failures[0].reason == "symlink-not-allowed"
+
+
+@pytest.mark.asyncio
 async def test_startup_loads_only_known_tenants_with_their_own_model_registries(
     tmp_path: Path,
 ) -> None:
@@ -526,7 +549,7 @@ async def test_code_and_markdown_adapters_share_the_execution_contract(
     ) -> _ContractActor:
         del tool_capture, skill_invocation
         code_tool_names.append(tuple(tool.__name__ for tool in tools))
-        return _ContractActor(tools=tools, inputs=code_inputs)
+        return _ContractActor(inputs=code_inputs)
 
     code_catalog = SpecialistCatalog(
         registrations=(

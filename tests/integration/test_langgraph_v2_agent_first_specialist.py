@@ -823,6 +823,9 @@ TENANT-MARKDOWN-INSTRUCTIONS-SENTINEL
     assert checkpoint is not None
     state = checkpoint.checkpoint["channel_values"]
     accepted = next(iter(state["accepted_batches"].values()))
+    assert accepted["outcomes"][0]["result"]["summary"] == (
+        "Markdown specialist finding"
+    )
     pin = accepted["specialist_definition_pins"][0]["pin"]
     assert pin == catalogs["tenant-a"].resolve("market-data").definition_pin
     assert telemetry_records == [

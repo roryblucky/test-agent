@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
+from opentelemetry.trace import Tracer
 
 import app.core.telemetry as telemetry_module
 
@@ -12,13 +16,18 @@ import app.core.telemetry as telemetry_module
 def test_specialist_definition_pin_is_recorded_without_definition_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    events: list[tuple[str, dict[str, Any]]] = []
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
 
-    class Span:
-        def add_event(self, name: str, attributes: dict[str, Any]) -> None:
-            events.append((name, attributes))
+    def get_tracer(_name: str) -> Tracer:
+        return provider.get_tracer("test")
 
-    monkeypatch.setattr(telemetry_module.trace, "get_current_span", Span)
+    monkeypatch.setattr(
+        telemetry_module.trace,
+        "get_tracer",
+        get_tracer,
+    )
 
     telemetry_module.record_specialist_definition_pin(
         tenant_id="tenant-a",
@@ -27,14 +36,12 @@ def test_specialist_definition_pin_is_recorded_without_definition_content(
         pin="a" * 64,
     )
 
-    assert events == [
-        (
-            "specialist.task.accepted",
-            {
-                "tenant.id": "tenant-a",
-                "request.id": "request-1",
-                "task.id": "task-1",
-                "specialist.definition.pin": "a" * 64,
-            },
-        )
-    ]
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].name == "specialist.task.accepted"
+    assert dict(spans[0].attributes or {}) == {
+        "tenant.id": "tenant-a",
+        "request.id": "request-1",
+        "task.id": "task-1",
+        "specialist.definition.pin": "a" * 64,
+    }
